@@ -1,12 +1,19 @@
 # Golden configuration corpus
 
-Drop sing-box / sing-box-lx test configs and Tachyon-generated fixtures here
-(file name → one config per file). Used by `tests/differential`:
-
-1. `tachyon-core check -c <file>` vs `sing-box check -c <file>` — same exit code.
-2. Run-time smoke: `tachyon-core run` on configs marked `smoke: true`.
+Valid configurations must pass `tachyon-core check` **and** the reference
+`sing-box-lx check` (exit code 0). Files under `invalid/` are valid JSON with
+semantic errors: the reference must reject them; `tachyon-core` must reject
+them too once semantic validation lands (F1) — until then the differential
+harness reports them as known gaps unless `STRICT=1`.
 
 Sources:
-- `Leadaxe/sing-box-lx` → `lx-test/config/`
-- `SagerNet/sing-box` → `cmd/sing-box/testdata/`
-- Tachyon `tests/` fixtures
+
+| Dir | Source |
+|---|---|
+| `lx/` | `Leadaxe/sing-box-lx` → `lx-test/config/` (XHTTP, AWG2/3, chain) |
+| `tachyon/` | shape of configs emitted by Tachyon `generator.uc` |
+| `invalid/` | semantic-failure cases ported from `lx-test/initerr` |
+
+Upstream `SagerNet/sing-box` keeps its test configs inline in Go sources
+(`test/box_test.go`, …), so there is no upstream JSON corpus to import;
+equivalent cases get ported to `tachyon/` / `invalid/` as they are written.

@@ -4,10 +4,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use super::crypto::{Cipher, Method, derive_subkey, master_key, random_bytes};
-use crate::inbound::Target;
+use crate::inbound::{AnyRead, AnyWrite, Target};
 
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {
@@ -51,7 +50,7 @@ impl Shadowsocks {
     pub async fn connect(
         &self,
         target: &Target,
-    ) -> io::Result<(SsReader<OwnedReadHalf>, SsWriter<OwnedWriteHalf>)> {
+    ) -> io::Result<(SsReader<AnyRead>, SsWriter<AnyWrite>)> {
         let mut stream = TcpStream::connect((self.server.as_str(), self.port)).await?;
         let mut salt = vec![0u8; self.method.salt_len()];
         random_bytes(&mut salt)?;
@@ -96,7 +95,7 @@ impl Shadowsocks {
 
         let (read_half, write_half) = stream.into_split();
         let mut writer = SsWriter {
-            inner: write_half,
+            inner: Box::new(write_half) as AnyWrite,
             cipher: Cipher::new(self.method, &subkey),
             counter: writer_counter,
             max_chunk: self.method.max_chunk(),
@@ -106,7 +105,7 @@ impl Shadowsocks {
             writer.write_chunk(&addr).await?;
         }
         let reader = SsReader {
-            inner: read_half,
+            inner: Box::new(read_half) as AnyRead,
             method: self.method,
             master_key: Arc::clone(&self.master_key),
             cipher: None,

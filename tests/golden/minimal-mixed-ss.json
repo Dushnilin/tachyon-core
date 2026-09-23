@@ -1,0 +1,30 @@
+{
+  "log": { "level": "warn", "timestamp": false },
+  "dns": {
+    "servers": [
+      { "type": "udp", "tag": "dns-server", "server": "1.1.1.1" }
+    ],
+    "final": "dns-server",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct-out" },
+    {
+      "type": "shadowsocks",
+      "tag": "node-1",
+      "server": "example.com",
+      "server_port": 443,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAAA="
+    }
+  ],
+  "route": {
+    "rules": [
+      { "action": "route", "inbound": ["mixed-in"], "outbound": "node-1" }
+    ],
+    "final": "direct-out"
+  }
+}

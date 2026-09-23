@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The workspace .cargo/config.toml pins a local MSVC path; runners resolve
+      # `link.exe` from PATH themselves.
+      - name: Build (override local MSVC linker pin)
+        if: runner.os == 'Windows'
+        run: cargo build --workspace
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
+      - run: cargo test --workspace
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
+
+  cross:
+    name: Cross build (musl)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Size budget (<= 12 MiB)
+        run: |
+          size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")
+          echo "size=$size bytes"
+          test "$size" -le 12582912
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tachyon-core-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/tachyon-core

@@ -1,0 +1,15 @@
+[package]
+name = "core-tls"
+description = "TLS stack integration: pure-Rust crypto provider, fingerprint/REALITY spikes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-rustcrypto = "0.0.2-alpha"
+
+[dev-dependencies]
+webpki-roots = "0.26"

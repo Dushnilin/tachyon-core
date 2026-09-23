@@ -39,3 +39,22 @@ freelist; the format is stable and documented in the Go source.
   compatibility with upstream additions).
 - If upstream ever switches storage engine, this crate is isolated behind the
   `cache_file` interface and gets replaced, not rewritten across the core.
+
+## Spike outcome (F0, 2026-09-23)
+
+- Format facts validated against go.etcd.io/bbolt v1.5.0 source:
+  magic `0xED0CDAED`, version `2`, meta = page header (16B) + 64B body,
+  checksum = FNV-1a-64 over body[0..56), page `id` = `txid % 2`,
+  active meta = highest valid txid, `freelist = u64::MAX` means
+  "no persisted freelist", leaf element `pos` is relative to the element
+  (not the page), **keys must be stored sorted** (Go lookup is binary
+  search), inline buckets carry `root = 0` with the page appended after the
+  16B bucket header.
+- `crates/core-experimental` implements the read path (leaf/branch/inline)
+  and a single-page-per-node write path; round-trip proven in
+  `tests/golden_roundtrip.rs`: reads the committed Go-written
+  `tests/spikes/bbolt/golden.db`, and its own output is verified by
+  `tests/spikes/bbolt/gen` (`go run ./gen verify`) — both legs green in the
+  Docker gate.
+- Multi-page leaf overflow, freelist compaction and branch-page writing are
+  out of scope for the spike; needed later for large DNS caches (F4 gate).

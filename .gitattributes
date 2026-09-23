@@ -2,3 +2,4 @@
 *.png binary
 *.jpg binary
 *.ico binary
+*.db binary

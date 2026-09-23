@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/core-cli",
     "crates/core-config",
+    "crates/core-experimental",
+    "crates/core-tls",
 ]
 
 [workspace.package]

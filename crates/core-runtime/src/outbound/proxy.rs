@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::inbound::Target;
+use crate::inbound::{Conn, Target};
 use crate::route::Router;
 
 pub(crate) fn server_endpoint(
@@ -291,7 +291,7 @@ impl Selector {
         Ok(())
     }
 
-    pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<TcpStream> {
+    pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<Conn> {
         let index = self.current.load(Ordering::Relaxed);
         let Some(member) = self.resolved.get(index) else {
             return Err(io::Error::other("selector has no members"));

@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::inbound::{Target, dial, pump, require_u16};
+use crate::inbound::{Target, dial, pump_conn, require_u16};
 use crate::logging;
 use crate::route::Router;
 
@@ -192,10 +192,10 @@ async fn socks5(
     };
 
     match dial(router, &target).await {
-        Ok(upstream) => {
+        Ok(conn) => {
             socks_reply(&mut stream, 0x00).await?;
             logging::info(format_args!("mixed[{tag}] {peer} CONNECT {target}"));
-            pump(stream, upstream).await?;
+            pump_conn(stream, conn).await?;
             Ok(())
         }
         Err(err) => {
@@ -263,12 +263,12 @@ async fn http(
     };
 
     match dial(router, &target).await {
-        Ok(upstream) => {
+        Ok(conn) => {
             stream
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .await?;
             logging::info(format_args!("mixed[{tag}] {peer} CONNECT {target}"));
-            pump(stream, upstream).await?;
+            pump_conn(stream, conn).await?;
             Ok(())
         }
         Err(_) => {

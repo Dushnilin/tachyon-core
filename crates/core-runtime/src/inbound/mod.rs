@@ -4,10 +4,57 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
+use crate::route::Router;
 
 pub mod mixed;
+
+/// An established upstream connection: raw TCP or a shadowsocks stream.
+pub enum Conn {
+    Plain(TcpStream),
+    Shadowsocks(Box<SsReader<OwnedReadHalf>>, Box<SsWriter<OwnedWriteHalf>>),
+}
+
+/// Relay the client stream into an established upstream connection.
+pub async fn pump_conn(client: TcpStream, conn: Conn) -> io::Result<()> {
+    match conn {
+        Conn::Plain(upstream) => {
+            pump(client, upstream).await?;
+            Ok(())
+        }
+        Conn::Shadowsocks(mut reader, mut writer) => {
+            let (mut client_read, mut client_write) = client.into_split();
+            let mut up_buf = vec![0u8; 0x3FFF];
+            let mut down_buf = vec![0u8; 0x3FFF];
+            let up = async {
+                loop {
+                    let n = client_read.read(&mut up_buf).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    writer.write_chunk(&up_buf[..n]).await?;
+                }
+            };
+            let down = async {
+                loop {
+                    match reader.read(&mut down_buf).await {
+                        Ok(0) => return Ok(()),
+                        Ok(n) => client_write.write_all(&down_buf[..n]).await?,
+                        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            };
+            tokio::try_join!(up, down).map(|_| ())
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Target {
@@ -54,6 +101,6 @@ where
 }
 
 /// Dial the proxy target through the router's default outbound.
-pub async fn dial(router: &Arc<crate::route::Router>, target: &Target) -> io::Result<TcpStream> {
+pub async fn dial(router: &Arc<Router>, target: &Target) -> io::Result<Conn> {
     router.connect(target).await
 }

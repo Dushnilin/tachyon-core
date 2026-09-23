@@ -5,29 +5,34 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::net::TcpStream;
 
-use crate::inbound::Target;
+use crate::inbound::{Conn, Target};
 use crate::logging;
 use crate::outbound::block::Block;
 use crate::outbound::direct::Direct;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
+use crate::outbound::shadowsocks::stream::Shadowsocks;
 
 pub enum Outbound {
     Direct(Direct),
     Block(Block),
     Socks(Socks),
     Http(HttpOut),
+    Shadowsocks(Shadowsocks),
     Selector(Selector),
 }
 
 impl Outbound {
-    pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<TcpStream> {
+    pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<Conn> {
         match self {
-            Outbound::Direct(direct) => direct.connect(target).await,
-            Outbound::Block(block) => block.connect(target).await,
-            Outbound::Socks(socks) => socks.connect(target).await,
-            Outbound::Http(http) => http.connect(target).await,
+            Outbound::Direct(direct) => direct.connect(target).await.map(Conn::Plain),
+            Outbound::Block(block) => block.connect(target).await.map(Conn::Plain),
+            Outbound::Socks(socks) => socks.connect(target).await.map(Conn::Plain),
+            Outbound::Http(http) => http.connect(target).await.map(Conn::Plain),
+            Outbound::Shadowsocks(ss) => ss
+                .connect(target)
+                .await
+                .map(|(reader, writer)| Conn::Shadowsocks(Box::new(reader), Box::new(writer))),
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
     }
@@ -45,6 +50,7 @@ impl Outbound {
             "block" => Ok(Outbound::Block(Block)),
             "socks" => Ok(Outbound::Socks(Socks::build(obj, at)?)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
+            "shadowsocks" => Ok(Outbound::Shadowsocks(Shadowsocks::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(
                 "{at}: outbound type {other:?} not implemented yet"
@@ -115,7 +121,7 @@ impl Router {
     pub fn connect<'a>(
         &'a self,
         target: &'a Target,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = io::Result<Conn>> + Send + 'a>> {
         self.connect_index(self.default, target)
     }
 
@@ -124,7 +130,7 @@ impl Router {
         &'a self,
         index: usize,
         target: &'a Target,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = io::Result<Conn>> + Send + 'a>> {
         Box::pin(async move {
             let Some(outbound) = self.outbounds.get(index) else {
                 return Err(io::Error::other("outbound index out of range"));

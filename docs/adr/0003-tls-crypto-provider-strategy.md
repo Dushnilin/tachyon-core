@@ -33,3 +33,21 @@ arch would fork the codebase.
   measured in F9.
 - F0 spike exit criterion: one TLS 1.3 handshake completed in tests with the
   pure-Rust provider against a real endpoint.
+
+## Spike outcome (F0, 2026-09-23)
+
+- Provider: `rustls-rustcrypto` 0.0.2-alpha (RustCrypto org, MIT/Apache-2.0),
+  installed process-wide via `core_tls::install_default_provider()`.
+- `crates/core-tls/tests/rustcrypto_handshake.rs` completes a live TLS 1.3
+  GET against `example.com` — passes in the Docker gate.
+- `tests/docker/inside.sh` enforces a **no-C-crypto gate**: the build fails if
+  `ring`/`aws-lc*`/`openssl_sys` artifacts appear in the target dir; verified
+  across gnu debug + musl release builds (musl binary: 438 840 bytes,
+  static-pie, stripped).
+- Caveat: `rustls-rustcrypto` is explicitly alpha upstream ("not for
+  production"); the crate is small (~124 kB source) and pinned by Cargo.lock —
+  exit strategy is vendoring it under `core-tls` if abandoned.
+- `ring` may appear as a phantom entry in `Cargo.lock`/`cargo metadata`
+  (optional-dep bookkeeping of `rustls-webpki`), but is never compiled:
+  rustc invocations carry only `feature="alloc" feature="std"`, and the
+  no-C-crypto gate proves no artifacts exist.

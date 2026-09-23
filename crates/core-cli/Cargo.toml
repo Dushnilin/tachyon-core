@@ -13,5 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 core-config = { path = "../core-config" }
+core-runtime = { path = "../core-runtime" }
 serde_json.workspace = true
 anyhow.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -4,6 +4,7 @@ members = [
     "crates/core-cli",
     "crates/core-config",
     "crates/core-experimental",
+    "crates/core-runtime",
     "crates/core-tls",
 ]
 

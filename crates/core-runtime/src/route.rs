@@ -13,6 +13,7 @@ use crate::outbound::direct::Direct;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
+use crate::outbound::urltest::Urltest;
 use crate::outbound::vmess::Vmess;
 
 pub enum Outbound {
@@ -24,6 +25,7 @@ pub enum Outbound {
     Vless(Vless),
     Trojan(Trojan),
     Vmess(Vmess),
+    Urltest(Urltest),
     Selector(Selector),
 }
 
@@ -50,6 +52,7 @@ impl Outbound {
             Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
             Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
             Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
+            Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
     }
@@ -71,6 +74,7 @@ impl Outbound {
             "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
             "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
             "vmess" => Ok(Outbound::Vmess(Vmess::build(obj, at)?)),
+            "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(
                 "{at}: outbound type {other:?} not implemented yet"
@@ -83,6 +87,14 @@ pub struct Router {
     outbounds: Vec<Outbound>,
     tags: HashMap<String, usize>,
     default: usize,
+    probe_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Router {
+    /// Abort the urltest probe loops (called on instance shutdown).
+    pub fn take_probe_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut *self.probe_tasks.lock().expect("probe tasks"))
+    }
 }
 
 impl Router {
@@ -109,8 +121,10 @@ impl Router {
             outbounds.push(Outbound::build(obj, &format!("outbounds[{i}]"))?);
         }
         for outbound in &mut outbounds {
-            if let Outbound::Selector(selector) = outbound {
-                selector.resolve(&tags)?;
+            match outbound {
+                Outbound::Selector(selector) => selector.resolve(&tags)?,
+                Outbound::Urltest(urltest) => urltest.resolve(&tags)?,
+                _ => {}
             }
         }
         let default = match root
@@ -127,11 +141,19 @@ impl Router {
             }
             None => 0,
         };
-        Ok(Arc::new(Router {
+        let router = Arc::new(Router {
             outbounds,
             tags,
             default,
-        }))
+            probe_tasks: std::sync::Mutex::new(Vec::new()),
+        });
+        for outbound in &router.outbounds {
+            if let Outbound::Urltest(urltest) = outbound {
+                let handle = urltest.spawn(Arc::clone(&router));
+                router.probe_tasks.lock().expect("probe tasks").push(handle);
+            }
+        }
+        Ok(router)
     }
 
     pub fn index_of(&self, tag: &str) -> Option<usize> {

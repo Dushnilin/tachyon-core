@@ -49,6 +49,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     let router = Router::new(root)?;
 
     let mut tasks = Vec::new();
+    tasks.extend(router.take_probe_tasks());
     let mut inbounds = Vec::new();
     let empty = Vec::new();
     let list = root

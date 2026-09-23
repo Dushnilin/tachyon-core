@@ -6,7 +6,7 @@ use std::io;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes_gcm::aead::{Aead, AeadInPlace, Payload};
 use aes_gcm::{Aes128Gcm, Tag};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 
 use crate::inbound::Target;
 use crate::outbound::shadowsocks::crypto::random_bytes;
@@ -60,11 +60,29 @@ pub(crate) fn gcm_open(
     Ok(())
 }
 
-fn unix_now() -> io::Result<u64> {
+pub(crate) fn unix_now() -> io::Result<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|e| io::Error::other(format!("clock: {e}")))
+}
+
+/// Legacy header user hash: `HMAC-MD5(alterKey, BE64(timestamp))`.
+pub(crate) fn legacy_header_hash(alter_key: &[u8; 16], timestamp: u64) -> [u8; 16] {
+    use hmac::Mac;
+    type HmacMd5 = hmac::Hmac<md5::Md5>;
+    let mut mac = <HmacMd5 as Mac>::new_from_slice(alter_key).expect("hmac key length");
+    Mac::update(&mut mac, &timestamp.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// Legacy header CFB IV: `MD5(BE64(timestamp) repeated 4 times)`.
+pub(crate) fn legacy_time_iv(timestamp: u64) -> [u8; 16] {
+    let mut input = [0u8; 32];
+    for slot in input.chunks_mut(8) {
+        slot.copy_from_slice(&timestamp.to_be_bytes());
+    }
+    md5::Md5::digest(input).into()
 }
 
 /// `CreateAuthID`: BE64(time) || rand4 || BE32(crc32(first 12)), AES-ECB
@@ -182,6 +200,17 @@ pub(crate) fn derive_response_keys(
     (
         key[..16].try_into().expect("sha256 output is 32 bytes"),
         iv[..16].try_into().expect("sha256 output is 32 bytes"),
+    )
+}
+
+/// Legacy response keys (alterId > 0): `MD5(requestKey)` / `MD5(requestIV)`.
+pub(crate) fn legacy_response_keys(
+    request_key: &[u8; 16],
+    request_iv: &[u8; 16],
+) -> ([u8; 16], [u8; 16]) {
+    (
+        md5::Md5::digest(request_key).into(),
+        md5::Md5::digest(request_iv).into(),
     )
 }
 

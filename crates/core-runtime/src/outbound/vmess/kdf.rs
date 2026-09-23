@@ -104,6 +104,24 @@ pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+/// `AlterId(user)`: MD5 chain seeded with user || salt; practically the
+/// first round always differs from the original uuid.
+pub(crate) fn alter_key(uuid: &[u8; 16]) -> [u8; 16] {
+    let mut hash = Md5::new();
+    hash.update(uuid);
+    hash.update(b"16167dc8-16b6-4e6d-b8bb-65dd68113a81");
+    let mut candidate: [u8; 16] = hash.clone().finalize().into();
+    if candidate == *uuid {
+        hash.update(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
+        candidate = hash.clone().finalize().into();
+        while candidate == *uuid {
+            hash.update(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
+            candidate = hash.clone().finalize().into();
+        }
+    }
+    candidate
+}
+
 /// Canonical hyphenated UUIDs parse directly; anything else becomes
 /// `uuid.NewV5(uuid.Nil, raw)` (SHA1 of NIL || name with version/variant bits).
 pub(crate) fn parse_uuid(raw: &str) -> Result<[u8; 16], std::io::Error> {

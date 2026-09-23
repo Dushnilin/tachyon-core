@@ -1,13 +1,17 @@
 //! VMess body framing: SHAKE128 length masking/padding, body AEAD
 //! (aes-128-gcm / chacha20-poly1305 with BE16-counter nonces), the
-//! authenticated-length (`auth_len`) variant, and the incremental frame
-//! assembler for the download direction.
+//! authenticated-length (`auth_len`) variant, the legacy aes-128-cfb body
+//! with FNV1a-32 chunk checksums, and the incremental frame assembler for
+//! the download direction.
 
 use std::io;
 use std::task::{Context, Poll};
 
+use aes::Aes128;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Tag};
+use cfb_mode::cipher::KeyIvInit;
+use cfb_mode::{BufDecryptor, BufEncryptor};
 use chacha20poly1305::ChaCha20Poly1305;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Shake128, Shake128Reader};
@@ -15,11 +19,14 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::inbound::AnyStream;
 use crate::outbound::shadowsocks::crypto::random_bytes;
-use crate::outbound::vmess::kdf::{chacha_key, kdf16};
+use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
 
 pub(crate) const WRITE_CHUNK: usize = 15000;
 const CIPHER_OVERHEAD: usize = 16;
 const MAX_PADDING: u16 = 64;
+
+pub(crate) type CfbEncrypt = BufEncryptor<Aes128>;
+pub(crate) type CfbDecrypt = BufDecryptor<Aes128>;
 
 /// `GenerateChunkNonce`: nonce = BE16(counter) || iv[2..12].
 fn chunk_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
@@ -107,9 +114,9 @@ impl Shake {
     }
 }
 
-/// Upload frame builder (stream-chunk or auth-len variant).
+/// Upload frame builder (stream-chunk, auth-len, or legacy checksum variant).
 pub(crate) struct BodyWriter {
-    body: BodyAead,
+    body: Option<BodyAead>,
     body_iv: [u8; 16],
     body_count: u16,
     auth: Option<BodyAead>,
@@ -119,6 +126,10 @@ pub(crate) struct BodyWriter {
     global_padding: bool,
     chunk_masking: bool,
     authenticated_length: bool,
+    /// Legacy body: CFB-128 stream over requestKey/requestIV; frames carry a
+    /// FNV1a-32 checksum prefix instead of AEAD protection.
+    cfb: Option<CfbEncrypt>,
+    checksum: bool,
 }
 
 impl BodyWriter {
@@ -130,26 +141,45 @@ impl BodyWriter {
         chunk_masking: bool,
         authenticated_length: bool,
     ) -> Self {
+        let legacy = security == super::SEC_LEGACY;
         Self {
-            body: BodyAead::new(security, request_key),
+            body: (!legacy).then(|| BodyAead::new(security, request_key)),
             body_iv: *request_iv,
             body_count: 0,
-            auth: authenticated_length.then(|| BodyAead::auth_len(security, request_key)),
+            auth: (!legacy && authenticated_length)
+                .then(|| BodyAead::auth_len(security, request_key)),
             auth_iv: *request_iv,
             auth_count: 0,
-            shake: (global_padding || chunk_masking).then(|| Shake::new(request_iv)),
-            global_padding,
-            chunk_masking,
-            authenticated_length,
+            shake: (!legacy && (global_padding || chunk_masking)).then(|| Shake::new(request_iv)),
+            global_padding: !legacy && global_padding,
+            chunk_masking: !legacy && chunk_masking,
+            authenticated_length: !legacy && authenticated_length,
+            cfb: legacy.then(|| {
+                CfbEncrypt::new_from_slices(request_key, request_iv).expect("cfb key/iv length")
+            }),
+            checksum: legacy,
         }
     }
 
     /// One frame for one chunk of plaintext (`data.len() <= WRITE_CHUNK`).
     pub(crate) fn frame(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
         debug_assert!(!data.is_empty() && data.len() <= WRITE_CHUNK);
+
+        if self.checksum {
+            let mut frame = Vec::with_capacity(2 + 4 + data.len());
+            frame.extend_from_slice(&(data.len() as u16).wrapping_add(4).to_be_bytes());
+            frame.extend_from_slice(&fnv1a32(data).to_be_bytes());
+            frame.extend_from_slice(data);
+            if let Some(cfb) = &mut self.cfb {
+                cfb.encrypt(&mut frame);
+            }
+            return Ok(frame);
+        }
+
         let mut ciphertext = data.to_vec();
-        self.body
-            .seal(self.body_count, &self.body_iv, &mut ciphertext)?;
+        if let Some(body) = &self.body {
+            body.seal(self.body_count, &self.body_iv, &mut ciphertext)?;
+        }
         self.body_count = self.body_count.wrapping_add(1);
 
         let mut pad_len: u16 = 0;
@@ -190,10 +220,11 @@ impl BodyWriter {
 }
 
 /// Download frame parser mirroring `StreamChunkReader` / `AEADChunkReader`
-/// plus the body AEAD layer. A zero data length is the end of stream; a
-/// clean EOF at a frame boundary also ends the stream (servers close TCP).
+/// plus the body AEAD layer (or the legacy CFB + checksum variant). A zero
+/// data length is the end of stream; a clean EOF at a frame boundary also
+/// ends the stream (servers close TCP).
 pub(crate) struct FrameAssembler {
-    body: BodyAead,
+    body: Option<BodyAead>,
     body_iv: [u8; 16],
     body_count: u16,
     auth: Option<BodyAead>,
@@ -203,6 +234,10 @@ pub(crate) struct FrameAssembler {
     global_padding: bool,
     chunk_masking: bool,
     authenticated_length: bool,
+    /// Legacy body: continuing CFB decrypt stream (response header stream for
+    /// legacy headers, fresh response-key stream for AEAD headers).
+    cfb: Option<CfbDecrypt>,
+    checksum: bool,
     state: AssembleState,
     pending: Vec<u8>,
     pos: usize,
@@ -233,18 +268,23 @@ impl FrameAssembler {
         global_padding: bool,
         chunk_masking: bool,
         authenticated_length: bool,
+        cfb: Option<CfbDecrypt>,
     ) -> Self {
+        let legacy = security == super::SEC_LEGACY;
         Self {
-            body: BodyAead::new(security, response_key),
+            body: (!legacy).then(|| BodyAead::new(security, response_key)),
             body_iv: *response_iv,
             body_count: 0,
-            auth: authenticated_length.then(|| BodyAead::auth_len(security, request_key)),
+            auth: (!legacy && authenticated_length)
+                .then(|| BodyAead::auth_len(security, request_key)),
             auth_iv: *request_iv,
             auth_count: 0,
-            shake: (global_padding || chunk_masking).then(|| Shake::new(response_iv)),
-            global_padding,
-            chunk_masking,
-            authenticated_length,
+            shake: (!legacy && (global_padding || chunk_masking)).then(|| Shake::new(response_iv)),
+            global_padding: !legacy && global_padding,
+            chunk_masking: !legacy && chunk_masking,
+            authenticated_length: !legacy && authenticated_length,
+            cfb,
+            checksum: legacy,
             state: AssembleState::Len { buf: Vec::new() },
             pending: Vec::new(),
             pos: 0,
@@ -274,6 +314,7 @@ impl FrameAssembler {
                     } else {
                         2
                     };
+                    let start = buf.len();
                     match poll_fill(inner, cx, &mut buf, need) {
                         Poll::Ready(Ok(true)) => {}
                         Poll::Ready(Ok(false)) => {
@@ -285,6 +326,9 @@ impl FrameAssembler {
                             self.state = AssembleState::Len { buf };
                             return Poll::Pending;
                         }
+                    }
+                    if let Some(cfb) = &mut self.cfb {
+                        cfb.decrypt(&mut buf[start..]);
                     }
                     let mut length = if self.authenticated_length {
                         if let Some(auth) = &mut self.auth {
@@ -330,6 +374,7 @@ impl FrameAssembler {
                     total,
                     pad,
                 } => {
+                    let start = buf.len();
                     match poll_fill(inner, cx, &mut buf, total) {
                         Poll::Ready(Ok(true)) => {}
                         Poll::Ready(Ok(false)) => {
@@ -344,15 +389,31 @@ impl FrameAssembler {
                             return Poll::Pending;
                         }
                     }
+                    if let Some(cfb) = &mut self.cfb {
+                        cfb.decrypt(&mut buf[start..]);
+                    }
                     let Some(ct_len) = total.checked_sub(pad) else {
                         return Poll::Ready(Err(io::Error::other(
                             "bad chunk: length below padding",
                         )));
                     };
                     buf.truncate(ct_len);
-                    self.body
-                        .open(self.body_count, &self.body_iv, &mut buf)
-                        .map_err(|e| io::Error::other(format!("body-chunk: {e}")))?;
+                    if self.checksum {
+                        if buf.len() < 4 {
+                            return Poll::Ready(Err(io::Error::other("checksum chunk too short")));
+                        }
+                        let expected = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        if fnv1a32(&buf[4..]) != expected {
+                            return Poll::Ready(Err(io::Error::other(
+                                "vmess: invalid chunk checksum",
+                            )));
+                        }
+                        buf.drain(..4);
+                    }
+                    if let Some(body) = &self.body {
+                        body.open(self.body_count, &self.body_iv, &mut buf)
+                            .map_err(|e| io::Error::other(format!("body-chunk: {e}")))?;
+                    }
                     self.body_count = self.body_count.wrapping_add(1);
                     self.pending = buf;
                     self.state = AssembleState::Len { buf: Vec::new() };

@@ -133,7 +133,12 @@ async fn socks_roundtrip(proxy: SocketAddr, echo: SocketAddr, label: &str) {
     assert!(tail.is_empty(), "{label}: expected clean EOF");
 }
 
-async fn assert_variant(ref_bin: &str, label: &str, make_outbound: impl Fn(u16) -> Value) {
+async fn assert_variant(
+    ref_bin: &str,
+    label: &str,
+    users: Value,
+    make_outbound: impl Fn(u16) -> Value,
+) {
     let ref_port = free_port();
     let echo = spawn_echo().await;
     let _server = start_ref(
@@ -142,7 +147,7 @@ async fn assert_variant(ref_bin: &str, label: &str, make_outbound: impl Fn(u16) 
             "log": {"level": "error"},
             "inbounds": [
                 {"type": "vmess", "listen": "127.0.0.1", "listen_port": ref_port,
-                 "users": [{"name": "u", "uuid": VMESS_UUID}]}
+                 "users": users}
             ],
             "outbounds": [{"type": "direct", "tag": "direct"}]
         }),
@@ -177,39 +182,77 @@ async fn interop_vmess_variants() {
         return;
     };
     let ref_bin = ref_bin.to_string_lossy().into_owned();
-    assert_variant(&ref_bin, "auto default", |port| {
+    let aead_users = json!([{"name": "u", "uuid": VMESS_UUID}]);
+    let legacy_users = json!([{"name": "u", "uuid": VMESS_UUID, "alterId": 1}]);
+    assert_variant(&ref_bin, "auto default", aead_users.clone(), |port| {
         json!({
             "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
             "uuid": VMESS_UUID
         })
     })
     .await;
-    assert_variant(&ref_bin, "aes-128-gcm", |port| {
+    assert_variant(&ref_bin, "aes-128-gcm", aead_users.clone(), |port| {
         json!({
             "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
             "uuid": VMESS_UUID, "security": "aes-128-gcm"
         })
     })
     .await;
-    assert_variant(&ref_bin, "chacha20-poly1305", |port| {
+    assert_variant(&ref_bin, "chacha20-poly1305", aead_users.clone(), |port| {
         json!({
             "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
             "uuid": VMESS_UUID, "security": "chacha20-poly1305"
         })
     })
     .await;
-    assert_variant(&ref_bin, "none", |port| {
+    assert_variant(&ref_bin, "none", aead_users.clone(), |port| {
         json!({
             "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
             "uuid": VMESS_UUID, "security": "none"
         })
     })
     .await;
-    assert_variant(&ref_bin, "global padding + authenticated length", |port| {
+    assert_variant(
+        &ref_bin,
+        "global padding + authenticated length",
+        aead_users.clone(),
+        |port| {
+            json!({
+                "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VMESS_UUID, "security": "aes-128-gcm",
+                "global_padding": true, "authenticated_length": true
+            })
+        },
+    )
+    .await;
+    assert_variant(
+        &ref_bin,
+        "aes-128-cfb legacy body (aead header)",
+        aead_users.clone(),
+        |port| {
+            json!({
+                "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VMESS_UUID, "security": "aes-128-cfb"
+            })
+        },
+    )
+    .await;
+    assert_variant(
+        &ref_bin,
+        "full legacy alterId 1",
+        legacy_users.clone(),
+        |port| {
+            json!({
+                "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VMESS_UUID, "security": "aes-128-cfb", "alter_id": 1
+            })
+        },
+    )
+    .await;
+    assert_variant(&ref_bin, "legacy header + gcm body", legacy_users, |port| {
         json!({
             "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
-            "uuid": VMESS_UUID, "security": "aes-128-gcm",
-            "global_padding": true, "authenticated_length": true
+            "uuid": VMESS_UUID, "security": "aes-128-gcm", "alter_id": 1
         })
     })
     .await;

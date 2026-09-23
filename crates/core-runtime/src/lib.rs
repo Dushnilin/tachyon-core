@@ -1,0 +1,108 @@
+pub mod inbound;
+pub mod logging;
+pub mod outbound;
+pub mod route;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use anyhow::Context;
+use serde_json::Value;
+use tokio::task::JoinHandle;
+
+use crate::route::Router;
+
+/// A started box instance: running inbound listeners plus their tasks.
+pub struct BoxInstance {
+    tasks: Vec<JoinHandle<()>>,
+    inbounds: Vec<(String, SocketAddr)>,
+}
+
+impl BoxInstance {
+    /// Local addresses of all started inbounds.
+    pub fn inbound_addrs(&self) -> &[(String, SocketAddr)] {
+        &self.inbounds
+    }
+
+    /// Abort all listeners and connection tasks.
+    pub fn shutdown(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Build and start the data plane from a parsed configuration document.
+pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
+    let level = root
+        .get("log")
+        .and_then(|log| log.get("level"))
+        .and_then(Value::as_str);
+    if !logging::init(level)
+        && let Some(raw) = level
+    {
+        anyhow::bail!("unknown log level: {raw}");
+    }
+
+    let router = Router::new(root)?;
+
+    let mut tasks = Vec::new();
+    let mut inbounds = Vec::new();
+    let empty = Vec::new();
+    let list = root
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    for (i, obj) in list.iter().enumerate() {
+        let ty = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("inbounds[{i}]: missing type"))?;
+        let tag = obj
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match ty {
+            "mixed" => {
+                let inbound = inbound::mixed::Mixed::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: mixed"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
+        }
+    }
+
+    Ok(BoxInstance { tasks, inbounds })
+}
+
+/// Load a configuration file, run the box, and block until SIGINT/SIGTERM.
+pub async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config {}", config_path.display()))?;
+    let root: Value = serde_json::from_str(&raw).with_context(|| "decode config".to_string())?;
+    let instance = start(&root).await?;
+    wait_for_signal().await;
+    logging::info(format_args!("shutting down"));
+    instance.shutdown();
+    Ok(())
+}
+
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}

@@ -51,11 +51,23 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let path = config_path_from(args).ok_or("run: missing -c/--config <path>")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("run: {e}"))?;
+    runtime
+        .block_on(async { core_runtime::run(&path).await })
+        .map_err(|e| format!("run: {e:#}"))
+}
+
 fn usage() -> String {
     "usage: tachyon-core <command> [options]\n\
      \n\
      commands (sing-box compatible surface):\n\
        check  -c <path>   validate configuration\n\
+       run    -c <path>   start the proxy\n\
        version            print version\n\
        help               show this help\n"
         .to_string()
@@ -72,6 +84,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "check" => cmd_check(&args),
+        "run" => cmd_run(&args),
         "help" | "-h" | "--help" => {
             print!("{}", usage());
             Ok(())

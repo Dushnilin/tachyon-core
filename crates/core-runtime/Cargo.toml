@@ -1,0 +1,22 @@
+[package]
+name = "core-runtime"
+description = "tachyon-core data plane runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+core-config = { path = "../core-config" }
+serde_json.workspace = true
+anyhow.workspace = true
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+] }

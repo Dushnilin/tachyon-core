@@ -1,0 +1,10 @@
+{
+  "log": { "disabled": true },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "in-local",
+      "tls": { "enabled": true }
+    }
+  ]
+}

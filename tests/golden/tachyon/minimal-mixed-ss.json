@@ -18,7 +18,7 @@
       "server": "example.com",
       "server_port": 443,
       "method": "2022-blake3-aes-128-gcm",
-      "password": "AAAA="
+      "password": "MTIzNDU2Nzg5MGFiY2RlZg=="
     }
   ],
   "route": {

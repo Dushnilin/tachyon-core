@@ -1,11 +1,19 @@
 # Differential tests
 
-Harness comparing `tachyon-core` against the reference `sing-box` /
-`sing-box-lx` binary on the golden corpus. Fails when:
+`run.sh` compares `tachyon-core check` against the reference `sing-box-lx check`
+on the golden corpus:
 
-- `check` exit codes differ;
-- formatted output of `check` errors diverge (message contract);
-- routing decision for the probe set (fixed domain/IP/port queries) differs.
+```bash
+cargo build --workspace
+SING_BOX_REF=/path/to/sing-box bash tests/differential/run.sh
+# semantic rejection is enforced only after F1:
+STRICT=1 SING_BOX_REF=/path/to/sing-box bash tests/differential/run.sh
+```
 
-The reference binary is provided via `SING_BOX_REF` env var (path), or downloaded
-in CI from Leadaxe/sing-box-lx releases.
+Rules:
+
+- valid corpus (`lx/`, `tachyon/`): **both** binaries must exit 0;
+- `invalid/`: reference must reject; until semantic validation lands (F1) a
+  `tachyon-core` acceptance is reported as `GAP` (failure only under `STRICT=1`).
+
+`SING_BOX_REF` is provided by CI (downloaded from Leadaxe/sing-box-lx releases).

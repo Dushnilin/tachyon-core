@@ -3,6 +3,8 @@
 //! The default provider is pure Rust (`rustls-rustcrypto`) so the same binary
 //! builds for MIPS softfloat targets where `ring`/`aws-lc-rs` do not exist.
 
+pub mod hello;
+
 pub use rustls;
 
 /// Install the pure-Rust crypto provider as the process-wide rustls default.

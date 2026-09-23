@@ -40,3 +40,22 @@ defeats the static-musl goal) and pure-Rust Hello builders.
   layer, so REALITY fragmentation support comes for free (leadaxe feature 017).
 - Preset table maintenance: synced from upstream tables when fingerprints
   drift; divergence noted in COMPAT.md.
+
+## Spike outcome (F0, 2026-09-23)
+
+- Captured a real utls `chrome` ClientHello from sing-box-lx v1.14.1-lx.8:
+  local socks inbound → vless outbound (utls chrome) → TCP sink
+  (`tests/spikes/clienthello/run.sh`, fixture `chrome_lx8.bin`, 1789 bytes).
+- Modern chrome fingerprint observed: hybrid X25519MLKEM768 key share
+  (group `0x11ec`) plus a GREASE key share entry, GREASE ciphers, ALPN
+  `h2,http/1.1`, SNI `www.gstatic.com`.
+- `core-tls::hello` implements a byte-level parser + builder: the rebuilt
+  hello matches the capture **byte-for-byte** when fed the same
+  random/session_id/SNI and reuses the template key share; with fresh
+  randomness it differs only in random/session/key fields while preserving
+  cipher list and extension order (tests in `crates/core-tls/tests/chrome_hello.rs`,
+  green in the Docker gate).
+- Template extraction from a capture is the spike path; production presets
+  will be vendored as static tables from utls-lx fingerprint sources (F2),
+  with this byte-diff harness as the verification method.
+- REALITY live handshake against Xray remains an F2 verification item.

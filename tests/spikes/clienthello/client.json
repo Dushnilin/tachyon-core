@@ -1,0 +1,22 @@
+{
+  "log": {"level": "error"},
+  "inbounds": [
+    {"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 21080}
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "out",
+      "server": "127.0.0.1",
+      "server_port": 9443,
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "flow": "",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.gstatic.com",
+        "utls": {"enabled": true, "fingerprint": "chrome"}
+      }
+    }
+  ],
+  "route": {"rules": [], "final": "out"}
+}

@@ -1,0 +1,12 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun",
+      "inet4_address": "172.19.0.1/30"
+    }
+  ]
+}

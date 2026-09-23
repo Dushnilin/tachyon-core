@@ -1,0 +1,17 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "hysteria",
+      "tag": "hy",
+      "server": "127.0.0.1",
+      "server_port": 443,
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      }
+    }
+  ]
+}

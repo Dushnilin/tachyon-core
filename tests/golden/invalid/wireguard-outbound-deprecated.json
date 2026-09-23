@@ -1,0 +1,4 @@
+{
+  "log": { "disabled": true },
+  "outbounds": [{ "type": "wireguard", "tag": "wg" }]
+}

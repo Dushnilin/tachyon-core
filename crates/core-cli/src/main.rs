@@ -47,7 +47,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let path = config_path_from(args).ok_or("check: missing -c/--config <path>")?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("check: read {}: {e}", path.display()))?;
-    core_config::parse_str(&raw).map_err(|e| format!("check: {}: {e}", path.display()))?;
+    core_config::check_str(&raw).map_err(|e| format!("check: {}: {e}", path.display()))?;
     Ok(())
 }
 

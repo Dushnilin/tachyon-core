@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "127.0.0.1",
+      "listen_port": 8388,
+      "method": "aes-256-gcm"
+    }
+  ]
+}

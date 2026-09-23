@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "naive",
+      "tag": "nv",
+      "listen": "127.0.0.1",
+      "listen_port": 8080
+    }
+  ]
+}

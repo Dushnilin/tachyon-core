@@ -1,8 +1,7 @@
 //! Golden corpus contract:
-//! every config under `../tests/golden/{lx,tachyon}` is importable
-//! (syntactically valid JSON, permissive schema), and every config under
-//! `../tests/golden/invalid` is at least syntactically valid JSON so the
-//! differential harness can exercise semantic rejection later (F1).
+//! every config under `../tests/golden/{lx,tachyon}` must pass
+//! `core_config::check_str` (schema + semantic validation), and every config
+//! under `../tests/golden/invalid` must fail it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +23,7 @@ fn json_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn assert_parses(dir_name: &str) {
+fn corpus_files(dir_name: &str) -> Vec<PathBuf> {
     let dir = corpus_root().join(dir_name);
     let files = json_files(&dir);
     assert!(
@@ -32,24 +31,41 @@ fn assert_parses(dir_name: &str) {
         "corpus dir {dir_name} is empty or missing: {}",
         dir.display()
     );
-    for file in files {
+    files
+}
+
+fn assert_accepts(dir_name: &str) {
+    for file in corpus_files(dir_name) {
         let raw =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        core_config::parse_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", file.display()));
+        let result = core_config::check_str(&raw);
+        if let Err(e) = result {
+            panic!("check rejected valid config {}: {e}", file.display());
+        }
+    }
+}
+
+fn assert_rejects(dir_name: &str) {
+    for file in corpus_files(dir_name) {
+        let raw =
+            fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if core_config::check_str(&raw).is_ok() {
+            panic!("check accepted invalid config {}", file.display());
+        }
     }
 }
 
 #[test]
-fn golden_lx_configs_parse() {
-    assert_parses("lx");
+fn golden_lx_configs_pass_check() {
+    assert_accepts("lx");
 }
 
 #[test]
-fn golden_tachyon_configs_parse() {
-    assert_parses("tachyon");
+fn golden_tachyon_configs_pass_check() {
+    assert_accepts("tachyon");
 }
 
 #[test]
-fn golden_invalid_configs_are_json() {
-    assert_parses("invalid");
+fn golden_invalid_configs_fail_check() {
+    assert_rejects("invalid");
 }

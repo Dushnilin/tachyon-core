@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "chain",
+      "tag": "c",
+      "outbounds": [
+        "direct"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "block"
+      }
+    ],
+    "final": "direct"
+  }
+}

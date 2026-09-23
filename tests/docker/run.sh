@@ -3,16 +3,17 @@
 # Cache volumes: cargo registry/git, cargo target, go module/build caches.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# Git-bash rewrites leading-slash args (/src -> C:/Program Files/Git/src)
+export MSYS_NO_PATHCONV=1
+
+# Windows-style path (G:/tachyon-core) so docker build/run can use it directly
+ROOT="$(cd "$(dirname "$0")/../.." && (pwd -W 2>/dev/null || pwd))"
 IMAGE="${IMAGE:-tachyon-core-test:latest}"
 
 docker build -q -t "$IMAGE" -f "$ROOT/tests/docker/Dockerfile" "$ROOT/tests/docker" >/dev/null
 
-HOST_DIR="${HOST_DIR:-$(pwd -W 2>/dev/null || pwd)}"
+HOST_DIR="${HOST_DIR:-$ROOT}"
 echo "== docker run: $HOST_DIR -> /src (image: $IMAGE)"
-
-# Git-bash rewrites leading-slash args (/src -> C:/Program Files/Git/src)
-export MSYS_NO_PATHCONV=1
 
 docker run --rm \
     -v "$HOST_DIR:/src" \

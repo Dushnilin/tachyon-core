@@ -1,0 +1,19 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "dup",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "mixed",
+      "tag": "dup",
+      "listen": "127.0.0.1",
+      "listen_port": 1081
+    }
+  ]
+}

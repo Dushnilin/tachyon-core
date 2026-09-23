@@ -1,0 +1,10 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      "https://dns.google/dns-query"
+    ]
+  }
+}

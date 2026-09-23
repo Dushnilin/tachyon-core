@@ -1,9 +1,20 @@
 # Compatibility matrix
 
 Goal: **full schema compatibility** with sing-box (Leadaxe/sing-box-lx feature set).
-Policy: unknown fields are ignored with a debug warning (upstream default behaviour);
-strict mode is opt-in. Raw JSON outbounds from subscriptions are accepted verbatim;
-an unknown `type` must fail the same way `sing-box check` fails.
+Policy: the reference `check` decodes strictly — unknown fields anywhere are
+rejected. `tachyon-core check` mirrors this at the top level and inside `log`,
+`experimental`, `route`, plus all verified enums/types (inbound/outbound/
+endpoint/transport/dns-server/rule-action/log-level/uTLS fingerprint/ss method);
+per-protocol outbound field allowlists land with the typed model (F1 tail).
+Raw JSON outbounds from subscriptions are accepted verbatim when they use a
+known `type`; an unknown `type` fails the same way `sing-box check` fails.
+
+Known gaps vs reference `check` (documented, no fixtures yet):
+
+- unknown fields *inside* protocol objects (e.g. `direct` + `server`) —
+  reference rejects, we accept;
+- PEM/x509 content of server certificates — reference parses at check time,
+  we only verify presence of certificate/key fields.
 
 Status legend: `planned` · `partial` · `done` · `divergent` (documented difference)
 
@@ -12,7 +23,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | Command | Surface used by Tachyon | Status |
 |---|---|---|
 | `version` | `generator.uc` regex `sing-box version ([^\s]+)` | scaffold |
-| `check -c` | `watchdog.uc`, installer preflight | scaffold (JSON parse only) |
+| `check -c` | `watchdog.uc`, installer preflight | done (schema + semantic validation) |
 | `run` | service runtime | planned |
 | `format`, `upgrade` | config maintenance | planned |
 | `generate uuid\|rand\|reality-keypair\|wg-keypair\|tls-keypair` | `server/service.uc`, `warp_generator.uc` | planned |

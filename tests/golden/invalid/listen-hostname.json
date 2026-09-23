@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "s",
+      "listen": "localhost",
+      "listen_port": 1080
+    }
+  ]
+}

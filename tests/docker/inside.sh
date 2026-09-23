@@ -31,7 +31,7 @@ echo "size=$size bytes"
 test "$size" -le 12582912
 file "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core"
 
-echo "== differential vs $SING_BOX_REF"
-bash tests/differential/run.sh
+echo "== differential vs $SING_BOX_REF (STRICT=1)"
+STRICT=1 bash tests/differential/run.sh
 
 echo "ALL DOCKER TESTS PASSED"

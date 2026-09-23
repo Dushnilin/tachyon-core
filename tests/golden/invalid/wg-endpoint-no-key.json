@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "ep",
+      "address": [
+        "10.0.0.2/32"
+      ]
+    }
+  ]
+}

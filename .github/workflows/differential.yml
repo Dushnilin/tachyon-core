@@ -29,4 +29,6 @@ jobs:
           "$REF_BIN" version
 
       - name: Run differential harness
+        env:
+          STRICT: "1"
         run: bash tests/differential/run.sh

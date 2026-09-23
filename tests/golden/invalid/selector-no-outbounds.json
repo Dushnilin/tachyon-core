@@ -1,0 +1,11 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "sel"
+    }
+  ]
+}

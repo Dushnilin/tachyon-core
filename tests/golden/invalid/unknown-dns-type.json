@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "memory",
+        "tag": "m"
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "log": {
+    "level": "chatty"
+  },
+  "outbounds": [
+    {
+      "type": "direct"
+    }
+  ]
+}

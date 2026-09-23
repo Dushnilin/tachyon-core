@@ -1,0 +1,15 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss",
+      "server": "127.0.0.1",
+      "server_port": 8388,
+      "method": "plain",
+      "password": "secret"
+    }
+  ]
+}

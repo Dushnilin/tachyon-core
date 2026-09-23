@@ -1,3 +1,5 @@
+pub mod validate;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -39,6 +41,13 @@ pub fn parse_str(raw: &str) -> Result<Config, serde_json::Error> {
 
 pub fn parse_slice(bytes: &[u8]) -> Result<Config, serde_json::Error> {
     serde_json::from_slice(bytes)
+}
+
+/// Full `sing-box check` equivalent: schema parse + semantic validation.
+pub fn check_str(raw: &str) -> Result<(), String> {
+    parse_str(raw).map_err(|e| e.to_string())?;
+    let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    validate::validate(&value)
 }
 
 #[cfg(test)]

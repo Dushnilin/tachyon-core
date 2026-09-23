@@ -11,6 +11,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+use cfb_mode::cipher::KeyIvInit;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -18,12 +19,16 @@ use tokio::net::TcpStream;
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
-use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_CHUNK};
+use crate::outbound::vmess::framing::{
+    BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_CHUNK,
+};
 use crate::outbound::vmess::wire::{
-    derive_response_keys, response_header_keys, seal_request_header,
+    derive_response_keys, legacy_header_hash, legacy_response_keys, legacy_time_iv,
+    response_header_keys, seal_request_header, unix_now,
 };
 use crate::tls_client::TlsOptions;
 
+pub(crate) const SEC_LEGACY: u8 = 1;
 pub(crate) const SEC_AES128_GCM: u8 = 3;
 pub(crate) const SEC_CHACHA20_POLY1305: u8 = 4;
 pub(crate) const SEC_NONE: u8 = 5;
@@ -40,6 +45,7 @@ pub struct Vmess {
     security: u8,
     global_padding: bool,
     authenticated_length: bool,
+    alter_key: Option<[u8; 16]>,
     tls: Option<TlsOptions>,
 }
 
@@ -54,9 +60,10 @@ impl Vmess {
         let cmd_key = kdf::cmd_key(&uuid);
 
         let alter_id = obj.get("alter_id").and_then(Value::as_u64).unwrap_or(0);
-        if alter_id != 0 {
-            anyhow::bail!("{at}: vmess alter_id {alter_id} (legacy header) not implemented yet");
-        }
+        let alter_key = match alter_id {
+            0 => None,
+            _ => Some(kdf::alter_key(&uuid)),
+        };
         if obj.get("transport").is_some_and(|v| !v.is_null()) {
             anyhow::bail!("{at}: vmess transports not implemented yet");
         }
@@ -91,9 +98,7 @@ impl Vmess {
             "none" | "zero" => SEC_NONE,
             "aes-128-gcm" => SEC_AES128_GCM,
             "chacha20-poly1305" => SEC_CHACHA20_POLY1305,
-            "aes-128-cfb" => {
-                anyhow::bail!("{at}: vmess security aes-128-cfb (legacy body) not implemented yet")
-            }
+            "aes-128-cfb" => SEC_LEGACY,
             other => anyhow::bail!("{at}: vmess security {other:?} not supported"),
         };
         Ok(Self {
@@ -109,6 +114,7 @@ impl Vmess {
                 .get("authenticated_length")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            alter_key,
             tls,
         })
     }
@@ -136,6 +142,8 @@ impl Vmess {
             if self.authenticated_length {
                 option |= OPT_AUTHENTICATED_LENGTH;
             }
+        } else if self.security == SEC_LEGACY {
+            option |= OPT_CHUNK_STREAM;
         }
 
         let header = wire::build_request_header(
@@ -146,12 +154,31 @@ impl Vmess {
             self.security,
             target,
         )?;
-        let sealed = seal_request_header(&self.cmd_key, &header)?;
-        stream.write_all(&sealed).await?;
+        if let Some(alter_key) = &self.alter_key {
+            // Legacy header: HMAC-MD5(alterKey, ts) || CFB(cmdKey, md5(ts x4)).
+            let timestamp = unix_now()?;
+            let mut request = Vec::with_capacity(16 + header.len());
+            request.extend_from_slice(&legacy_header_hash(alter_key, timestamp));
+            let mut encrypted = header;
+            let mut cfb = CfbEncrypt::new_from_slices(&self.cmd_key, &legacy_time_iv(timestamp))
+                .map_err(|_| io::Error::other("cfb init"))?;
+            cfb.encrypt(&mut encrypted);
+            request.extend_from_slice(&encrypted);
+            stream.write_all(&request).await?;
+        } else {
+            let sealed = seal_request_header(&self.cmd_key, &header)?;
+            stream.write_all(&sealed).await?;
+        }
 
         let (response_key, response_iv) = derive_response_keys(&request_key, &request_iv);
         let (len_key, len_nonce, hdr_key, hdr_nonce) =
             response_header_keys(&response_key, &response_iv);
+        let legacy_resp_cfb = if self.alter_key.is_some() {
+            let (rk, riv) = legacy_response_keys(&request_key, &request_iv);
+            Some(CfbDecrypt::new_from_slices(&rk, &riv).map_err(|_| io::Error::other("cfb init"))?)
+        } else {
+            None
+        };
         Ok(Box::new(VmessStream {
             inner: stream,
             security: self.security,
@@ -166,7 +193,12 @@ impl Vmess {
             response_iv,
             global_padding: self.global_padding,
             authenticated_length: self.authenticated_length,
-            read: ReadPhase::RespLen { buf: Vec::new() },
+            legacy_resp_cfb,
+            read: if self.alter_key.is_some() {
+                ReadPhase::LegacyRespHeader { buf: Vec::new() }
+            } else {
+                ReadPhase::RespLen { buf: Vec::new() }
+            },
             write: match self.security {
                 SEC_NONE => WritePhase::Raw,
                 _ => WritePhase::Framed(Box::new(WriterState {
@@ -200,6 +232,9 @@ struct VmessStream {
     response_iv: [u8; 16],
     global_padding: bool,
     authenticated_length: bool,
+    /// CFB stream for the legacy 4-byte response header (alterId > 0);
+    /// continued into the body for the legacy security.
+    legacy_resp_cfb: Option<CfbDecrypt>,
     read: ReadPhase,
     write: WritePhase,
 }
@@ -211,6 +246,8 @@ enum ReadPhase {
     RespLen { buf: Vec<u8> },
     /// AEAD response header payload of `need` bytes.
     RespPayload { buf: Vec<u8>, need: usize },
+    /// Legacy response header: 4 CFB-decrypted bytes (alterId > 0).
+    LegacyRespHeader { buf: Vec<u8> },
     /// Body frames via the per-security assembler.
     Body(Box<FrameAssembler>),
 }
@@ -229,6 +266,7 @@ struct WriterState {
 enum HeaderStep {
     RespLen(Vec<u8>),
     RespPayload(Vec<u8>, usize),
+    LegacyRespHeader(Vec<u8>),
 }
 
 impl AsyncRead for VmessStream {
@@ -246,6 +284,7 @@ impl AsyncRead for VmessStream {
                 ReadPhase::Raw => unreachable!("raw handled above"),
                 ReadPhase::RespLen { buf } => HeaderStep::RespLen(buf),
                 ReadPhase::RespPayload { buf, need } => HeaderStep::RespPayload(buf, need),
+                ReadPhase::LegacyRespHeader { buf } => HeaderStep::LegacyRespHeader(buf),
                 ReadPhase::Body(assembler) => {
                     this.read = ReadPhase::Body(assembler);
                     let ReadPhase::Body(assembler) = &mut this.read else {
@@ -301,6 +340,12 @@ impl AsyncRead for VmessStream {
                     this.read = if this.security == SEC_NONE {
                         ReadPhase::Raw
                     } else {
+                        // AEAD header with a legacy body: the download CFB
+                        // stream starts fresh with the sha256-derived keys.
+                        let cfb = (this.security == SEC_LEGACY).then(|| {
+                            CfbDecrypt::new_from_slices(&this.response_key, &this.response_iv)
+                                .expect("cfb key/iv length")
+                        });
                         let assembler = FrameAssembler::new(
                             this.security,
                             &this.request_key,
@@ -310,6 +355,54 @@ impl AsyncRead for VmessStream {
                             this.global_padding,
                             true,
                             this.authenticated_length,
+                            cfb,
+                        );
+                        ReadPhase::Body(Box::new(assembler))
+                    };
+                }
+                HeaderStep::LegacyRespHeader(mut buf) => {
+                    match poll_fill(&mut this.inner, cx, &mut buf, 4) {
+                        Poll::Ready(Ok(true)) => {}
+                        Poll::Ready(Ok(false)) => {
+                            return Poll::Ready(Err(io::Error::other(
+                                "vmess: connection closed before response header",
+                            )));
+                        }
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                        Poll::Pending => {
+                            this.read = ReadPhase::LegacyRespHeader { buf };
+                            return Poll::Pending;
+                        }
+                    }
+                    if let Some(cfb) = &mut this.legacy_resp_cfb {
+                        cfb.decrypt(&mut buf);
+                    }
+                    if buf.first() != Some(&this.response_header) {
+                        return Poll::Ready(Err(io::Error::other(
+                            "vmess: unexpected response header",
+                        )));
+                    }
+                    this.read = if this.security == SEC_NONE {
+                        ReadPhase::Raw
+                    } else {
+                        // Legacy headers derive response keys with MD5; the
+                        // CFB stream continues only into a legacy body.
+                        let (rk, riv) = legacy_response_keys(&this.request_key, &this.request_iv);
+                        let cfb = if this.security == SEC_LEGACY {
+                            this.legacy_resp_cfb.take()
+                        } else {
+                            None
+                        };
+                        let assembler = FrameAssembler::new(
+                            this.security,
+                            &this.request_key,
+                            &this.request_iv,
+                            &rk,
+                            &riv,
+                            this.global_padding,
+                            true,
+                            this.authenticated_length,
+                            cfb,
                         );
                         ReadPhase::Body(Box::new(assembler))
                     };

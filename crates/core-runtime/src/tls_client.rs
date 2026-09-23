@@ -223,6 +223,18 @@ impl TlsOptions {
     }
 }
 
+/// TLS wrap for runtime probes (urltest): any proxy stream, any certificate.
+pub(crate) async fn wrap_probe(stream: AnyStream, server_name: &str) -> io::Result<AnyStream> {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|_| io::Error::other(format!("invalid probe server_name {server_name:?}")))?;
+    Ok(Box::new(connector.connect(name, stream).await?))
+}
+
 fn load_pem_certs(
     mut pem: &[u8],
     out: &mut Vec<rustls::pki_types::CertificateDer<'static>>,

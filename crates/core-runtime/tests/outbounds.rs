@@ -209,3 +209,96 @@ async fn socks_outbound_auth_handshake() {
     assert_eq!(reply[1], 0x00, "authed socks chain must succeed");
     assert_tunnel(stream).await;
 }
+
+async fn spawn_http204() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 204");
+    let addr = listener.local_addr().expect("204 addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+async fn try_relay(inbound: SocketAddr, echo: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect(inbound).await else {
+        return false;
+    };
+    if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+        return false;
+    }
+    let mut auth = [0u8; 2];
+    if stream.read_exact(&mut auth).await.is_err() || auth != [0x05, 0x00] {
+        return false;
+    }
+    let std::net::IpAddr::V4(v4) = echo.ip() else {
+        return false;
+    };
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&v4.octets());
+    request.extend_from_slice(&echo.port().to_be_bytes());
+    if stream.write_all(&request).await.is_err() {
+        return false;
+    }
+    let mut reply = [0u8; 4];
+    if stream.read_exact(&mut reply).await.is_err() || reply[1] != 0x00 {
+        return false;
+    }
+    let mut bnd = [0u8; 6];
+    stream.read_exact(&mut bnd).await.is_ok()
+}
+
+#[tokio::test]
+async fn urltest_selects_working_member() {
+    use std::time::Duration;
+
+    let echo = spawn_echo().await;
+    let probe_target = spawn_http204().await;
+    let downstream = spawn_box(json!({
+        "log": {"level": "warn"},
+        "inbounds": [
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 0}
+        ],
+        "outbounds": [{"type": "direct", "tag": "out"}],
+        "route": {"final": "out"}
+    }))
+    .await;
+    let inbound = spawn_box(json!({
+        "log": {"level": "warn"},
+        "inbounds": [
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 0}
+        ],
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            {"type": "socks", "tag": "dead", "server": "127.0.0.1", "server_port": 1},
+            {"type": "socks", "tag": "live", "server": "127.0.0.1", "server_port": downstream.port()},
+            {"type": "urltest", "tag": "auto", "outbounds": ["dead", "live"],
+             "url": format!("http://127.0.0.1:{}/generate_204", probe_target.port()),
+             "interval": "1h", "tolerance": 50}
+        ],
+        "route": {"final": "auto"}
+    }))
+    .await;
+
+    // The first member is a dead proxy; the roundtrip only works once the
+    // background probe settles the selection on the live member.
+    let mut ok = false;
+    for _ in 0..50 {
+        if try_relay(inbound, echo).await {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(ok, "urltest never selected the live member");
+}

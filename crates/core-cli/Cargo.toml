@@ -1,0 +1,17 @@
+[package]
+name = "core-cli"
+description = "tachyon-core: sing-box-compatible proxy core optimized for routers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tachyon-core"
+path = "src/main.rs"
+
+[dependencies]
+core-config = { path = "../core-config" }
+serde_json.workspace = true
+anyhow.workspace = true

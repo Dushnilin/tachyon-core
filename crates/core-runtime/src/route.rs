@@ -11,6 +11,7 @@ use crate::logging;
 use crate::outbound::block::Block;
 use crate::outbound::direct::Direct;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
+use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
 
 pub enum Outbound {
@@ -19,20 +20,33 @@ pub enum Outbound {
     Socks(Socks),
     Http(HttpOut),
     Shadowsocks(Shadowsocks),
+    Vless(Vless),
+    Trojan(Trojan),
     Selector(Selector),
 }
 
 impl Outbound {
     pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<Conn> {
         match self {
-            Outbound::Direct(direct) => direct.connect(target).await.map(Conn::Plain),
-            Outbound::Block(block) => block.connect(target).await.map(Conn::Plain),
-            Outbound::Socks(socks) => socks.connect(target).await.map(Conn::Plain),
-            Outbound::Http(http) => http.connect(target).await.map(Conn::Plain),
+            Outbound::Direct(direct) => direct
+                .connect(target)
+                .await
+                .map(|s| Conn::Plain(Box::new(s))),
+            Outbound::Block(block) => block
+                .connect(target)
+                .await
+                .map(|s| Conn::Plain(Box::new(s))),
+            Outbound::Socks(socks) => socks
+                .connect(target)
+                .await
+                .map(|s| Conn::Plain(Box::new(s))),
+            Outbound::Http(http) => http.connect(target).await.map(|s| Conn::Plain(Box::new(s))),
             Outbound::Shadowsocks(ss) => ss
                 .connect(target)
                 .await
-                .map(|(reader, writer)| Conn::Shadowsocks(Box::new(reader), Box::new(writer))),
+                .map(|(reader, writer)| Conn::Shadowsocks(Box::new(reader), writer)),
+            Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
+            Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
     }
@@ -51,6 +65,8 @@ impl Outbound {
             "socks" => Ok(Outbound::Socks(Socks::build(obj, at)?)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
             "shadowsocks" => Ok(Outbound::Shadowsocks(Shadowsocks::build(obj, at)?)),
+            "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
+            "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(
                 "{at}: outbound type {other:?} not implemented yet"

@@ -2,6 +2,7 @@ pub mod inbound;
 pub mod logging;
 pub mod outbound;
 pub mod route;
+pub mod tls_client;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ impl BoxInstance {
 
 /// Build and start the data plane from a parsed configuration document.
 pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
+    core_tls::install_default_provider();
     let level = root
         .get("log")
         .and_then(|log| log.get("level"))

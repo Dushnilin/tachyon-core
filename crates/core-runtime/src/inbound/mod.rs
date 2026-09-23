@@ -6,24 +6,31 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
 use crate::route::Router;
 
 pub mod mixed;
 
-/// An established upstream connection: raw TCP or a shadowsocks stream.
+/// Object-safe stream for dial results (TCP, TLS, future transports).
+pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyStream for T {}
+pub type AnyStream = Box<dyn ProxyStream>;
+pub type AnyRead = Box<dyn AsyncRead + Send + Unpin>;
+pub type AnyWrite = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// An established upstream connection: raw streams or a shadowsocks codec.
 pub enum Conn {
-    Plain(TcpStream),
-    Shadowsocks(Box<SsReader<OwnedReadHalf>>, Box<SsWriter<OwnedWriteHalf>>),
+    Plain(AnyStream),
+    Shadowsocks(Box<SsReader<AnyRead>>, SsWriter<AnyWrite>),
 }
 
 /// Relay the client stream into an established upstream connection.
 pub async fn pump_conn(client: TcpStream, conn: Conn) -> io::Result<()> {
     match conn {
-        Conn::Plain(upstream) => {
-            pump(client, upstream).await?;
+        Conn::Plain(mut upstream) => {
+            let mut client_stream: AnyStream = Box::new(client);
+            tokio::io::copy_bidirectional(&mut client_stream, &mut upstream).await?;
             Ok(())
         }
         Conn::Shadowsocks(mut reader, mut writer) => {

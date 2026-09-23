@@ -13,6 +13,7 @@ use crate::outbound::direct::Direct;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
+use crate::outbound::vmess::Vmess;
 
 pub enum Outbound {
     Direct(Direct),
@@ -22,6 +23,7 @@ pub enum Outbound {
     Shadowsocks(Shadowsocks),
     Vless(Vless),
     Trojan(Trojan),
+    Vmess(Vmess),
     Selector(Selector),
 }
 
@@ -47,6 +49,7 @@ impl Outbound {
                 .map(|(reader, writer)| Conn::Shadowsocks(Box::new(reader), writer)),
             Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
             Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
+            Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
     }
@@ -67,6 +70,7 @@ impl Outbound {
             "shadowsocks" => Ok(Outbound::Shadowsocks(Shadowsocks::build(obj, at)?)),
             "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
             "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
+            "vmess" => Ok(Outbound::Vmess(Vmess::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(
                 "{at}: outbound type {other:?} not implemented yet"

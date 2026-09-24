@@ -2,9 +2,10 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
@@ -25,16 +26,188 @@ pub enum Conn {
     Shadowsocks(Box<SsReader<AnyRead>>, SsWriter<AnyWrite>),
 }
 
-/// Relay the client stream into an established upstream connection.
-pub async fn pump_conn(client: TcpStream, conn: Conn) -> io::Result<()> {
+/// SOCKS reply state on the client side of a mixed inbound connection.
+enum LazyReply {
+    /// HTTP CONNECT path: no SOCKS reply is due.
+    None,
+    /// SOCKS success reply waiting to be flushed on first payload I/O.
+    Pending(Vec<u8>),
+    /// Success reply flushed.
+    Sent,
+    /// Terminal: success flushed, or failure written, or never applicable.
+    Done,
+}
+
+/// Client stream that flushes the SOCKS success reply lazily (reference
+/// `LazyConn`): the first read/write emits the reply, then passes through.
+/// Sniffing therefore triggers the success reply before the client sends
+/// its payload — no handshake deadlock.
+pub struct ClientConn {
+    inner: TcpStream,
+    reply: LazyReply,
+}
+
+impl ClientConn {
+    /// SOCKS path: success `reply` bytes flush on first payload I/O.
+    pub fn socks(inner: TcpStream, reply: Vec<u8>) -> Self {
+        Self {
+            inner,
+            reply: LazyReply::Pending(reply),
+        }
+    }
+
+    /// HTTP CONNECT path: the 200 response is written by the caller.
+    pub fn http(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            reply: LazyReply::None,
+        }
+    }
+
+    /// Write a SOCKS failure reply if the success reply is still pending
+    /// (reference `HandshakeFailure`).
+    pub async fn fail(&mut self, err: &io::Error) -> io::Result<()> {
+        if matches!(self.reply, LazyReply::Pending(_)) {
+            let code = reply_code_for_error(err);
+            self.reply = LazyReply::Done;
+            self.inner.write_all(&socks_failure_reply(code)).await?;
+        }
+        Ok(())
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn poll_flush_reply(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let mut bytes = match std::mem::replace(&mut self.reply, LazyReply::Done) {
+                LazyReply::Pending(bytes) => bytes,
+                other => {
+                    self.reply = other;
+                    return Poll::Ready(Ok(()));
+                }
+            };
+            match Pin::new(&mut self.inner).poll_write(cx, &bytes) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::other("socks reply write stalled")));
+                }
+                Poll::Ready(Ok(n)) => {
+                    bytes.drain(..n);
+                    if bytes.is_empty() {
+                        self.reply = LazyReply::Sent;
+                        return Poll::Ready(Ok(()));
+                    }
+                    self.reply = LazyReply::Pending(bytes);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    self.reply = LazyReply::Pending(bytes);
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+use std::pin::Pin;
+
+impl AsyncRead for ClientConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_flush_reply(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_read(cx, buf),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for ClientConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.poll_flush_reply(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_write(cx, buf),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// SOCKS5 success reply bound to the proxy-side local address
+/// (reference `LazyConn` success reply).
+pub fn socks_success_reply(local: SocketAddr) -> Vec<u8> {
+    let mut out = vec![0x05, 0x00, 0x00];
+    match local {
+        SocketAddr::V4(a) => {
+            out.push(0x01);
+            out.extend_from_slice(&a.ip().octets());
+            out.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            out.push(0x04);
+            out.extend_from_slice(&a.ip().octets());
+            out.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+    out
+}
+
+pub fn socks_failure_reply(code: u8) -> Vec<u8> {
+    vec![0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+}
+
+/// Reference `ReplyCodeForError`: map OS errnos only (raw_os_error), so
+/// synthetic errors like block/reject stay0x01 (general failure).
+fn reply_code_for_error(err: &io::Error) -> u8 {
+    match err.raw_os_error() {
+        // ENETUNREACH / WSAENETUNREACH
+        Some(101) | Some(10051) => 0x03,
+        // EHOSTUNREACH / WSAEHOSTUNREACH
+        Some(113) | Some(10065) => 0x04,
+        // ECONNREFUSED / WSAECONNREFUSED
+        Some(111) | Some(10061) => 0x05,
+        // EPERM / WSAEACCES
+        Some(1) | Some(10013) => 0x02,
+        _ => 0x01,
+    }
+}
+
+/// Relay the client stream into an established upstream connection,
+/// replaying any sniff-read `prefix` upstream first.
+pub async fn pump_conn<S>(mut client: S, conn: Conn, prefix: &[u8]) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     match conn {
         Conn::Plain(mut upstream) => {
-            let mut client_stream: AnyStream = Box::new(client);
-            tokio::io::copy_bidirectional(&mut client_stream, &mut upstream).await?;
+            if !prefix.is_empty() {
+                upstream.write_all(prefix).await?;
+            }
+            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
             Ok(())
         }
         Conn::Shadowsocks(mut reader, mut writer) => {
-            let (mut client_read, mut client_write) = client.into_split();
+            if !prefix.is_empty() {
+                writer.write_chunk(prefix).await?;
+            }
+            let (mut client_read, mut client_write) = tokio::io::split(client);
             let mut up_buf = vec![0u8; 0x3FFF];
             let mut down_buf = vec![0u8; 0x3FFF];
             let up = async {

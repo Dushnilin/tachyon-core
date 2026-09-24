@@ -37,22 +37,61 @@ const KNOWN_EXPERIMENTAL_FIELDS: &[&str] = &["cache_file", "clash_api"];
 const KNOWN_ROUTE_FIELDS: &[&str] = &[
     "rules",
     "final",
+    "rule_set",
+    "geoip",
+    "geosite",
+    "find_process",
+    "find_neighbor",
+    "dhcp_lease_files",
     "auto_detect_interface",
-    "default_domain_resolver",
-    "default_domain_strategy",
+    "override_android_vpn",
     "default_interface",
     "default_mark",
-    "default_http_client",
+    "default_domain_resolver",
+    "default_domain_strategy",
     "default_network_strategy",
+    "default_network_type",
+    "default_fallback_network_type",
+    "default_fallback_delay",
+    "default_http_client",
 ];
 
 const RULE_ACTIONS: &[&str] = &[
     "route",
+    "route-options",
+    "bypass",
     "hijack-dns",
     "direct",
     "sniff",
     "reject",
     "resolve",
+];
+
+/// Route-rule action fields rejected inside nested (logical sub) rules.
+const NESTED_ACTION_KEYS: &[&str] = &[
+    "action",
+    "outbound",
+    "override_address",
+    "override_port",
+    "method",
+    "no_drop",
+    "sniffer",
+    "timeout",
+    "server",
+    "strategy",
+    "disable_cache",
+    "disable_optimistic_cache",
+    "rewrite_ttl",
+    "client_subnet",
+    "network_strategy",
+    "fallback_delay",
+    "udp_timeout",
+    "udp_connect",
+    "udp_disable_domain_unmapping",
+    "tls_fragment",
+    "tls_record_fragment",
+    "tls_spoof",
+    "tls_spoof_method",
 ];
 
 const DNS_LEGACY_ERROR: &str = "legacy DNS server formats are deprecated in sing-box 1.12.0 and removed in sing-box 1.14.0, checkout migration: https://sing-box.sagernet.org/migration/#migrate-to-new-dns-server-formats";
@@ -304,17 +343,79 @@ fn validate_route(route: &Value) -> Result<(), String> {
             .as_array()
             .ok_or_else(|| "route.rules: must be an array".to_string())?;
         for (i, rule) in rules.iter().enumerate() {
-            let rule = rule
-                .as_object()
-                .ok_or_else(|| format!("route.rules[{i}]: must be an object"))?;
-            if let Some(action) = rule.get("action") {
-                let action = action
-                    .as_str()
-                    .ok_or_else(|| format!("route.rules[{i}]: action: must be a string"))?;
-                if !action.is_empty() && !RULE_ACTIONS.contains(&action) {
-                    return Err(format!("route.rules[{i}]: unknown rule action: {action}"));
-                }
+            validate_route_rule(rule, &format!("route.rules[{i}]"), false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reference `NewRule(..., checkOutbound)` + `rejectNestedRouteRuleAction`.
+fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), String> {
+    let rule = rule
+        .as_object()
+        .ok_or_else(|| format!("{at}: must be an object"))?;
+
+    if nested {
+        for key in NESTED_ACTION_KEYS {
+            if rule.contains_key(*key) {
+                return Err(format!(
+                    "{at}: rule action is not supported in nested rules"
+                ));
             }
+        }
+    }
+
+    let ty = rule.get("type").and_then(Value::as_str).unwrap_or("");
+    match ty {
+        "" | "default" => {
+            if !rule.keys().any(|k| k != "invert" && k != "type") {
+                return Err(format!("{at}: missing conditions"));
+            }
+            check_route_rule_action(rule, at, nested)?;
+        }
+        "logical" => {
+            match rule.get("mode").and_then(Value::as_str) {
+                Some("and") | Some("or") => {}
+                Some(other) => return Err(format!("{at}: unknown logical mode: {other}")),
+                None => return Err(format!("{at}: unknown logical mode: ")),
+            }
+            let subs = rule
+                .get("rules")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{at}: missing rules"))?;
+            if subs.is_empty()
+                || !subs.iter().all(|sub| {
+                    sub.as_object().is_some_and(|m| {
+                        m.keys().any(|k| k != "invert" && k != "type")
+                            || m.get("type").and_then(Value::as_str) == Some("logical")
+                    })
+                })
+            {
+                return Err(format!("{at}: missing conditions"));
+            }
+            check_route_rule_action(rule, at, nested)?;
+            for (i, sub) in subs.iter().enumerate() {
+                validate_route_rule(sub, &format!("{at}: sub rule[{i}]"), true)?;
+            }
+        }
+        other => return Err(format!("{at}: unknown rule type: {other}")),
+    }
+    Ok(())
+}
+
+fn check_route_rule_action(
+    rule: &Map<String, Value>,
+    at: &str,
+    nested: bool,
+) -> Result<(), String> {
+    let action = rule.get("action").and_then(Value::as_str).unwrap_or("");
+    if !action.is_empty() && !RULE_ACTIONS.contains(&action) {
+        return Err(format!("{at}: unknown rule action: {action}"));
+    }
+    if (action.is_empty() || action == "route") && !nested {
+        let outbound = rule.get("outbound").and_then(Value::as_str).unwrap_or("");
+        if outbound.is_empty() {
+            return Err(format!("{at}: missing outbound field"));
         }
     }
     Ok(())

@@ -4,6 +4,7 @@
 use std::net::IpAddr;
 
 use hickory_proto::rr::RecordType;
+use regex::Regex;
 use serde_json::Value;
 
 use super::codec::QueryInfo;
@@ -49,8 +50,11 @@ pub struct Rule {
     pub domain: Vec<String>,
     pub domain_suffix: Vec<String>,
     pub domain_keyword: Vec<String>,
+    pub domain_regex: Vec<Regex>,
     pub source_ip_cidr: Vec<super::transport::IpPrefix>,
     pub network: Vec<String>,
+    /// `rule_set` present: whole rule never matches (before invert), F3 gap.
+    pub never_match: bool,
     pub invert: bool,
     pub match_response: bool,
     pub action: Action,
@@ -81,15 +85,18 @@ impl Rule {
         let domain = string_list(map, "domain", at)?;
         let domain_suffix = string_list(map, "domain_suffix", at)?;
         let domain_keyword = string_list(map, "domain_keyword", at)?;
+        let domain_regex = string_list(map, "domain_regex", at)?
+            .into_iter()
+            .map(|expr| {
+                Regex::new(&expr)
+                    .map_err(|e| anyhow::anyhow!("{at}: parse expression {expr:?}: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let network = string_list(map, "network", at)?;
-        if !string_list(map, "domain_regex", at)?.is_empty() {
+        let never_match = map.get("rule_set").is_some_and(|v| !v.is_null());
+        if never_match {
             crate::logging::warn(format_args!(
-                "{at}: domain_regex matcher is not implemented yet (rule inert)"
-            ));
-        }
-        if map.get("rule_set").is_some_and(|v| !v.is_null()) {
-            crate::logging::warn(format_args!(
-                "{at}: rule_set matchers land in F3 (rule inert)"
+                "{at}: rule_set matchers land in F3 (rule never matches)"
             ));
         }
         let source_ip_cidr = string_list(map, "source_ip_cidr", at)?
@@ -168,8 +175,10 @@ impl Rule {
             domain,
             domain_suffix,
             domain_keyword,
+            domain_regex,
             source_ip_cidr,
             network,
+            never_match,
             invert,
             match_response,
             action,
@@ -178,6 +187,9 @@ impl Rule {
     }
 
     pub fn matches(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
+        if self.never_match {
+            return false;
+        }
         let hit = self.matches_inner(meta, query);
         hit != self.invert
     }
@@ -226,6 +238,11 @@ impl Rule {
                 .domain_keyword
                 .iter()
                 .any(|k| query.name.contains(k.as_str()))
+        {
+            return false;
+        }
+        if !self.domain_regex.is_empty()
+            && !self.domain_regex.iter().any(|re| re.is_match(&query.name))
         {
             return false;
         }

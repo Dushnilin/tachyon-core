@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use super::crypto::{Cipher, Method, derive_subkey, master_key, random_bytes};
 use crate::inbound::{AnyRead, AnyWrite, Target};
@@ -51,7 +50,7 @@ impl Shadowsocks {
         &self,
         target: &Target,
     ) -> io::Result<(SsReader<AnyRead>, SsWriter<AnyWrite>)> {
-        let mut stream = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let mut stream = crate::dns::connect_tcp(&self.server, self.port).await?;
         let mut salt = vec![0u8; self.method.salt_len()];
         random_bytes(&mut salt)?;
         let subkey = derive_subkey(self.method, &self.master_key, &salt);

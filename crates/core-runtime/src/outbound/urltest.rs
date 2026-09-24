@@ -107,6 +107,23 @@ impl Urltest {
         router.connect_index(*member, target).await
     }
 
+    pub async fn connect_udp(
+        &self,
+        router: &Router,
+        target: &Target,
+    ) -> io::Result<tokio::net::UdpSocket> {
+        let members = self
+            .shared
+            .resolved
+            .get()
+            .ok_or_else(|| io::Error::other("urltest members not resolved"))?;
+        let index = self.shared.current.load(Ordering::Relaxed);
+        let Some(member) = members.get(index) else {
+            return Err(io::Error::other("urltest selection out of range"));
+        };
+        router.connect_udp_index(*member, target).await
+    }
+
     /// Spawn the background probe loop (called once the router is shared).
     pub(crate) fn spawn(&self, router: Arc<Router>) -> tokio::task::JoinHandle<()> {
         let shared = Arc::clone(&self.shared);

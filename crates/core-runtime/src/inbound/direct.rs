@@ -3,12 +3,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 
+use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, UdpHub};
 use crate::inbound::{
     Target, drive_transparent, network_includes_tcp, network_includes_udp, parse_listen,
 };
 use crate::logging;
+use crate::outbound::urltest::parse_duration;
 use crate::route::Router;
 
 /// Inbound destination override (reference `DirectInboundOptions`).
@@ -22,13 +24,28 @@ enum Override {
     PortOnly(u16),
 }
 
+impl Clone for Override {
+    fn clone(&self) -> Self {
+        match self {
+            Override::None => Override::None,
+            Override::Full(t) => Override::Full(t.clone()),
+            Override::AddrOnly(t) => Override::AddrOnly(t.clone()),
+            Override::PortOnly(p) => Override::PortOnly(*p),
+        }
+    }
+}
+
 /// direct inbound: accept raw TCP, destination = local address (the address
 /// the client connected to) with optional override_address / override_port.
+/// UDP (when `network` includes it) uses the same override rules with
+/// destination = listen address (reference `NewPacketConnectionEx`).
 pub struct Direct {
-    listener: TcpListener,
+    listener: Option<TcpListener>,
+    udp: Option<Arc<UdpSocket>>,
     tag: String,
     router: Arc<Router>,
     r#override: Override,
+    udp_timeout: std::time::Duration,
 }
 
 impl Direct {
@@ -38,16 +55,30 @@ impl Direct {
             .ok_or_else(|| anyhow::anyhow!("inbound: must be an object"))?;
         let tag = obj.get("tag").and_then(Value::as_str).unwrap_or("direct");
         let at = format!("inbound[{tag}]");
-        if !network_includes_tcp(obj) {
-            anyhow::bail!("{at}: tcp network not requested (udp-only not implemented yet)");
-        }
-        if network_includes_udp(obj) {
-            logging::warn(format_args!(
-                "inbound direct[{tag}]: udp network not implemented yet (tcp only)"
-            ));
+        let want_tcp = network_includes_tcp(obj);
+        let want_udp = network_includes_udp(obj);
+        if !want_tcp && !want_udp {
+            anyhow::bail!("{at}: network excludes both tcp and udp");
         }
         let (ip, port) = parse_listen(obj, &at)?;
-        let listener = TcpListener::bind(SocketAddr::new(ip, port)).await?;
+
+        // Bind TCP first (or UDP alone) so both can share one ephemeral port
+        // when listen_port is 0.
+        let listener = if want_tcp {
+            Some(TcpListener::bind(SocketAddr::new(ip, port)).await?)
+        } else {
+            None
+        };
+        let bound_port = match &listener {
+            Some(l) => l.local_addr()?.port(),
+            None => port,
+        };
+        let udp = if want_udp {
+            let sock = UdpSocket::bind(SocketAddr::new(ip, bound_port)).await?;
+            Some(Arc::new(sock))
+        } else {
+            None
+        };
 
         let addr_override = obj.get("override_address").and_then(Value::as_str);
         let port_override = obj
@@ -60,74 +91,149 @@ impl Direct {
             (None, Some(port)) => Override::PortOnly(port),
             (None, None) => Override::None,
         };
+        let udp_timeout = parse_duration(
+            obj.get("udp_timeout"),
+            DEFAULT_UDP_TIMEOUT,
+            &format!("{at}: udp_timeout"),
+        )?;
 
         logging::info(format_args!(
-            "inbound direct[{tag}] listening at {ip}:{port}"
+            "inbound direct[{tag}] listening at {ip}:{bound_port} (tcp={}, udp={})",
+            listener.is_some(),
+            udp.is_some()
         ));
         Ok(Self {
             listener,
+            udp,
             tag: tag.to_string(),
             router,
             r#override,
+            udp_timeout,
         })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        if let Some(l) = &self.listener {
+            return l.local_addr();
+        }
+        self.udp
+            .as_ref()
+            .map(|u| u.local_addr())
+            .unwrap_or_else(|| Err(io::Error::other("direct inbound: no listener")))
     }
 
     pub async fn serve(self) {
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, peer)) => {
-                    let router = Arc::clone(&self.router);
-                    let tag = self.tag.clone();
-                    let local = stream.local_addr().ok();
-                    let destination = self.destination(local);
-                    tokio::spawn(async move {
-                        if let Err(err) =
-                            drive_transparent(stream, peer, destination, &tag, &router).await
-                        {
-                            logging::debug(format_args!("direct[{tag}] {peer}: {err}"));
-                        }
-                    });
+        let Self {
+            listener,
+            udp,
+            tag,
+            router,
+            r#override,
+            udp_timeout,
+        } = self;
+        let (tcp_tag, tcp_router, tcp_override) =
+            (tag.clone(), Arc::clone(&router), r#override.clone());
+        let tcp = async move {
+            let Some(listener) = listener else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let router = Arc::clone(&tcp_router);
+                        let tag = tcp_tag.clone();
+                        let r#override = tcp_override.clone();
+                        let local = stream.local_addr().ok();
+                        let destination = destination_for(&r#override, local);
+                        tokio::spawn(async move {
+                            if let Err(err) =
+                                drive_transparent(stream, peer, destination, &tag, &router).await
+                            {
+                                logging::debug(format_args!("direct[{tag}] {peer}: {err}"));
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        logging::warn(format_args!("direct[{tcp_tag}] accept: {err}"));
+                        return;
+                    }
                 }
+            }
+        };
+        let udp_loop = async move {
+            let Some(sock) = udp else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            let hub = UdpHub::new(Arc::clone(&router), udp_timeout);
+            let listen_addr = match sock.local_addr() {
+                Ok(a) => a,
                 Err(err) => {
-                    logging::warn(format_args!("direct[{}] accept: {err}", self.tag));
+                    logging::error(format_args!("direct[{tag}] udp local addr: {err}"));
                     return;
                 }
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, source)) => {
+                        let dest = destination_for(&r#override, Some(listen_addr));
+                        let Target::Ip(dest) = dest else {
+                            continue;
+                        };
+                        let hub = Arc::clone(&hub);
+                        let sock2 = Arc::clone(&sock);
+                        let tag = tag.clone();
+                        let payload = buf[..n].to_vec();
+                        tokio::spawn(async move {
+                            if let Err(err) = hub.handle(&sock2, source, dest, &payload, &tag).await
+                            {
+                                logging::debug(format_args!("direct[{tag}] udp {source}: {err}"));
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        logging::warn(format_args!("direct[{tag}] udp recv: {err}"));
+                        return;
+                    }
+                }
             }
+        };
+        tokio::select! {
+            _ = tcp => {}
+            _ = udp_loop => {}
         }
     }
+}
 
-    /// Reference `overrideOption` 1/2/3 applied to `OriginDestination`
-    /// (= local address of the accepted connection).
-    fn destination(&self, local: Option<SocketAddr>) -> Target {
-        let origin = local
-            .map(Target::Ip)
-            .unwrap_or_else(|| Target::Domain(String::new(), 0));
-        match &self.r#override {
-            Override::None => origin,
-            Override::Full(full) => full.clone(),
-            Override::AddrOnly(addr) => {
-                let mut resolved = addr.clone();
-                if let (Target::Domain(_, port), Target::Ip(orig)) = (&mut resolved, &origin) {
-                    *port = orig.port();
-                }
-                if let (Target::Ip(dst), Target::Ip(orig)) = (&mut resolved, &origin) {
-                    let port = orig.port();
-                    *dst = SocketAddr::new(dst.ip(), port);
-                }
-                resolved
+/// Reference `overrideOption` 1/2/3 applied to `OriginDestination`
+/// (= local address of the accepted connection / listen address for UDP).
+fn destination_for(r#override: &Override, local: Option<SocketAddr>) -> Target {
+    let origin = local
+        .map(Target::Ip)
+        .unwrap_or_else(|| Target::Domain(String::new(), 0));
+    match r#override {
+        Override::None => origin,
+        Override::Full(full) => full.clone(),
+        Override::AddrOnly(addr) => {
+            let mut resolved = addr.clone();
+            if let (Target::Domain(_, port), Target::Ip(orig)) = (&mut resolved, &origin) {
+                *port = orig.port();
             }
-            Override::PortOnly(port) => match origin {
-                Target::Ip(mut addr) => {
-                    addr.set_port(*port);
-                    Target::Ip(addr)
-                }
-                Target::Domain(host, _) => Target::Domain(host, *port),
-            },
+            if let (Target::Ip(dst), Target::Ip(orig)) = (&mut resolved, &origin) {
+                let port = orig.port();
+                *dst = SocketAddr::new(dst.ip(), port);
+            }
+            resolved
         }
+        Override::PortOnly(port) => match origin {
+            Target::Ip(mut addr) => {
+                addr.set_port(*port);
+                Target::Ip(addr)
+            }
+            Target::Domain(host, _) => Target::Domain(host, *port),
+        },
     }
 }
 

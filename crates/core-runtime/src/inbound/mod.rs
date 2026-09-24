@@ -16,6 +16,7 @@ pub mod direct;
 pub mod mixed;
 pub mod redirect;
 pub mod tproxy;
+pub(crate) mod udp;
 
 /// Object-safe stream for dial results (TCP, TLS, future transports).
 pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}

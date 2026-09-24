@@ -1,6 +1,7 @@
 pub mod dns;
 pub mod inbound;
 pub mod logging;
+pub mod ntp;
 pub mod outbound;
 pub mod route;
 pub mod tls_client;
@@ -43,14 +44,24 @@ impl BoxInstance {
 /// Build and start the data plane from a parsed configuration document.
 pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     core_tls::install_default_provider();
-    let level = root
-        .get("log")
-        .and_then(|log| log.get("level"))
-        .and_then(Value::as_str);
-    if !logging::init(level)
+    let log = root.get("log");
+    let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
+    let output = log.and_then(|l| l.get("output")).and_then(Value::as_str);
+    let timestamp = log
+        .and_then(|l| l.get("timestamp"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let disabled = log
+        .and_then(|l| l.get("disabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !logging::init(output, level, timestamp)
         && let Some(raw) = level
     {
         anyhow::bail!("unknown log level: {raw}");
+    }
+    if disabled {
+        logging::set_disabled();
     }
 
     let router = Router::new(root)?;
@@ -59,6 +70,9 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
 
     let mut tasks = Vec::new();
     tasks.extend(router.take_probe_tasks());
+    if let Some(ntp) = ntp::NtpService::build(root)? {
+        tasks.push(ntp.spawn());
+    }
     let mut inbounds = Vec::new();
     let empty = Vec::new();
     let list = root

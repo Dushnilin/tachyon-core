@@ -79,12 +79,21 @@ const KNOWN_ROUTE_FIELDS: &[&str] = &[
     "default_interface",
     "default_mark",
     "default_domain_resolver",
-    "default_domain_strategy",
     "default_network_strategy",
     "default_network_type",
     "default_fallback_network_type",
     "default_fallback_delay",
     "default_http_client",
+];
+
+/// reference `option.DomainStrategy` values accepted on `domain_resolver.strategy`.
+const DOMAIN_STRATEGIES: &[&str] = &[
+    "",
+    "as_is",
+    "prefer_ipv4",
+    "prefer_ipv6",
+    "ipv4_only",
+    "ipv6_only",
 ];
 
 const RULE_ACTIONS: &[&str] = &[
@@ -246,11 +255,13 @@ pub fn validate(root: &Value) -> Result<(), String> {
     if let Some(experimental) = root.get("experimental") {
         validate_experimental(experimental)?;
     }
+    let mut dns_tags: HashSet<String> = HashSet::new();
+    let mut has_outbounds = false;
     if let Some(route) = root.get("route") {
         validate_route(route)?;
     }
     if let Some(dns) = root.get("dns") {
-        validate_dns(dns)?;
+        validate_dns(dns, &mut dns_tags)?;
     }
 
     let mut inbound_tags: HashSet<&str> = HashSet::new();
@@ -287,6 +298,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
 
     if let Some(list) = root.get("outbounds") {
         let entries = list.as_array().ok_or("outbounds: must be an array")?;
+        has_outbounds = !entries.is_empty();
         for (i, entry) in entries.iter().enumerate() {
             let obj = object_entry(entry, &format!("outbounds[{i}]"))?;
             let ty = type_field(obj, &format!("outbounds[{i}]"))?;
@@ -324,7 +336,70 @@ pub fn validate(root: &Value) -> Result<(), String> {
         }
     }
 
+    // reference: decode-time shape of `route.default_domain_resolver`.
+    let mut ddr_tag: Option<String> = None;
+    if let Some(route) = root.get("route")
+        && let Some(ddr) = route.get("default_domain_resolver")
+        && !ddr.is_null()
+    {
+        ddr_tag = domain_resolver_server(ddr, "route.default_domain_resolver")?;
+    }
+
+    // reference: initialize outbound → `default domain resolver not found: X`
+    // runs only when outbounds exist (empty/absent list skips dialer setup).
+    if has_outbounds
+        && let Some(tag) = ddr_tag
+        && !tag.is_empty()
+        && !dns_tags.contains(&tag)
+    {
+        return Err(format!(
+            "initialize outbound[0] direct[direct]: default domain resolver not found: {tag}"
+        ));
+    }
+
     Ok(())
+}
+
+/// reference `option.DomainResolveOptions.UnmarshalJSON`: string tag or object
+/// with required non-empty `server`; returns the server tag (`None` for null).
+fn domain_resolver_server(value: &Value, at: &str) -> Result<Option<String>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Object(map) => {
+            let server = map
+                .get("server")
+                .ok_or_else(|| format!("{at}: empty domain_resolver.server"))?;
+            let server = server.as_str().ok_or_else(|| {
+                format!(
+                    "{at}.server: json: cannot unmarshal number into Go struct field _DomainResolveOptions.server of type string"
+                )
+            })?;
+            if server.is_empty() {
+                return Err(format!("{at}: empty domain_resolver.server"));
+            }
+            if let Some(strategy) = map.get("strategy") {
+                let strategy = strategy.as_str().ok_or_else(|| {
+                    format!("{at}.strategy: json: cannot unmarshal into Go field of type string")
+                })?;
+                if !DOMAIN_STRATEGIES.contains(&strategy) {
+                    return Err(format!(
+                        "{at}.strategy: unknown domain strategy: {strategy}"
+                    ));
+                }
+            }
+            Ok(Some(server.to_string()))
+        }
+        Value::Array(_) => Err(format!(
+            "{at}: json: cannot unmarshal array into Go struct field RouteOptions.route.default_domain_resolver of type option._DomainResolveOptions"
+        )),
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number into Go struct field RouteOptions.route.default_domain_resolver of type option._DomainResolveOptions"
+        )),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field RouteOptions.route.default_domain_resolver of type option._DomainResolveOptions"
+        )),
+    }
 }
 
 fn validate_log(log: &Value) -> Result<(), String> {
@@ -464,10 +539,20 @@ fn check_route_rule_action(
             return Err(format!("{at}: missing outbound field"));
         }
     }
+    if action == "reject" {
+        let method = rule.get("method").and_then(Value::as_str).unwrap_or("");
+        match method {
+            "" | "default" | "drop" | "reply" => {}
+            other => return Err(format!("{at}: unknown reject method: {other}")),
+        }
+        if method == "drop" && rule.get("no_drop").and_then(Value::as_bool) == Some(true) {
+            return Err(format!("{at}: no_drop is not available in current context"));
+        }
+    }
     Ok(())
 }
 
-fn validate_dns(dns: &Value) -> Result<(), String> {
+fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
     let obj = dns
         .as_object()
         .ok_or_else(|| "dns: must be a JSON object".to_string())?;
@@ -491,6 +576,9 @@ fn validate_dns(dns: &Value) -> Result<(), String> {
             .ok_or_else(|| format!("dns.servers[{i}].type: must be a string"))?;
         if !DNS_SERVER_TYPES.contains(&ty) {
             return Err(format!("dns.servers[{i}]: unknown transport type: {ty}"));
+        }
+        if let Some(tag) = server.get("tag").and_then(Value::as_str) {
+            tags.insert(tag.to_string());
         }
         if (ty == "fakeip" || ty == "dhcp") && server.contains_key("server") {
             return Err(format!(
@@ -1016,5 +1104,122 @@ mod tests {
         assert!(!tls_enabled(Some(&json!({}))));
         assert!(!tls_enabled(Some(&json!({"enabled": false}))));
         assert!(tls_enabled(Some(&json!({"enabled": true}))));
+    }
+
+    #[test]
+    fn rejects_default_domain_strategy() {
+        let err =
+            validate(&json!({"route": {"default_domain_strategy": "prefer_ipv4"}})).unwrap_err();
+        assert!(err.contains("default_domain_strategy"), "{err}");
+    }
+
+    #[test]
+    fn domain_resolver_shapes() {
+        assert_eq!(
+            domain_resolver_server(&json!("u"), "at").unwrap(),
+            Some("u".into())
+        );
+        assert_eq!(
+            domain_resolver_server(&json!(""), "at").unwrap(),
+            Some("".into())
+        );
+        assert_eq!(domain_resolver_server(&json!(null), "at").unwrap(), None);
+        assert_eq!(
+            domain_resolver_server(&json!({"server": "u", "strategy": "prefer_ipv4"}), "at")
+                .unwrap(),
+            Some("u".into())
+        );
+        assert_eq!(
+            domain_resolver_server(&json!({"server": "u", "strategy": ""}), "at").unwrap(),
+            Some("u".into())
+        );
+        let err = domain_resolver_server(&json!({}), "at").unwrap_err();
+        assert!(err.contains("empty domain_resolver.server"), "{err}");
+        let err = domain_resolver_server(&json!({"server": ""}), "at").unwrap_err();
+        assert!(err.contains("empty domain_resolver.server"), "{err}");
+        let err = domain_resolver_server(&json!({"server": 42}), "at").unwrap_err();
+        assert!(err.contains("cannot unmarshal number"), "{err}");
+        let err = domain_resolver_server(&json!(["x"]), "at").unwrap_err();
+        assert!(err.contains("cannot unmarshal array"), "{err}");
+        let err = domain_resolver_server(&json!(42), "at").unwrap_err();
+        assert!(err.contains("cannot unmarshal number"), "{err}");
+        let err =
+            domain_resolver_server(&json!({"server": "u", "strategy": "bogus"}), "at").unwrap_err();
+        assert!(err.contains("unknown domain strategy: bogus"), "{err}");
+    }
+
+    #[test]
+    fn default_domain_resolver_tag_missing() {
+        let err = validate(&json!({
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct", "default_domain_resolver": "nope"}
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("default domain resolver not found: nope"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn default_domain_resolver_tag_ok() {
+        let cfg = json!({
+            "dns": {"servers": [{"type": "udp", "tag": "u", "server": "1.1.1.1"}], "final": "u"},
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct", "default_domain_resolver": "u"}
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn default_domain_resolver_without_outbounds_ok() {
+        let cfg = json!({"route": {"default_domain_resolver": "u"}});
+        assert!(validate(&cfg).is_ok());
+        let cfg = json!({"outbounds": [], "route": {"default_domain_resolver": "u"}});
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn reject_method_validation() {
+        let err = validate(&json!({
+            "outbounds": [{"type": "direct", "tag": "d"}],
+            "route": {"final": "d", "rules": [{"action": "reject", "method": "bogus"}]}
+        }))
+        .unwrap_err();
+        assert!(err.contains("unknown reject method: bogus"), "{err}");
+        let err = validate(&json!({
+            "outbounds": [{"type": "direct", "tag": "d"}],
+            "route": {"final": "d", "rules": [{"action": "reject", "method": "drop", "no_drop": true}]}
+        }))
+        .unwrap_err();
+        assert!(err.contains("no_drop is not available"), "{err}");
+        assert!(
+            validate(&json!({
+                "outbounds": [{"type": "direct", "tag": "d"}],
+                "route": {"final": "d", "rules": [{"action": "reject"}]}
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate(&json!({
+                "outbounds": [{"type": "direct", "tag": "d"}],
+                "route": {"final": "d", "rules": [{"action": "reject", "method": "drop"}]}
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate(&json!({
+                "outbounds": [{"type": "direct", "tag": "d"}],
+                "route": {"final": "d", "rules": [{"action": "reject", "method": "reply"}]}
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate(&json!({
+                "outbounds": [{"type": "direct", "tag": "d"}],
+                "route": {"final": "d", "rules": [{"action": "reject", "no_drop": true}]}
+            }))
+            .is_ok()
+        );
     }
 }

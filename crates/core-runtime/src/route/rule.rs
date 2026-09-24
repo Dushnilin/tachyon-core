@@ -2,7 +2,8 @@
 //! all matchers used by real configs, and rule actions.
 
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::Value;
@@ -13,11 +14,33 @@ use crate::outbound::urltest::parse_duration;
 
 pub const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// reference `RuleActionReject` flood window: >50 default rejects in 30s
+/// escalate to `drop`.
+const REJECT_FLOOD_WINDOW: Duration = Duration::from_secs(30);
+const REJECT_FLOOD_LIMIT: usize = 50;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectMethod {
     Default,
     Drop,
     Reply,
+}
+
+/// Shared per-rule reject trigger history (reference `dropCounter`).
+#[derive(Debug, Default)]
+pub struct RejectFlood {
+    hits: Mutex<Vec<Instant>>,
+}
+
+impl RejectFlood {
+    /// Record a trigger and report whether the flood limit is exceeded.
+    pub fn trigger(&self) -> bool {
+        let mut hits = self.hits.lock().expect("reject flood");
+        let now = Instant::now();
+        hits.retain(|t| now.duration_since(*t) <= REJECT_FLOOD_WINDOW);
+        hits.push(now);
+        hits.len() > REJECT_FLOOD_LIMIT
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +76,8 @@ pub enum Action {
     },
     Reject {
         method: RejectMethod,
+        no_drop: bool,
+        flood: Arc<RejectFlood>,
     },
     HijackDns,
     Sniff {
@@ -758,10 +783,11 @@ fn build_action(map: &serde_json::Map<String, Value>, at: &str) -> anyhow::Resul
             })
         }
         "reject" => {
+            let no_drop = map.get("no_drop").and_then(Value::as_bool) == Some(true);
             let method = match map.get("method").and_then(Value::as_str) {
                 None | Some("") | Some("default") => RejectMethod::Default,
                 Some("drop") => {
-                    if map.get("no_drop").and_then(Value::as_bool) == Some(true) {
+                    if no_drop {
                         anyhow::bail!("{at}: no_drop is not available in current context");
                     }
                     RejectMethod::Drop
@@ -769,7 +795,11 @@ fn build_action(map: &serde_json::Map<String, Value>, at: &str) -> anyhow::Resul
                 Some("reply") => RejectMethod::Reply,
                 Some(other) => anyhow::bail!("{at}: unknown reject method: {other}"),
             };
-            Ok(Action::Reject { method })
+            Ok(Action::Reject {
+                method,
+                no_drop,
+                flood: Arc::new(RejectFlood::default()),
+            })
         }
         "hijack-dns" => Ok(Action::HijackDns),
         "sniff" => {
@@ -1215,5 +1245,75 @@ mod tests {
     fn unknown_rule_type() {
         let err = Rule::build(&json!({"type": "bogus", "domain": ["a"]}), "r", true).unwrap_err();
         assert!(err.to_string().contains("unknown rule type"));
+    }
+
+    #[test]
+    fn reject_flood_window_escalates_after_50() {
+        let flood = RejectFlood::default();
+        for _ in 0..50 {
+            assert!(!flood.trigger(), "within window must not flood");
+        }
+        assert!(flood.trigger(), "51st hit inside 30s window floods");
+    }
+
+    #[test]
+    fn reject_method_build_parity() {
+        let r = Rule::build(
+            &json!({"action": "reject", "method": "drop", "port": [1]}),
+            "r",
+            true,
+        )
+        .unwrap();
+        match r.action() {
+            Action::Reject {
+                method,
+                no_drop,
+                flood,
+            } => {
+                assert_eq!(*method, RejectMethod::Drop);
+                assert!(!*no_drop);
+                assert!(!flood.trigger(), "drop never counts toward flood");
+            }
+            other => panic!("expected reject, got {:?}", other.type_name()),
+        }
+
+        let r = Rule::build(
+            &json!({"action": "reject", "no_drop": true, "port": [1]}),
+            "r",
+            true,
+        )
+        .unwrap();
+        match r.action() {
+            Action::Reject {
+                method,
+                no_drop,
+                flood,
+            } => {
+                assert_eq!(*method, RejectMethod::Default);
+                assert!(*no_drop);
+                // no_drop short-circuits before the counter in reject_error;
+                // the shared flood handle itself is still fresh.
+                assert!(!flood.trigger());
+            }
+            other => panic!("expected reject, got {:?}", other.type_name()),
+        }
+
+        let err = Rule::build(
+            &json!({"action": "reject", "method": "drop", "no_drop": true, "port": [1]}),
+            "r",
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no_drop is not available"),
+            "{err}"
+        );
+        let err = Rule::build(
+            &json!({"action": "reject", "method": "bogus", "port": [1]}),
+            "r",
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown reject method"), "{err}");
     }
 }

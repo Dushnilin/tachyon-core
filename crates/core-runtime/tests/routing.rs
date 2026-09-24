@@ -1,6 +1,8 @@
 //! Routing engine integration: rule walk, actions, sniff, hijack-dns.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,6 +10,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 
 use core_runtime::dns::codec;
+
+type Hits = Arc<AtomicUsize>;
 
 /// Serialize box instances: the dns service is process-global.
 async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
@@ -41,9 +45,11 @@ async fn spawn_echo() -> SocketAddr {
     addr
 }
 
-async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> SocketAddr {
+async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
     let addr = sock.local_addr().expect("udp addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         loop {
@@ -53,13 +59,14 @@ async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> SocketAddr {
             let Ok(query) = hickory_proto::op::Message::from_vec(&buf[..n]) else {
                 continue;
             };
+            hits2.fetch_add(1, Ordering::SeqCst);
             let resp = codec::synth_address(&query, answer_ip.into(), 60).expect("answer");
             if sock.send_to(&resp, from).await.is_err() {
                 return;
             }
         }
     });
-    addr
+    (addr, hits)
 }
 
 fn box_cfg(outbounds: Value, route: Value) -> Value {
@@ -432,7 +439,7 @@ async fn hijack_dns_answers_queries() {
         "dns": {
             "servers": [{
                 "type": "udp", "tag": "u",
-                "server": "127.0.0.1", "server_port": mock.port()
+                "server": "127.0.0.1", "server_port": mock.0.port()
             }],
             "final": "u"
         },
@@ -494,4 +501,91 @@ async fn empty_route_option_action_rejected() {
         err.to_string().contains("empty route option action"),
         "{err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// route dialing defaults: default_mark / default_interface / auto_detect
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn route_dial_defaults_accepted_and_echo_works() {
+    let _g = test_guard().await;
+    let echo = spawn_echo().await;
+    // auto_detect_interface would SO_BINDTODEVICE the default NIC, which
+    // cannot reach a loopback echo (reference behaves the same). Exercise
+    // default_mark (Linux SO_MARK / no-op elsewhere) + default_interface
+    // parsing without binding the dial away from lo.
+    let cfg = box_cfg(
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({
+            "rules": [{"action": "route", "outbound": "out", "port": [echo.port()]}],
+            "final": "out",
+            "auto_detect_interface": false,
+            "default_mark": 134217728
+        }),
+    );
+    let (instance, inbound) = start_box(cfg).await;
+    let (stream, code) = socks_connect(inbound, Target::V4(v4_of(echo), echo.port())).await;
+    assert_eq!(code, 0x00, "route defaults must not break direct dial");
+    assert_echo_roundtrip(stream, b"dflt").await;
+    instance.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// route.default_domain_resolver overrides the dns rule walk for host dials
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn default_domain_resolver_resolves_outbound_hostnames() {
+    let _g = test_guard().await;
+    let echo = spawn_echo().await;
+    let echo_ip = v4_of(echo);
+    // Upstream answers 10.0.0.9 (blackhole); the default resolver answers
+    // the real echo IP. A successful CONNECT proves ddr was used.
+    let (dead_addr, _dead_hits) = spawn_udp_dns(Ipv4Addr::new(10, 0, 0, 9)).await;
+    let (good_addr, good_hits) = spawn_udp_dns(echo_ip).await;
+    let cfg = json!({
+        "log": {"level": "error"},
+        "inbounds": [
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 0}
+        ],
+        "outbounds": [{"type": "direct", "tag": "out"}],
+        "dns": {
+            "servers": [
+                {"type": "udp", "tag": "dead", "server": "127.0.0.1", "server_port": dead_addr.port()},
+                {"type": "udp", "tag": "good", "server": "127.0.0.1", "server_port": good_addr.port()}
+            ],
+            "final": "dead",
+            "disable_cache": true
+        },
+        "route": {
+            "final": "out",
+            "default_domain_resolver": "good"
+        }
+    });
+    let (instance, inbound) = start_box(cfg).await;
+
+    let (stream, code) =
+        socks_connect(inbound, Target::Domain("via-ddr.test".into(), echo.port())).await;
+    assert_eq!(code, 0x00, "ddr must win over dns final");
+    assert!(
+        good_hits.load(Ordering::SeqCst) > 0,
+        "good resolver must receive the query"
+    );
+    assert_echo_roundtrip(stream, b"ddr1").await;
+    instance.shutdown();
+
+    // Global slot is cleared by the next start without the field.
+    let cleared = core_runtime::start(&box_cfg(
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    ))
+    .await
+    .expect("start without ddr");
+    assert_eq!(
+        core_runtime::dns::default_domain_resolver(),
+        None,
+        "absent route.default_domain_resolver clears the global tag"
+    );
+    cleared.shutdown();
 }

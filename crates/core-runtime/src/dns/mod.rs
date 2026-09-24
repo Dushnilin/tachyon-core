@@ -615,6 +615,7 @@ fn rand_id() -> u16 {
 // ---------------------------------------------------------------------------
 
 static SERVICE: RwLock<Option<Arc<DnsService>>> = RwLock::new(None);
+static DEFAULT_DOMAIN_RESOLVER: RwLock<Option<String>> = RwLock::new(None);
 
 /// Install (or clear) the process-wide dns service; called from `start()`.
 pub fn set_service(service: Option<Arc<DnsService>>) {
@@ -626,6 +627,22 @@ pub fn current() -> Option<Arc<DnsService>> {
     SERVICE.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// `route.default_domain_resolver` tag used when dialing outbound servers
+/// (reference `networkManager.DefaultOptions().DomainResolver`).
+pub fn set_default_domain_resolver(tag: Option<String>) {
+    let mut slot = DEFAULT_DOMAIN_RESOLVER
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *slot = tag;
+}
+
+pub fn default_domain_resolver() -> Option<String> {
+    DEFAULT_DOMAIN_RESOLVER
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Connect to `host:port` through the dns service when configured, else via
 /// the OS resolver. IP literals short-circuit.
 pub async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
@@ -633,7 +650,10 @@ pub async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
         return TcpStream::connect(SocketAddr::new(ip, port)).await;
     }
     if let Some(service) = current() {
-        let addrs = service.resolve(host).await?;
+        let addrs = match default_domain_resolver() {
+            Some(tag) => service.resolve_via(&tag, host).await?,
+            None => service.resolve(host).await?,
+        };
         let mut last_err = None;
         for addr in addrs {
             match TcpStream::connect(SocketAddr::new(addr, port)).await {

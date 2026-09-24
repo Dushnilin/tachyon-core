@@ -1,0 +1,8 @@
+{
+  "log": { "disabled": true },
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": {
+    "rules": [{ "action": "reject", "method": "bogus" }],
+    "final": "direct"
+  }
+}

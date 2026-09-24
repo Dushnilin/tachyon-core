@@ -1,0 +1,9 @@
+{
+  "log": { "disabled": true },
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": {
+    "rules": [{ "action": "route", "outbound": "direct" }],
+    "final": "direct",
+    "default_domain_resolver": {}
+  }
+}

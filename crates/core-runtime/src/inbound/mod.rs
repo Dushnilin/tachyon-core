@@ -8,10 +8,14 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
+use crate::logging;
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
-use crate::route::Router;
+use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
+pub mod direct;
 pub mod mixed;
+pub mod redirect;
+pub mod tproxy;
 
 /// Object-safe stream for dial results (TCP, TLS, future transports).
 pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -236,7 +240,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Ip(SocketAddr),
     Domain(String, u16),
@@ -269,6 +273,75 @@ pub fn require_u16(
         .and_then(Value::as_u64)
         .and_then(|v| u16::try_from(v).ok())
         .ok_or_else(|| anyhow::anyhow!("{at}: missing or invalid {key}"))
+}
+
+/// Common `listen` / `listen_port` parsing for inbound listeners.
+pub(crate) fn parse_listen(
+    obj: &serde_json::Map<String, Value>,
+    at: &str,
+) -> anyhow::Result<(std::net::IpAddr, u16)> {
+    let port = require_u16(obj, "listen_port", at)?;
+    let host = obj
+        .get("listen")
+        .and_then(Value::as_str)
+        .unwrap_or("127.0.0.1");
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{at}: invalid listen address {host:?}"))?;
+    Ok((ip, port))
+}
+
+/// True when `network` includes `tcp` (absent = tcp+udp default → true).
+pub(crate) fn network_includes_tcp(obj: &serde_json::Map<String, Value>) -> bool {
+    match obj.get("network").and_then(Value::as_str) {
+        None | Some("") => true,
+        Some(n) => n
+            .split(',')
+            .map(str::trim)
+            .any(|part| part.eq_ignore_ascii_case("tcp")),
+    }
+}
+
+pub(crate) fn network_includes_udp(obj: &serde_json::Map<String, Value>) -> bool {
+    match obj.get("network").and_then(Value::as_str) {
+        None | Some("") => true,
+        Some(n) => n
+            .split(',')
+            .map(str::trim)
+            .any(|part| part.eq_ignore_ascii_case("udp")),
+    }
+}
+
+/// Route one accepted transparent connection (direct / redirect / tproxy):
+/// no SOCKS reply, destination already resolved by the inbound.
+pub(crate) async fn drive_transparent(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    destination: Target,
+    tag: &str,
+    router: &Arc<Router>,
+) -> io::Result<()> {
+    let mut client = ClientConn::http(stream);
+    let mut ctx = ConnContext::new(tag, peer, destination, "tcp");
+    let decision = match router.route(&mut client, &mut ctx).await {
+        Ok(decision) => decision,
+        Err(err) => return Err(err),
+    };
+    match decision {
+        Decision::HijackDns => {
+            logging::info(format_args!(
+                "inbound {tag} {peer} HIJACK-DNS {}",
+                ctx.destination
+            ));
+            hijack_dns(&mut client, &ctx).await
+        }
+        Decision::Outbound(idx) => {
+            let dest = ctx.destination.clone();
+            let conn = router.connect_index(idx, &dest).await?;
+            logging::info(format_args!("inbound {tag} {peer} CONNECT {dest}"));
+            pump_conn(client, conn, &ctx.sniff_prefix).await
+        }
+    }
 }
 
 /// Copy both directions until one side closes.

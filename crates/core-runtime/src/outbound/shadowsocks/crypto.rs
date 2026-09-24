@@ -176,7 +176,7 @@ pub fn master_key(method: Method, password: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-fn decode_base64_std(input: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn decode_base64_std(input: &str) -> io::Result<Vec<u8>> {
     if !input.len().is_multiple_of(4) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "base64 length"));
     }

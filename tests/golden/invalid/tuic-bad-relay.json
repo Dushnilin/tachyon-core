@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"tuic","tag":"t","server":"1.2.3.4","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"x","tls":{"enabled":true,"insecure":true},"udp_relay_mode":"weird"}]}

@@ -1,0 +1,1 @@
+{"inbounds":[{"type":"hysteria2","tag":"t","listen":"127.0.0.1","listen_port":8443,"tls":{"enabled":true,"certificate_path":"tests/golden/certs/localhost.crt","key_path":"tests/golden/certs/localhost.key"},"users":[{"name":"a","password":"p","xyz":1}]}]}

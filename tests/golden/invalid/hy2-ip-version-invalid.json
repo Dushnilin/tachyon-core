@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"hysteria2","tag":"t","tls":{"enabled":true,"insecure":true},"realm":{"server_url":"https://r.example/","ip_version":5}}]}

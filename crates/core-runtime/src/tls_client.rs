@@ -80,6 +80,11 @@ pub struct TlsOptions {
 }
 
 impl TlsOptions {
+    /// SNI / certificate name (config `server_name`, defaulting to the server).
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
     /// Parse outbound `tls` options; `None` when TLS is absent or disabled.
     pub fn from_outbound(
         obj: &serde_json::Map<String, Value>,
@@ -172,6 +177,16 @@ impl TlsOptions {
     }
 
     pub async fn connect(&self, stream: TcpStream) -> io::Result<TlsStream<TcpStream>> {
+        self.connect_with_defaults(stream, &[]).await
+    }
+
+    /// Like [`connect`], but offers `default_alpn` when the config set none —
+    /// transports such as grpc/http need `h2` and sing-box injects it there.
+    pub async fn connect_with_defaults(
+        &self,
+        stream: TcpStream,
+        default_alpn: &[&[u8]],
+    ) -> io::Result<TlsStream<TcpStream>> {
         let versions: &[&'static rustls::SupportedProtocolVersion] = if self.min_tls13 {
             &[&rustls::version::TLS13]
         } else if self.max_tls12 {
@@ -193,6 +208,8 @@ impl TlsOptions {
         };
         if !self.alpn.is_empty() {
             config.alpn_protocols = self.alpn.clone();
+        } else if !default_alpn.is_empty() {
+            config.alpn_protocols = default_alpn.iter().map(|a| a.to_vec()).collect();
         }
 
         let connector = TlsConnector::from(Arc::new(config));
@@ -220,6 +237,16 @@ impl TlsOptions {
 
     pub async fn wrap(&self, stream: TcpStream) -> io::Result<AnyStream> {
         Ok(Box::new(self.connect(stream).await?))
+    }
+
+    pub async fn wrap_with_defaults(
+        &self,
+        stream: TcpStream,
+        default_alpn: &[&[u8]],
+    ) -> io::Result<AnyStream> {
+        Ok(Box::new(
+            self.connect_with_defaults(stream, default_alpn).await?,
+        ))
     }
 }
 

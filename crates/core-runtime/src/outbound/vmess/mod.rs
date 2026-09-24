@@ -123,7 +123,7 @@ impl Vmess {
         let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
         let mut stream: AnyStream = self
             .transport
-            .connect(tcp, self.tls.as_ref(), &self.server)
+            .connect(tcp, self.tls.as_ref(), &self.server, self.port)
             .await?;
 
         let mut request_key = [0u8; 16];

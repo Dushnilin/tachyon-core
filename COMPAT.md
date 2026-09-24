@@ -42,7 +42,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `endpoints` | planned | sing-box 1.12+, incl. AWG fields |
 | `inbounds` | partial | tproxy/direct/mixed/redirect data plane live (F1); server half planned |
 | `outbounds` | planned | see protocol table |
-| `route` | partial | matchers + actions live; rule_set/SRS F3; auto_detect_interface/default_mark warn+inert |
+| `route` | partial | matchers + actions live; dial defaults `auto_detect_interface`/`default_interface`/`default_mark`/`default_domain_resolver` live (Linux SO_MARK/SO_BINDTODEVICE; non-Linux mark/interface inert); reject flood counter; `default_domain_strategy` rejected like leadaxe; per-outbound `domain_resolver` dial field not yet; rule_set/SRS F3 |
 | `services` | planned | |
 | `experimental` | planned | cache_file, clash_api |
 | `http_clients` | planned | 1.14+ gate |

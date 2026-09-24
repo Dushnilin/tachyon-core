@@ -16,7 +16,9 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub use crate::inbound::Target;
-pub use rule::{Action, RejectMethod, ResolveAction, RouteOptions, Rule, apply_route_options};
+pub use rule::{
+    Action, RejectFlood, RejectMethod, ResolveAction, RouteOptions, Rule, apply_route_options,
+};
 
 use crate::dns::{self, QueryMeta};
 use crate::inbound::Conn;
@@ -187,12 +189,7 @@ const ROUTE_UNIMPL_FIELDS: &[&str] = &[
     "find_process",
     "find_neighbor",
     "dhcp_lease_files",
-    "auto_detect_interface",
     "override_android_vpn",
-    "default_interface",
-    "default_mark",
-    "default_domain_resolver",
-    "default_domain_strategy",
     "default_network_strategy",
     "default_network_type",
     "default_fallback_network_type",
@@ -200,12 +197,103 @@ const ROUTE_UNIMPL_FIELDS: &[&str] = &[
     "default_http_client",
 ];
 
+/// Parsed `route` section dialing defaults (reference `NetworkOptions`).
+#[derive(Debug, Clone, Default)]
+pub struct RouteDefaults {
+    pub auto_detect_interface: bool,
+    pub default_interface: Option<String>,
+    pub default_mark: Option<u32>,
+    /// `route.default_domain_resolver` server tag (string form or `.server`).
+    pub default_domain_resolver: Option<String>,
+}
+
+impl RouteDefaults {
+    fn parse(route: Option<&Value>) -> anyhow::Result<Self> {
+        let Some(map) = route.and_then(Value::as_object) else {
+            return Ok(Self::default());
+        };
+        let mut out = Self {
+            auto_detect_interface: map
+                .get("auto_detect_interface")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            default_interface: map
+                .get("default_interface")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            default_mark: map
+                .get("default_mark")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            default_domain_resolver: None,
+        };
+        match map.get("default_domain_resolver") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(tag)) => out.default_domain_resolver = Some(tag.clone()),
+            Some(obj @ Value::Object(_)) => {
+                out.default_domain_resolver = obj
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            Some(_) => anyhow::bail!(
+                "route.default_domain_resolver: json: cannot unmarshal into option._DomainResolveOptions"
+            ),
+        }
+        Ok(out)
+    }
+
+    /// Interface to bind outbound dials to: explicit `default_interface`
+    /// wins, otherwise the auto-detected default route NIC when
+    /// `auto_detect_interface` is set (reference `DefaultDialer`).
+    pub fn bind_interface(&self) -> Option<String> {
+        if let Some(name) = &self.default_interface {
+            return Some(name.clone());
+        }
+        if self.auto_detect_interface {
+            return detect_default_interface();
+        }
+        None
+    }
+}
+
+/// Detect the default-route NIC (Linux `/proc/net/route`); other platforms
+/// have no portable equivalent and return `None`.
+fn detect_default_interface() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let table = std::fs::read_to_string("/proc/net/route").ok()?;
+        for line in table.lines().skip(1) {
+            let mut cols = line.split_whitespace();
+            let iface = cols.next()?;
+            let dest = cols.next()?;
+            // Destination 00000000 = default route.
+            if dest == "00000000" {
+                return Some(iface.to_string());
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 pub struct Router {
     outbounds: Vec<Outbound>,
     tags: HashMap<String, usize>,
     default: usize,
     rules: Vec<Rule>,
+    defaults: RouteDefaults,
     probe_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Router {
+    /// Route dialing defaults (`route.auto_detect_interface`, …).
+    pub fn defaults(&self) -> &RouteDefaults {
+        &self.defaults
+    }
 }
 
 impl Router {
@@ -217,6 +305,13 @@ impl Router {
 
 impl Router {
     pub fn new(root: &Value) -> anyhow::Result<Arc<Router>> {
+        let defaults = RouteDefaults::parse(root.get("route"))?;
+        if let Some(tag) = &defaults.default_domain_resolver {
+            crate::dns::set_default_domain_resolver(Some(tag.clone()));
+        } else {
+            crate::dns::set_default_domain_resolver(None);
+        }
+        let bind_iface = defaults.bind_interface();
         let empty = Vec::new();
         let outbounds_list = root
             .get("outbounds")
@@ -236,7 +331,16 @@ impl Router {
                 }
                 tags.insert(tag, i);
             }
-            outbounds.push(Outbound::build(obj, &format!("outbounds[{i}]"))?);
+            let mut outbound = Outbound::build(obj, &format!("outbounds[{i}]"))?;
+            if let Outbound::Direct(direct) = &mut outbound {
+                if direct.routing_mark.is_none() {
+                    direct.routing_mark = defaults.default_mark;
+                }
+                if direct.bind_interface.is_none() {
+                    direct.bind_interface = bind_iface.clone();
+                }
+            }
+            outbounds.push(outbound);
         }
         for outbound in &mut outbounds {
             match outbound {
@@ -281,6 +385,7 @@ impl Router {
             tags,
             default,
             rules,
+            defaults,
             probe_tasks: std::sync::Mutex::new(Vec::new()),
         });
         for outbound in &router.outbounds {
@@ -389,8 +494,12 @@ impl Router {
                 Action::Bypass { outbound, .. } if !outbound.is_empty() => {
                     return Ok(Decision::Outbound(self.outbound_index(outbound)?));
                 }
-                Action::Reject { method } => {
-                    return Err(reject_error(*method));
+                Action::Reject {
+                    method,
+                    no_drop,
+                    flood,
+                } => {
+                    return Err(reject_error(*method, *no_drop, flood));
                 }
                 Action::HijackDns => return Ok(Decision::HijackDns),
                 _ => {}
@@ -425,14 +534,18 @@ fn prepare(ctx: &mut ConnContext) {
     };
 }
 
-fn reject_error(method: RejectMethod) -> io::Error {
+fn reject_error(method: RejectMethod, no_drop: bool, flood: &rule::RejectFlood) -> io::Error {
     match method {
-        RejectMethod::Default => {
-            io::Error::new(io::ErrorKind::ConnectionRefused, "rejected by rule")
-        }
         RejectMethod::Drop => io::Error::new(io::ErrorKind::ConnectionReset, "dropped by rule"),
         RejectMethod::Reply => {
             io::Error::other("reject method `reply` is not supported for TCP connections")
+        }
+        RejectMethod::Default => {
+            if !no_drop && flood.trigger() {
+                logging::debug(format_args!("dropped due to flooding"));
+                return io::Error::new(io::ErrorKind::ConnectionReset, "dropped by rule");
+            }
+            io::Error::new(io::ErrorKind::ConnectionRefused, "rejected by rule")
         }
     }
 }
@@ -522,5 +635,113 @@ where
         framed.extend_from_slice(&(resp.len() as u16).to_be_bytes());
         framed.extend_from_slice(&resp);
         client.write_all(&framed).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn route_defaults_parse_string_and_object_resolver() {
+        let d = RouteDefaults::parse(Some(&json!({
+            "auto_detect_interface": true,
+            "default_interface": "eth9",
+            "default_mark": 42,
+            "default_domain_resolver": "u"
+        })))
+        .unwrap();
+        assert!(d.auto_detect_interface);
+        assert_eq!(d.default_interface.as_deref(), Some("eth9"));
+        assert_eq!(d.default_mark, Some(42));
+        assert_eq!(d.default_domain_resolver.as_deref(), Some("u"));
+        assert_eq!(d.bind_interface().as_deref(), Some("eth9"));
+
+        let d = RouteDefaults::parse(Some(&json!({
+            "default_domain_resolver": {"server": "u", "strategy": "prefer_ipv4"}
+        })))
+        .unwrap();
+        assert_eq!(d.default_domain_resolver.as_deref(), Some("u"));
+        assert_eq!(d.bind_interface(), None);
+
+        let d = RouteDefaults::parse(Some(&json!({"default_domain_resolver": null}))).unwrap();
+        assert_eq!(d.default_domain_resolver, None);
+
+        RouteDefaults::parse(Some(&json!({"default_domain_resolver": ["x"]})))
+            .expect_err("array form must fail");
+        RouteDefaults::parse(Some(&json!({"auto_detect_interface": "yes"}))).ok();
+    }
+
+    #[test]
+    fn router_applies_route_defaults_to_direct() {
+        let router = Router::new(&json!({
+            "outbounds": [
+                {"type": "direct", "tag": "marked"},
+                {"type": "direct", "tag": "plain"}
+            ],
+            "route": {
+                "final": "plain",
+                "default_interface": "lo",
+                "default_mark": 7,
+                "default_domain_resolver": "u"
+            }
+        }))
+        .unwrap();
+        assert_eq!(router.defaults().default_mark, Some(7));
+        assert_eq!(router.defaults().bind_interface().as_deref(), Some("lo"));
+        assert_eq!(
+            dns::default_domain_resolver().as_deref(),
+            Some("u"),
+            "route defaults install the global ddr tag"
+        );
+
+        // Explicit outbound fields win over route defaults.
+        let router = Router::new(&json!({
+            "outbounds": [{"type": "direct", "tag": "d", "routing_mark": 99, "bind_interface": "eth0"}],
+            "route": {"final": "d", "default_interface": "lo", "default_mark": 7}
+        }))
+        .unwrap();
+        match router.outbounds.first() {
+            Some(Outbound::Direct(d)) => {
+                assert_eq!(d.routing_mark, Some(99));
+                assert_eq!(d.bind_interface.as_deref(), Some("eth0"));
+            }
+            _ => panic!("expected direct outbound"),
+        }
+
+        // No route section clears a previously installed ddr tag.
+        let _ = Router::new(&json!({"outbounds": [{"type": "direct", "tag": "d"}]})).unwrap();
+        assert_eq!(dns::default_domain_resolver(), None);
+    }
+
+    #[test]
+    fn reject_error_flood_and_no_drop() {
+        let flood = rule::RejectFlood::default();
+        for _ in 0..50 {
+            let e = reject_error(RejectMethod::Default, false, &flood);
+            assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused, "pre-flood");
+        }
+        let e = reject_error(RejectMethod::Default, false, &flood);
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::ConnectionReset,
+            "51st hit escalates to drop"
+        );
+
+        let flood = rule::RejectFlood::default();
+        for _ in 0..60 {
+            let e = reject_error(RejectMethod::Default, true, &flood);
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused,
+                "no_drop never floods"
+            );
+        }
+
+        let flood = rule::RejectFlood::default();
+        let e = reject_error(RejectMethod::Drop, false, &flood);
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+        assert!(!flood.trigger(), "drop method must not touch the counter");
     }
 }

@@ -1,0 +1,13 @@
+{
+  "log": { "disabled": true },
+  "dns": {
+    "servers": [{ "type": "udp", "tag": "u", "server": "1.1.1.1" }],
+    "final": "u"
+  },
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": {
+    "rules": [{ "action": "route", "outbound": "direct" }],
+    "final": "direct",
+    "default_domain_resolver": "nope"
+  }
+}

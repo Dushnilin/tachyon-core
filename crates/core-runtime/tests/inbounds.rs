@@ -1,11 +1,14 @@
-//! Inbound integration: direct (override), redirect, tproxy, plain-http proxy.
+//! Inbound integration: direct (override), redirect, tproxy, plain-http proxy,
+//! UDP forward + UDP hijack-dns.
 
 use std::net::SocketAddr;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+
+use core_runtime::dns::codec;
 
 /// Serialize box instances: the dns service is process-global.
 async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
@@ -453,6 +456,134 @@ async fn mixed_http_proxy_auth_when_users_configured() {
     assert!(
         resp.starts_with("HTTP/1.1 407"),
         "expected 407 without Proxy-Authorization, got: {resp:?}"
+    );
+    instance.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// UDP paths: direct inbound forward through direct outbound; hijack-dns
+// ---------------------------------------------------------------------------
+
+async fn spawn_udp_echo() -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
+    let addr = sock.local_addr().expect("udp echo addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            if sock.send_to(&buf[..n], from).await.is_err() {
+                return;
+            }
+        }
+    });
+    addr
+}
+
+async fn spawn_udp_dns(answer: std::net::Ipv4Addr) -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp dns");
+    let addr = sock.local_addr().expect("udp dns addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok(query) = hickory_proto::op::Message::from_vec(&buf[..n]) else {
+                continue;
+            };
+            let resp = codec::synth_address(&query, answer.into(), 60).expect("answer");
+            if sock.send_to(&resp, from).await.is_err() {
+                return;
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn direct_inbound_udp_forwards_to_echo() {
+    let _g = test_guard().await;
+    let echo = spawn_udp_echo().await;
+    let cfg = base_cfg(
+        json!([
+            {
+                "type": "direct",
+                "tag": "direct-in",
+                "listen": "127.0.0.1",
+                "listen_port": 0,
+                "network": "udp",
+                "override_address": "127.0.0.1",
+                "override_port": echo.port()
+            }
+        ]),
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    );
+    let instance = start_box(cfg).await;
+    let addr = inbound_addr(&instance, "direct-in");
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    client.send_to(b"udp-hello", addr).await.expect("send");
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.recv_from(&mut buf),
+    )
+    .await
+    .expect("udp reply timeout")
+    .expect("udp reply");
+    assert_eq!(&buf[..n], b"udp-hello");
+    instance.shutdown();
+}
+
+#[tokio::test]
+async fn direct_inbound_udp_hijack_dns() {
+    let _g = test_guard().await;
+    let mock = spawn_udp_dns(std::net::Ipv4Addr::new(9, 9, 9, 9)).await;
+    let cfg = json!({
+        "log": {"level": "error"},
+        "dns": {
+            "servers": [{
+                "type": "udp", "tag": "u",
+                "server": "127.0.0.1", "server_port": mock.port()
+            }],
+            "final": "u"
+        },
+        "inbounds": [
+            {
+                "type": "direct", "tag": "dns-in",
+                "listen": "127.0.0.1", "listen_port": 0,
+                "network": "udp"
+            }
+        ],
+        "outbounds": [{"type": "direct", "tag": "out"}],
+        "route": {
+            "rules": [{"action": "hijack-dns", "inbound": ["dns-in"]}],
+            "final": "out"
+        }
+    });
+    let instance = start_box(cfg).await;
+    let addr = inbound_addr(&instance, "dns-in");
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let query = codec::build_query(0x4242, "udp-hijack.test", hickory_proto::rr::RecordType::A)
+        .expect("query");
+    client.send_to(&query, addr).await.expect("send query");
+    let mut buf = [0u8; 512];
+    let (n, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.recv_from(&mut buf),
+    )
+    .await
+    .expect("dns reply timeout")
+    .expect("dns reply");
+    let ips = codec::answer_ips(&buf[..n]).expect("parse answer");
+    assert!(
+        ips.iter()
+            .any(|ip| *ip == std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9))),
+        "expected mock answer, got {ips:?}"
     );
     instance.shutdown();
 }

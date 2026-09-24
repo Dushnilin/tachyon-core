@@ -298,4 +298,16 @@ impl Selector {
         };
         router.connect_index(*member, target).await
     }
+
+    pub async fn connect_udp(
+        &self,
+        router: &Router,
+        target: &Target,
+    ) -> io::Result<tokio::net::UdpSocket> {
+        let index = self.current.load(Ordering::Relaxed);
+        let Some(member) = self.resolved.get(index) else {
+            return Err(io::Error::other("selector has no members"));
+        };
+        router.connect_udp_index(*member, target).await
+    }
 }

@@ -135,6 +135,24 @@ impl Outbound {
         }
     }
 
+    /// UDP dial; only outbounds that can carry datagrams implement it.
+    pub async fn connect_udp(
+        &self,
+        router: &Router,
+        target: &Target,
+    ) -> io::Result<tokio::net::UdpSocket> {
+        match self {
+            Outbound::Direct(direct) => direct.connect_udp(target).await,
+            Outbound::Block(_) => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "blocked by outbound",
+            )),
+            Outbound::Selector(selector) => selector.connect_udp(router, target).await,
+            Outbound::Urltest(urltest) => urltest.connect_udp(router, target).await,
+            _ => Err(io::Error::other("udp not supported by this outbound")),
+        }
+    }
+
     fn build(obj: &Value, at: &str) -> anyhow::Result<Outbound> {
         let ty = obj
             .get("type")
@@ -144,7 +162,7 @@ impl Outbound {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
         match ty {
-            "direct" => Ok(Outbound::Direct(Direct)),
+            "direct" => Ok(Outbound::Direct(Direct::build(obj))),
             "block" => Ok(Outbound::Block(Block)),
             "socks" => Ok(Outbound::Socks(Socks::build(obj, at)?)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
@@ -296,6 +314,20 @@ impl Router {
                 return Err(io::Error::other("outbound index out of range"));
             };
             outbound.connect(self, target).await
+        })
+    }
+
+    /// UDP dial through a specific outbound (selector/urltest chain-safe).
+    pub fn connect_udp_index<'a>(
+        &'a self,
+        index: usize,
+        target: &'a Target,
+    ) -> Pin<Box<dyn Future<Output = io::Result<tokio::net::UdpSocket>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(outbound) = self.outbounds.get(index) else {
+                return Err(io::Error::other("outbound index out of range"));
+            };
+            outbound.connect_udp(self, target).await
         })
     }
 

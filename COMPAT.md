@@ -35,14 +35,14 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 
 | Section | Status | Notes |
 |---|---|---|
-| `log` | planned | |
-| `dns` | planned | incl. FakeIP, predefined rules, groups (lx) |
-| `ntp` | planned | |
+| `log` | partial | level/output/timestamp/disabled live; `time` (unix epoch format) ignored |
+| `dns` | partial | udp/tcp/tls/https/fakeip + rule walk live; predefined rules, groups (lx) planned; `evaluate`/`respond` warn+inert |
+| `ntp` | partial | SNTP client + write_to_system; no interval edge cases yet |
 | `certificate` | planned | |
 | `endpoints` | planned | sing-box 1.12+, incl. AWG fields |
-| `inbounds` | planned | tproxy/direct/mixed/redirect + server half |
+| `inbounds` | partial | tproxy/direct/mixed/redirect data plane live (F1); server half planned |
 | `outbounds` | planned | see protocol table |
-| `route` | planned | all matchers, rule_set, actions |
+| `route` | partial | matchers + actions live; rule_set/SRS F3; auto_detect_interface/default_mark warn+inert |
 | `services` | planned | |
 | `experimental` | planned | cache_file, clash_api |
 | `http_clients` | planned | 1.14+ gate |
@@ -65,7 +65,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 
 | Type | Status | Notes |
 |---|---|---|
-| `tproxy` (v4/v6), `direct`, `mixed`, `redirect` | planned | Tachyon data plane |
+| `tproxy` (v4/v6), `direct`, `mixed`, `redirect` | done | Tachyon data plane (F1: TCP+UDP, OOB orig-dst, hijack-dns) |
 | `socks`, `http`, `mixed` server, … | planned | server half |
 | `tun` | planned | `stack: system` first, userspace stack later (divergent vs gvisor) |
 

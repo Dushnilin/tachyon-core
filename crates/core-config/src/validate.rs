@@ -32,6 +32,37 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
 const KNOWN_LOG_FIELDS: &[&str] = &["disabled", "level", "timestamp", "output", "time"];
 const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "fatal"];
 
+/// reference `option.NTPOptions` = ServerOptions + DialerOptions + own fields.
+const KNOWN_NTP_FIELDS: &[&str] = &[
+    "enabled",
+    "interval",
+    "write_to_system",
+    "server",
+    "server_port",
+    "detour",
+    "bind_interface",
+    "inet4_bind_address",
+    "inet6_bind_address",
+    "bind_address_no_port",
+    "protect_path",
+    "routing_mark",
+    "reuse_addr",
+    "netns",
+    "connect_timeout",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "disable_tcp_keep_alive",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "udp_fragment",
+    "domain_resolver",
+    "network_strategy",
+    "network_type",
+    "fallback_network_type",
+    "fallback_delay",
+    "domain_strategy",
+];
+
 const KNOWN_EXPERIMENTAL_FIELDS: &[&str] = &["cache_file", "clash_api"];
 
 const KNOWN_ROUTE_FIELDS: &[&str] = &[
@@ -209,6 +240,9 @@ pub fn validate(root: &Value) -> Result<(), String> {
     if let Some(log) = root.get("log") {
         validate_log(log)?;
     }
+    if let Some(ntp) = root.get("ntp") {
+        validate_ntp(ntp)?;
+    }
     if let Some(experimental) = root.get("experimental") {
         validate_experimental(experimental)?;
     }
@@ -310,6 +344,18 @@ fn validate_log(log: &Value) -> Result<(), String> {
             return Err(format!(
                 "create log factory: parse log level: unknown log level: {level}"
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ntp(ntp: &Value) -> Result<(), String> {
+    let obj = ntp
+        .as_object()
+        .ok_or_else(|| "ntp: must be a JSON object".to_string())?;
+    for key in obj.keys() {
+        if !KNOWN_NTP_FIELDS.contains(&key.as_str()) {
+            return Err(format!("ntp: {key}: json: unknown field \"{key}\""));
         }
     }
     Ok(())

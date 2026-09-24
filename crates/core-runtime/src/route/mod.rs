@@ -32,6 +32,7 @@ use crate::outbound::shadowsocks::stream::Shadowsocks;
 use crate::outbound::tuic::Tuic;
 use crate::outbound::urltest::Urltest;
 use crate::outbound::vmess::Vmess;
+use crate::outbound::wireguard::WireGuard;
 
 /// Result of a completed rule walk for one connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,7 @@ pub enum Outbound {
     Vmess(Vmess),
     Hysteria2(Hysteria2),
     Tuic(Tuic),
+    WireGuard(WireGuard),
     Urltest(Urltest),
     Selector(Selector),
 }
@@ -138,6 +140,7 @@ impl Outbound {
             Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
             Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
             Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
+            Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
@@ -153,6 +156,7 @@ impl Outbound {
             Outbound::Direct(direct) => direct.connect_udp(target).await,
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
+            Outbound::WireGuard(wg) => wg.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "blocked by outbound",
@@ -351,6 +355,32 @@ impl Router {
                 }
             }
             outbounds.push(outbound);
+        }
+        let endpoints_list = root
+            .get("endpoints")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        for (i, obj) in endpoints_list.iter().enumerate() {
+            let at = format!("endpoints[{i}]");
+            let ty = obj.get("type").and_then(Value::as_str).unwrap_or_default();
+            if ty != "wireguard" {
+                anyhow::bail!("{at}: unknown endpoint type: {ty}");
+            }
+            let map = obj
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
+            let tag = map
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !tag.is_empty() {
+                if tags.contains_key(&tag) {
+                    anyhow::bail!("duplicate outbound tag: {tag}");
+                }
+                tags.insert(tag, outbounds.len());
+            }
+            outbounds.push(Outbound::WireGuard(WireGuard::build(map, &at)?));
         }
         for outbound in &mut outbounds {
             match outbound {

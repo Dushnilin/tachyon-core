@@ -12,6 +12,14 @@ core-config = { path = "../core-config" }
 core-tls = { path = "../core-tls" }
 serde_json.workspace = true
 anyhow.workspace = true
+smoltcp = { workspace = true, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }
+x25519-dalek.workspace = true
 aes.workspace = true
 aes-gcm.workspace = true
 blake2.workspace = true

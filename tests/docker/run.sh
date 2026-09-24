@@ -16,6 +16,8 @@ HOST_DIR="${HOST_DIR:-$ROOT}"
 echo "== docker run: $HOST_DIR -> /src (image: $IMAGE)"
 
 docker run --rm \
+    --cap-add=NET_ADMIN \
+    --cap-add=NET_RAW \
     -v "$HOST_DIR:/src" \
     -v tachyon-core-cargo-registry:/usr/local/cargo/registry \
     -v tachyon-core-cargo-git:/usr/local/cargo/git \

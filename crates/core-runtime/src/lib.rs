@@ -84,6 +84,30 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
+            "direct" => {
+                let inbound = inbound::direct::Direct::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: direct"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "redirect" => {
+                let inbound = inbound::redirect::Redirect::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: redirect"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "tproxy" => {
+                let inbound = inbound::tproxy::Tproxy::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: tproxy"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
             other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
         }
     }

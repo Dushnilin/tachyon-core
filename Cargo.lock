@@ -245,6 +245,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http",
+ "libc",
  "md-5",
  "regex",
  "rustls-pemfile",
@@ -252,6 +253,7 @@ dependencies = [
  "sha1",
  "sha2",
  "sha3",
+ "socket2",
  "tokio",
  "tokio-rustls",
 ]

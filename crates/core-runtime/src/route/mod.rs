@@ -305,6 +305,23 @@ impl Router {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        self.route_walk(Some(client), ctx).await
+    }
+
+    /// Rule walk without a client stream (HTTP plain forward: the request
+    /// head is already consumed and `protocol` is set, so sniff is skipped).
+    pub async fn route_raw(&self, ctx: &mut ConnContext) -> io::Result<Decision> {
+        self.route_walk::<tokio::net::TcpStream>(None, ctx).await
+    }
+
+    async fn route_walk<S>(
+        &self,
+        mut client: Option<&mut S>,
+        ctx: &mut ConnContext,
+    ) -> io::Result<Decision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         prepare(ctx);
         for (i, rule) in self.rules.iter().enumerate() {
             if !rule.matches(ctx) {
@@ -323,7 +340,9 @@ impl Router {
 
             match action {
                 Action::Sniff { sniffer, timeout } => {
-                    sniff::action_sniff(client, ctx, sniffer, *timeout).await;
+                    if let Some(c) = client.as_deref_mut() {
+                        sniff::action_sniff(c, ctx, sniffer, *timeout).await;
+                    }
                 }
                 Action::Resolve(res) => {
                     action_resolve(ctx, res).await?;

@@ -114,7 +114,7 @@ impl Vless {
         let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
         let mut stream: AnyStream = self
             .transport
-            .connect(tcp, self.tls.as_ref(), &self.server)
+            .connect(tcp, self.tls.as_ref(), &self.server, self.port)
             .await?;
 
         let mut header = Vec::with_capacity(24 + 8);
@@ -243,7 +243,10 @@ impl Trojan {
             return Err(io::Error::other("trojan requires TLS"));
         };
         let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
-        let mut stream = self.transport.connect(tcp, Some(tls), &self.server).await?;
+        let mut stream = self
+            .transport
+            .connect(tcp, Some(tls), &self.server, self.port)
+            .await?;
 
         let mut header = Vec::with_capacity(64);
         header.extend_from_slice(self.password_hash.as_bytes());

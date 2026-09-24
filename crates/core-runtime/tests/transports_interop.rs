@@ -1,6 +1,6 @@
-//! Transport interop: vless/vmess/trojan over ws and httpupgrade against the
-//! reference sing-box server. Skipped unless SING_BOX_REF is set (the Docker
-//! gate and CI always set it).
+//! Transport interop: vless/vmess/trojan over ws, httpupgrade, grpc and http
+//! against the reference sing-box server. Skipped unless SING_BOX_REF is set
+//! (the Docker gate and CI always set it).
 //!
 //! One sequential test: parallel spawns would race for probe-allocated ports.
 
@@ -173,6 +173,8 @@ async fn interop_transports() {
 
     let ws = || json!({"type": "ws", "path": "/ws-path"});
     let hu = || json!({"type": "httpupgrade", "path": "/hu-path"});
+    let grpc = || json!({"type": "grpc", "service_name": "interop-svc"});
+    let http_t = || json!({"type": "http", "path": "/hpath", "method": "PUT"});
 
     assert_transport(&ref_bin, "vless+ws", |port| {
         (
@@ -253,6 +255,62 @@ async fn interop_transports() {
             json!({
                 "type": "trojan", "tag": "up", "server": "127.0.0.1", "server_port": port,
                 "password": "trojan-secret", "transport": ws(),
+                "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
+            }),
+        )
+    })
+    .await;
+    assert_transport(&ref_bin, "vless+grpc", |port| {
+        (
+            json!({
+                "type": "vless", "listen": "127.0.0.1", "listen_port": port,
+                "users": [{"uuid": VLESS_UUID}], "transport": grpc()
+            }),
+            json!({
+                "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VLESS_UUID, "transport": grpc()
+            }),
+        )
+    })
+    .await;
+    assert_transport(&ref_bin, "vless+grpc+tls", |port| {
+        (
+            json!({
+                "type": "vless", "listen": "127.0.0.1", "listen_port": port,
+                "users": [{"uuid": VLESS_UUID}], "transport": grpc(),
+                "tls": {"enabled": true, "certificate": CERT_PEM, "key": KEY_PEM}
+            }),
+            json!({
+                "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VLESS_UUID, "transport": grpc(),
+                "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
+            }),
+        )
+    })
+    .await;
+    assert_transport(&ref_bin, "vless+http", |port| {
+        (
+            json!({
+                "type": "vless", "listen": "127.0.0.1", "listen_port": port,
+                "users": [{"uuid": VLESS_UUID}], "transport": http_t()
+            }),
+            json!({
+                "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VLESS_UUID, "transport": http_t()
+            }),
+        )
+    })
+    .await;
+    assert_transport(&ref_bin, "vless+http+tls", |port| {
+        (
+            json!({
+                "type": "vless", "listen": "127.0.0.1", "listen_port": port,
+                "users": [{"uuid": VLESS_UUID}], "transport": http_t(),
+                "tls": {"enabled": true, "certificate": CERT_PEM, "key": KEY_PEM}
+            }),
+            json!({
+                "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VLESS_UUID, "transport": http_t(),
                 "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
             }),
         )

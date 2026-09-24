@@ -1,5 +1,9 @@
-//! v2ray-style stream transports (ws, httpupgrade; grpc/http follow) and the
+//! v2ray-style stream transports (ws, httpupgrade, grpc, http) and the
 //! shared outbound dial tail: TCP → optional TLS → transport → protocol.
+
+mod grpc;
+mod h2io;
+mod http;
 
 use std::collections::VecDeque;
 use std::io;
@@ -42,20 +46,80 @@ enum Kind {
         host: Option<String>,
         headers: Vec<(String, String)>,
     },
+    Grpc {
+        service_name: String,
+    },
+    Http {
+        host: Vec<String>,
+        path: String,
+        method: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 fn parse_headers(value: Option<&Value>, at: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let Some(map) = value.and_then(Value::as_object) else {
+    let Some(headers) = value else {
         return Ok(Vec::new());
     };
-    map.iter()
-        .map(|(k, v)| {
-            let v = v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("{at}: transport header {k:?} must be a string"))?;
-            Ok((k.clone(), v.to_string()))
-        })
-        .collect()
+    match headers {
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| {
+                let v = v.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("{at}: transport header {k:?} must be a string")
+                })?;
+                Ok((k.clone(), v.to_string()))
+            })
+            .collect(),
+        Value::Array(items) => {
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let item = item.as_object().ok_or_else(|| {
+                        anyhow::anyhow!("{at}: transport headers[{i}] must be an object")
+                    })?;
+                    let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
+                        anyhow::anyhow!("{at}: transport headers[{i}].name missing")
+                    })?;
+                    let value = item.get("value").and_then(Value::as_str).ok_or_else(|| {
+                        anyhow::anyhow!("{at}: transport headers[{i}].value missing")
+                    })?;
+                    Ok((name.to_string(), value.to_string()))
+                })
+                .collect()
+        }
+        _ => Err(anyhow::anyhow!(
+            "{at}: transport headers must be an object or an array"
+        )),
+    }
+}
+
+fn parse_host_list(value: Option<&Value>, at: &str) -> anyhow::Result<Vec<String>> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::String(host)) => Ok(vec![host.clone()]),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("{at}: transport host entries must be strings"))
+            })
+            .collect(),
+        Some(_) => Err(anyhow::anyhow!(
+            "{at}: transport host must be a string or an array of strings"
+        )),
+    }
+}
+
+/// `host:port` authority, bracketing IPv6 literals.
+fn authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 impl Transport {
@@ -108,6 +172,41 @@ impl Transport {
                     .map(str::to_string),
                 headers: parse_headers(transport.get("headers"), at)?,
             },
+            "grpc" => {
+                warn_unimplemented_grpc_fields(transport, at);
+                Kind::Grpc {
+                    service_name: transport
+                        .get("service_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                }
+            }
+            "http" => {
+                warn_unimplemented_http_fields(transport, at);
+                let mut method = transport
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("PUT")
+                    .to_string();
+                if method.is_empty() {
+                    method = "PUT".to_string();
+                }
+                let mut path = transport
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/")
+                    .to_string();
+                if !path.starts_with('/') {
+                    path.insert(0, '/');
+                }
+                Kind::Http {
+                    host: parse_host_list(transport.get("host"), at)?,
+                    path,
+                    method,
+                    headers: parse_headers(transport.get("headers"), at)?,
+                }
+            }
             other => anyhow::bail!("{at}: transport type {other:?} not implemented yet"),
         };
         Ok(Self { kind })
@@ -119,9 +218,16 @@ impl Transport {
         tcp: TcpStream,
         tls: Option<&TlsOptions>,
         server: &str,
+        port: u16,
     ) -> io::Result<AnyStream> {
+        // sing-box defaults ALPN to h2 for grpc/http when the user set none.
+        let default_alpn: &[&[u8]] = match &self.kind {
+            Kind::Grpc { .. } => &[b"h2"],
+            Kind::Http { .. } if tls.is_some() => &[b"h2"],
+            _ => &[],
+        };
         let stream: AnyStream = match tls {
-            Some(tls) => tls.wrap(tcp).await?,
+            Some(tls) => tls.wrap_with_defaults(tcp, default_alpn).await?,
             None => Box::new(tcp),
         };
         match &self.kind {
@@ -142,6 +248,50 @@ impl Transport {
                 let host = host.as_deref().unwrap_or(server);
                 httpupgrade_handshake(stream, path, host, headers).await
             }
+            Kind::Grpc { service_name } => {
+                let sni = tls.map(TlsOptions::server_name).unwrap_or(server);
+                grpc::connect(stream, service_name, &authority(sni, port), tls.is_some()).await
+            }
+            Kind::Http {
+                host,
+                path,
+                method,
+                headers,
+            } => {
+                http::connect(
+                    stream,
+                    tls.is_some(),
+                    server,
+                    port,
+                    host,
+                    path,
+                    method,
+                    headers,
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn warn_unimplemented_grpc_fields(transport: &serde_json::Map<String, Value>, at: &str) {
+    let mut warned = false;
+    for key in ["idle_timeout", "ping_timeout", "permit_without_stream"] {
+        if transport.contains_key(key) && !warned {
+            crate::logging::warn(format_args!(
+                "{at}: transport grpc keepalive options are not implemented yet; ignoring"
+            ));
+            warned = true;
+        }
+    }
+}
+
+fn warn_unimplemented_http_fields(transport: &serde_json::Map<String, Value>, at: &str) {
+    for key in ["idle_timeout", "ping_timeout"] {
+        if transport.contains_key(key) {
+            crate::logging::warn(format_args!(
+                "{at}: transport http {key} is not implemented yet; ignoring"
+            ));
         }
     }
 }

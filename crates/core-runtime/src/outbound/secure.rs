@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::proxy::server_endpoint;
+use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
 
 fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
@@ -81,6 +82,7 @@ pub struct Vless {
     server: String,
     port: u16,
     uuid: [u8; 16],
+    transport: Transport,
     tls: Option<TlsOptions>,
 }
 
@@ -97,21 +99,23 @@ impl Vless {
         {
             anyhow::bail!("{at}: vless flow {flow:?} is not implemented yet");
         }
+        let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
         Ok(Self {
             server,
             port,
             uuid,
+            transport,
             tls,
         })
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
         let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
-        let mut stream: AnyStream = match &self.tls {
-            Some(tls) => tls.wrap(tcp).await?,
-            None => Box::new(tcp),
-        };
+        let mut stream: AnyStream = self
+            .transport
+            .connect(tcp, self.tls.as_ref(), &self.server)
+            .await?;
 
         let mut header = Vec::with_capacity(24 + 8);
         header.push(0x00);
@@ -206,6 +210,7 @@ pub struct Trojan {
     server: String,
     port: u16,
     password_hash: String,
+    transport: Transport,
     tls: Option<TlsOptions>,
 }
 
@@ -222,11 +227,13 @@ impl Trojan {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
+        let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
         Ok(Self {
             server,
             port,
             password_hash,
+            transport,
             tls,
         })
     }
@@ -236,7 +243,7 @@ impl Trojan {
             return Err(io::Error::other("trojan requires TLS"));
         };
         let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
-        let mut stream = tls.wrap(tcp).await?;
+        let mut stream = self.transport.connect(tcp, Some(tls), &self.server).await?;
 
         let mut header = Vec::with_capacity(64);
         header.extend_from_slice(self.password_hash.as_bytes());

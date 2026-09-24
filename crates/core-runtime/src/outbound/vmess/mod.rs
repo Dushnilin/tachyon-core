@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
+use crate::outbound::transport::Transport;
 use crate::outbound::vmess::framing::{
     BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_CHUNK,
 };
@@ -46,6 +47,7 @@ pub struct Vmess {
     global_padding: bool,
     authenticated_length: bool,
     alter_key: Option<[u8; 16]>,
+    transport: Transport,
     tls: Option<TlsOptions>,
 }
 
@@ -64,9 +66,6 @@ impl Vmess {
             0 => None,
             _ => Some(kdf::alter_key(&uuid)),
         };
-        if obj.get("transport").is_some_and(|v| !v.is_null()) {
-            anyhow::bail!("{at}: vmess transports not implemented yet");
-        }
         if obj
             .get("multiplex")
             .and_then(|m| m.get("enabled"))
@@ -115,16 +114,17 @@ impl Vmess {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             alter_key,
+            transport: Transport::parse(obj, at)?,
             tls,
         })
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
         let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
-        let mut stream: AnyStream = match &self.tls {
-            Some(tls) => tls.wrap(tcp).await?,
-            None => Box::new(tcp),
-        };
+        let mut stream: AnyStream = self
+            .transport
+            .connect(tcp, self.tls.as_ref(), &self.server)
+            .await?;
 
         let mut request_key = [0u8; 16];
         let mut request_iv = [0u8; 16];

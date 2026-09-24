@@ -1,6 +1,6 @@
 [package]
 name = "core-tls"
-description = "TLS stack integration: pure-Rust crypto provider, fingerprint/REALITY spikes"
+description = "TLS stack integration: pure-Rust crypto provider, fingerprint/REALITY spikes, ring-free QUIC backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,15 @@ rust-version.workspace = true
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
 core-crypto = { path = "../core-crypto" }
+quinn-proto = { version = "0.11.18", default-features = false }
+bytes.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 webpki-roots = "0.26"
+rustls-pemfile = "2"
+bytes.workspace = true
+aes-gcm.workspace = true

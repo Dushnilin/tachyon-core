@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod inbound;
 pub mod logging;
 pub mod outbound;
@@ -17,12 +18,18 @@ use crate::route::Router;
 pub struct BoxInstance {
     tasks: Vec<JoinHandle<()>>,
     inbounds: Vec<(String, SocketAddr)>,
+    dns: Option<Arc<dns::DnsService>>,
 }
 
 impl BoxInstance {
     /// Local addresses of all started inbounds.
     pub fn inbound_addrs(&self) -> &[(String, SocketAddr)] {
         &self.inbounds
+    }
+
+    /// The configured dns service (`None` without a `dns` section).
+    pub fn dns(&self) -> Option<Arc<dns::DnsService>> {
+        self.dns.clone()
     }
 
     /// Abort all listeners and connection tasks.
@@ -47,6 +54,8 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     }
 
     let router = Router::new(root)?;
+    let dns_service = dns::DnsService::build(root).context("dns section")?;
+    dns::set_service(dns_service.clone());
 
     let mut tasks = Vec::new();
     tasks.extend(router.take_probe_tasks());
@@ -79,7 +88,11 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         }
     }
 
-    Ok(BoxInstance { tasks, inbounds })
+    Ok(BoxInstance {
+        tasks,
+        inbounds,
+        dns: dns_service,
+    })
 }
 
 /// Load a configuration file, run the box, and block until SIGINT/SIGTERM.

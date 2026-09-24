@@ -2,7 +2,6 @@ use std::io;
 
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::proxy::server_endpoint;
@@ -111,7 +110,7 @@ impl Vless {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         let mut stream: AnyStream = self
             .transport
             .connect(tcp, self.tls.as_ref(), &self.server, self.port)
@@ -242,7 +241,7 @@ impl Trojan {
         let Some(tls) = &self.tls else {
             return Err(io::Error::other("trojan requires TLS"));
         };
-        let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         let mut stream = self
             .transport
             .connect(tcp, Some(tls), &self.server, self.port)

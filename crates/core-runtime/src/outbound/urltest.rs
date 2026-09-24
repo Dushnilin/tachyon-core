@@ -260,6 +260,7 @@ pub(crate) fn parse_duration(
                 "ms" => 0.001,
                 "m" => 60.0,
                 "h" => 3600.0,
+                "d" => 86400.0,
                 other => anyhow::bail!("{at}: unknown duration unit {other:?}"),
             };
             Ok(Duration::from_secs_f64(value * scale))
@@ -303,6 +304,10 @@ mod tests {
         assert_eq!(
             parse_duration(Some(&json!("2h")), Duration::ZERO, "t").expect("ok"),
             Duration::from_secs(7200)
+        );
+        assert_eq!(
+            parse_duration(Some(&json!("3d")), Duration::ZERO, "t").expect("ok"),
+            Duration::from_secs(3 * 86400)
         );
         assert_eq!(
             parse_duration(Some(&json!(30)), Duration::ZERO, "t").expect("ok"),

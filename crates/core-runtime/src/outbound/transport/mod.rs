@@ -2,7 +2,7 @@
 //! shared outbound dial tail: TCP → optional TLS → transport → protocol.
 
 mod grpc;
-mod h2io;
+pub(crate) mod h2io;
 mod http;
 
 use std::collections::VecDeque;

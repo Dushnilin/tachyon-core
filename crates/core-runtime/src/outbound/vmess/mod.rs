@@ -14,7 +14,6 @@ use std::task::{Context, Poll, ready};
 use cfb_mode::cipher::KeyIvInit;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::proxy::server_endpoint;
@@ -120,7 +119,7 @@ impl Vmess {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         let mut stream: AnyStream = self
             .transport
             .connect(tcp, self.tls.as_ref(), &self.server, self.port)

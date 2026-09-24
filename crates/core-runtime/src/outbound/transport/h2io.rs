@@ -14,12 +14,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
 /// One HTTP/2 request/response stream wrapped as raw byte pipes.
-pub(super) struct H2Stream {
+pub(crate) struct H2Stream {
     send: Option<h2::SendStream<Bytes>>,
     response: Option<Pin<Box<ResponseFuture>>>,
     recv: Option<RecvStream>,
     /// Received bytes not yet handed to the caller.
-    pub(super) pending: BytesMut,
+    pub(crate) pending: BytesMut,
     /// Encoded bytes waiting on flow-control capacity.
     out: Vec<u8>,
     out_pos: usize,
@@ -29,7 +29,7 @@ pub(super) struct H2Stream {
 }
 
 impl H2Stream {
-    pub(super) fn new(
+    pub(crate) fn new(
         response: ResponseFuture,
         send: h2::SendStream<Bytes>,
         conn_task: JoinHandle<()>,
@@ -47,25 +47,25 @@ impl H2Stream {
         }
     }
 
-    pub(super) fn has_out(&self) -> bool {
+    pub(crate) fn has_out(&self) -> bool {
         self.out_pos < self.out.len()
     }
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
     /// AsyncWrite caller once the whole frame has been accepted.
-    pub(super) fn stage(&mut self, frame: Vec<u8>, report: usize) {
+    pub(crate) fn stage(&mut self, frame: Vec<u8>, report: usize) {
         debug_assert!(!self.has_out());
         self.out = frame;
         self.out_pos = 0;
         self.report = report;
     }
 
-    pub(super) fn take_report(&mut self) -> usize {
+    pub(crate) fn take_report(&mut self) -> usize {
         std::mem::replace(&mut self.report, 0)
     }
 
     /// Flush staged bytes as flow control allows; clears `out` when done.
-    pub(super) fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.out_pos >= self.out.len() {
                 self.out.clear();
@@ -99,7 +99,7 @@ impl H2Stream {
 
     /// Wait for the next received chunk into `pending`.
     /// `Ok(false)` means the response body ended (EOF latched).
-    pub(super) fn poll_recv_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+    pub(crate) fn poll_recv_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         if self.recv.is_none() {
             let Some(response) = self.response.as_mut() else {
                 // Response already consumed; recv stream exhausted.
@@ -137,12 +137,12 @@ impl H2Stream {
         }
     }
 
-    pub(super) fn is_eof(&self) -> bool {
+    pub(crate) fn is_eof(&self) -> bool {
         self.eof
     }
 
     /// Half-close: flush staged bytes, then END_STREAM on the send side.
-    pub(super) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.poll_flush_out(cx))?;
         if let Some(mut send) = self.send.take()
             && let Err(e) = send.send_data(Bytes::new(), true)
@@ -164,8 +164,8 @@ impl Drop for H2Stream {
 
 /// Serve `buf`-style state machines over [`H2Stream`]: reads drain `pending`,
 /// writes go through stage + flush. Used directly by the http (h2) transport.
-pub(super) struct H2Io {
-    pub(super) h2: H2Stream,
+pub(crate) struct H2Io {
+    pub(crate) h2: H2Stream,
 }
 
 impl AsyncRead for H2Io {

@@ -81,7 +81,7 @@ impl Socks {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<TcpStream> {
-        let mut stream = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let mut stream = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         let methods: &[u8] = if self.credentials.is_some() {
             &[0x02]
         } else {
@@ -167,7 +167,7 @@ impl HttpOut {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<TcpStream> {
-        let mut stream = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let mut stream = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         let authority = match target {
             Target::Ip(addr) => addr.to_string(),
             Target::Domain(host, port) => format!("{host}:{port}"),

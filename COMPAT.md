@@ -56,7 +56,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `direct`, `selector`, `urltest`, `block`, `dns` | planned | urltest `mode: round_robin` (lx) |
 | `socks`, `http`, `shadowsocks` | planned | |
 | `vmess`, `vless`, `trojan` | planned | |
-| `hysteria2`, `tuic` | check-parity done / runtime planned | quinn (runtime blocked on ring in quinn-proto; check: full field allowlists, nested tls/obfs/realm/users/masquerade, Go duration/MemoryBytes/network/server_ports, legacy inbound fields) |
+| `hysteria2`, `tuic` | check-parity done / runtime next (ring-free QUIC crypto layer landed: `core-crypto` crate, `quic: Some(..)` suites, RFC 9001 vectors green) | quinn (custom RustCrypto Session backend port pending; check: full field allowlists, nested tls/obfs/realm/users/masquerade, Go duration/MemoryBytes/network/server_ports, legacy inbound fields) |
 | `wireguard` (+ AWG 2/3 fields) | planned | lx/extended schema at endpoint root |
 | `xhttp` transport | planned | lx `with_xhttp` |
 | `masque` / `warp` | planned | lx |

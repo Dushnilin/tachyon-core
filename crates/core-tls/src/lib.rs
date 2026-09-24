@@ -1,6 +1,7 @@
 //! TLS integration layer (F0 spike ADR-0003/0004).
 //!
-//! The default provider is pure Rust (`rustls-rustcrypto`) so the same binary
+//! The default provider is pure Rust (`core-crypto`, a vendored
+//! `rustls-rustcrypto`/oxitls fork with QUIC support) so the same binary
 //! builds for MIPS softfloat targets where `ring`/`aws-lc-rs` do not exist.
 
 pub mod hello;
@@ -11,5 +12,5 @@ pub use rustls;
 ///
 /// Idempotent: returns `true` when this call performed the installation.
 pub fn install_default_provider() -> bool {
-    rustls_rustcrypto::provider().install_default().is_ok()
+    core_crypto::provider().install_default().is_ok()
 }

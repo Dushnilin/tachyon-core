@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core-cli",
     "crates/core-config",
+    "crates/core-crypto",
     "crates/core-experimental",
     "crates/core-runtime",
     "crates/core-tls",

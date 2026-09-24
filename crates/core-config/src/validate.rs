@@ -63,6 +63,79 @@ const KNOWN_NTP_FIELDS: &[&str] = &[
 
 const KNOWN_EXPERIMENTAL_FIELDS: &[&str] = &["cache_file", "clash_api"];
 
+/// reference `option.WireGuardEndpointOptions`: wireguard.go root fields +
+/// `option.AmneziaWGOptions` (wireguard_awg.go, embedded without a wrapper
+/// key) + the `type`/`tag` wrapper fields. Shared dial fields live in
+/// `DIALER_OUT_FIELDS` and are accepted alongside these.
+const KNOWN_ENDPOINT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "system",
+    "name",
+    "mtu",
+    "address",
+    "private_key",
+    "listen_port",
+    "peers",
+    "udp_timeout",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "workers",
+    "jc",
+    "jmin",
+    "jmax",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "i1",
+    "i2",
+    "i3",
+    "i4",
+    "i5",
+    "id",
+    "ip",
+    "ib",
+    "header_protection_key",
+    "content_padding_addition",
+    "rekey_after_time",
+    "rekey_timeout",
+    "reject_after_time",
+    "keepalive_timeout",
+    "max_handshake_attempts",
+    "random_trailers",
+    "disable_cookies",
+];
+
+/// reference `option.WireGuardPeer` (wireguard.go).
+const KNOWN_ENDPOINT_PEER_FIELDS: &[&str] = &[
+    "address",
+    "port",
+    "public_key",
+    "pre_shared_key",
+    "allowed_ips",
+    "persistent_keepalive_interval",
+    "reserved",
+];
+
+/// reference `option.UNNATBehavior` (udp-nat shared doc).
+const UDP_NAT_BEHAVIORS: &[&str] = &[
+    "endpoint_independent",
+    "address_dependent",
+    "address_and_port_dependent",
+];
+
+/// reference network strategy values (dial.md `network_strategy`).
+const NETWORK_STRATEGIES: &[&str] = &["", "default", "hybrid", "fallback"];
+
+/// reference InterfaceType values (dial.md `network_type`).
+const INTERFACE_TYPES: &[&str] = &["", "wifi", "cellular", "ethernet", "other"];
+
 const KNOWN_ROUTE_FIELDS: &[&str] = &[
     "rules",
     "final",
@@ -1563,22 +1636,54 @@ pub fn validate(root: &Value) -> Result<(), String> {
     }
 
     if let Some(list) = root.get("endpoints") {
-        let entries = list.as_array().ok_or("endpoints: must be an array")?;
+        let entries = list.as_array().ok_or_else(|| {
+            format!(
+                "endpoints: json: cannot unmarshal {} into Go struct field _Options.endpoints of type []option.Endpoint",
+                json_kind(list)
+            )
+        })?;
+        // reference: whole config decodes before any endpoint initializes, so
+        // decode checks for every endpoint run first, then the initialize pass.
+        let mut initialized: Vec<(usize, String)> = Vec::new();
         for (i, entry) in entries.iter().enumerate() {
-            let obj = object_entry(entry, &format!("endpoints[{i}]"))?;
-            let ty = type_field(obj, &format!("endpoints[{i}]"))?;
+            let obj = entry.as_object().ok_or_else(|| {
+                format!(
+                    "endpoints[{i}]: json: cannot unmarshal {} into Go struct field _Options.endpoints of type option._Endpoint",
+                    json_kind(entry)
+                )
+            })?;
+            let ty = match obj.get("type") {
+                None | Some(Value::Null) => "",
+                Some(Value::String(s)) => s.as_str(),
+                Some(v) => {
+                    return Err(format!(
+                        "endpoints[{i}].type: json: cannot unmarshal {} into Go struct field _Endpoint.type of type string",
+                        json_kind(v)
+                    ));
+                }
+            };
             if ty != "wireguard" {
                 return Err(format!("endpoints[{i}]: unknown endpoint type: {ty}"));
             }
-            let tag = tag_field(obj, &format!("endpoints[{i}]"))?;
+            let tag = match obj.get("tag") {
+                None | Some(Value::Null) => "",
+                Some(Value::String(s)) => s.as_str(),
+                Some(v) => {
+                    return Err(format!(
+                        "endpoints[{i}].tag: json: cannot unmarshal {} into Go struct field _Endpoint.tag of type string",
+                        json_kind(v)
+                    ));
+                }
+            };
             if !tag.is_empty() && !outbound_tags.insert(tag) {
                 return Err(format!("duplicate outbound/endpoint tag: {tag}"));
             }
-            if !obj.contains_key("private_key") {
-                return Err(format!(
-                    "initialize endpoint[{i}] wireguard[{tag}]: missing private key"
-                ));
-            }
+            endpoint_decode(i, obj)?;
+            initialized.push((i, tag.to_string()));
+        }
+        for (i, tag) in initialized {
+            let obj = entries[i].as_object().expect("validated above");
+            endpoint_initialize(i, &tag, obj)?;
         }
     }
 
@@ -2406,6 +2511,1031 @@ fn tls_enabled(tls: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "bool",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Null => "null",
+    }
+}
+
+/// The reference decoder treats a bare `{}` as a zero value for any field
+/// (observed for peers, address elements, detour) but rejects non-empty
+/// objects against scalar/slice targets. `null` is a no-op everywhere.
+fn is_zero_json(value: &Value) -> bool {
+    value.is_null() || matches!(value, Value::Object(map) if map.is_empty())
+}
+
+/// Go `json: cannot unmarshal <kind> into Go struct field <gs>.<f> of type <ty>`.
+fn go_field_err(at: &str, value: &Value, go_struct: &str, field: &str, ty: &str) -> String {
+    format!(
+        "{at}: json: cannot unmarshal {} into Go struct field {go_struct}.{field} of type {ty}",
+        json_kind(value)
+    )
+}
+
+/// string-typed struct field: null/empty-object OK.
+fn ep_str(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        Value::String(_) => Ok(()),
+        v if is_zero_json(v) => Ok(()),
+        other => Err(go_field_err(at, other, go_struct, field, "string")),
+    }
+}
+
+/// bool-typed struct field: null/empty-object OK.
+fn ep_bool(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        Value::Bool(_) => Ok(()),
+        v if is_zero_json(v) => Ok(()),
+        other => Err(go_field_err(at, other, go_struct, field, "bool")),
+    }
+}
+
+/// Go number literal rendering for error messages (`4.5`, `4294967296`).
+fn go_number_literal(value: &Value) -> String {
+    value.to_string()
+}
+
+/// unsigned integer struct field (uint16/uint32): in-range numbers OK,
+/// out-of-range/fractional numbers carry the literal (`number 4.5`).
+fn ep_unsigned(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    field: &str,
+    max: u64,
+) -> Result<(), String> {
+    let ty = if max == u64::from(u32::MAX) {
+        "uint32"
+    } else {
+        "uint16"
+    };
+    match value {
+        v if is_zero_json(v) => Ok(()),
+        Value::Number(n) => match n.as_u64() {
+            Some(x) if x <= max => Ok(()),
+            _ => Err(format!(
+                "{at}: json: cannot unmarshal number {} into Go struct field {go_struct}.{field} of type {ty}",
+                go_number_literal(value)
+            )),
+        },
+        other => Err(go_field_err(at, other, go_struct, field, ty)),
+    }
+}
+
+/// int-typed struct field (Go int): any integer OK, floats carry the literal.
+fn ep_int(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        v if is_zero_json(v) => Ok(()),
+        Value::Number(n) => match n.as_i64() {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "{at}: json: cannot unmarshal number {} into Go struct field {go_struct}.{field} of type int",
+                go_number_literal(value)
+            )),
+        },
+        other => Err(go_field_err(at, other, go_struct, field, "int")),
+    }
+}
+
+/// Go `strconv.ParseUint` error text (`strconv.ParseUint: parsing "x": ...`).
+fn go_parse_uint_err(s: &str, bit_size: u32) -> String {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return format!("strconv.ParseUint: parsing {s:?}: invalid syntax");
+    }
+    match s.parse::<u128>() {
+        Ok(n) if n <= go_uint_max(bit_size) => String::new(),
+        _ => format!("strconv.ParseUint: parsing {s:?}: value out of range"),
+    }
+}
+
+fn go_uint_max(bit_size: u32) -> u128 {
+    if bit_size >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bit_size) - 1
+    }
+}
+
+/// `routing_mark` custom unmarshaller: number or numeric string; everything
+/// else reports the first (string) unmarshal error under the wrapper.
+fn check_routing_mark(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        v if is_zero_json(v) => Ok(()),
+        Value::String(s) => {
+            let err = go_parse_uint_err(s, 32);
+            if err.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{at}: {err}"))
+            }
+        }
+        Value::Number(n) => match n.as_u64() {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "{at}: invalid number or string mark: json: cannot unmarshal number into Go value of type string"
+            )),
+        },
+        other => Err(format!(
+            "{at}: invalid number or string mark: json: cannot unmarshal {} into Go value of type string",
+            json_kind(other)
+        )),
+    }
+}
+
+/// Go base64 StdEncoding first-error index (mirrors `illegal base64 data at
+/// input byte N`): first non-alphabet byte, broken padding, or a lone
+/// trailing char (`len % 4 == 1` reports `len - 1`).
+fn go_b64_error_index(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let is_b64 = |c: u8| c.is_ascii_alphanumeric() || c == b'+' || c == b'/';
+    let mut i = 0;
+    while i < b.len() && is_b64(b[i]) {
+        i += 1;
+    }
+    if i < b.len() && b[i] != b'=' {
+        return Some(i);
+    }
+    let pad_start = i;
+    while i < b.len() && b[i] == b'=' {
+        i += 1;
+    }
+    if i < b.len() {
+        return Some(i);
+    }
+    let pad = b.len() - pad_start;
+    if pad > 0 {
+        if pad > 2 || !b.len().is_multiple_of(4) || pad_start % 4 != (4 - pad) % 4 {
+            return Some(pad_start);
+        }
+        return None;
+    }
+    match b.len() % 4 {
+        0 => None,
+        1 => Some(b.len() - 1),
+        2 => Some(b.len() - 2),
+        _ => Some(b.len() - 3),
+    }
+}
+
+/// base64 decode for endpoint keys: `None` = valid, `Some(idx)` = Go error index.
+fn go_b64_check(s: &str) -> Option<usize> {
+    go_b64_error_index(s)
+}
+
+/// reference `option.AWGRange` decode (`normalizeAWGRange`): canonical
+/// `"N"` / `"N-M"` string, `""` when unset. Errors mirror
+/// `AWGRange.UnmarshalJSON` / `normalizeAWGRange`.
+fn awg_normalize_range(spec: &str) -> Result<String, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() > 2 {
+        return Err(format!(
+            "invalid range {:?}: expected uint32 or \"min-max\"",
+            trimmed
+        ));
+    }
+    let start_s = parts[0].trim();
+    let start = match parse_go_u32(start_s) {
+        Some(n) => n,
+        None => return Err(awg_parse_err(trimmed, parts[0], start_s)),
+    };
+    let end = if parts.len() == 2 {
+        let end_s = parts[1].trim();
+        match parse_go_u32(end_s) {
+            Some(n) => n,
+            None => return Err(awg_parse_err(trimmed, parts[1], end_s)),
+        }
+    } else {
+        start
+    };
+    if end < start {
+        return Err(format!("invalid range {trimmed:?}: range start > end"));
+    }
+    if end == 0 {
+        return Ok(String::new());
+    }
+    if start == end {
+        return Ok(start.to_string());
+    }
+    Ok(format!("{start}-{end}"))
+}
+
+fn awg_parse_err(spec: &str, raw_part: &str, trimmed_part: &str) -> String {
+    let reason = if trimmed_part.is_empty() || !trimmed_part.bytes().all(|b| b.is_ascii_digit()) {
+        "invalid syntax"
+    } else {
+        "value out of range"
+    };
+    format!(
+        "invalid range {:?}: parse {:?}: strconv.ParseUint: parsing {:?}: {reason}",
+        spec, raw_part, trimmed_part
+    )
+}
+
+fn parse_go_u32(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// AWGRange-typed field decode: null/empty-object OK, string normalized,
+/// in-range number OK; anything else is `invalid range <json>`.
+fn check_awg_range(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        v if is_zero_json(v) => Ok(()),
+        Value::Null => Ok(()),
+        Value::String(s) => awg_normalize_range(s)
+            .map(drop)
+            .map_err(|m| format!("{at}: {m}")),
+        Value::Number(n) => match n.as_u64() {
+            Some(x) if x <= u32::MAX as u64 => Ok(()),
+            _ => Err(format!(
+                "{at}: invalid range {value}: expected uint32 or \"min-max\" string"
+            )),
+        },
+        other => Err(format!(
+            "{at}: invalid range {other}: expected uint32 or \"min-max\" string"
+        )),
+    }
+}
+
+/// canonical form of an AWGRange field (`None` = unset), used by the
+/// initialize-time `IsSet` gate. Decode errors are unreachable here.
+fn awg_range_canonical(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(s) => awg_normalize_range(s).ok().filter(|c| !c.is_empty()),
+        Value::Number(n) => n
+            .as_u64()
+            .filter(|x| *x != 0 && *x <= u32::MAX as u64)
+            .map(|x| x.to_string()),
+        v if is_zero_json(v) => None,
+        _ => None,
+    }
+}
+
+/// Go `netip.ParsePrefix` failure reason (without the wrapper).
+fn prefix_parse_reason(s: &str) -> Result<(), String> {
+    let Some(i) = s.rfind('/') else {
+        return Err("no '/'".to_string());
+    };
+    let addr = &s[..i];
+    let bits = &s[i + 1..];
+    let is_v4 =
+        parse_ip_addr(addr).ok_or_else(|| format!("ParseAddr({addr:?}): unable to parse IP"))?;
+    let bit_len: i64 = if is_v4 { 32 } else { 128 };
+    let f: i64 = bits
+        .parse()
+        .map_err(|_| format!("bad bits after slash: {bits:?}"))?;
+    if f < 0 || f > bit_len {
+        return Err("prefix length out of range".to_string());
+    }
+    Ok(())
+}
+
+/// IPv4/IPv6 literal parser (netip.ParseAddr subset): dotted quad without
+/// leading zeros, or colon-hex with at most one `::` and an optional
+/// trailing v4 / `%zone`.
+fn parse_ip_addr(s: &str) -> Option<bool> {
+    let s = s.split('%').next().unwrap_or("");
+    if s.is_empty() {
+        return None;
+    }
+    if !s.contains(':') {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        for p in &parts {
+            if p.is_empty()
+                || p.len() > 3
+                || !p.bytes().all(|b| b.is_ascii_digit())
+                || (p.len() > 1 && p.starts_with('0'))
+                || p.parse::<u16>().ok()? > 255
+            {
+                return None;
+            }
+        }
+        return Some(true);
+    }
+    // IPv6: split on "::" (at most once), groups of 1-4 hex digits, optional
+    // trailing dotted quad.
+    let (head, tail) = match s.split_once("::") {
+        Some((h, t)) => {
+            if t.contains("::") {
+                return None;
+            }
+            (h, Some(t))
+        }
+        None => (s, None),
+    };
+    let mut count = split_ipv6_groups(head)?.len();
+    if let Some(t) = tail {
+        let groups = split_ipv6_groups(t)?;
+        if let Some(last) = groups.last() {
+            if last.contains('.') {
+                // trailing v4 counts as two groups
+                if !parse_ip_addr(last)? || groups.len() > 1 {
+                    return None;
+                }
+                count += 2;
+            } else {
+                count += groups.len();
+            }
+        }
+    }
+    if tail.is_none() && count != 8 {
+        return None;
+    }
+    if tail.is_some() && count > 7 {
+        return None;
+    }
+    Some(false)
+}
+
+/// one IPv6 "run" (side of `::`): empty or ≥1 groups of 1-4 hex digits.
+fn split_ipv6_groups(part: &str) -> Option<Vec<&str>> {
+    if part.is_empty() {
+        return Some(Vec::new());
+    }
+    let groups: Vec<&str> = part.split(':').collect();
+    for g in &groups {
+        if g.is_empty() || g.len() > 4 || !g.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    Some(groups)
+}
+
+/// `badoption.Listable[netip.Prefix]` decode: returns kept entries where
+/// `Zero` marks a `null` element (fails `AddPrefix` at initialize) while a
+/// bare `{}` element is dropped. Errors mirror the reference's combined
+/// single/list attempt text: `<at>: (<err A> | <err B>)`.
+fn check_prefix_list(value: &Value, at: &str) -> Result<Vec<bool>, String> {
+    const SINGLE: &str = "json: cannot unmarshal array into Go value of type **netip.Prefix";
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(s) => match prefix_parse_reason(s) {
+            Ok(()) => Ok(vec![true]),
+            Err(reason) => Err(format!(
+                "{at}: (netip.ParsePrefix({s:?}): {reason} | json: cannot unmarshal string into Go value of type []netip.Prefix)"
+            )),
+        },
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for (idx, item) in items.iter().enumerate() {
+                match item {
+                    Value::String(s) => match prefix_parse_reason(s) {
+                        Ok(()) => out.push(true),
+                        Err(reason) => {
+                            return Err(format!(
+                                "{at}: ({SINGLE} | netip.ParsePrefix({s:?}): {reason})"
+                            ));
+                        }
+                    },
+                    Value::Null => out.push(false),
+                    Value::Object(map) if map.is_empty() => {}
+                    other => {
+                        return Err(format!(
+                            "{at}: ({SINGLE} | [{idx}]: json: cannot unmarshal {} into Go value of type netip.Prefix)",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Value::Object(map) if map.is_empty() => Ok(Vec::new()),
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type **netip.Prefix | json: cannot unmarshal {kind} into Go value of type []netip.Prefix)"
+            ))
+        }
+    }
+}
+
+/// `udp_mapping` / `udp_filtering`: string enum of NAT behaviors.
+fn check_udp_nat(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        Value::String(s) if UDP_NAT_BEHAVIORS.contains(&s.as_str()) => Ok(()),
+        Value::String(s) => Err(format!("{at}: unknown UDP NAT behavior: {s}")),
+        v if is_zero_json(v) => Ok(()),
+        other => Err(go_field_err(at, other, go_struct, field, "string")),
+    }
+}
+
+/// `network_type` / `fallback_network_type`: listable InterfaceType.
+fn check_interface_types(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::String(s) if INTERFACE_TYPES.contains(&s.as_str()) => Ok(()),
+        Value::String(s) => Err(format!(
+            "{at}: (unknown interface type: {s} | illegal base64 data at input byte {})",
+            go_b64_error_index(s).unwrap_or(0)
+        )),
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) if INTERFACE_TYPES.contains(&s.as_str()) => {}
+                    Value::String(s) => return Err(format!("{at}: unknown interface type: {s}")),
+                    v if is_zero_json(v) => {}
+                    other => {
+                        return Err(format!(
+                            "{at}: json: cannot unmarshal {} into Go value of type string",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        v if is_zero_json(v) => Ok(()),
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type []option.InterfaceType)"
+            ))
+        }
+    }
+}
+
+/// reference `option.AmneziaWGOptions` + wireguard root decode checks.
+fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("endpoints[{i}]");
+    for key in obj.keys() {
+        let k = key.as_str();
+        if !KNOWN_ENDPOINT_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    const WG: &str = "WireGuardEndpointOptions";
+    const AWG: &str = "WireGuardEndpointOptions.AmneziaWGOptions";
+    const DIAL: &str = "WireGuardEndpointOptions.DialerOptions";
+    const ABS: &str = "WireGuardEndpointOptions.DialerOptions.AbstractDialerOptions";
+
+    if let Some(v) = obj.get("system") {
+        ep_bool(v, &format!("{at}.system"), WG, "system")?;
+    }
+    if let Some(v) = obj.get("name") {
+        ep_str(v, &format!("{at}.name"), WG, "name")?;
+    }
+    if let Some(v) = obj.get("mtu") {
+        ep_unsigned(v, &format!("{at}.mtu"), WG, "mtu", u32::MAX as u64)?;
+    }
+    if let Some(v) = obj.get("private_key") {
+        ep_str(v, &format!("{at}.private_key"), WG, "private_key")?;
+    }
+    if let Some(v) = obj.get("listen_port") {
+        ep_unsigned(
+            v,
+            &format!("{at}.listen_port"),
+            WG,
+            "listen_port",
+            u16::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("workers") {
+        ep_int(v, &format!("{at}.workers"), WG, "workers")?;
+    }
+    if let Some(v) = obj.get("udp_timeout") {
+        check_duration_field(v, &format!("{at}.udp_timeout"), WG, "udp_timeout")?;
+    }
+    if let Some(v) = obj.get("udp_mapping") {
+        check_udp_nat(v, &format!("{at}.udp_mapping"), WG, "udp_mapping")?;
+    }
+    if let Some(v) = obj.get("udp_filtering") {
+        check_udp_nat(v, &format!("{at}.udp_filtering"), WG, "udp_filtering")?;
+    }
+    if let Some(v) = obj.get("udp_nat_max") {
+        ep_unsigned(
+            v,
+            &format!("{at}.udp_nat_max"),
+            WG,
+            "udp_nat_max",
+            u32::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("address") {
+        check_prefix_list(v, &format!("{at}.address"))?;
+    }
+    for f in ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4"] {
+        if let Some(v) = obj.get(f) {
+            ep_unsigned(v, &format!("{at}.{f}"), AWG, f, u32::MAX as u64)?;
+        }
+    }
+    for f in [
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "content_padding_addition",
+        "rekey_after_time",
+        "rekey_timeout",
+        "reject_after_time",
+        "keepalive_timeout",
+        "max_handshake_attempts",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_awg_range(v, &format!("{at}.{f}"))?;
+        }
+    }
+    for f in [
+        "i1",
+        "i2",
+        "i3",
+        "i4",
+        "i5",
+        "id",
+        "ip",
+        "ib",
+        "header_protection_key",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), AWG, f)?;
+        }
+    }
+    for f in ["random_trailers", "disable_cookies"] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), AWG, f)?;
+        }
+    }
+    if let Some(v) = obj.get("peers") {
+        endpoint_peers_decode(i, v)?;
+    }
+
+    // shared dial fields.
+    for f in [
+        "bind_interface",
+        "inet4_bind_address",
+        "inet6_bind_address",
+        "netns",
+        "protect_path",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    for f in [
+        "bind_address_no_port",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "disable_tcp_keep_alive",
+        "udp_fragment",
+        "reuse_addr",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    for f in [
+        "connect_timeout",
+        "tcp_keep_alive",
+        "tcp_keep_alive_interval",
+        "fallback_delay",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    if let Some(v) = obj.get("detour") {
+        match v {
+            Value::String(_) | Value::Null => {}
+            Value::Object(map) if map.is_empty() => {}
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.detour"),
+                    other,
+                    DIAL,
+                    "detour",
+                    "string",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        match v {
+            Value::String(_) | Value::Null => {}
+            Value::Object(map) if map.is_empty() => {}
+            Value::Object(_) => {
+                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_resolver"),
+                    other,
+                    ABS,
+                    "domain_resolver",
+                    "option._DomainResolveOptions",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("network_strategy") {
+        match v {
+            Value::String(s) if NETWORK_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.network_strategy: unknown network strategy: {s}"
+                ));
+            }
+            x if is_zero_json(x) => {}
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.network_strategy"),
+                    other,
+                    ABS,
+                    "network_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("domain_strategy") {
+        match v {
+            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.domain_strategy: unknown domain strategy: {s}"
+                ));
+            }
+            x if is_zero_json(x) => {}
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_strategy"),
+                    other,
+                    ABS,
+                    "domain_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    for f in ["network_type", "fallback_network_type"] {
+        if let Some(v) = obj.get(f) {
+            check_interface_types(v, &format!("{at}.{f}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn endpoint_peers_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].peers");
+    const WGP: &str = "WireGuardPeer.peers";
+    const GO_PEERS: &str = "WireGuardEndpointOptions.peers";
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(map) if map.is_empty() => Ok(()),
+        Value::Array(items) => {
+            for (j, entry) in items.iter().enumerate() {
+                let peer_at = format!("{at}[{j}]");
+                let peer = match entry {
+                    Value::Object(map) => map,
+                    v if is_zero_json(v) => continue,
+                    other => {
+                        return Err(format!(
+                            "{peer_at}: json: cannot unmarshal {} into Go struct field {GO_PEERS} of type option.WireGuardPeer",
+                            json_kind(other)
+                        ));
+                    }
+                };
+                reject_unknown_fields(peer, KNOWN_ENDPOINT_PEER_FIELDS, &peer_at)?;
+                if let Some(v) = peer.get("address") {
+                    ep_str(v, &format!("{peer_at}.address"), WGP, "address")?;
+                }
+                if let Some(v) = peer.get("port") {
+                    ep_unsigned(v, &format!("{peer_at}.port"), WGP, "port", u16::MAX as u64)?;
+                }
+                for f in ["public_key", "pre_shared_key"] {
+                    if let Some(v) = peer.get(f) {
+                        ep_str(v, &format!("{peer_at}.{f}"), WGP, f)?;
+                    }
+                }
+                if let Some(v) = peer.get("allowed_ips") {
+                    check_prefix_list(v, &format!("{peer_at}.allowed_ips"))?;
+                }
+                if let Some(v) = peer.get("persistent_keepalive_interval") {
+                    check_awg_range(v, &format!("{peer_at}.persistent_keepalive_interval"))?;
+                }
+                if let Some(v) = peer.get("reserved") {
+                    check_reserved(v, &format!("{peer_at}.reserved"))?;
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "{at}: json: cannot unmarshal {} into Go struct field {GO_PEERS} of type []option.WireGuardPeer",
+            json_kind(other)
+        )),
+    }
+}
+
+fn check_reserved(value: &Value, at: &str) -> Result<(), String> {
+    const WGP: &str = "WireGuardPeer.peers";
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(map) if map.is_empty() => Ok(()),
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                match item {
+                    Value::Number(n) => match n.as_u64() {
+                        Some(x) if x <= u8::MAX as u64 => {}
+                        _ => {
+                            return Err(format!(
+                                "{at}[{idx}]: json: cannot unmarshal number {} into Go struct field {WGP}.reserved of type uint8",
+                                go_number_literal(item)
+                            ));
+                        }
+                    },
+                    v if is_zero_json(v) => {}
+                    other => {
+                        return Err(format!(
+                            "{at}[{idx}]: json: cannot unmarshal {} into Go struct field {WGP}.reserved of type uint8",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "{at}: json: cannot unmarshal {} into Go struct field {WGP}.reserved of type []uint8",
+            json_kind(other)
+        )),
+    }
+}
+
+/// strict LDH masquerade domain validator (mirror of `validateMasqueDomain`).
+fn validate_masque_domain(domain: &str) -> Result<(), String> {
+    if domain.is_empty() {
+        return Err("amneziawg: id (masquerade domain) is required when ip/ib is set".to_string());
+    }
+    let name = domain.strip_suffix('.').unwrap_or(domain);
+    if name.is_empty() || name.len() > 253 {
+        return Err(format!(
+            "amneziawg: invalid masquerade domain {domain:?}: empty or longer than 253 bytes"
+        ));
+    }
+    if name.starts_with('.') {
+        return Err(format!(
+            "amneziawg: invalid masquerade domain {domain:?}: leading dot"
+        ));
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Err(format!(
+                "amneziawg: invalid masquerade domain {domain:?}: empty label"
+            ));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "amneziawg: invalid masquerade domain {domain:?}: label longer than 63 bytes"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "amneziawg: invalid masquerade domain {domain:?}: label with leading/trailing hyphen"
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(format!(
+                "amneziawg: invalid masquerade domain {domain:?}: illegal character (only a-z A-Z 0-9 - _ allowed)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn endpoint_str<'a>(obj: &'a Map<String, Value>, key: &str) -> &'a str {
+    obj.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// reference initialize pass: private key → AWG (`awgIpcLines`) → addresses →
+/// peers, mirroring `protocol/wireguard/endpoint.go` + `device_awg.go`.
+fn endpoint_initialize(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("initialize endpoint[{i}] wireguard[{tag}]");
+    let private_key = endpoint_str(obj, "private_key");
+    if private_key.is_empty() {
+        return Err(format!("{at}: missing private key"));
+    }
+    if let Some(idx) = go_b64_check(private_key) {
+        return Err(format!(
+            "{at}: decode private key: illegal base64 data at input byte {idx}"
+        ));
+    }
+
+    let u32_field = |key: &str| -> u64 { obj.get(key).and_then(Value::as_u64).unwrap_or(0) };
+    let (jc, jmin, jmax) = (u32_field("jc"), u32_field("jmin"), u32_field("jmax"));
+    let (s1, s2, s3, s4) = (
+        u32_field("s1"),
+        u32_field("s2"),
+        u32_field("s3"),
+        u32_field("s4"),
+    );
+    let hpk = endpoint_str(obj, "header_protection_key");
+    let (id, ip, ib) = (
+        endpoint_str(obj, "id"),
+        endpoint_str(obj, "ip"),
+        endpoint_str(obj, "ib"),
+    );
+    let (i1, i2) = (endpoint_str(obj, "i1"), endpoint_str(obj, "i2"));
+    let ranges_set = [
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "content_padding_addition",
+        "rekey_after_time",
+        "rekey_timeout",
+        "reject_after_time",
+        "keepalive_timeout",
+        "max_handshake_attempts",
+    ]
+    .iter()
+    .any(|f| awg_range_canonical(obj.get(*f)).is_some());
+    let awg_set = jc != 0
+        || jmin != 0
+        || jmax != 0
+        || s1 != 0
+        || s2 != 0
+        || s3 != 0
+        || s4 != 0
+        || ranges_set
+        || [
+            i1,
+            i2,
+            endpoint_str(obj, "i3"),
+            endpoint_str(obj, "i4"),
+            endpoint_str(obj, "i5"),
+        ]
+        .iter()
+        .any(|s| !s.is_empty())
+        || !id.is_empty()
+        || !ip.is_empty()
+        || !ib.is_empty()
+        || !hpk.is_empty()
+        || obj.get("random_trailers").and_then(Value::as_bool) == Some(true)
+        || obj.get("disable_cookies").and_then(Value::as_bool) == Some(true);
+
+    if awg_set {
+        if jmin > jmax {
+            return Err(format!(
+                "{at}: amneziawg: jmin ({jmin}) must be <= jmax ({jmax})"
+            ));
+        }
+        if !hpk.is_empty() {
+            match go_b64_check(hpk) {
+                Some(idx) => {
+                    return Err(format!(
+                        "{at}: amneziawg: decode header_protection_key (expected base64, as printed by `awg genkey`): illegal base64 data at input byte {idx}"
+                    ));
+                }
+                None => {
+                    let len = go_b64_decoded_len(hpk);
+                    if len != 32 {
+                        return Err(format!(
+                            "{at}: amneziawg: header_protection_key must decode to 32 bytes, got {len}"
+                        ));
+                    }
+                    if go_b64_decoded_bytes(hpk).is_some_and(|b| b.iter().all(|x| *x == 0)) {
+                        return Err(format!(
+                            "{at}: amneziawg: header_protection_key is all zeros (the device treats that as \"off\"); omit the field instead"
+                        ));
+                    }
+                    for (key, value) in [("s1", s1), ("s2", s2), ("s3", s3), ("s4", s4)] {
+                        if value < 12 {
+                            return Err(format!(
+                                "{at}: amneziawg: {key}={value} is too short for header_protection_key: each of s1-s4 must be at least 12 bytes (the padding carries the header cipher nonce)"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !id.is_empty() || !ip.is_empty() || !ib.is_empty() {
+            if !i1.is_empty() {
+                return Err(format!(
+                    "{at}: amneziawg: id/ip/ib masquerade conflicts with an explicit i1; use one or the other"
+                ));
+            }
+            let proto = ip.trim().to_lowercase();
+            if proto.is_empty() {
+                return Err(format!(
+                    "{at}: amneziawg: ip (masquerade protocol) is required when id/ib is set; one of quic|dns|stun|sip"
+                ));
+            }
+            let domain = id.trim();
+            if !domain.is_empty() {
+                validate_masque_domain(domain).map_err(|m| format!("{at}: {m}"))?;
+            }
+            let browser = ib.trim().to_lowercase();
+            if !browser.is_empty() {
+                if !["chrome", "firefox", "curl"].contains(&browser.as_str()) {
+                    return Err(format!(
+                        "{at}: amneziawg: unknown masquerade browser {ib:?}; one of chrome|firefox|curl"
+                    ));
+                }
+                if proto != "quic" {
+                    return Err(format!(
+                        "{at}: amneziawg: ib (browser) is only meaningful with ip=quic, got ip={proto:?}"
+                    ));
+                }
+            }
+            match proto.as_str() {
+                "quic" => {
+                    if domain.is_empty() {
+                        return Err(format!(
+                            "{at}: amneziawg: id (masquerade domain) is required for ip=quic (it becomes the ClientHello SNI)"
+                        ));
+                    }
+                }
+                "stun" | "dns" | "sip" => {}
+                _ => {
+                    return Err(format!(
+                        "{at}: amneziawg: unknown masquerade protocol {proto:?}; one of quic|dns|stun|sip"
+                    ));
+                }
+            }
+            if proto == "sip" && !i2.is_empty() {
+                return Err(format!(
+                    "{at}: amneziawg: id/ip/ib masquerade (ip=sip) fills i2; an explicit i2 conflicts with it"
+                ));
+            }
+        }
+    }
+
+    if let Some(address) = obj.get("address")
+        && let Ok(list) = check_prefix_list(address, &format!("{at}.address"))
+        && list.contains(&false)
+    {
+        return Err(format!("{at}: AddPrefix(invalid IP/-1)"));
+    }
+    if let Some(Value::Array(peers)) = obj.get("peers") {
+        for (j, peer) in peers.iter().enumerate() {
+            let allowed = peer
+                .as_object()
+                .and_then(|m| m.get("allowed_ips"))
+                .map(|v| check_prefix_list(v, &format!("{at}.peers[{j}].allowed_ips")))
+                .transpose()?
+                .unwrap_or_default();
+            if allowed.is_empty() {
+                return Err(format!("{at}: missing allowed ips for peer {j}"));
+            }
+            if allowed.contains(&false) {
+                return Err(format!("{at}: AddPrefix(invalid IP/-1)"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// decoded length of a valid base64 string (data bytes, ignoring padding).
+fn go_b64_decoded_len(s: &str) -> usize {
+    let data = s.bytes().take_while(|b| *b != b'=').count();
+    let full = data / 4 * 3;
+    match data % 4 {
+        0 => full,
+        2 => full + 1,
+        3 => full + 2,
+        _ => full,
+    }
+}
+
+/// decoded bytes of a valid base64 string (`None` if invalid alphabet).
+fn go_b64_decoded_bytes(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::new();
+    for b in s.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let v = ALPHABET.iter().position(|&c| c == b)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 fn object_entry<'a>(entry: &'a Value, at: &str) -> Result<&'a Map<String, Value>, String> {
     entry
         .as_object()
@@ -3207,6 +4337,240 @@ mod tests {
                 {"type": "direct", "tag": "direct"}
             ],
             "route": {"final": "direct"}
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    // ── WireGuard / AmneziaWG endpoint check-parity (messages verified
+    //    against sing-box-lx v1.14.1-lx.8 and re-verified byte-identical on
+    //    v1.14.2-lx.1) ──────────────────────────────────────────────────
+
+    const WG_PRIV: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const WG_PEER_KEY: &str = "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=";
+
+    /// build a single wireguard endpoint config from an endpoint object
+    fn wg_cfg(ep: Value) -> Value {
+        json!({"endpoints": [ep]})
+    }
+
+    /// wireguard endpoint skeleton: key, address, one peer with allowed ips
+    fn wg_ep(extra: Value) -> Value {
+        let mut ep = json!({
+            "type": "wireguard",
+            "tag": "ep",
+            "private_key": WG_PRIV,
+            "address": ["10.0.0.2/32"],
+            "peers": [{"public_key": WG_PEER_KEY, "allowed_ips": ["10.0.0.1/32"]}],
+        });
+        if let Value::Object(extra) = extra {
+            ep.as_object_mut().unwrap().extend(extra);
+        }
+        ep
+    }
+
+    #[test]
+    fn wg_decode_errors() {
+        let err = validate(&wg_cfg(
+            json!({"type": "wireguard", "tag": "ep", "bogus": 1}),
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("endpoints[0].bogus: json: unknown field \"bogus\""),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(json!({"type": "wireguard", "tag": 5}))).unwrap_err();
+        assert!(
+            err.contains(
+                "endpoints[0].tag: json: cannot unmarshal number into Go struct field _Endpoint.tag of type string"
+            ),
+            "{err}"
+        );
+
+        let err = validate(&json!({"endpoints": [{"type": "gost", "tag": "e"}]})).unwrap_err();
+        assert!(
+            err.contains("endpoints[0]: unknown endpoint type: gost"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(
+            wg_ep(json!({"peers": [{"public_key": WG_PEER_KEY, "allowed_ips": ["10.0.0.1/32"], "xyz": 1}]})),
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("endpoints[0].peers[0].xyz: json: unknown field \"xyz\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wg_listable_prefix_errors() {
+        let err = validate(&wg_cfg(wg_ep(json!({"address": ["1.2.3.4/33"]})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].address: (json: cannot unmarshal array into Go value of type **netip.Prefix | netip.ParsePrefix(\"1.2.3.4/33\"): prefix length out of range)"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"address": "bogus"})))).unwrap_err();
+        assert!(
+            err.contains("netip.ParsePrefix(\"bogus\"): no '/'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn awg_range_errors() {
+        let err = validate(&wg_cfg(wg_ep(json!({"h1": "xyz"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].h1: invalid range \"xyz\": parse \"xyz\": strconv.ParseUint: parsing \"xyz\": invalid syntax"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"h1": "10-5"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].h1: invalid range \"10-5\": range start > end"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"h4": 4.5})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].h4: invalid range 4.5: expected uint32 or \"min-max\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn awg_type_errors() {
+        let err = validate(&wg_cfg(wg_ep(json!({"jc": "100"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].jc: json: cannot unmarshal string into Go struct field WireGuardEndpointOptions.AmneziaWGOptions.jc of type uint32"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"private_key": 7})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].private_key: json: cannot unmarshal number into Go struct field WireGuardEndpointOptions.private_key of type string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn awg_initialize_errors() {
+        let err = validate(&wg_cfg(wg_ep(json!({"jmin": 100, "jmax": 50})))).unwrap_err();
+        assert!(
+            err.contains(
+                "initialize endpoint[0] wireguard[ep]: amneziawg: jmin (100) must be <= jmax (50)"
+            ),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"header_protection_key": "AAAA"})))).unwrap_err();
+        assert!(
+            err.contains("initialize endpoint[0] wireguard[ep]: amneziawg: header_protection_key must decode to 32 bytes, got 3"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"id": "example.com", "i1": "AAAA"})))).unwrap_err();
+        assert!(
+            err.contains("initialize endpoint[0] wireguard[ep]: amneziawg: id/ip/ib masquerade conflicts with an explicit i1; use one or the other"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"id": "..bad..", "ip": "quic"})))).unwrap_err();
+        assert!(
+            err.contains("initialize endpoint[0] wireguard[ep]: amneziawg: invalid masquerade domain \"..bad..\": leading dot"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(json!({
+            "type": "wireguard", "tag": "ep", "private_key": WG_PRIV,
+            "address": ["10.0.0.2/32"],
+            "peers": [{"public_key": WG_PEER_KEY}],
+        })))
+        .unwrap_err();
+        assert!(
+            err.contains("initialize endpoint[0] wireguard[ep]: missing allowed ips for peer 0"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(json!({"type": "wireguard", "tag": "ep"}))).unwrap_err();
+        assert!(
+            err.contains("initialize endpoint[0] wireguard[ep]: missing private key"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wg_dialer_value_errors() {
+        let err = validate(&wg_cfg(wg_ep(json!({"udp_mapping": "bogus"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].udp_mapping: unknown UDP NAT behavior: bogus"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"udp_timeout": "abc"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].udp_timeout: time: invalid duration \"abc\""),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"network_strategy": "bogus"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].network_strategy: unknown network strategy: bogus"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"domain_strategy": "bogus"})))).unwrap_err();
+        assert!(
+            err.contains("endpoints[0].domain_strategy: unknown domain strategy: bogus"),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"routing_mark": "x"})))).unwrap_err();
+        assert!(
+            err.contains(
+                "endpoints[0].routing_mark: strconv.ParseUint: parsing \"x\": invalid syntax"
+            ),
+            "{err}"
+        );
+
+        let err = validate(&wg_cfg(wg_ep(json!({"network_type": "bogus"})))).unwrap_err();
+        assert!(err.contains("unknown interface type: bogus"), "{err}");
+    }
+
+    #[test]
+    fn wg_reserved_element_error() {
+        let err = validate(&wg_cfg(wg_ep(json!({
+            "peers": [{"public_key": WG_PEER_KEY, "allowed_ips": ["10.0.0.1/32"], "reserved": [300]}],
+        }))))
+        .unwrap_err();
+        assert!(
+            err.contains("endpoints[0].peers[0].reserved[0]: json: cannot unmarshal number 300 into Go struct field WireGuardPeer.peers.reserved of type uint8"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_wireguard_and_awg_endpoints() {
+        let cfg = json!({
+            "log": {"level": "error"},
+            "endpoints": [
+                {"type": "wireguard", "tag": "wg", "private_key": WG_PRIV,
+                 "address": ["10.0.0.2/32"], "mtu": 1408,
+                 "udp_timeout": "5m", "udp_mapping": "endpoint_independent",
+                 "network_strategy": "default",
+                 "peers": [{"address": "1.2.3.4", "port": 51820,
+                            "public_key": WG_PEER_KEY,
+                            "allowed_ips": ["10.0.0.1/32"],
+                            "persistent_keepalive_interval": "25-35"}]},
+                {"type": "wireguard", "tag": "awg", "private_key": WG_PRIV,
+                 "address": ["10.0.0.3/32"],
+                 "jc": 4, "jmin": 40, "jmax": 70,
+                 "s1": 0, "s2": 0, "h1": 1, "h2": 2, "h3": 3, "h4": 4,
+                 "peers": [{"public_key": WG_PEER_KEY, "allowed_ips": ["10.0.0.1/32"]}]},
+            ],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"rules": [{"inbound": [], "outbound": "wg"}], "final": "direct"}
         });
         assert!(validate(&cfg).is_ok());
     }

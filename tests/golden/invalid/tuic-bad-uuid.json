@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"tuic","tag":"t","server":"1.2.3.4","server_port":443,"uuid":"nope","password":"x","tls":{"enabled":true,"insecure":true}}]}

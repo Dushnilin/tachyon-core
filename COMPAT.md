@@ -5,14 +5,16 @@ Policy: the reference `check` decodes strictly — unknown fields anywhere are
 rejected. `tachyon-core check` mirrors this at the top level and inside `log`,
 `experimental`, `route`, plus all verified enums/types (inbound/outbound/
 endpoint/transport/dns-server/rule-action/log-level/uTLS fingerprint/ss method);
-per-protocol outbound field allowlists land with the typed model (F1 tail).
+per-protocol outbound field allowlists — landed for hysteria2/tuic (F2);
+other protocols still only verify fields we checked empirically.
 Raw JSON outbounds from subscriptions are accepted verbatim when they use a
 known `type`; an unknown `type` fails the same way `sing-box check` fails.
 
 Known gaps vs reference `check` (documented, no fixtures yet):
 
-- unknown fields *inside* protocol objects (e.g. `direct` + `server`) —
-  reference rejects, we accept;
+- unknown fields *inside* protocol objects for non-hy2/tuic types (e.g.
+  `direct` + `server`) — reference rejects, we accept; hy2/tuic in/out now
+  have full nested allowlists;
 - PEM/x509 content of server certificates — reference parses at check time,
   we only verify presence of certificate/key fields.
 
@@ -54,7 +56,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `direct`, `selector`, `urltest`, `block`, `dns` | planned | urltest `mode: round_robin` (lx) |
 | `socks`, `http`, `shadowsocks` | planned | |
 | `vmess`, `vless`, `trojan` | planned | |
-| `hysteria2`, `tuic` | planned | quinn |
+| `hysteria2`, `tuic` | check-parity done / runtime planned | quinn (runtime blocked on ring in quinn-proto; check: full field allowlists, nested tls/obfs/realm/users/masquerade, Go duration/MemoryBytes/network/server_ports, legacy inbound fields) |
 | `wireguard` (+ AWG 2/3 fields) | planned | lx/extended schema at endpoint root |
 | `xhttp` transport | planned | lx `with_xhttp` |
 | `masque` / `warp` | planned | lx |

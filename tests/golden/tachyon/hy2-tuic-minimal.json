@@ -1,0 +1,14 @@
+{
+  "log": {"level": "error"},
+  "inbounds": [{"type": "mixed", "tag": "m", "listen": "127.0.0.1", "listen_port": 2080}],
+  "outbounds": [
+    {"type": "hysteria2", "tag": "hy2", "server": "127.0.0.1", "server_port": 8443,
+     "up_mbps": 10, "down_mbps": 10, "password": "x",
+     "tls": {"enabled": true, "insecure": true}},
+    {"type": "tuic", "tag": "tuic", "server": "127.0.0.1", "server_port": 443,
+     "uuid": "00000000-0000-0000-0000-000000000000", "password": "x",
+     "tls": {"enabled": true, "insecure": true}},
+    {"type": "direct", "tag": "direct"}
+  ],
+  "route": {"final": "direct"}
+}

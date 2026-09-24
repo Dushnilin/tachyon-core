@@ -1,13 +1,11 @@
-//! Semantic validation mirroring reference `sing-box check` (F1).
+//! Semantic validation mirroring reference `sing-box check` (F1 + F2 hy2/tuic).
 //!
 //! Rules were derived empirically against sing-box-lx v1.14.1-lx.8: the
 //! differential harness compares exit codes only, so messages here are
 //! best-effort echoes of the reference wording, not a contract.
 //!
 //! Known intentional gaps (documented in COMPAT.md):
-//! - per-protocol outbound/inbound field allowlists (reference rejects
-//!   unknown fields inside protocol objects; we only check fields we
-//!   verified empirically);
+//! - field allowlists for protocols other than hysteria2/tuic;
 //! - PEM/x509 content parsing of server certificates (presence only).
 
 use serde_json::{Map, Value};
@@ -233,6 +231,1254 @@ const TUN_LEGACY_FIELDS: &[&str] = &[
     "inet4_route_exclude_address",
     "inet6_route_exclude_address",
 ];
+
+/// Legacy inbound fields: known keys; any non-zero value → legacy-field error.
+const LEGACY_INBOUND_FIELDS: &[&str] = &[
+    "sniff",
+    "sniff_override_destination",
+    "sniff_timeout",
+    "domain_strategy",
+    "udp_disable_domain_unmapping",
+];
+
+const LEGACY_INBOUND_ERROR: &str = "legacy inbound fields are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, checkout migration: https://sing-box.sagernet.org/migration/#migrate-legacy-inbound-fields-to-rule-actions";
+
+/// reference `option.DialerOptions` (shared by hy2/tuic outbound).
+const DIALER_OUT_FIELDS: &[&str] = &[
+    "detour",
+    "bind_interface",
+    "inet4_bind_address",
+    "inet6_bind_address",
+    "bind_address_no_port",
+    "protect_path",
+    "routing_mark",
+    "reuse_addr",
+    "netns",
+    "connect_timeout",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "disable_tcp_keep_alive",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "udp_fragment",
+    "domain_resolver",
+    "network_strategy",
+    "network_type",
+    "fallback_network_type",
+    "fallback_delay",
+    "domain_strategy",
+];
+
+/// reference `option.ListenOptions` (shared by hy2/tuic inbound).
+const LISTEN_IN_FIELDS: &[&str] = &[
+    "listen",
+    "listen_port",
+    "bind_interface",
+    "routing_mark",
+    "reuse_addr",
+    "netns",
+    "disable_tcp_keep_alive",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "udp_fragment",
+    "udp_timeout",
+    "detour",
+    "proxy_protocol",
+    "proxy_protocol_accept_no_header",
+];
+
+/// reference `option.QUICOptions` flattened (idle_timeout, keep_alive_period,
+/// HTTP2 window fields, initial_packet_size, disable_path_mtu_discovery).
+const QUIC_OUT_FIELDS: &[&str] = &[
+    "idle_timeout",
+    "keep_alive_period",
+    "stream_receive_window",
+    "connection_receive_window",
+    "max_concurrent_streams",
+    "initial_packet_size",
+    "disable_path_mtu_discovery",
+];
+
+/// reference `option.OutboundTLSOptions`.
+const TLS_OUT_FIELDS: &[&str] = &[
+    "enabled",
+    "engine",
+    "disable_sni",
+    "server_name",
+    "insecure",
+    "alpn",
+    "min_version",
+    "max_version",
+    "cipher_suites",
+    "curve_preferences",
+    "certificate",
+    "certificate_path",
+    "certificate_public_key_sha256",
+    "client_certificate",
+    "client_certificate_path",
+    "client_key",
+    "client_key_path",
+    "fragment",
+    "fragment_fallback_delay",
+    "record_fragment",
+    "spoof",
+    "spoof_method",
+    "kernel_tx",
+    "kernel_rx",
+    "handshake_timeout",
+    "ech",
+    "utls",
+    "reality",
+];
+
+/// reference `option.InboundTLSOptions`.
+const TLS_IN_FIELDS: &[&str] = &[
+    "enabled",
+    "server_name",
+    "insecure",
+    "alpn",
+    "min_version",
+    "max_version",
+    "cipher_suites",
+    "curve_preferences",
+    "certificate",
+    "certificate_path",
+    "client_authentication",
+    "client_certificate",
+    "client_certificate_path",
+    "client_certificate_public_key_sha256",
+    "key",
+    "key_path",
+    "kernel_tx",
+    "kernel_rx",
+    "handshake_timeout",
+    "certificate_provider",
+    "acme",
+    "ech",
+    "reality",
+];
+
+/// Hy2 outbound allowlist (lx hysteria2.go), excluding TLS/QUIC containers.
+const HY2_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "server_ports",
+    "hop_interval",
+    "hop_interval_max",
+    "up_mbps",
+    "down_mbps",
+    "obfs",
+    "password",
+    "network",
+    "bbr_profile",
+    "brutal_debug",
+    "disable_chrome_parrot",
+    "realm",
+    "tls",
+];
+
+/// Tuic outbound allowlist (lx tuic.go).
+const TUIC_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "uuid",
+    "password",
+    "congestion_control",
+    "udp_relay_mode",
+    "udp_over_stream",
+    "zero_rtt_handshake",
+    "heartbeat",
+    "network",
+    "tls",
+];
+
+/// Hy2 inbound allowlist (lx hy2_inbound.go).
+const HY2_IN_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "up_mbps",
+    "down_mbps",
+    "obfs",
+    "users",
+    "ignore_client_bandwidth",
+    "masquerade",
+    "bbr_profile",
+    "brutal_debug",
+    "realm",
+    "tls",
+];
+
+/// Tuic inbound allowlist (lx tuic inbound options).
+const TUIC_IN_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "users",
+    "congestion_control",
+    "auth_timeout",
+    "zero_rtt_handshake",
+    "heartbeat",
+    "tls",
+];
+
+const BBR_PROFILES: &[&str] = &["standard", "conservative", "aggressive"];
+const TUIC_CC_ALGS: &[&str] = &["cubic", "new_reno", "bbr"];
+const TUIC_UDP_RELAY_MODES: &[&str] = &["native", "quic"];
+const OBFS_TYPES: &[&str] = &["salamander", "gecko"];
+const MASQ_URL_SCHEMES: &[&str] = &["file", "http", "https"];
+const MASQ_OBJ_TYPES: &[&str] = &["file", "proxy", "string"];
+const MASQ_FILE_FIELDS: &[&str] = &["type", "directory"];
+const MASQ_PROXY_FIELDS: &[&str] = &["type", "url", "rewrite_host"];
+const MASQ_STRING_FIELDS: &[&str] = &["type", "status_code", "headers", "content"];
+const HTTP_CLIENT_BASE_FIELDS: &[&str] = &[
+    "tag",
+    "engine",
+    "version",
+    "disable_version_fallback",
+    "headers",
+    "tls",
+];
+const HTTP2_CLIENT_FIELDS: &[&str] = &[
+    "idle_timeout",
+    "keep_alive_period",
+    "stream_receive_window",
+    "connection_receive_window",
+    "max_concurrent_streams",
+];
+const QUIC_CLIENT_EXTRA_FIELDS: &[&str] = &["initial_packet_size", "disable_path_mtu_discovery"];
+const REALM_OUT_FIELDS: &[&str] = &[
+    "server_url",
+    "token",
+    "realm_id",
+    "stun_servers",
+    "ip_version",
+    "port_mapping",
+    "http_client",
+];
+const REALM_IN_FIELDS: &[&str] = &[
+    "server_url",
+    "token",
+    "realm_id",
+    "stun_servers",
+    "stun_domain_resolver",
+    "ip_version",
+    "port_mapping",
+    "http_client",
+];
+const REALM_PM_FIELDS: &[&str] = &["enabled", "timeout", "lifetime"];
+
+fn reject_unknown_fields(
+    obj: &Map<String, Value>,
+    allowed: &[&str],
+    at: &str,
+) -> Result<(), String> {
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{at}.{key}: json: unknown field \"{key}\""));
+        }
+    }
+    Ok(())
+}
+
+/// Go `my_time.ParseDuration` subset (badoption.Duration string form).
+/// Grammar: `[-+]?([0-9]*(\.[0-9]*)?[a-zµμ]+)+`
+fn go_parse_duration(raw: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        return Err(format!("time: invalid duration \"{raw}\""));
+    }
+    let mut s = raw;
+    if let Some(rest) = s.strip_prefix('-').or_else(|| s.strip_prefix('+')) {
+        s = rest;
+    }
+    if s.is_empty() {
+        return Err(format!("time: invalid duration \"{raw}\""));
+    }
+    const UNITS: &[&str] = &["ns", "us", "µs", "μs", "ms", "s", "m", "h", "d"];
+    let mut consumed_any = false;
+    while !s.is_empty() {
+        // number part: digits and at most one '.'
+        let mut num_len = 0usize;
+        let mut dots = 0;
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                num_len += 1;
+            } else if c == '.' {
+                dots += 1;
+                if dots > 1 {
+                    break;
+                }
+                num_len += 1;
+            } else {
+                break;
+            }
+        }
+        // trailing '.' with no digits after is still consumed by loop only if digit before
+        if num_len == 0 {
+            return Err(if consumed_any {
+                format!("time: missing unit in duration \"{raw}\"")
+            } else {
+                format!("time: invalid duration \"{raw}\"")
+            });
+        }
+        // unit: leading alphabetic characters (including µ/μ)
+        let rest = &s[num_len..];
+        let unit_len = rest
+            .chars()
+            .take_while(|c| c.is_alphabetic())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if unit_len == 0 {
+            return Err(format!("time: missing unit in duration \"{raw}\""));
+        }
+        let unit = &rest[..unit_len];
+        if !UNITS.contains(&unit) {
+            return Err(format!(
+                "time: unknown unit \"{unit}\" in duration \"{raw}\""
+            ));
+        }
+        s = &rest[unit_len..];
+        consumed_any = true;
+    }
+    if !consumed_any {
+        return Err(format!("time: invalid duration \"{raw}\""));
+    }
+    Ok(())
+}
+
+/// Decode-time duration field: string → Go parse; null → invalid duration "";
+/// number/bool → cannot unmarshal into Go struct field of type string.
+fn check_duration_field(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    go_field: &str,
+) -> Result<(), String> {
+    match value {
+        Value::Null => Err(format!("{at}: time: invalid duration \"\"")),
+        Value::String(s) => go_parse_duration(s).map_err(|m| format!("{at}: {m}")),
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number into Go struct field {go_struct}.{go_field} of type string"
+        )),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.{go_field} of type string"
+        )),
+        Value::Array(_) => Err(format!(
+            "{at}: json: cannot unmarshal array into Go struct field {go_struct}.{go_field} of type string"
+        )),
+        Value::Object(_) => Err(format!(
+            "{at}: json: cannot unmarshal object into Go struct field {go_struct}.{go_field} of type string"
+        )),
+    }
+}
+
+/// MemoryBytes: number OK; null OK; string = leading digits + unit.
+fn check_memory_bytes(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    go_field: &str,
+) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Number(_) => Ok(()),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.{go_field} of type int"
+        )),
+        Value::String(s) => check_memory_bytes_str(s, at),
+        Value::Array(_) | Value::Object(_) => Err(format!(
+            "{at}: json: cannot unmarshal value into Go struct field {go_struct}.{go_field} of type string"
+        )),
+    }
+}
+
+fn check_memory_bytes_str(s: &str, at: &str) -> Result<(), String> {
+    let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 || s.starts_with(|c: char| c.is_whitespace() || c == '-' || c == '+') {
+        return Err(format!("{at}: invalid format: {s}"));
+    }
+    let unit = &s[digits..];
+    let unit_trim = unit.trim();
+    if unit_trim.is_empty() {
+        return Err(format!("{at}: invalid format: {s}"));
+    }
+    let matches = unit_trim.eq_ignore_ascii_case("b")
+        || unit_trim.eq_ignore_ascii_case("kb")
+        || unit_trim.eq_ignore_ascii_case("mb")
+        || unit_trim.eq_ignore_ascii_case("gb")
+        || unit_trim.eq_ignore_ascii_case("tb")
+        || unit_trim.eq_ignore_ascii_case("k");
+    if matches {
+        Ok(())
+    } else {
+        Err(format!("{at}: unsupported unit: {unit}"))
+    }
+}
+
+/// Listable network: string | string[]; case-sensitive tcp/udp.
+fn check_network(value: &Value, at: &str, go_struct: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            if s == "tcp" || s == "udp" {
+                Ok(())
+            } else {
+                Err(format!("{at}: unknown network: {s}"))
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let s = item.as_str().ok_or_else(|| {
+                    format!(
+                        "{at}: json: cannot unmarshal array into Go struct field {go_struct}.network of type string"
+                    )
+                })?;
+                if s != "tcp" && s != "udp" {
+                    return Err(format!("{at}: unknown network: {s}"));
+                }
+            }
+            Ok(())
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Object(_) => Err(format!(
+            "{at}: json: cannot unmarshal value into Go struct field {go_struct}.network of type string"
+        )),
+    }
+}
+
+/// Int field: number OK; null/[] no-op; bool/string → cannot unmarshal.
+fn check_int_field(value: &Value, at: &str, go_struct: &str, go_field: &str) -> Result<(), String> {
+    match value {
+        Value::Null | Value::Array(_) => Ok(()),
+        Value::Number(_) => Ok(()),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.{go_field} of type int"
+        )),
+        Value::String(_) => Err(format!(
+            "{at}: json: cannot unmarshal string into Go struct field {go_struct}.{go_field} of type int"
+        )),
+        Value::Object(_) => Err(format!(
+            "{at}: json: cannot unmarshal object into Go struct field {go_struct}.{go_field} of type int"
+        )),
+    }
+}
+
+/// String enum field at decode: null/[] OK; bool → cannot unmarshal; string OK.
+fn check_string_field(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    go_field: &str,
+) -> Result<(), String> {
+    match value {
+        Value::Null | Value::Array(_) | Value::String(_) => Ok(()),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.{go_field} of type string"
+        )),
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number into Go struct field {go_struct}.{go_field} of type string"
+        )),
+        Value::Object(_) => Err(format!(
+            "{at}: json: cannot unmarshal object into Go struct field {go_struct}.{go_field} of type string"
+        )),
+    }
+}
+
+/// server_ports Listable[string]: null/[] OK; string|number|array; range checked at init.
+fn check_server_ports_listable(value: &Value, at: &str) -> Result<Vec<String>, String> {
+    match value {
+        Value::Null | Value::Array(_) => {
+            let mut out = Vec::new();
+            if let Value::Array(items) = value {
+                for (idx, item) in items.iter().enumerate() {
+                    match item {
+                        Value::String(s) => out.push(s.clone()),
+                        _ => {
+                            return Err(format!(
+                                "{at}: (json: cannot unmarshal array into Go value of type string | [{idx}]: json: cannot unmarshal value into Go value of type string)"
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Value::String(s) => Ok(vec![s.clone()]),
+        Value::Number(_) => Err(format!(
+            "{at}: (json: cannot unmarshal number into Go value of type string | json: cannot unmarshal number into Go value of type []string)"
+        )),
+        Value::Bool(_) => Err(format!(
+            "{at}: (json: cannot unmarshal bool into Go value of type string | json: cannot unmarshal bool into Go value of type []string)"
+        )),
+        Value::Object(_) => Err(format!(
+            "{at}: (json: cannot unmarshal object into Go value of type string | json: cannot unmarshal object into Go value of type []string)"
+        )),
+    }
+}
+
+/// ParseUint base10 bitSize16; empty part → 0.
+fn parse_port_part(s: &str) -> Result<u16, String> {
+    if s.is_empty() {
+        return Ok(0);
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "strconv.ParseUint: parsing \"{s}\": invalid syntax"
+        ));
+    }
+    match s.parse::<u64>() {
+        Ok(n) if n <= u64::from(u16::MAX) => Ok(n as u16),
+        Ok(_) => Err(format!(
+            "strconv.ParseUint: parsing \"{s}\": value out of range"
+        )),
+        Err(_) => Err(format!(
+            "strconv.ParseUint: parsing \"{s}\": invalid syntax"
+        )),
+    }
+}
+
+fn check_port_range(raw: &str) -> Result<(), String> {
+    let Some((a, b)) = raw.split_once(':') else {
+        return Err(format!("bad port range: {raw}"));
+    };
+    let start = parse_port_part(a).map_err(|e| format!("bad port range: {raw}: {e}"))?;
+    let end = parse_port_part(b).map_err(|e| format!("bad port range: {raw}: {e}"))?;
+    let _ = (start, end);
+    Ok(())
+}
+
+/// reference: realm present ⇔ object with ≥1 key (empty object behaves as nil).
+fn realm_present(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| v.as_object().is_some_and(|m| !m.is_empty()))
+}
+
+fn reject_unknown_fields_deep(value: &Value, path: &str, allowed: &[&str]) -> Result<(), String> {
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!("{path}.{key}: json: unknown field \"{key}\""));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_obfs(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null | Value::Array(_) => Ok(()),
+        Value::String(_) => Err(format!(
+            "{at}: json: cannot unmarshal string into Go struct field Hysteria2OutboundOptions.obfs of type option._Hysteria2Obfs"
+        )),
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number into Go struct field Hysteria2OutboundOptions.obfs of type option._Hysteria2Obfs"
+        )),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field Hysteria2OutboundOptions.obfs of type option._Hysteria2Obfs"
+        )),
+        Value::Object(map) => {
+            let ty = map.get("type").and_then(Value::as_str).unwrap_or("");
+            if !OBFS_TYPES.contains(&ty) {
+                return Err(format!("{at}: unknown obfs type: {ty}"));
+            }
+            if ty == "gecko" {
+                for key in map.keys() {
+                    if key != "type" {
+                        return Err(format!("{at}.{key}: json: unknown field \"{key}\""));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_masquerade(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            // reference url.Parse → scheme
+            let scheme = match s.split_once("://") {
+                Some((scheme, _)) => scheme.to_string(),
+                None => {
+                    // bare path → file? only if starts with / and no scheme-like prefix
+                    let scheme_like = s
+                        .split_once(':')
+                        .filter(|(head, _)| {
+                            !head.is_empty()
+                                && head.starts_with(|c: char| c.is_ascii_alphabetic())
+                                && head.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
+                                })
+                        })
+                        .map(|(head, _)| head.to_string());
+                    scheme_like.unwrap_or_default()
+                }
+            };
+            if scheme.is_empty() {
+                // no scheme: accept absolute path as file, reject other forms?
+                if s.starts_with('/') {
+                    return Ok(());
+                }
+                return Err(format!("{at}: unknown masquerade URL scheme: {scheme}"));
+            }
+            if !MASQ_URL_SCHEMES.contains(&scheme.as_str()) {
+                return Err(format!("{at}: unknown masquerade URL scheme: {scheme}"));
+            }
+            Ok(())
+        }
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number into Go struct field Hysteria2InboundOptions.masquerade of type option._Hysteria2Masquerade"
+        )),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field Hysteria2InboundOptions.masquerade of type option._Hysteria2Masquerade"
+        )),
+        Value::Array(_) => Err(format!(
+            "{at}: json: cannot unmarshal array into Go struct field Hysteria2InboundOptions.masquerade of type option._Hysteria2Masquerade"
+        )),
+        Value::Object(map) => {
+            let ty = map.get("type").and_then(Value::as_str).unwrap_or("");
+            if !MASQ_OBJ_TYPES.contains(&ty) {
+                return Err(format!("{at}: unknown masquerade type: {ty}"));
+            }
+            let allowed: &[&str] = match ty {
+                "file" => MASQ_FILE_FIELDS,
+                "proxy" => MASQ_PROXY_FIELDS,
+                "string" => MASQ_STRING_FIELDS,
+                _ => &[],
+            };
+            for key in map.keys() {
+                if !allowed.contains(&key.as_str()) {
+                    return Err(format!("{at}.{key}: json: unknown field \"{key}\""));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_users_hy2(value: &Value, at: &str) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let users = value
+        .as_array()
+        .ok_or_else(|| format!("{at}: json: cannot unmarshal value into Go struct field Hysteria2InboundOptions.users of type []option.Hysteria2User"))?;
+    for (idx, user) in users.iter().enumerate() {
+        let u = user.as_object().ok_or_else(|| {
+            format!("{at}[{idx}]: json: cannot unmarshal value into Go value of type option.Hysteria2User")
+        })?;
+        reject_unknown_fields(u, &["name", "password"], &format!("{at}[{idx}"))?;
+    }
+    Ok(())
+}
+
+fn validate_users_tuic(value: &Value, at: &str, init_at: &str) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let users = value
+        .as_array()
+        .ok_or_else(|| format!("{at}: json: cannot unmarshal value into Go struct field TUICInboundOptions.users of type []option.TUICUser"))?;
+    for (idx, user) in users.iter().enumerate() {
+        let u = user.as_object().ok_or_else(|| {
+            format!(
+                "{at}[{idx}]: json: cannot unmarshal value into Go value of type option.TUICUser"
+            )
+        })?;
+        reject_unknown_fields(u, &["name", "uuid", "password"], &format!("{at}[{idx}"))?;
+        if let Some(uuid) = u.get("uuid").and_then(Value::as_str)
+            && !valid_uuid(uuid)
+        {
+            return Err(format!(
+                "{init_at}: invalid uuid for user {idx}: uuid: incorrect UUID length"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_realm(value: &Value, at: &str, inbound: bool) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let map = value.as_object().ok_or_else(|| {
+        format!("{at}: json: cannot unmarshal value into Go field of type option.Hysteria2Realm")
+    })?;
+    if map.is_empty() {
+        return Ok(());
+    }
+    let allowed = if inbound {
+        REALM_IN_FIELDS
+    } else {
+        REALM_OUT_FIELDS
+    };
+    reject_unknown_fields(map, allowed, at)?;
+    if let Some(pm) = map.get("port_mapping")
+        && let Some(pm_obj) = pm.as_object()
+    {
+        reject_unknown_fields(pm_obj, REALM_PM_FIELDS, &format!("{at}.port_mapping"))?;
+        if let Some(t) = pm_obj.get("timeout") {
+            check_duration_field(
+                t,
+                &format!("{at}.port_mapping.timeout"),
+                "Hysteria2RealmPortMapping",
+                "timeout",
+            )?;
+        }
+        if let Some(t) = pm_obj.get("lifetime") {
+            check_duration_field(
+                t,
+                &format!("{at}.port_mapping.lifetime"),
+                "Hysteria2RealmPortMapping",
+                "lifetime",
+            )?;
+        }
+    }
+    if let Some(hc) = map.get("http_client")
+        && hc.is_object()
+    {
+        validate_http_client(hc, &format!("{at}.http_client"))?;
+    }
+    Ok(())
+}
+
+fn validate_http_client(value: &Value, at: &str) -> Result<(), String> {
+    if value.is_null() || value.is_string() {
+        return Ok(());
+    }
+    let map = value
+        .as_object()
+        .ok_or_else(|| format!("{at}: json: cannot unmarshal value into Go struct field Hysteria2RealmOptions.http_client of type option._DomainResolveOptions"))?;
+    let version = map
+        .get("version")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n as u64)))
+        .unwrap_or(0);
+    if map.contains_key("version") && map.get("version").and_then(Value::as_u64).is_none() {
+        return Err(format!(
+            "{at}.version: json: cannot unmarshal value into Go struct field of type int"
+        ));
+    }
+    match version {
+        0 | 2 => {
+            let mut allowed: Vec<&str> = HTTP_CLIENT_BASE_FIELDS.to_vec();
+            allowed.extend(HTTP2_CLIENT_FIELDS);
+            allowed.extend(DIALER_OUT_FIELDS);
+            reject_unknown_fields(map, &allowed, at)?;
+            for f in HTTP2_CLIENT_FIELDS {
+                if let Some(v) = map.get(*f) {
+                    if *f == "stream_receive_window" || *f == "connection_receive_window" {
+                        check_memory_bytes(v, &format!("{at}.{f}"), "HTTP2Options", f)?;
+                    } else if *f == "idle_timeout" || *f == "keep_alive_period" {
+                        check_duration_field(v, &format!("{at}.{f}"), "HTTP2Options", f)?;
+                    } else {
+                        check_int_field(v, &format!("{at}.{f}"), "HTTP2Options", f)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        1 => {
+            let mut allowed: Vec<&str> = HTTP_CLIENT_BASE_FIELDS.to_vec();
+            allowed.extend(DIALER_OUT_FIELDS);
+            reject_unknown_fields(map, &allowed, at)?;
+            Ok(())
+        }
+        3 => {
+            let mut allowed: Vec<&str> = HTTP_CLIENT_BASE_FIELDS.to_vec();
+            allowed.extend(HTTP2_CLIENT_FIELDS);
+            allowed.extend(QUIC_CLIENT_EXTRA_FIELDS);
+            allowed.extend(DIALER_OUT_FIELDS);
+            reject_unknown_fields(map, &allowed, at)?;
+            for f in HTTP2_CLIENT_FIELDS {
+                if let Some(v) = map.get(*f) {
+                    if *f == "stream_receive_window" || *f == "connection_receive_window" {
+                        check_memory_bytes(v, &format!("{at}.{f}"), "HTTP2Options", f)?;
+                    } else if *f == "idle_timeout" || *f == "keep_alive_period" {
+                        check_duration_field(v, &format!("{at}.{f}"), "HTTP2Options", f)?;
+                    } else {
+                        check_int_field(v, &format!("{at}.{f}"), "HTTP2Options", f)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("{at}: unknown HTTP version: {other}")),
+    }
+}
+
+fn validate_tls_container(value: &Value, at: &str, inbound: bool) -> Result<(), String> {
+    if !value.is_object() {
+        return Ok(());
+    }
+    let allowed = if inbound {
+        TLS_IN_FIELDS
+    } else {
+        TLS_OUT_FIELDS
+    };
+    reject_unknown_fields_deep(value, at, allowed)?;
+    let obj = value.as_object().unwrap();
+    if let Some(f) = obj.get("fragment_fallback_delay") {
+        check_duration_field(
+            f,
+            &format!("{at}.fragment_fallback_delay"),
+            "OutboundTLSOptions",
+            "fragment_fallback_delay",
+        )?;
+    }
+    if let Some(f) = obj.get("handshake_timeout") {
+        check_duration_field(
+            f,
+            &format!("{at}.handshake_timeout"),
+            "TLSOptions",
+            "handshake_timeout",
+        )?;
+    }
+    Ok(())
+}
+
+/// Legacy inbound fields: known keys, non-zero → legacy error (decode-time).
+fn check_legacy_inbound(obj: &Map<String, Value>) -> Result<(), String> {
+    if obj.get("sniff").and_then(Value::as_bool) == Some(true) {
+        return Err(LEGACY_INBOUND_ERROR.to_string());
+    }
+    if obj
+        .get("sniff_override_destination")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(LEGACY_INBOUND_ERROR.to_string());
+    }
+    if obj
+        .get("udp_disable_domain_unmapping")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(LEGACY_INBOUND_ERROR.to_string());
+    }
+    if let Some(ds) = obj.get("domain_strategy").and_then(Value::as_str)
+        && !ds.is_empty()
+    {
+        return Err(LEGACY_INBOUND_ERROR.to_string());
+    }
+    if let Some(t) = obj.get("sniff_timeout") {
+        if t.is_null() {
+            return Err("time: invalid duration \"\"".to_string());
+        }
+        if let Some(s) = t.as_str() {
+            if s.is_empty() {
+                return Err("time: invalid duration \"\"".to_string());
+            }
+            go_parse_duration(s)?;
+            if s != "0s" && s != "0" {
+                return Err(LEGACY_INBOUND_ERROR.to_string());
+            }
+        } else if t.is_number() {
+            // non-zero number duration would be non-zero → legacy; 0 OK
+            if t.as_f64().is_some_and(|n| n != 0.0) {
+                return Err(LEGACY_INBOUND_ERROR.to_string());
+            }
+        } else if t.as_bool() == Some(true) {
+            return Err(LEGACY_INBOUND_ERROR.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// UDPTimeoutCompat: number (seconds) or duration string.
+fn check_udp_timeout(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Err(format!("{at}: time: invalid duration \"\"")),
+        Value::Number(_) => Ok(()),
+        Value::String(s) => go_parse_duration(s).map_err(|m| format!("{at}: {m}")),
+        Value::Bool(_) => Err(format!(
+            "{at}: json: cannot unmarshal bool into Go struct field ListenOptions.udp_timeout of type string"
+        )),
+        Value::Array(_) | Value::Object(_) => Err(format!(
+            "{at}: json: cannot unmarshal value into Go struct field ListenOptions.udp_timeout of type string"
+        )),
+    }
+}
+
+fn validate_hy2_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let mut allowed: Vec<&str> = HY2_OUT_FIELDS.to_vec();
+    allowed.extend(DIALER_OUT_FIELDS);
+    allowed.extend(QUIC_OUT_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+
+    if let Some(v) = obj.get("hop_interval") {
+        check_duration_field(
+            v,
+            &format!("{at}.hop_interval"),
+            "Hysteria2OutboundOptions",
+            "hop_interval",
+        )?;
+    }
+    if let Some(v) = obj.get("hop_interval_max") {
+        check_duration_field(
+            v,
+            &format!("{at}.hop_interval_max"),
+            "Hysteria2OutboundOptions",
+            "hop_interval_max",
+        )?;
+    }
+    if let Some(v) = obj.get("up_mbps") {
+        check_int_field(
+            v,
+            &format!("{at}.up_mbps"),
+            "Hysteria2OutboundOptions",
+            "up_mbps",
+        )?;
+    }
+    if let Some(v) = obj.get("down_mbps") {
+        check_int_field(
+            v,
+            &format!("{at}.down_mbps"),
+            "Hysteria2OutboundOptions",
+            "down_mbps",
+        )?;
+    }
+    if let Some(v) = obj.get("bbr_profile") {
+        check_string_field(
+            v,
+            &format!("{at}.bbr_profile"),
+            "Hysteria2OutboundOptions",
+            "bbr_profile",
+        )?;
+    }
+    if let Some(v) = obj.get("password") {
+        check_string_field(
+            v,
+            &format!("{at}.password"),
+            "Hysteria2OutboundOptions",
+            "password",
+        )?;
+    }
+    if let Some(v) = obj.get("network") {
+        check_network(v, &format!("{at}.network"), "Hysteria2OutboundOptions")?;
+    }
+    for f in ["idle_timeout", "keep_alive_period"] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(
+                v,
+                &format!("{at}.{f}"),
+                "Hysteria2OutboundOptions.QUICOptions.HTTP2Options",
+                f,
+            )?;
+        }
+    }
+    for f in ["stream_receive_window", "connection_receive_window"] {
+        if let Some(v) = obj.get(f) {
+            check_memory_bytes(
+                v,
+                &format!("{at}.{f}"),
+                "Hysteria2OutboundOptions.QUICOptions.HTTP2Options",
+                f,
+            )?;
+        }
+    }
+    for f in ["max_concurrent_streams", "initial_packet_size"] {
+        if let Some(v) = obj.get(f) {
+            check_int_field(
+                v,
+                &format!("{at}.{f}"),
+                "Hysteria2OutboundOptions.QUICOptions",
+                f,
+            )?;
+        }
+    }
+    if let Some(v) = obj.get("connect_timeout") {
+        check_duration_field(
+            v,
+            &format!("{at}.connect_timeout"),
+            "Hysteria2OutboundOptions.DialerOptions.AbstractDialerOptions",
+            "connect_timeout",
+        )?;
+    }
+    if let Some(v) = obj.get("fallback_delay") {
+        check_duration_field(
+            v,
+            &format!("{at}.fallback_delay"),
+            "Hysteria2OutboundOptions.DialerOptions.AbstractDialerOptions",
+            "fallback_delay",
+        )?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive"),
+            "Hysteria2OutboundOptions.DialerOptions.AbstractDialerOptions",
+            "tcp_keep_alive",
+        )?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive_interval") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive_interval"),
+            "Hysteria2OutboundOptions.DialerOptions.AbstractDialerOptions",
+            "tcp_keep_alive_interval",
+        )?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+    }
+    if let Some(tls) = obj.get("tls") {
+        validate_tls_container(tls, &format!("{at}.tls"), false)?;
+        validate_utls_reality(tls, &format!("initialize outbound[{i}]"))?;
+    }
+    if let Some(obfs) = obj.get("obfs") {
+        validate_obfs(obfs, &format!("{at}.obfs"))?;
+    }
+    if let Some(realm) = obj.get("realm") {
+        validate_realm(realm, &format!("{at}.realm"), false)?;
+    }
+    if let Some(ports) = obj.get("server_ports") {
+        check_server_ports_listable(ports, &format!("{at}.server_ports"))?;
+    }
+    Ok(())
+}
+
+fn validate_tuic_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let mut allowed: Vec<&str> = TUIC_OUT_FIELDS.to_vec();
+    allowed.extend(DIALER_OUT_FIELDS);
+    allowed.extend(QUIC_OUT_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+
+    if let Some(v) = obj.get("heartbeat") {
+        check_duration_field(
+            v,
+            &format!("{at}.heartbeat"),
+            "TUICOutboundOptions",
+            "heartbeat",
+        )?;
+    }
+    if let Some(v) = obj.get("password") {
+        check_string_field(
+            v,
+            &format!("{at}.password"),
+            "TUICOutboundOptions",
+            "password",
+        )?;
+    }
+    if let Some(v) = obj.get("congestion_control") {
+        check_string_field(
+            v,
+            &format!("{at}.congestion_control"),
+            "TUICOutboundOptions",
+            "congestion_control",
+        )?;
+    }
+    if let Some(v) = obj.get("udp_relay_mode") {
+        check_string_field(
+            v,
+            &format!("{at}.udp_relay_mode"),
+            "TUICOutboundOptions",
+            "udp_relay_mode",
+        )?;
+    }
+    if let Some(v) = obj.get("network") {
+        check_network(v, &format!("{at}.network"), "TUICOutboundOptions")?;
+    }
+    if let Some(v) = obj.get("connect_timeout") {
+        check_duration_field(
+            v,
+            &format!("{at}.connect_timeout"),
+            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
+            "connect_timeout",
+        )?;
+    }
+    if let Some(v) = obj.get("fallback_delay") {
+        check_duration_field(
+            v,
+            &format!("{at}.fallback_delay"),
+            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
+            "fallback_delay",
+        )?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive"),
+            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
+            "tcp_keep_alive",
+        )?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive_interval") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive_interval"),
+            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
+            "tcp_keep_alive_interval",
+        )?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+    }
+    if let Some(tls) = obj.get("tls") {
+        validate_tls_container(tls, &format!("{at}.tls"), false)?;
+        validate_utls_reality(tls, &format!("initialize outbound[{i}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_hy2_in_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("inbounds[{i}]");
+    let mut allowed: Vec<&str> = HY2_IN_FIELDS.to_vec();
+    allowed.extend(LISTEN_IN_FIELDS);
+    allowed.extend(QUIC_OUT_FIELDS);
+    allowed.extend(LEGACY_INBOUND_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+
+    if let Some(v) = obj.get("up_mbps") {
+        check_int_field(
+            v,
+            &format!("{at}.up_mbps"),
+            "Hysteria2InboundOptions",
+            "up_mbps",
+        )?;
+    }
+    if let Some(v) = obj.get("down_mbps") {
+        check_int_field(
+            v,
+            &format!("{at}.down_mbps"),
+            "Hysteria2InboundOptions",
+            "down_mbps",
+        )?;
+    }
+    if let Some(v) = obj.get("bbr_profile") {
+        check_string_field(
+            v,
+            &format!("{at}.bbr_profile"),
+            "Hysteria2InboundOptions",
+            "bbr_profile",
+        )?;
+    }
+    if let Some(v) = obj.get("udp_timeout") {
+        check_udp_timeout(v, &format!("{at}.udp_timeout"))?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive"),
+            "ListenOptions.AbstractListenOptions",
+            "tcp_keep_alive",
+        )?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive_interval") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive_interval"),
+            "ListenOptions.AbstractListenOptions",
+            "tcp_keep_alive_interval",
+        )?;
+    }
+    if let Some(v) = obj.get("sniff_timeout") {
+        check_duration_field(
+            v,
+            &format!("{at}.sniff_timeout"),
+            "InboundOptions",
+            "sniff_timeout",
+        )?;
+    }
+    for f in ["idle_timeout", "keep_alive_period"] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(
+                v,
+                &format!("{at}.{f}"),
+                "Hysteria2InboundOptions.QUICOptions.HTTP2Options",
+                f,
+            )?;
+        }
+    }
+    for f in ["stream_receive_window", "connection_receive_window"] {
+        if let Some(v) = obj.get(f) {
+            check_memory_bytes(
+                v,
+                &format!("{at}.{f}"),
+                "Hysteria2InboundOptions.QUICOptions.HTTP2Options",
+                f,
+            )?;
+        }
+    }
+    if let Some(obfs) = obj.get("obfs") {
+        validate_obfs(obfs, &format!("{at}.obfs"))?;
+    }
+    if let Some(users) = obj.get("users") {
+        validate_users_hy2(users, &format!("{at}.users"))?;
+    }
+    if let Some(mq) = obj.get("masquerade") {
+        validate_masquerade(mq, &format!("{at}.masquerade"))?;
+    }
+    if let Some(realm) = obj.get("realm") {
+        validate_realm(realm, &format!("{at}.realm"), true)?;
+    }
+    if let Some(tls) = obj.get("tls") {
+        validate_tls_container(tls, &format!("{at}.tls"), true)?;
+    }
+    check_legacy_inbound(obj)?;
+    Ok(())
+}
+
+fn validate_tuic_in_decode(
+    i: usize,
+    init_at: &str,
+    obj: &Map<String, Value>,
+) -> Result<(), String> {
+    let at = format!("inbounds[{i}]");
+    let mut allowed: Vec<&str> = TUIC_IN_FIELDS.to_vec();
+    allowed.extend(LISTEN_IN_FIELDS);
+    allowed.extend(QUIC_OUT_FIELDS);
+    allowed.extend(LEGACY_INBOUND_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+
+    if let Some(v) = obj.get("heartbeat") {
+        check_duration_field(
+            v,
+            &format!("{at}.heartbeat"),
+            "TUICInboundOptions",
+            "heartbeat",
+        )?;
+    }
+    if let Some(v) = obj.get("auth_timeout") {
+        check_duration_field(
+            v,
+            &format!("{at}.auth_timeout"),
+            "TUICInboundOptions",
+            "auth_timeout",
+        )?;
+    }
+    if let Some(v) = obj.get("congestion_control") {
+        check_string_field(
+            v,
+            &format!("{at}.congestion_control"),
+            "TUICInboundOptions",
+            "congestion_control",
+        )?;
+    }
+    if let Some(v) = obj.get("udp_timeout") {
+        check_udp_timeout(v, &format!("{at}.udp_timeout"))?;
+    }
+    if let Some(v) = obj.get("tcp_keep_alive") {
+        check_duration_field(
+            v,
+            &format!("{at}.tcp_keep_alive"),
+            "ListenOptions.AbstractListenOptions",
+            "tcp_keep_alive",
+        )?;
+    }
+    if let Some(users) = obj.get("users") {
+        validate_users_tuic(users, &format!("{at}.users"), init_at)?;
+    }
+    if let Some(tls) = obj.get("tls") {
+        validate_tls_container(tls, &format!("{at}.tls"), true)?;
+    }
+    check_legacy_inbound(obj)?;
+    Ok(())
+}
 
 /// Validate a parsed configuration document against reference `check` rules.
 pub fn validate(root: &Value) -> Result<(), String> {
@@ -602,6 +1848,14 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
 fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("initialize inbound[{i}] {ty}[{tag}]");
 
+    match ty {
+        "hysteria2" => validate_hy2_in_decode(i, obj)?,
+        "tuic" => validate_tuic_in_decode(i, &at, obj)?,
+        _ => {
+            check_legacy_inbound(obj)?;
+        }
+    }
+
     if ty == "tun" && TUN_LEGACY_FIELDS.iter().any(|f| obj.contains_key(*f)) {
         return Err(format!(
             "{at}: legacy tun address fields are deprecated in sing-box 1.10.0 and removed in sing-box 1.12.0"
@@ -631,6 +1885,104 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
         return Err(format!("{at}: TLS required"));
     }
 
+    if ty == "hysteria2" || ty == "tuic" {
+        if tls_enabled(obj.get("tls")) {
+            validate_server_tls(obj.get("tls").unwrap(), &at)?;
+        }
+        if ty == "hysteria2" {
+            if let Some(obfs) = obj.get("obfs")
+                && obfs.is_object()
+                && obfs.as_object().is_some_and(|m| !m.is_empty())
+            {
+                let has_user_pw = obj
+                    .get("users")
+                    .and_then(Value::as_array)
+                    .is_some_and(|users| {
+                        users.iter().any(|u| {
+                            u.get("password")
+                                .and_then(Value::as_str)
+                                .is_some_and(|p| !p.is_empty())
+                        })
+                    });
+                if !has_user_pw {
+                    return Err(format!("{at}: missing obfs password"));
+                }
+            }
+            if let Some(bbr) = obj.get("bbr_profile").and_then(Value::as_str)
+                && !bbr.is_empty()
+                && !BBR_PROFILES.contains(&bbr)
+            {
+                return Err(format!("{at}: unsupported BBR profile: {bbr}"));
+            }
+            if let Some(mq) = obj.get("masquerade")
+                && mq.is_string()
+            {
+                validate_masquerade(mq, "masquerade")?;
+            }
+            if let Some(realm) = obj.get("realm")
+                && realm_present(Some(realm))
+            {
+                let realm_obj = realm.as_object().unwrap();
+                let url = realm_obj
+                    .get("server_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if url.is_empty() {
+                    return Err(format!(
+                        "{at}: create realm server: control server URL is required"
+                    ));
+                }
+                let host = url_host(url);
+                if host.is_empty() {
+                    return Err(format!(
+                        "{at}: create realm server: control server URL is required"
+                    ));
+                }
+                if realm_obj
+                    .get("realm_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.is_empty())
+                {
+                    return Err(format!("{at}: create realm server: realm ID is required"));
+                }
+                if let Some(iv) = realm_obj.get("ip_version").and_then(Value::as_i64)
+                    && iv != 0
+                    && iv != 4
+                    && iv != 6
+                {
+                    return Err(format!("{at}: invalid IP version: {iv}"));
+                }
+                if let Some(listen) = obj.get("listen").and_then(Value::as_str)
+                    && let Ok(ip) = IpAddr::from_str(listen)
+                    && realm_obj.get("ip_version").and_then(Value::as_i64) == Some(6)
+                    && ip.is_ipv4()
+                {
+                    return Err(format!(
+                        "{at}: realm.ip_version 6 conflicts with listen address {listen}"
+                    ));
+                }
+            }
+        }
+        if ty == "tuic" {
+            if let Some(cc) = obj.get("congestion_control").and_then(Value::as_str)
+                && !cc.is_empty()
+                && !TUIC_CC_ALGS.contains(&cc)
+            {
+                return Err(format!("{at}: unknown congestion control algorithm: {cc}"));
+            }
+            if let Some(users) = obj.get("users").and_then(Value::as_array) {
+                for (idx, user) in users.iter().enumerate() {
+                    let uuid = user.get("uuid").and_then(Value::as_str).unwrap_or("");
+                    if !valid_uuid(uuid) {
+                        return Err(format!(
+                            "{at}: invalid uuid for user {idx}: uuid: incorrect UUID length"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     if ty == "shadowsocks" {
         validate_ss_method(obj, &at, true)?;
         if !ss_inbound_has_password(obj) {
@@ -652,6 +2004,12 @@ fn validate_outbound(
     obj: &Map<String, Value>,
 ) -> Result<(), String> {
     let at = format!("initialize outbound[{i}] {ty}[{tag}]");
+
+    match ty {
+        "hysteria2" => validate_hy2_out_decode(i, obj)?,
+        "tuic" => validate_tuic_out_decode(i, obj)?,
+        _ => {}
+    }
 
     match ty {
         "dns" => {
@@ -684,6 +2042,128 @@ fn validate_outbound(
 
     if TLS_REQUIRED_OUTBOUNDS.contains(&ty) && !tls_enabled(obj.get("tls")) {
         return Err(format!("{at}: TLS required"));
+    }
+
+    match ty {
+        "hysteria2" => {
+            let realm = obj.get("realm");
+            let has_server = obj
+                .get("server")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+                || obj.get("server_port").is_some()
+                || obj
+                    .get("server_ports")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+            if realm_present(realm) && has_server {
+                return Err(format!(
+                    "{at}: realm conflicts with server, server_port, and server_ports"
+                ));
+            }
+            if realm_present(realm) {
+                let realm_obj = realm.unwrap().as_object().unwrap();
+                let url = realm_obj
+                    .get("server_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let host = url_host(url);
+                if host.is_empty() {
+                    return Err(format!("{at}: missing host in realm server_url"));
+                }
+                if let Some(iv) = realm_obj.get("ip_version").and_then(Value::as_i64)
+                    && iv != 0
+                    && iv != 4
+                    && iv != 6
+                {
+                    return Err(format!("{at}: invalid IP version: {iv}"));
+                }
+            }
+            if tls_enabled(obj.get("tls"))
+                && !tls_insecure(obj.get("tls"))
+                && server_address(obj).is_empty()
+            {
+                return Err(format!("{at}: missing server_name or insecure=true"));
+            }
+            if let Some(obfs) = obj.get("obfs")
+                && obfs.is_object()
+                && obfs.as_object().is_some_and(|m| !m.is_empty())
+            {
+                let password = obj.get("password").and_then(Value::as_str).unwrap_or("");
+                if password.is_empty() {
+                    return Err(format!("{at}: missing obfs password"));
+                }
+            }
+            if let Some(ports) = obj.get("server_ports") {
+                let ranges = check_server_ports_listable(ports, "server_ports")
+                    .map_err(|m| format!("{at}: {m}"))?;
+                for r in &ranges {
+                    check_port_range(r).map_err(|m| format!("{at}: {m}"))?;
+                }
+            }
+            if let Some(bbr) = obj.get("bbr_profile").and_then(Value::as_str)
+                && !bbr.is_empty()
+                && !BBR_PROFILES.contains(&bbr)
+            {
+                return Err(format!("{at}: unsupported BBR profile: {bbr}"));
+            }
+            if realm_present(realm) {
+                let realm_obj = realm.unwrap().as_object().unwrap();
+                if let Some(pm) = realm_obj.get("port_mapping").and_then(Value::as_object)
+                    && pm.get("enabled").and_then(Value::as_bool) == Some(true)
+                    && realm_obj.get("ip_version").and_then(Value::as_i64) == Some(6)
+                {
+                    return Err(format!("{at}: port mapping requires IPv4"));
+                }
+            }
+            if let Some(hc) = obj
+                .get("realm")
+                .and_then(|r| r.as_object())
+                .and_then(|m| m.get("http_client"))
+                && let Some(tag) = hc.as_str()
+                && !tag.is_empty()
+            {
+                // reference resolves at initialize: create realm http client: http_client not found
+                let _ = tag;
+            }
+        }
+        "tuic" => {
+            if tls_enabled(obj.get("tls"))
+                && !tls_insecure(obj.get("tls"))
+                && server_address(obj).is_empty()
+            {
+                return Err(format!("{at}: missing server_name or insecure=true"));
+            }
+            let uuid = obj.get("uuid").and_then(Value::as_str).unwrap_or("");
+            if !valid_uuid(uuid) {
+                return Err(format!("{at}: invalid uuid: uuid: incorrect UUID length"));
+            }
+            if obj.get("udp_over_stream").and_then(Value::as_bool) == Some(true)
+                && obj
+                    .get("udp_relay_mode")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| !m.is_empty())
+            {
+                return Err(format!(
+                    "{at}: udp_over_stream is conflict with udp_relay_mode"
+                ));
+            }
+            if let Some(mode) = obj.get("udp_relay_mode").and_then(Value::as_str)
+                && !mode.is_empty()
+                && !TUIC_UDP_RELAY_MODES.contains(&mode)
+            {
+                return Err(format!(
+                    "{at}: unknown udp_relay_mode: {mode} (expected native or quic)"
+                ));
+            }
+            if let Some(cc) = obj.get("congestion_control").and_then(Value::as_str)
+                && !cc.is_empty()
+                && !TUIC_CC_ALGS.contains(&cc)
+            {
+                return Err(format!("{at}: unknown congestion control algorithm: {cc}"));
+            }
+        }
+        _ => {}
     }
 
     match ty {
@@ -762,12 +2242,6 @@ fn validate_outbound(
                 return Err(format!("{at}: missing download speed"));
             }
         }
-        "tuic" => {
-            let uuid = obj.get("uuid").and_then(Value::as_str).unwrap_or("");
-            if !valid_uuid(uuid) {
-                return Err(format!("{at}: invalid uuid: uuid: incorrect UUID length"));
-            }
-        }
         _ => {}
     }
 
@@ -777,6 +2251,61 @@ fn validate_outbound(
     }
 
     Ok(())
+}
+
+fn server_address(obj: &Map<String, Value>) -> String {
+    if realm_present(obj.get("realm")) {
+        let url = obj
+            .get("realm")
+            .and_then(|r| r.as_object())
+            .and_then(|m| m.get("server_url"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return url_host(url);
+    }
+    obj.get("server")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn url_host(url: &str) -> String {
+    // reference url.Parse → Hostname()
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.rsplit_once('@') {
+        Some((_, hostport)) => hostport,
+        None => authority,
+    };
+    let host = match hostport_split(host) {
+        Some(h) => h,
+        None => host,
+    };
+    host.to_string()
+}
+
+fn hostport_split(s: &str) -> Option<&str> {
+    if s.starts_with('[') {
+        let end = s.find(']')?;
+        Some(&s[1..end])
+    } else if let Some((host, port)) = s.rsplit_once(':')
+        && !host.contains(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some(host)
+    } else {
+        Some(s)
+    }
+}
+
+fn tls_insecure(tls: Option<&Value>) -> bool {
+    tls.and_then(|t| t.get("insecure"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn validate_utls_reality(tls: &Value, at: &str) -> Result<(), String> {
@@ -1221,5 +2750,464 @@ mod tests {
             }))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn go_duration_rules() {
+        assert!(go_parse_duration("30s").is_ok());
+        assert!(go_parse_duration("1h30m").is_ok());
+        assert!(go_parse_duration("1.5s").is_ok());
+        assert!(go_parse_duration("1d2h").is_ok());
+        assert!(go_parse_duration("1us").is_ok());
+        assert!(go_parse_duration("1µs").is_ok());
+        assert!(go_parse_duration("-30s").is_ok());
+        assert!(go_parse_duration("+5s").is_ok());
+        assert!(go_parse_duration("0").is_err());
+        assert!(go_parse_duration("").is_err());
+        assert!(go_parse_duration("30").is_err());
+        assert!(go_parse_duration("bogus").is_err());
+        assert!(go_parse_duration("2w").is_err());
+        assert!(go_parse_duration("1e3s").is_err());
+        assert!(go_parse_duration("1.5.5s").is_err());
+    }
+
+    #[test]
+    fn memory_bytes_rules() {
+        assert!(check_memory_bytes_str("1KB", "at").is_ok());
+        assert!(check_memory_bytes_str("1 MB", "at").is_ok());
+        assert!(check_memory_bytes_str("1gb", "at").is_ok());
+        assert!(check_memory_bytes_str("1k", "at").is_ok());
+        assert!(check_memory_bytes_str("1TB", "at").is_ok());
+        assert!(check_memory_bytes_str("1KB ", "at").is_ok());
+        assert!(check_memory_bytes_str("1  KB", "at").is_ok());
+        assert!(check_memory_bytes_str(" 1KB", "at").is_err());
+        assert!(check_memory_bytes_str("12345678", "at").is_err());
+        assert!(check_memory_bytes_str("MB", "at").is_err());
+        assert!(check_memory_bytes_str("1KiB", "at").is_err());
+        assert!(check_memory_bytes_str("1MiB", "at").is_err());
+        assert!(check_memory_bytes_str("-1MB", "at").is_err());
+        assert!(check_memory_bytes_str("32 MiB", "at").is_err());
+        assert!(check_memory_bytes_str("1.5MB", "at").is_err());
+    }
+
+    #[test]
+    fn port_range_rules() {
+        assert!(check_port_range("443:500").is_ok());
+        assert!(check_port_range("443:").is_ok());
+        assert!(check_port_range(":443").is_ok());
+        assert!(check_port_range(":").is_ok());
+        assert!(check_port_range("500:443").is_ok());
+        assert!(check_port_range("0:0").is_ok());
+        assert!(check_port_range("1:65535").is_ok());
+        assert!(check_port_range("443").is_err());
+        assert!(check_port_range("bogus").is_err());
+        assert!(check_port_range("::").is_err());
+        assert!(check_port_range("1:2:3").is_err());
+        assert!(check_port_range("443:500:").is_err());
+        assert!(check_port_range(" 443:500").is_err());
+        assert!(check_port_range("-1:2").is_err());
+        assert!(check_port_range("65536:65537").is_err());
+    }
+
+    #[test]
+    fn network_list_rules() {
+        assert!(check_network(&json!("tcp"), "at", "S").is_ok());
+        assert!(check_network(&json!("udp"), "at", "S").is_ok());
+        assert!(check_network(&json!("TCP"), "at", "S").is_err());
+        assert!(check_network(&json!(["tcp", "udp"]), "at", "S").is_ok());
+        assert!(check_network(&json!([]), "at", "S").is_ok());
+        assert!(check_network(&json!(null), "at", "S").is_ok());
+        assert!(check_network(&json!(1), "at", "S").is_err());
+        assert!(check_network(&json!(["tcp", "bogus"]), "at", "S").is_err());
+        assert!(check_network(&json!(["tcp", 1]), "at", "S").is_err());
+    }
+
+    #[test]
+    fn realm_empty_object_is_absent() {
+        assert!(!realm_present(Some(&json!({}))));
+        assert!(realm_present(Some(&json!({"server_url": ""}))));
+        assert!(!realm_present(Some(&json!(null))));
+        assert!(!realm_present(None));
+    }
+
+    #[test]
+    fn hy2_out_unknown_field() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "xyz": 1
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("outbounds[0].xyz: json: unknown field \"xyz\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hy2_out_tls_unknown_field() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true, "xyz": 1}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("outbounds[0].tls.xyz"), "{err}");
+    }
+
+    #[test]
+    fn hy2_out_rejects_congestion_control() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "congestion_control": "bbr"
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("unknown field \"congestion_control\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hy2_out_bad_duration() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "hop_interval": "bogus"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("time: invalid duration"), "{err}");
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "hop_interval": 30
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("cannot unmarshal number"), "{err}");
+    }
+
+    #[test]
+    fn hy2_out_up_mbps_string() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "up_mbps": "10"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("up_mbps"), "{err}");
+    }
+
+    #[test]
+    fn hy2_out_server_ports_rules() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "server_ports": 1
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("server_ports"), "{err}");
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "server_ports": ["443"]
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("bad port range"), "{err}");
+        assert!(
+            validate(&json!({
+                "outbounds": [{
+                    "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                    "tls": {"enabled": true, "insecure": true}, "server_ports": ["443:500"]
+                }]
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hy2_out_bad_bbr_case() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "bbr_profile": "Standard"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("unsupported BBR profile: Standard"), "{err}");
+        assert!(
+            validate(&json!({
+                "outbounds": [{
+                    "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                    "tls": {"enabled": true, "insecure": true}, "bbr_profile": "standard"
+                }]
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hy2_out_obfs_password_required() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true},
+                "obfs": {"type": "salamander"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("missing obfs password"), "{err}");
+        assert!(
+            validate(&json!({
+                "outbounds": [{
+                    "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                    "tls": {"enabled": true, "insecure": true},
+                    "obfs": {"type": "salamander"}, "password": "x"
+                }]
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hy2_out_obfs_bad_type() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "obfs": {"type": "bad"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("unknown obfs type: bad"), "{err}");
+    }
+
+    #[test]
+    fn hy2_out_realm_conflict() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true},
+                "realm": {"server_url": ""}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("realm conflicts"), "{err}");
+        assert!(
+            validate(&json!({
+                "outbounds": [{
+                    "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                    "tls": {"enabled": true, "insecure": true}, "realm": {}
+                }]
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hy2_out_realm_no_host() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t",
+                "tls": {"enabled": true, "insecure": true},
+                "realm": {"server_url": ""}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("missing host in realm server_url"), "{err}");
+    }
+
+    #[test]
+    fn hy2_out_bad_network() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true}, "network": "TCP"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("unknown network: TCP"), "{err}");
+    }
+
+    #[test]
+    fn hy2_out_realm_unknown_field() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "tls": {"enabled": true, "insecure": true},
+                "realm": {"xyz": 1}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("realm.xyz"), "{err}");
+    }
+
+    #[test]
+    fn tuic_out_unknown_field() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
+                "tls": {"enabled": true, "insecure": true}, "auth_timeout": "5s"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("auth_timeout"), "{err}");
+    }
+
+    #[test]
+    fn tuic_out_bad_cc() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
+                "tls": {"enabled": true, "insecure": true}, "congestion_control": "weird"
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("unknown congestion control algorithm: weird"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn tuic_out_bad_relay() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
+                "tls": {"enabled": true, "insecure": true}, "udp_relay_mode": "weird"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("unknown udp_relay_mode"), "{err}");
+    }
+
+    #[test]
+    fn tuic_out_ovs_conflict() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
+                "tls": {"enabled": true, "insecure": true},
+                "udp_over_stream": true, "udp_relay_mode": "native"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("udp_over_stream is conflict"), "{err}");
+    }
+
+    #[test]
+    fn tuic_out_bad_heartbeat() {
+        let err = validate(&json!({
+            "outbounds": [{
+                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
+                "tls": {"enabled": true, "insecure": true}, "heartbeat": "bogus"
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("time: invalid duration"), "{err}");
+    }
+
+    #[test]
+    fn hy2_in_unknown_field() {
+        let err = validate(&json!({
+            "inbounds": [{
+                "type": "hysteria2", "tag": "t", "listen": "127.0.0.1", "listen_port": 8443,
+                "tls": {"enabled": true, "certificate_path": "x", "key_path": "y"},
+                "xyz": 1
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("inbounds[0].xyz"), "{err}");
+    }
+
+    #[test]
+    fn hy2_in_no_cert() {
+        let err = validate(&json!({
+            "inbounds": [{
+                "type": "hysteria2", "tag": "t", "listen": "127.0.0.1", "listen_port": 8443,
+                "tls": {"enabled": true}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("missing certificate"), "{err}");
+    }
+
+    #[test]
+    fn tuic_in_unknown_field() {
+        let err = validate(&json!({
+            "inbounds": [{
+                "type": "tuic", "tag": "t", "listen": "127.0.0.1", "listen_port": 8443,
+                "tls": {"enabled": true, "certificate_path": "x", "key_path": "y"},
+                "up_mbps": 10
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("up_mbps"), "{err}");
+    }
+
+    #[test]
+    fn legacy_inbound_sniff() {
+        let err = validate(&json!({
+            "inbounds": [{
+                "type": "mixed", "tag": "t", "listen": "127.0.0.1", "listen_port": 2080,
+                "sniff": true
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("legacy inbound fields"), "{err}");
+        assert!(
+            validate(&json!({
+                "inbounds": [{
+                    "type": "mixed", "tag": "t", "listen": "127.0.0.1", "listen_port": 2080,
+                    "sniff": false, "domain_strategy": "", "sniff_timeout": "0s"
+                }]
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn masquerade_rules() {
+        assert!(validate_masquerade(&json!("http://x/"), "at").is_ok());
+        assert!(validate_masquerade(&json!("file:///x"), "at").is_ok());
+        let err = validate_masquerade(&json!("ftp://x"), "at").unwrap_err();
+        assert!(err.contains("unknown masquerade URL scheme: ftp"), "{err}");
+        let err = validate_masquerade(&json!({"type": "bogus"}), "at").unwrap_err();
+        assert!(err.contains("unknown masquerade type: bogus"), "{err}");
+        let err =
+            validate_masquerade(&json!({"type": "file", "xyz": 1}), "masquerade").unwrap_err();
+        assert!(err.contains("masquerade.xyz"), "{err}");
+        assert!(validate_masquerade(&json!({"type": "proxy", "url": "http://x/"}), "at").is_ok());
+        assert!(validate_masquerade(&json!({"type": "string", "status_code": 302}), "at").is_ok());
+    }
+
+    #[test]
+    fn valid_hy2_tuic_shapes() {
+        let cfg = json!({
+            "log": {"level": "error"},
+            "inbounds": [{"type": "mixed", "tag": "m", "listen": "127.0.0.1", "listen_port": 2080}],
+            "outbounds": [
+                {"type": "hysteria2", "tag": "hy2", "server": "127.0.0.1", "server_port": 8443,
+                 "up_mbps": 10, "down_mbps": 10, "password": "x",
+                 "tls": {"enabled": true, "insecure": true}},
+                {"type": "tuic", "tag": "tuic", "server": "127.0.0.1", "server_port": 443,
+                 "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "s",
+                 "tls": {"enabled": true, "insecure": true}},
+                {"type": "direct", "tag": "direct"}
+            ],
+            "route": {"final": "direct"}
+        });
+        assert!(validate(&cfg).is_ok());
     }
 }

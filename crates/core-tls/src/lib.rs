@@ -5,6 +5,7 @@
 //! builds for MIPS softfloat targets where `ring`/`aws-lc-rs` do not exist.
 
 pub mod hello;
+pub mod quic;
 
 pub use rustls;
 

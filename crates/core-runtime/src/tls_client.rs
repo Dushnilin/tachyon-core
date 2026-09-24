@@ -235,6 +235,36 @@ impl TlsOptions {
         Ok(roots)
     }
 
+    /// QUIC client config for quinn (hysteria2 / tuic): TLS 1.3 only, early
+    /// data on, ALPN from `tls.alpn` or `default_alpn`.
+    pub fn quic_config(
+        &self,
+        default_alpn: &[&[u8]],
+    ) -> io::Result<core_tls::quic::QuicClientConfig> {
+        let builder =
+            rustls::ClientConfig::builder_with_provider(core_tls::quic::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|e| io::Error::other(format!("QUIC TLS provider: {e}")))?;
+        let mut config = if self.insecure {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth()
+        } else {
+            builder
+                .with_root_certificates(self.root_store()?)
+                .with_no_client_auth()
+        };
+        if !self.alpn.is_empty() {
+            config.alpn_protocols = self.alpn.clone();
+        } else {
+            config.alpn_protocols = default_alpn.iter().map(|a| a.to_vec()).collect();
+        }
+        config.enable_early_data = true;
+        core_tls::quic::QuicClientConfig::try_from_rustls(Arc::new(config))
+            .map_err(|e| io::Error::other(format!("QUIC initial suite: {e}")))
+    }
+
     pub async fn wrap(&self, stream: TcpStream) -> io::Result<AnyStream> {
         Ok(Box::new(self.connect(stream).await?))
     }

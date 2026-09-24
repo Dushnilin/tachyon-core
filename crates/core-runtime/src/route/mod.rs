@@ -25,9 +25,11 @@ use crate::inbound::Conn;
 use crate::logging;
 use crate::outbound::block::Block;
 use crate::outbound::direct::Direct;
+use crate::outbound::hysteria2::Hysteria2;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
+use crate::outbound::tuic::Tuic;
 use crate::outbound::urltest::Urltest;
 use crate::outbound::vmess::Vmess;
 
@@ -105,6 +107,8 @@ pub enum Outbound {
     Vless(Vless),
     Trojan(Trojan),
     Vmess(Vmess),
+    Hysteria2(Hysteria2),
+    Tuic(Tuic),
     Urltest(Urltest),
     Selector(Selector),
 }
@@ -132,6 +136,8 @@ impl Outbound {
             Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
             Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
             Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
+            Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
+            Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
@@ -145,6 +151,8 @@ impl Outbound {
     ) -> io::Result<tokio::net::UdpSocket> {
         match self {
             Outbound::Direct(direct) => direct.connect_udp(target).await,
+            Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
+            Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "blocked by outbound",
@@ -172,6 +180,8 @@ impl Outbound {
             "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
             "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
             "vmess" => Ok(Outbound::Vmess(Vmess::build(obj, at)?)),
+            "hysteria2" => Ok(Outbound::Hysteria2(Hysteria2::build(obj, at)?)),
+            "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(

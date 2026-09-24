@@ -4,7 +4,7 @@
 //! and UDP packet commands are not implemented yet.
 
 mod framing;
-mod kdf;
+pub(crate) mod kdf;
 mod wire;
 
 use std::io;

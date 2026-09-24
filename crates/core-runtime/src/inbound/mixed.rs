@@ -6,9 +6,9 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::inbound::{Target, dial, pump_conn, require_u16};
+use crate::inbound::{ClientConn, Target, pump_conn, require_u16, socks_success_reply};
 use crate::logging;
-use crate::route::Router;
+use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
 /// mixed inbound: SOCKS5 + HTTP CONNECT on one port.
 pub struct Mixed {
@@ -124,6 +124,7 @@ async fn socks5(
         return Err(io::Error::other("no acceptable auth method"));
     }
 
+    let mut auth_user: Option<String> = None;
     if users.is_empty() {
         stream.write_all(&[0x05, 0x00]).await?;
     } else {
@@ -147,6 +148,7 @@ async fn socks5(
         if !ok {
             return Err(io::Error::other("auth failed"));
         }
+        auth_user = String::from_utf8(username).ok();
     }
 
     let mut head = [0u8; 4];
@@ -155,7 +157,9 @@ async fn socks5(
         return Err(io::Error::other("bad socks version in request"));
     }
     if head[1] != 0x01 {
-        socks_reply(&mut stream, 0x07).await?;
+        stream
+            .write_all(&crate::inbound::socks_failure_reply(0x07))
+            .await?;
         return Err(io::Error::other("only CONNECT is supported"));
     }
     let target = match head[3] {
@@ -186,29 +190,48 @@ async fn socks5(
             Target::Domain(host, u16::from_be_bytes(port_raw))
         }
         _ => {
-            socks_reply(&mut stream, 0x08).await?;
+            stream
+                .write_all(&crate::inbound::socks_failure_reply(0x08))
+                .await?;
             return Err(io::Error::other("unsupported address type"));
         }
     };
 
-    match dial(router, &target).await {
-        Ok(conn) => {
-            socks_reply(&mut stream, 0x00).await?;
-            logging::info(format_args!("mixed[{tag}] {peer} CONNECT {target}"));
-            pump_conn(stream, conn).await?;
-            Ok(())
-        }
+    let local = stream.local_addr()?;
+    let mut client = ClientConn::socks(stream, socks_success_reply(local));
+    let mut ctx = ConnContext::new(tag, peer, target, "tcp");
+    ctx.auth_user = auth_user;
+
+    let decision = match router.route(&mut client, &mut ctx).await {
+        Ok(decision) => decision,
         Err(err) => {
-            socks_reply(&mut stream, 0x01).await?;
-            Err(err)
+            let _ = client.fail(&err).await;
+            return Err(err);
+        }
+    };
+
+    match decision {
+        Decision::HijackDns => {
+            logging::info(format_args!(
+                "mixed[{tag}] {peer} HIJACK-DNS {}",
+                ctx.destination
+            ));
+            hijack_dns(&mut client, &ctx).await
+        }
+        Decision::Outbound(idx) => {
+            let dest = ctx.destination.clone();
+            match router.connect_index(idx, &dest).await {
+                Ok(conn) => {
+                    logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
+                    pump_conn(client, conn, &ctx.sniff_prefix).await
+                }
+                Err(err) => {
+                    let _ = client.fail(&err).await;
+                    Err(err)
+                }
+            }
         }
     }
-}
-
-async fn socks_reply(stream: &mut TcpStream, code: u8) -> io::Result<()> {
-    stream
-        .write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
 }
 
 async fn http(
@@ -262,20 +285,28 @@ async fn http(
         Target::Domain(host.to_string(), port)
     };
 
-    match dial(router, &target).await {
-        Ok(conn) => {
-            stream
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await?;
-            logging::info(format_args!("mixed[{tag}] {peer} CONNECT {target}"));
-            pump_conn(stream, conn).await?;
-            Ok(())
+    // Reference serves the 200 before route/dial; a later failure just closes.
+    stream
+        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        .await?;
+
+    let mut client = ClientConn::http(stream);
+    let mut ctx = ConnContext::new(tag, peer, target, "tcp");
+
+    let decision = router.route(&mut client, &mut ctx).await?;
+    match decision {
+        Decision::HijackDns => {
+            logging::info(format_args!(
+                "mixed[{tag}] {peer} HIJACK-DNS {}",
+                ctx.destination
+            ));
+            hijack_dns(&mut client, &ctx).await
         }
-        Err(_) => {
-            stream
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await?;
-            Err(io::Error::other("dial failed"))
+        Decision::Outbound(idx) => {
+            let dest = ctx.destination.clone();
+            let conn = router.connect_index(idx, &dest).await?;
+            logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
+            pump_conn(client, conn, &ctx.sniff_prefix).await
         }
     }
 }

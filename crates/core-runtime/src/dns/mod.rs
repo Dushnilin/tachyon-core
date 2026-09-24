@@ -522,6 +522,29 @@ impl DnsService {
         Ok(out)
     }
 
+    /// `resolve` rule action with an explicit server tag: lookup bypasses the
+    /// dns rule walk and goes straight through that transport.
+    pub async fn resolve_via(
+        self: &Arc<Self>,
+        server_tag: &str,
+        host: &str,
+    ) -> std::io::Result<Vec<IpAddr>> {
+        if let Some(ip) = transport::is_ip_literal(host) {
+            return Ok(vec![ip]);
+        }
+        let cfg = self
+            .servers
+            .get(server_tag)
+            .ok_or_else(|| std::io::Error::other(format!("DNS server not found: {server_tag}")))?;
+        if cfg.is_fakeip() {
+            return Err(std::io::Error::other(format!(
+                "DNS server not found: {server_tag}"
+            )));
+        }
+        let addrs = self.lookup_via(cfg, host, 0).await?;
+        Ok(order_addresses(addrs, self.strategy))
+    }
+
     /// Resolve a hostname to addresses through the dns section
     /// (system-mode fallback lives in [`connect_tcp`]).
     pub async fn resolve(self: &Arc<Self>, host: &str) -> std::io::Result<Vec<IpAddr>> {

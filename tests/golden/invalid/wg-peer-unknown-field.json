@@ -1,0 +1,4 @@
+{
+  "log": {"disabled": true},
+  "endpoints": [{"type":"wireguard","tag":"ep","private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":["10.0.0.2/32"],"peers":[{"public_key":"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=","allowed_ips":["10.0.0.1/32"],"xyz":1}]}]
+}

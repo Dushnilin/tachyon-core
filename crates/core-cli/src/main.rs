@@ -22,10 +22,7 @@ fn version_line() -> String {
             env!("CARGO_PKG_VERSION")
         )
     } else {
-        format!(
-            "tachyon-core {} (sing-box schema compatible)\n",
-            env!("CARGO_PKG_VERSION")
-        )
+        format!("tachyon-core {}\n", env!("CARGO_PKG_VERSION"))
     }
 }
 
@@ -65,7 +62,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 fn usage() -> String {
     "usage: tachyon-core <command> [options]\n\
      \n\
-     commands (sing-box compatible surface):\n\
+     commands:\n\
        check  -c <path>   validate configuration\n\
        run    -c <path>   start the proxy\n\
        version            print version\n\

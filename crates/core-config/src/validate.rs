@@ -2392,6 +2392,22 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// VLESS `encryption` spec (SPEC 032): parse + padding validation mirror the
+/// reference client setup, so a malformed string fails at check time.
+fn validate_vless_encryption(obj: &Map<String, Value>) -> Result<(), String> {
+    let Some(enc) = obj.get("encryption").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if enc.is_empty() || enc == "none" {
+        return Ok(());
+    }
+    let spec = crate::vless_enc::parse_client_encryption(enc)
+        .map_err(|e| format!("parse encryption: {e}"))?;
+    crate::vless_enc::parse_padding(&spec.padding)
+        .map_err(|e| format!("initialize encryption: {e}"))?;
+    Ok(())
+}
+
 fn validate_outbound(
     i: usize,
     ty: &str,
@@ -2403,6 +2419,7 @@ fn validate_outbound(
     match ty {
         "hysteria2" => validate_hy2_out_decode(i, obj)?,
         "tuic" => validate_tuic_out_decode(i, obj)?,
+        "vless" => validate_vless_encryption(obj)?,
         _ => {}
     }
 

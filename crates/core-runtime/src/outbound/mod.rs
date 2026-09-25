@@ -8,5 +8,6 @@ pub mod shadowsocks;
 pub mod transport;
 pub mod tuic;
 pub mod urltest;
+pub mod vless_enc;
 pub mod vmess;
 pub mod wireguard;

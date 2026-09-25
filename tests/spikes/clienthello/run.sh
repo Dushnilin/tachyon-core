@@ -8,7 +8,7 @@ trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 CAPTURE_PID=$!
 sleep 2
 
-SING_BOX="${SING_BOX:-/tmp/sbx-ref/sing-box-1.14.1-lx.8-windows-amd64/sing-box.exe}"
+SING_BOX="${SING_BOX:-/tmp/sbx-ref/sing-box-1.14.2-lx.3-windows-amd64/sing-box.exe}"
 "$SING_BOX" run -c client.json &
 sleep 2
 

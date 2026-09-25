@@ -1,0 +1,14 @@
+{
+  "log": { "disabled": true },
+  "inbounds": [
+    {
+      "type": "snell",
+      "tag": "snell-in",
+      "listen": "127.0.0.1",
+      "listen_port": 4050,
+      "version": 6,
+      "psk": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "users": [{ "userkey": "" }]
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "log": { "disabled": true },
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    {
+      "type": "snell",
+      "tag": "sn4",
+      "server": "127.0.0.1",
+      "server_port": 4050,
+      "version": 4,
+      "psk": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "userkey": "user-key-2026",
+      "obfs_mode": "tls",
+      "obfs_host": "www.example.com",
+      "network": ["tcp", "udp"]
+    },
+    {
+      "type": "snell",
+      "tag": "sn6",
+      "server": "127.0.0.1",
+      "server_port": 4051,
+      "version": 6,
+      "psk": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "userkey": "user-key-2026",
+      "mode": "unshaped"
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "snell",
+      "tag": "snell-in5",
+      "listen": "127.0.0.1",
+      "listen_port": 4052,
+      "version": 5,
+      "psk": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "obfs_mode": "tls",
+      "users": [
+        { "name": "alice", "userkey": "alice-key" },
+        { "userkey": "bob-key" }
+      ]
+    },
+    {
+      "type": "snell",
+      "tag": "snell-in6",
+      "listen": "127.0.0.1",
+      "listen_port": 4053,
+      "version": 6,
+      "psk": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "mode": "default",
+      "users": [{ "name": "carol", "userkey": "carol-key" }]
+    }
+  ]
+}

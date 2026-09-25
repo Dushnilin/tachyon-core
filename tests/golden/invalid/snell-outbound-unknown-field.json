@@ -1,0 +1,15 @@
+{
+  "log": { "disabled": true },
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    {
+      "type": "snell",
+      "tag": "sn",
+      "server": "127.0.0.1",
+      "server_port": 4050,
+      "version": 4,
+      "psk": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "unknown_option": 1
+    }
+  ]
+}

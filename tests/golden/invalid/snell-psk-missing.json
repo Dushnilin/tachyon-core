@@ -1,0 +1,12 @@
+{
+  "log": { "disabled": true },
+  "outbounds": [
+    {
+      "type": "snell",
+      "tag": "sn",
+      "server": "127.0.0.1",
+      "server_port": 4050,
+      "version": 4
+    }
+  ]
+}

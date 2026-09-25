@@ -226,6 +226,7 @@ const KNOWN_INBOUND_TYPES: &[&str] = &[
     "shadowtls",
     "naive",
     "hysteria",
+    "snell",
 ];
 
 const KNOWN_OUTBOUND_TYPES: &[&str] = &[
@@ -325,6 +326,23 @@ const LEGACY_INBOUND_FIELDS: &[&str] = &[
 const LEGACY_INBOUND_ERROR: &str = "legacy inbound fields are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, checkout migration: https://sing-box.sagernet.org/migration/#migrate-legacy-inbound-fields-to-rule-actions";
 
 /// reference `option.DialerOptions` (shared by hy2/tuic outbound).
+/// reference `option.ServerOptions` embeddings: `{proto}OutboundOptions`
+/// carrying a plain-string `server` (snell/anytls/masque validate their own).
+const SERVER_OUT_BASES: &[(&str, &str)] = &[
+    ("socks", "SOCKSOutboundOptions"),
+    ("http", "HTTPOutboundOptions"),
+    ("shadowsocks", "ShadowsocksOutboundOptions"),
+    ("shadowtls", "ShadowTLSOutboundOptions"),
+    ("vmess", "VMessOutboundOptions"),
+    ("vless", "VLESSOutboundOptions"),
+    ("trojan", "TrojanOutboundOptions"),
+    ("hysteria", "HysteriaOutboundOptions"),
+    ("hysteria2", "Hysteria2OutboundOptions"),
+    ("tuic", "TUICOutboundOptions"),
+    ("naive", "NaiveOutboundOptions"),
+    ("ssh", "SSHOutboundOptions"),
+];
+
 const DIALER_OUT_FIELDS: &[&str] = &[
     "detour",
     "bind_interface",
@@ -581,6 +599,23 @@ const TUIC_IN_FIELDS: &[&str] = &[
     "heartbeat",
     "tls",
 ];
+
+/// Snell outbound base allowlist (`option.AbstractSnellOutboundOptions` +
+/// `ServerOptions`; version-specific fields are added after the version switch).
+const SNELL_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "version",
+    "psk",
+    "userkey",
+    "reuse",
+    "network",
+    "server",
+    "server_port",
+];
+
+/// Snell inbound base allowlist (`option.AbstractSnellInboundOptions`).
+const SNELL_IN_FIELDS: &[&str] = &["type", "tag", "version", "psk", "users"];
 
 const BBR_PROFILES: &[&str] = &["standard", "conservative", "aggressive"];
 const TUIC_CC_ALGS: &[&str] = &["cubic", "new_reno", "bbr"];
@@ -2246,22 +2281,30 @@ pub fn validate(root: &Value) -> Result<(), String> {
         validate_dns(dns, &mut dns_tags)?;
     }
 
-    let mut inbound_tags: HashSet<&str> = HashSet::new();
-    let mut outbound_tags: HashSet<&str> = HashSet::new();
+    let mut inbound_tags: HashSet<String> = HashSet::new();
+    let mut outbound_tags: HashSet<String> = HashSet::new();
 
     if let Some(list) = root.get("inbounds") {
         let entries = list.as_array().ok_or("inbounds: must be an array")?;
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, raw) in entries.iter().enumerate() {
+            // reference stage-2 prune runs before every option decode: empty
+            // containers behave as absent (whole entries keep their shape).
+            let entry = if raw.is_object() {
+                deep_prune(raw).unwrap_or_else(|| Value::Object(Map::new()))
+            } else {
+                raw.clone()
+            };
+            let entry = &entry;
             let obj = object_entry(entry, &format!("inbounds[{i}]"))?;
             let ty = type_field(obj, &format!("inbounds[{i}]"))?;
             if !KNOWN_INBOUND_TYPES.contains(&ty) {
                 return Err(format!("inbounds[{i}]: unknown inbound type: {ty}"));
             }
             let tag = tag_field(obj, &format!("inbounds[{i}]"))?;
-            if !tag.is_empty() && !inbound_tags.insert(tag) {
+            if !tag.is_empty() && !inbound_tags.insert(tag.to_string()) {
                 return Err(format!("duplicate inbound tag: {tag}"));
             }
-            if let Some(listen) = obj.get("listen") {
+            if let Some(listen) = obj.get("listen").filter(|v| !v.is_null()) {
                 let addr = listen
                     .as_str()
                     .ok_or_else(|| format!("inbounds[{i}].listen: must be a string"))?;
@@ -2271,7 +2314,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
                     ));
                 }
             }
-            if let Some(port) = obj.get("listen_port") {
+            if let Some(port) = obj.get("listen_port").filter(|p| !p.is_null()) {
                 check_u16(port).map_err(|m| format!("inbounds[{i}].listen_port: {m}"))?;
             }
             validate_inbound(i, ty, tag, obj)?;
@@ -2281,14 +2324,22 @@ pub fn validate(root: &Value) -> Result<(), String> {
     if let Some(list) = root.get("outbounds") {
         let entries = list.as_array().ok_or("outbounds: must be an array")?;
         has_outbounds = !entries.is_empty();
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, raw) in entries.iter().enumerate() {
+            // reference stage-2 prune runs before every option decode: empty
+            // containers behave as absent (whole entries keep their shape).
+            let entry = if raw.is_object() {
+                deep_prune(raw).unwrap_or_else(|| Value::Object(Map::new()))
+            } else {
+                raw.clone()
+            };
+            let entry = &entry;
             let obj = object_entry(entry, &format!("outbounds[{i}]"))?;
             let ty = type_field(obj, &format!("outbounds[{i}]"))?;
             if !KNOWN_OUTBOUND_TYPES.contains(&ty) {
                 return Err(format!("outbounds[{i}]: unknown outbound type: {ty}"));
             }
             let tag = tag_field(obj, &format!("outbounds[{i}]"))?;
-            if !tag.is_empty() && !outbound_tags.insert(tag) {
+            if !tag.is_empty() && !outbound_tags.insert(tag.to_string()) {
                 return Err(format!("duplicate outbound/endpoint tag: {tag}"));
             }
             if let Some(port) = obj
@@ -2341,7 +2392,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
                     ));
                 }
             };
-            if !tag.is_empty() && !outbound_tags.insert(tag) {
+            if !tag.is_empty() && !outbound_tags.insert(tag.to_string()) {
                 return Err(format!("duplicate outbound/endpoint tag: {tag}"));
             }
             endpoint_decode(i, obj)?;
@@ -2628,12 +2679,185 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// reference `option.SnellInboundOptions.UnmarshalJSON` (same three passes as
+/// the outbound, version enum 5/6, users decoded without strict unknown).
+fn validate_snell_in_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("inbounds[{i}]");
+    const ABSI: &str = "_SnellInboundOptions.AbstractSnellInboundOptions";
+    const LIS: &str = "_SnellInboundOptions.AbstractSnellInboundOptions.ListenOptions";
+
+    // pass 1: base + listen field types.
+    if let Some(v) = obj.get("version") {
+        snell_version_check(v, &format!("{at}.version"), "_SnellInboundOptions")?;
+    }
+    if let Some(v) = obj.get("psk") {
+        ep_str(v, &format!("{at}.psk"), ABSI, "psk")?;
+    }
+    if let Some(v) = obj.get("users") {
+        snell_users_decode(v, &format!("{at}.users"))?;
+    }
+    for f in ["bind_interface", "netns", "detour"] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), LIS, f)?;
+        }
+    }
+    for f in [
+        "reuse_addr",
+        "disable_tcp_keep_alive",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "udp_fragment",
+        "proxy_protocol",
+        "proxy_protocol_accept_no_header",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), LIS, f)?;
+        }
+    }
+    for f in ["tcp_keep_alive", "tcp_keep_alive_interval"] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), LIS, f)?;
+        }
+    }
+    if let Some(v) = obj.get("udp_timeout") {
+        check_udp_timeout(v, &format!("{at}.udp_timeout"))?;
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+
+    // pass 2: version switch.
+    let version = snell_version(obj);
+    match version {
+        0 => return Err(format!("{at}: snell: missing version")),
+        5 | 6 => {}
+        v => return Err(format!("{at}: snell: unsupported version: {v}")),
+    }
+
+    // pass 3: version-specific fields, then unknown fields + legacy check.
+    let mut allowed: Vec<&str> = SNELL_IN_FIELDS.to_vec();
+    allowed.extend(LISTEN_IN_FIELDS);
+    allowed.extend(LEGACY_INBOUND_FIELDS);
+    if version == 5 {
+        if let Some(v) = obj.get("obfs_mode") {
+            ep_str(
+                v,
+                &format!("{at}.obfs_mode"),
+                "SnellObfsServerOptions",
+                "obfs_mode",
+            )?;
+        }
+        allowed.push("obfs_mode");
+    } else {
+        if let Some(v) = obj.get("mode") {
+            ep_str(v, &format!("{at}.mode"), "SnellV6Options", "mode")?;
+        }
+        allowed.push("mode");
+    }
+    reject_unknown_fields(obj, &allowed, &at)?;
+    check_legacy_inbound(obj)?;
+    Ok(())
+}
+
+/// users: elements decode leniently (no unknown rejection); null elements and
+/// prunable containers match the reference slice decode.
+fn snell_users_decode(value: &Value, at: &str) -> Result<(), String> {
+    const GO: &str = "_SnellInboundOptions.AbstractSnellInboundOptions";
+    match value {
+        Value::Null => Ok(()),
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                match item {
+                    Value::Null => {}
+                    Value::Object(user) => {
+                        let uat = format!("{at}[{idx}]");
+                        if let Some(v) = user.get("userkey") {
+                            ep_str(
+                                v,
+                                &format!("{uat}.userkey"),
+                                "SnellUser.AbstractSnellInboundOptions.users",
+                                "userkey",
+                            )?;
+                        }
+                        if let Some(v) = user.get("name") {
+                            ep_str(
+                                v,
+                                &format!("{uat}.name"),
+                                "SnellUser.AbstractSnellInboundOptions.users",
+                                "name",
+                            )?;
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "{at}[{idx}]: json: cannot unmarshal {} into Go struct field {GO}.users of type option.SnellUser",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(at, other, GO, "users", "[]option.SnellUser")),
+    }
+}
+
+/// reference inbound init: mode/obfs parse, psk checks (v6 enforces the
+/// 12..255-byte psk range), then per-user key rules.
+fn validate_snell_in_init(at: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let psk = obj.get("psk").and_then(Value::as_str).unwrap_or("");
+    if snell_version(obj) == 5 {
+        let raw = obj.get("obfs_mode").and_then(Value::as_str).unwrap_or("");
+        if !matches!(raw.to_lowercase().as_str(), "" | "none" | "http" | "tls") {
+            return Err(format!("{at}: snell: unknown obfs mode: {raw}"));
+        }
+        if psk.is_empty() {
+            return Err(format!("{at}: snell: missing pre-shared key"));
+        }
+    } else {
+        let raw = obj.get("mode").and_then(Value::as_str).unwrap_or("");
+        if !matches!(raw, "" | "default" | "unshaped" | "unsafe-raw") {
+            return Err(format!("{at}: snell: unknown v6 mode: {raw}"));
+        }
+        if psk.is_empty() {
+            return Err(format!("{at}: snell: missing pre-shared key"));
+        }
+        if !(12..=255).contains(&psk.len()) {
+            return Err(format!(
+                "{at}: snell: psk length must be between 12 and 255 bytes"
+            ));
+        }
+    }
+    if let Some(users) = obj.get("users").and_then(Value::as_array)
+        && !users.is_empty()
+    {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for user in users {
+            let key = user.get("userkey").and_then(Value::as_str).unwrap_or("");
+            if key.is_empty() {
+                return Err(format!("{at}: snell: bad user key"));
+            }
+            if key.len() > 255 {
+                return Err(format!("{at}: snell: user key too long"));
+            }
+            if !seen.insert(key) {
+                return Err(format!("{at}: snell: duplicate user key"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("initialize inbound[{i}] {ty}[{tag}]");
 
     match ty {
         "hysteria2" => validate_hy2_in_decode(i, obj)?,
         "tuic" => validate_tuic_in_decode(i, &at, obj)?,
+        "snell" => {
+            validate_snell_in_decode(i, obj)?;
+            validate_snell_in_init(&at, obj)?;
+        }
         _ => {
             check_legacy_inbound(obj)?;
         }
@@ -3522,6 +3746,237 @@ fn go_read_file(path: &str) -> Result<String, String> {
         })
 }
 
+/// reference `option.SnellOutboundOptions.UnmarshalJSON`: base pass (types),
+/// version switch, then version-specific fields plus unknown fields via
+/// `badjson.UnmarshallExcluded`. Input is already stage-2 pruned by `validate`.
+fn validate_snell_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    const ABSO: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions";
+    const DIAL: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions.DialerOptions";
+    const ABS: &str =
+        "_SnellOutboundOptions.AbstractSnellOutboundOptions.DialerOptions.AbstractDialerOptions";
+    const SRV: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions.ServerOptions";
+
+    // pass 1: base + dialer field types.
+    if let Some(v) = obj.get("version") {
+        snell_version_check(v, &format!("{at}.version"), "_SnellOutboundOptions")?;
+    }
+    for f in ["psk", "userkey"] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), ABSO, f)?;
+        }
+    }
+    if let Some(v) = obj.get("reuse") {
+        ep_bool(v, &format!("{at}.reuse"), ABSO, "reuse")?;
+    }
+    if let Some(v) = obj.get("network") {
+        snell_network(v, &format!("{at}.network"), ABSO)?;
+    }
+    if let Some(v) = obj.get("server") {
+        ep_str(v, &format!("{at}.server"), SRV, "server")?;
+    }
+    if let Some(v) = obj.get("detour") {
+        ep_str(v, &format!("{at}.detour"), DIAL, "detour")?;
+    }
+    for f in [
+        "bind_interface",
+        "inet4_bind_address",
+        "inet6_bind_address",
+        "protect_path",
+        "netns",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    // reference parses inet4/inet6 bind addresses at decode (netip.Addr).
+    for f in ["inet4_bind_address", "inet6_bind_address"] {
+        if let Some(Value::String(s)) = obj.get(f)
+            && !valid_netip_addr(s)
+        {
+            return Err(format!("{at}.{f}: ParseAddr({s:?}): unable to parse IP"));
+        }
+    }
+    for f in [
+        "bind_address_no_port",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "disable_tcp_keep_alive",
+        "udp_fragment",
+        "reuse_addr",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    for f in [
+        "connect_timeout",
+        "tcp_keep_alive",
+        "tcp_keep_alive_interval",
+        "fallback_delay",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        match v {
+            Value::Array(_) | Value::Number(_) | Value::Bool(_) => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_resolver"),
+                    v,
+                    ABS,
+                    "domain_resolver",
+                    "option._DomainResolveOptions",
+                ));
+            }
+            _ => {
+                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+            }
+        }
+    }
+    if let Some(v) = obj.get("network_strategy") {
+        match v {
+            Value::Null => {}
+            Value::String(s) if NETWORK_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.network_strategy: unknown network strategy: {s}"
+                ));
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.network_strategy"),
+                    other,
+                    ABS,
+                    "network_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("domain_strategy") {
+        match v {
+            Value::Null => {}
+            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.domain_strategy: unknown domain strategy: {s}"
+                ));
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_strategy"),
+                    other,
+                    ABS,
+                    "domain_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    for f in ["network_type", "fallback_network_type"] {
+        if let Some(v) = obj.get(f) {
+            check_interface_types(v, &format!("{at}.{f}"))?;
+        }
+    }
+
+    // pass 2: version switch.
+    let version = snell_version(obj);
+    match version {
+        0 => return Err(format!("{at}: snell: missing version")),
+        4 | 6 => {}
+        v => return Err(format!("{at}: snell: unsupported version: {v}")),
+    }
+
+    // pass 3: version-specific fields, then unknown fields.
+    let mut allowed: Vec<&str> = SNELL_OUT_FIELDS.to_vec();
+    allowed.extend(DIALER_OUT_FIELDS);
+    if version == 4 {
+        for f in ["obfs_mode", "obfs_host"] {
+            if let Some(v) = obj.get(f) {
+                ep_str(v, &format!("{at}.{f}"), "SnellObfsClientOptions", f)?;
+            }
+        }
+        allowed.extend(["obfs_mode", "obfs_host"]);
+    } else {
+        if let Some(v) = obj.get("mode") {
+            ep_str(v, &format!("{at}.mode"), "SnellV6Options", "mode")?;
+        }
+        allowed.push("mode");
+    }
+    reject_unknown_fields(obj, &allowed, &at)?;
+    Ok(())
+}
+
+/// `version`: type errors report first (pass 1); the value itself is read back
+/// for the version switch. Integral floats (`4.0`) decode like Go's int.
+fn snell_version_check(value: &Value, at: &str, go_struct: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Number(n)
+            if n.as_i64().is_some() || n.as_f64().is_some_and(|f| f.fract() == 0.0) =>
+        {
+            Ok(())
+        }
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number {} into Go struct field {go_struct}.version of type int",
+            go_number_literal(value)
+        )),
+        other => Err(go_field_err(at, other, go_struct, "version", "int")),
+    }
+}
+
+fn snell_version(obj: &Map<String, Value>) -> i64 {
+    match obj.get("version") {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// NetworkList: listable network enum; scalars otherwise follow the string
+/// field decode, arrays report the array-level type error.
+fn snell_network(value: &Value, at: &str, go_struct: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) if s == "tcp" || s == "udp" => Ok(()),
+        Value::String(s) => Err(format!("{at}: unknown network: {s}")),
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) if s == "tcp" || s == "udp" => {}
+                    Value::String(s) => return Err(format!("{at}: unknown network: {s}")),
+                    _ => {
+                        return Err(format!(
+                            "{at}: json: cannot unmarshal array into Go struct field {go_struct}.network of type string"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(at, other, go_struct, "network", "string")),
+    }
+}
+
+/// `netip.ParseAddr`: strict IP literal, optional non-empty zone.
+fn valid_netip_addr(s: &str) -> bool {
+    let (addr, zone) = match s.split_once('%') {
+        Some((addr, zone)) => (addr, Some(zone)),
+        None => (s, None),
+    };
+    if zone.is_some_and(|z| z.is_empty()) {
+        return false;
+    }
+    addr.parse::<IpAddr>().is_ok()
+}
+
 fn validate_outbound(
     i: usize,
     ty: &str,
@@ -3536,8 +3991,22 @@ fn validate_outbound(
         "tuic" => validate_tuic_out_decode(i, obj)?,
         "masque" => validate_masque_out_decode(i, obj)?,
         "anytls" => validate_anytls_out_decode(i, obj)?,
+        "snell" => validate_snell_out_decode(i, obj)?,
         "vless" => validate_vless_encryption(obj)?,
         _ => {}
+    }
+    if let Some(base) = SERVER_OUT_BASES
+        .iter()
+        .find(|(t, _)| *t == ty)
+        .map(|(_, b)| *b)
+        && let Some(v) = obj.get("server")
+    {
+        ep_str(
+            v,
+            &format!("outbounds[{i}].server"),
+            &format!("{base}.ServerOptions"),
+            "server",
+        )?;
     }
 
     match ty {
@@ -3923,19 +4392,31 @@ fn validate_outbound(
                 }
             }
         }
-        "snell" => match obj.get("version") {
-            None => return Err(format!("outbounds[{i}]: snell: missing version")),
-            Some(version) => {
-                let version = version
-                    .as_u64()
-                    .ok_or_else(|| format!("outbounds[{i}]: snell: version must be a number"))?;
-                if version != 4 {
-                    return Err(format!(
-                        "outbounds[{i}]: snell: unsupported version: {version}"
-                    ));
+        "snell" => {
+            // reference NewOutbound: obfs/mode parse, then psk, then userkey.
+            if snell_version(obj) == 4 {
+                let raw = obj.get("obfs_mode").and_then(Value::as_str).unwrap_or("");
+                if !matches!(raw.to_lowercase().as_str(), "" | "none" | "http" | "tls") {
+                    return Err(format!("{at}: snell: unknown obfs mode: {raw}"));
+                }
+            } else {
+                let raw = obj.get("mode").and_then(Value::as_str).unwrap_or("");
+                if !matches!(raw, "" | "default" | "unshaped" | "unsafe-raw") {
+                    return Err(format!("{at}: snell: unknown v6 mode: {raw}"));
                 }
             }
-        },
+            let psk = obj.get("psk").and_then(Value::as_str).unwrap_or("");
+            if psk.is_empty() {
+                return Err(format!("{at}: snell: missing pre-shared key"));
+            }
+            if obj
+                .get("userkey")
+                .and_then(Value::as_str)
+                .is_some_and(|k| k.len() > 255)
+            {
+                return Err(format!("{at}: snell: user key too long"));
+            }
+        }
         "hysteria" => {
             let has_up = ["up", "up_mbps"].iter().any(|k| obj.contains_key(*k));
             if !has_up {
@@ -4283,8 +4764,8 @@ fn check_routing_mark(value: &Value, at: &str) -> Result<(), String> {
             }
         }
         Value::Number(n) => match n.as_u64() {
-            Some(_) => Ok(()),
-            None => Err(format!(
+            Some(v) if v <= u32::MAX as u64 => Ok(()),
+            _ => Err(format!(
                 "{at}: invalid number or string mark: json: cannot unmarshal number into Go value of type string"
             )),
         },

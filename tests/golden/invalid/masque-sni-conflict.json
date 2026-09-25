@@ -1,0 +1,18 @@
+{
+ "outbounds": [
+  {
+   "type": "masque",
+   "tag": "warp",
+   "server": "162.159.198.2",
+   "server_port": 443,
+   "profile": "cloudflare",
+   "tls": {
+    "server_name": "www.cloudflare.com"
+   },
+   "private_key": "MHcCAQEEII0yRXpZqxtdgaDRKlsmWg1QDp+D5AWvSHg2WAaubf3woAoGCCqGSM49AwEHoUQDQgAE7IKkFW+4TVa3+LQyWrHAit6Q3J/FdgtrHn0+AioSqpCSojadOVInMjSDxN920+T1Rcplag2IRpgoCr7Fyp2tJA==",
+   "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE7IKkFW+4TVa3+LQyWrHAit6Q3J/FdgtrHn0+AioSqpCSojadOVInMjSDxN920+T1Rcplag2IRpgoCr7Fyp2tJA==",
+   "sni": "a.example.com",
+   "ip": "172.16.0.2/32"
+  }
+ ]
+}

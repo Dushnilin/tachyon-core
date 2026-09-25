@@ -433,6 +433,33 @@ const TLS_IN_FIELDS: &[&str] = &[
     "reality",
 ];
 
+/// Masque outbound allowlist (option.MASQUEOutboundOptions), excluding
+/// dialer/TLS containers.
+const MASQUE_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "profile",
+    "vhttp",
+    "network",
+    "private_key",
+    "public_key",
+    "ip",
+    "ipv6",
+    "uri",
+    "mtu",
+    "sni",
+    "skip_cert_verify",
+    "fragment",
+    "fragment_fallback_delay",
+    "record_fragment",
+    "idle_timeout",
+    "keep_alive_period",
+    "network_list",
+    "tls",
+];
+
 /// Hy2 outbound allowlist (lx hysteria2.go), excluding TLS/QUIC containers.
 const HY2_OUT_FIELDS: &[&str] = &[
     "type",
@@ -561,6 +588,9 @@ fn reject_unknown_fields(
 /// Go `my_time.ParseDuration` subset (badoption.Duration string form).
 /// Grammar: `[-+]?([0-9]*(\.[0-9]*)?[a-zµμ]+)+`
 fn go_parse_duration(raw: &str) -> Result<(), String> {
+    if raw == "0" || raw == "+0" || raw == "-0" {
+        return Ok(());
+    }
     if raw.is_empty() {
         return Err(format!("time: invalid duration \"{raw}\""));
     }
@@ -621,6 +651,72 @@ fn go_parse_duration(raw: &str) -> Result<(), String> {
         return Err(format!("time: invalid duration \"{raw}\""));
     }
     Ok(())
+}
+
+/// Parsed duration in nanoseconds for legacy-vs-tls conflict comparisons
+/// (`badoption.Duration` equality). `None` when the text is not a valid
+/// duration — callers treat that as zero, decode has already rejected it.
+fn go_duration_ns(raw: &str) -> Option<i128> {
+    let mut s = raw;
+    let mut sign: i128 = 1;
+    if let Some(rest) = s.strip_prefix('-') {
+        sign = -1;
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix('+') {
+        s = rest;
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let mut total: i128 = 0;
+    let mut consumed_any = false;
+    while !s.is_empty() {
+        let mut num_len = 0usize;
+        let mut dots = 0;
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                num_len += 1;
+            } else if c == '.' {
+                dots += 1;
+                if dots > 1 {
+                    break;
+                }
+                num_len += 1;
+            } else {
+                break;
+            }
+        }
+        if num_len == 0 {
+            return None;
+        }
+        let value: f64 = s[..num_len].parse().ok()?;
+        let rest = &s[num_len..];
+        let unit_len = rest
+            .chars()
+            .take_while(|c| c.is_alphabetic())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if unit_len == 0 {
+            return None;
+        }
+        let mult: i128 = match &rest[..unit_len] {
+            "ns" => 1,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            "d" => 86_400_000_000_000,
+            _ => return None,
+        };
+        total += (value * mult as f64) as i128;
+        s = &rest[unit_len..];
+        consumed_any = true;
+    }
+    if !consumed_any {
+        return None;
+    }
+    Some(sign * total)
 }
 
 /// Decode-time duration field: string → Go parse; null → invalid duration "";
@@ -1398,6 +1494,192 @@ fn validate_tuic_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), St
     Ok(())
 }
 
+fn validate_masque_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    // reference stage-2 prune: the whole outbound map drops prunable values
+    // before the strict options decode, so `{}`/`[]` act as absent fields.
+    let pruned: Map<String, Value> = obj
+        .iter()
+        .filter(|(_, v)| !prunes_value(v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let obj = &pruned;
+
+    // Field checks run before the unknown-field pass: the reference reports
+    // whichever error comes first in document order, and a fixed field order
+    // matches more observed probes than the BTreeMap alphabetical key walk.
+    for f in ["profile", "ip", "ipv6"] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), "MASQUEOutboundOptions", f)?;
+        }
+    }
+    if let Some(v) = obj.get("network_list") {
+        check_masque_network_list(v, &format!("{at}.network_list"))?;
+    }
+    for f in [
+        "vhttp",
+        "network",
+        "sni",
+        "uri",
+        "private_key",
+        "public_key",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), "MASQUEOutboundOptions", f)?;
+        }
+    }
+    if let Some(v) = obj.get("server") {
+        ep_str(
+            v,
+            &format!("{at}.server"),
+            "MASQUEOutboundOptions.ServerOptions",
+            "server",
+        )?;
+    }
+    if let Some(v) = obj.get("detour") {
+        ep_str(
+            v,
+            &format!("{at}.detour"),
+            "MASQUEOutboundOptions.DialerOptions",
+            "detour",
+        )?;
+    }
+    if let Some(v) = obj.get("bind_interface") {
+        ep_str(
+            v,
+            &format!("{at}.bind_interface"),
+            "MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions",
+            "bind_interface",
+        )?;
+    }
+    if let Some(v) = obj.get("mtu") {
+        ep_unsigned(
+            v,
+            &format!("{at}.mtu"),
+            "MASQUEOutboundOptions",
+            "mtu",
+            u64::from(u32::MAX),
+        )?;
+    }
+    for f in ["skip_cert_verify", "fragment", "record_fragment"] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), "MASQUEOutboundOptions", f)?;
+        }
+    }
+    if let Some(v) = obj.get("udp_fragment") {
+        ep_bool(
+            v,
+            &format!("{at}.udp_fragment"),
+            "MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions",
+            "udp_fragment",
+        )?;
+    }
+    for f in [
+        "fragment_fallback_delay",
+        "keep_alive_period",
+        "idle_timeout",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), "MASQUEOutboundOptions", f)?;
+        }
+    }
+    for f in [
+        "connect_timeout",
+        "tcp_keep_alive",
+        "tcp_keep_alive_interval",
+        "fallback_delay",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(
+                v,
+                &format!("{at}.{f}"),
+                "MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions",
+                f,
+            )?;
+        }
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        match v {
+            Value::Array(_) | Value::Number(_) | Value::Bool(_) => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_resolver"),
+                    v,
+                    "MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions",
+                    "domain_resolver",
+                    "option._DomainResolveOptions",
+                ));
+            }
+            _ => {
+                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+            }
+        }
+    }
+    if let Some(tls) = obj.get("tls") {
+        match tls {
+            Value::Null => {}
+            Value::Object(_) => validate_tls_container(tls, &format!("{at}.tls"), false)?,
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.tls"),
+                    other,
+                    "MASQUEOutboundOptions.OutboundTLSOptionsContainer",
+                    "tls",
+                    "option.OutboundTLSOptions",
+                ));
+            }
+        }
+    }
+
+    let mut allowed: Vec<&str> = MASQUE_OUT_FIELDS.to_vec();
+    allowed.extend(DIALER_OUT_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    Ok(())
+}
+
+/// `network_list` (Listable[string] at decode): null OK; string validated
+/// against tcp/udp; an array of strings/nulls validates element-wise (a null
+/// element becomes `""`), any other array shape reports the array kind.
+fn check_masque_network_list(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            if s == "tcp" || s == "udp" {
+                Ok(())
+            } else {
+                Err(format!("{at}: unknown network: {s}"))
+            }
+        }
+        Value::Array(items) => {
+            if !items.iter().all(|v| v.is_string() || v.is_null()) {
+                return Err(go_field_err(
+                    at,
+                    value,
+                    "MASQUEOutboundOptions",
+                    "network_list",
+                    "string",
+                ));
+            }
+            for item in items {
+                let s = item.as_str().unwrap_or("");
+                if s != "tcp" && s != "udp" {
+                    return Err(format!("{at}: unknown network: {s}"));
+                }
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            "MASQUEOutboundOptions",
+            "network_list",
+            "string",
+        )),
+    }
+}
+
 fn validate_hy2_in_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("inbounds[{i}]");
     let mut allowed: Vec<&str> = HY2_IN_FIELDS.to_vec();
@@ -1628,7 +1910,10 @@ pub fn validate(root: &Value) -> Result<(), String> {
             if !tag.is_empty() && !outbound_tags.insert(tag) {
                 return Err(format!("duplicate outbound/endpoint tag: {tag}"));
             }
-            if let Some(port) = obj.get("server_port") {
+            if let Some(port) = obj
+                .get("server_port")
+                .filter(|p| !p.is_null() && !prunes_value(p))
+            {
                 check_u16(port).map_err(|m| format!("outbounds[{i}].server_port: {m}"))?;
             }
             validate_outbound(i, ty, tag, obj)?;
@@ -2419,6 +2704,7 @@ fn validate_outbound(
     match ty {
         "hysteria2" => validate_hy2_out_decode(i, obj)?,
         "tuic" => validate_tuic_out_decode(i, obj)?,
+        "masque" => validate_masque_out_decode(i, obj)?,
         "vless" => validate_vless_encryption(obj)?,
         _ => {}
     }
@@ -2606,13 +2892,159 @@ fn validate_outbound(
             }
         }
         "masque" => {
-            let has_ip = ["ip", "ipv6"].iter().any(|k| {
-                obj.get(*k)
+            // reference NewOutbound: ParseProfile → resolveLegacyOptions →
+            // uri → resolveVHTTP → parsePrefixes → keys → key parse → mtu.
+            let profile_name = obj.get("profile").and_then(Value::as_str).unwrap_or("");
+            let pin = matches!(profile_name, "" | "cloudflare");
+            let default_uri = if pin {
+                "https://cloudflareaccess.com"
+            } else {
+                ""
+            };
+            if !pin && profile_name != "standard" {
+                return Err(format!("{at}: masque: unknown profile: {profile_name}"));
+            }
+
+            let legacy_network = obj.get("network").and_then(Value::as_str).unwrap_or("");
+            let mut vhttp = obj.get("vhttp").and_then(Value::as_str).unwrap_or("");
+            if !legacy_network.is_empty() {
+                if !vhttp.is_empty() && vhttp != legacy_network {
+                    return Err(format!(
+                        "{at}: masque: `vhttp` is {vhttp} but deprecated `network` is {legacy_network} — remove `network`"
+                    ));
+                }
+                if vhttp.is_empty() {
+                    vhttp = legacy_network;
+                }
+            }
+
+            let tls_obj = obj.get("tls").and_then(Value::as_object);
+            let tls_server_name = tls_obj
+                .and_then(|m| m.get("server_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let legacy_sni = obj.get("sni").and_then(Value::as_str).unwrap_or("");
+            if !legacy_sni.is_empty()
+                && !tls_server_name.is_empty()
+                && tls_server_name != legacy_sni
+            {
+                return Err(format!(
+                    "{at}: masque: `tls.server_name` is {tls_server_name} but deprecated `sni` is {legacy_sni} — remove `sni`"
+                ));
+            }
+
+            let legacy_ffd = obj
+                .get("fragment_fallback_delay")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if go_duration_ns(legacy_ffd).unwrap_or(0) != 0 {
+                let tls_ffd = tls_obj
+                    .and_then(|m| m.get("fragment_fallback_delay"))
                     .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-            });
-            if !has_ip {
+                    .unwrap_or("");
+                if go_duration_ns(tls_ffd).unwrap_or(0) != 0
+                    && go_duration_ns(tls_ffd) != go_duration_ns(legacy_ffd)
+                {
+                    return Err(format!(
+                        "{at}: masque: `tls.fragment_fallback_delay` and deprecated `fragment_fallback_delay` disagree — remove the latter"
+                    ));
+                }
+            }
+
+            let mut uri = obj.get("uri").and_then(Value::as_str).unwrap_or("");
+            if uri.is_empty() {
+                uri = default_uri;
+            }
+            if uri.is_empty() {
+                return Err(format!(
+                    "{at}: masque: uri is required for the standard profile — set it to the server's CONNECT-IP request URI, e.g. https://<host>/.well-known/masque/ip/*/*/"
+                ));
+            }
+
+            let mut network = vhttp;
+            if network.is_empty() {
+                network = "auto";
+            }
+            if network != "h3" && network != "h2" && network != "auto" {
+                return Err(format!(
+                    "{at}: masque: invalid vhttp: {network} (expected h3, h2 or auto)"
+                ));
+            }
+            let mut auto_mode = network == "auto";
+            if auto_mode && profile_name == "standard" {
+                auto_mode = false;
+                network = "h3";
+            }
+            if auto_mode {
+                network = "h3";
+            }
+            if network == "h2" && profile_name == "standard" {
+                return Err(format!(
+                    "{at}: masque: vhttp h2 is not implemented for the standard profile"
+                ));
+            }
+
+            let ip = obj.get("ip").and_then(Value::as_str).unwrap_or("");
+            let ipv6 = obj.get("ipv6").and_then(Value::as_str).unwrap_or("");
+            if !ip.is_empty()
+                && let Err(e) = crate::netip_parse::check_masque_prefix(ip, false)
+            {
+                return Err(format!("{at}: parse ip: {e}"));
+            }
+            if !ipv6.is_empty()
+                && let Err(e) = crate::netip_parse::check_masque_prefix(ipv6, true)
+            {
+                return Err(format!("{at}: parse ipv6: {e}"));
+            }
+            if ip.is_empty() && ipv6.is_empty() {
                 return Err(format!("{at}: masque: at least one of ip/ipv6 is required"));
+            }
+
+            let priv_key = obj.get("private_key").and_then(Value::as_str).unwrap_or("");
+            let pub_key = obj.get("public_key").and_then(Value::as_str).unwrap_or("");
+            if pin && (priv_key.is_empty() || pub_key.is_empty()) {
+                return Err(format!(
+                    "{at}: masque: private_key and public_key are required for the cloudflare profile"
+                ));
+            }
+            if !priv_key.is_empty() {
+                if let Some(idx) = go_b64_check(priv_key) {
+                    return Err(format!(
+                        "{at}: parse private_key: illegal base64 data at input byte {idx}"
+                    ));
+                }
+                let der = decode_base64_std(priv_key).unwrap_or_default();
+                if let Err(e) = crate::asn1_x509::parse_ec_private(&der) {
+                    return Err(format!("{at}: parse private_key: {e}"));
+                }
+            }
+            if !pub_key.is_empty() {
+                if let Some(idx) = go_b64_check(pub_key) {
+                    return Err(format!(
+                        "{at}: parse public_key: illegal base64 data at input byte {idx}"
+                    ));
+                }
+                let der = decode_base64_std(pub_key).unwrap_or_default();
+                match crate::asn1_x509::parse_pkix_public(&der) {
+                    Ok(crate::asn1_x509::PubKey::Ecdsa) => {}
+                    Ok(crate::asn1_x509::PubKey::NotEcdsa) => {
+                        return Err(format!(
+                            "{at}: parse public_key: public_key is not an ECDSA key"
+                        ));
+                    }
+                    Err(e) => return Err(format!("{at}: parse public_key: {e}")),
+                }
+            }
+
+            let mtu = obj
+                .get("mtu")
+                .and_then(Value::as_u64)
+                .filter(|m| *m != 0)
+                .unwrap_or(1280);
+            if (network == "h2" || auto_mode) && mtu > 16000 {
+                return Err(format!(
+                    "{at}: masque: mtu {mtu} too large for h2 (max 16000)"
+                ));
             }
         }
         "shadowsocks" => {
@@ -2839,6 +3271,17 @@ fn is_zero_json(value: &Value) -> bool {
     value.is_null() || matches!(value, Value::Object(map) if map.is_empty())
 }
 
+/// reference stage-2 prune: a value decodes to nothing when it is an object
+/// whose children all prune, or an array whose elements all prune (empty
+/// containers included). Scalars and null survive.
+fn prunes_value(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.values().all(prunes_value),
+        Value::Array(items) => items.iter().all(prunes_value),
+        _ => false,
+    }
+}
+
 /// Go `json: cannot unmarshal <kind> into Go struct field <gs>.<f> of type <ty>`.
 fn go_field_err(at: &str, value: &Value, go_struct: &str, field: &str, ty: &str) -> String {
     format!(
@@ -2935,6 +3378,9 @@ fn go_uint_max(bit_size: u32) -> u128 {
 /// else reports the first (string) unmarshal error under the wrapper.
 fn check_routing_mark(value: &Value, at: &str) -> Result<(), String> {
     match value {
+        Value::Null => Err(format!(
+            "{at}: strconv.ParseUint: parsing \"\": invalid syntax"
+        )),
         v if is_zero_json(v) => Ok(()),
         Value::String(s) => {
             let err = go_parse_uint_err(s, 32);
@@ -3854,7 +4300,9 @@ fn object_entry<'a>(entry: &'a Value, at: &str) -> Result<&'a Map<String, Value>
 
 fn type_field<'a>(obj: &'a Map<String, Value>, at: &str) -> Result<&'a str, String> {
     match obj.get("type") {
-        None => Ok(""),
+        // reference: json null leaves the Go string at "" and falls through
+        // to the unknown-type check.
+        None | Some(Value::Null) => Ok(""),
         Some(Value::String(ty)) => Ok(ty.as_str()),
         Some(_) => Err(format!(
             "{at}.type: json: cannot unmarshal into Go field of type string"
@@ -3864,7 +4312,7 @@ fn type_field<'a>(obj: &'a Map<String, Value>, at: &str) -> Result<&'a str, Stri
 
 fn tag_field<'a>(obj: &'a Map<String, Value>, at: &str) -> Result<&'a str, String> {
     match obj.get("tag") {
-        None => Ok(""),
+        None | Some(Value::Null) => Ok(""),
         Some(Value::String(tag)) => Ok(tag.as_str()),
         Some(_) => Err(format!(
             "{at}.tag: json: cannot unmarshal into Go field of type string"
@@ -4202,8 +4650,11 @@ mod tests {
         assert!(go_parse_duration("1µs").is_ok());
         assert!(go_parse_duration("-30s").is_ok());
         assert!(go_parse_duration("+5s").is_ok());
-        assert!(go_parse_duration("0").is_err());
+        assert!(go_parse_duration("0").is_ok());
+        assert!(go_parse_duration("+0").is_ok());
+        assert!(go_parse_duration("-0").is_ok());
         assert!(go_parse_duration("").is_err());
+        assert!(go_parse_duration("00").is_err());
         assert!(go_parse_duration("30").is_err());
         assert!(go_parse_duration("bogus").is_err());
         assert!(go_parse_duration("2w").is_err());
@@ -4883,5 +5334,511 @@ mod tests {
             "route": {"rules": [{"inbound": [], "outbound": "wg"}], "final": "direct"}
         });
         assert!(validate(&cfg).is_ok());
+    }
+
+    const MASQUE_PRIV: &str = "MHcCAQEEII0yRXpZqxtdgaDRKlsmWg1QDp+D5AWvSHg2WAaubf3woAoGCCqGSM49AwEHoUQDQgAE7IKkFW+4TVa3+LQyWrHAit6Q3J/FdgtrHn0+AioSqpCSojadOVInMjSDxN920+T1Rcplag2IRpgoCr7Fyp2tJA==";
+    const MASQUE_PUB: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE7IKkFW+4TVa3+LQyWrHAit6Q3J/FdgtrHn0+AioSqpCSojadOVInMjSDxN920+T1Rcplag2IRpgoCr7Fyp2tJA==";
+    const MASQUE_RSA_PUB: &str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAya+MLkgQqDELBz+zMa/DG0JaDq5Q5LA4TX6WnTy+ISaP/xRa+55nwG58Jb3XTbIpErPX09NMol6LhX6fPVLRPLGb/ayr49WRbsUR9rzYNm1aB3QVZLJzTT2TuTAqCrQm2nix1QLIx/J632Dpharr1rkvWGcAC9PWd0t41FCa2oxElOM1SnMk+lmK7BC4AoXlR1DGSTXKY2UZZMw9ECoQqthWvA6t7s+q+rbzPW0NTllKMi8r0o+Cy5lfWFoHjVrbz8flItbR2MUUYV2p7Vn2gavpxsF9RIRkbHzJdVZYBUNAA+ZK/p4mVgRjuemy9AheSfcWhu6512dQadaP2zKLEQIDAQAB";
+
+    /// cloudflare base outbound from the probe corpus; `extra` keys overlay it.
+    fn masque(extra: Value) -> Value {
+        let mut out = json!({
+            "type": "masque", "tag": "warp",
+            "server": "162.159.198.2", "server_port": 443,
+            "profile": "cloudflare",
+            "tls": {"server_name": "www.cloudflare.com"},
+            "private_key": MASQUE_PRIV,
+            "public_key": MASQUE_PUB,
+            "ip": "172.16.0.2/32"
+        });
+        if let Value::Object(map) = &mut out
+            && let Value::Object(extra) = extra
+        {
+            for (k, v) in extra {
+                match (k.as_str(), v) {
+                    ("tls", Value::Object(extra_tls)) => {
+                        if let Some(Value::Object(base_tls)) = map.get_mut("tls") {
+                            for (tk, tv) in extra_tls {
+                                base_tls.insert(tk, tv);
+                            }
+                        } else {
+                            map.insert("tls".to_string(), Value::Object(extra_tls));
+                        }
+                    }
+                    (k, v) => {
+                        map.insert(k.to_string(), v);
+                    }
+                }
+            }
+        }
+        json!({"outbounds": [out]})
+    }
+
+    fn masque_err(extra: Value) -> String {
+        validate(&masque(extra)).unwrap_err()
+    }
+
+    #[test]
+    fn accepts_valid_masque() {
+        assert!(validate(&masque(json!({}))).is_ok());
+        // uri absent: the cloudflare profile supplies the default URI
+        assert!(validate(&masque(json!({"uri": null}))).is_ok());
+        // legacy network folds into vhttp without a conflict
+        assert!(validate(&masque(json!({"network": "h3"}))).is_ok());
+        // standard profile carries no keys
+        let cfg =
+            masque(json!({"profile": "standard", "uri": "https://x/.well-known/masque/ip/*/*/"}));
+        let Value::Object(root) = cfg else { panic!() };
+        let Value::Array(obs) = &root["outbounds"] else {
+            panic!()
+        };
+        let Value::Object(ob) = &obs[0] else { panic!() };
+        let mut ob = ob.clone();
+        ob.remove("private_key");
+        ob.remove("public_key");
+        assert!(validate(&json!({"outbounds": [ob]})).is_ok());
+    }
+
+    #[test]
+    fn masque_profile_and_vhttp_errors() {
+        let err = masque_err(json!({"profile": "nope"}));
+        assert!(err.contains("masque: unknown profile: nope"), "{err}");
+
+        let err = masque_err(json!({"profile": "standard", "uri": null}));
+        assert!(
+            err.contains("masque: uri is required for the standard profile — set it to the server's CONNECT-IP request URI, e.g. https://<host>/.well-known/masque/ip/*/*/"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"vhttp": "bogus"}));
+        assert!(
+            err.contains("masque: invalid vhttp: bogus (expected h3, h2 or auto)"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"profile": "standard", "uri": "https://x/", "vhttp": "h2"}));
+        assert!(
+            err.contains("masque: vhttp h2 is not implemented for the standard profile"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"profile": "standard", "uri": null, "vhttp": "bad"}));
+        assert!(
+            err.contains("uri is required for the standard profile"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"ip": "bogus", "vhttp": "bad"}));
+        assert!(err.contains("invalid vhttp: bad"), "{err}");
+    }
+
+    #[test]
+    fn masque_legacy_conflicts() {
+        let err = masque_err(json!({"network": "h3", "vhttp": "h2"}));
+        assert!(
+            err.contains("masque: `vhttp` is h2 but deprecated `network` is h3 — remove `network`"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"sni": "x.example"}));
+        assert!(
+            err.contains("masque: `tls.server_name` is www.cloudflare.com but deprecated `sni` is x.example — remove `sni`"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({
+            "tls": {"server_name": "www.cloudflare.com", "fragment_fallback_delay": "2s"},
+            "fragment_fallback_delay": "1s"
+        }));
+        assert!(
+            err.contains("masque: `tls.fragment_fallback_delay` and deprecated `fragment_fallback_delay` disagree — remove the latter"),
+            "{err}"
+        );
+
+        // equal durations in different spellings are not a conflict
+        assert!(
+            validate(&masque(json!({
+                "tls": {"server_name": "www.cloudflare.com", "fragment_fallback_delay": "1000ms"},
+                "fragment_fallback_delay": "1s"
+            })))
+            .is_ok()
+        );
+
+        // legacy sni with no tls block folds silently
+        assert!(validate(&masque(json!({"tls": null, "sni": "x.example"}))).is_ok());
+    }
+
+    #[test]
+    fn masque_keys_and_parsing() {
+        let err = masque_err(json!({"private_key": null, "public_key": null}));
+        assert!(
+            err.contains(
+                "masque: private_key and public_key are required for the cloudflare profile"
+            ),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"private_key": []}));
+        assert!(
+            err.contains("private_key and public_key are required"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"private_key": "not/base64!!"}));
+        assert!(
+            err.contains("parse private_key: illegal base64 data at input byte 10"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"private_key": "YQ"}));
+        assert!(
+            err.contains("parse private_key: illegal base64 data at input byte 0"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"private_key": "YQ=="}));
+        assert!(
+            err.contains("parse private_key: x509: failed to parse EC private key"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"public_key": MASQUE_RSA_PUB}));
+        assert!(
+            err.contains("parse public_key: public_key is not an ECDSA key"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"public_key": "!!!"}));
+        assert!(
+            err.contains("parse public_key: illegal base64 data at input byte 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masque_prefix_errors() {
+        let err = masque_err(json!({"ip": "not-an-ip"}));
+        assert!(
+            err.contains("parse ip: netip.ParsePrefix(\"not-an-ip/32\"): ParseAddr(\"not-an-ip\"): unable to parse IP"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"ip": "1.2.3.4/33"}));
+        assert!(
+            err.contains("parse ip: netip.ParsePrefix(\"1.2.3.4/33\"): prefix length out of range"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"ip": "fe80::1%eth0/64"}));
+        assert!(
+            err.contains("parse ip: netip.ParsePrefix(\"fe80::1%eth0/64\"): IPv6 zones cannot be present in a prefix"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"ip": null, "ipv6": null}));
+        assert!(
+            err.contains("masque: at least one of ip/ipv6 is required"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"ipv6": "bogus"}));
+        assert!(
+            err.contains("parse ipv6: netip.ParsePrefix(\"bogus/128\"): ParseAddr(\"bogus\"): unable to parse IP"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masque_mtu_h2_ceiling() {
+        let err = masque_err(json!({"mtu": 16001}));
+        assert!(
+            err.contains("masque: mtu 16001 too large for h2 (max 16000)"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"vhttp": "h2", "mtu": 65536}));
+        assert!(
+            err.contains("masque: mtu 65536 too large for h2 (max 16000)"),
+            "{err}"
+        );
+
+        assert!(validate(&masque(json!({"mtu": 16000}))).is_ok());
+        assert!(validate(&masque(json!({"mtu": 0}))).is_ok());
+        assert!(validate(&masque(json!({"vhttp": "h3", "mtu": 65536}))).is_ok());
+    }
+
+    #[test]
+    fn masque_decode_field_errors() {
+        let err = masque_err(json!({"profile": 1}));
+        assert!(
+            err.contains("outbounds[0].profile: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.profile of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"ip": 3}));
+        assert!(
+            err.contains("outbounds[0].ip: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.ip of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"uri": 1}));
+        assert!(
+            err.contains("outbounds[0].uri: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.uri of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"uri": ["x"]}));
+        assert!(
+            err.contains("outbounds[0].uri: json: cannot unmarshal array into Go struct field MASQUEOutboundOptions.uri of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"mtu": -1}));
+        assert!(
+            err.contains("outbounds[0].mtu: json: cannot unmarshal number -1 into Go struct field MASQUEOutboundOptions.mtu of type uint32"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"mtu": "x"}));
+        assert!(
+            err.contains("outbounds[0].mtu: json: cannot unmarshal string into Go struct field MASQUEOutboundOptions.mtu of type uint32"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"server": 1}));
+        assert!(
+            err.contains("outbounds[0].server: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.ServerOptions.server of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"skip_cert_verify": 4}));
+        assert!(
+            err.contains("outbounds[0].skip_cert_verify: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.skip_cert_verify of type bool"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"tls": "x"}));
+        assert!(
+            err.contains("outbounds[0].tls: json: cannot unmarshal string into Go struct field MASQUEOutboundOptions.OutboundTLSOptionsContainer.tls of type option.OutboundTLSOptions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masque_decode_dialer_errors() {
+        let err = masque_err(json!({"detour": 1}));
+        assert!(
+            err.contains("outbounds[0].detour: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.DialerOptions.detour of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"bind_interface": 1}));
+        assert!(
+            err.contains("outbounds[0].bind_interface: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions.bind_interface of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"connect_timeout": null}));
+        assert!(
+            err.contains("outbounds[0].connect_timeout: time: invalid duration \"\""),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"connect_timeout": 1}));
+        assert!(
+            err.contains("outbounds[0].connect_timeout: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions.connect_timeout of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"keep_alive_period": "bogus"}));
+        assert!(
+            err.contains("outbounds[0].keep_alive_period: time: invalid duration \"bogus\""),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"idle_timeout": null}));
+        assert!(
+            err.contains("outbounds[0].idle_timeout: time: invalid duration \"\""),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"udp_fragment": 1}));
+        assert!(
+            err.contains("outbounds[0].udp_fragment: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions.udp_fragment of type bool"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"domain_resolver": 1}));
+        assert!(
+            err.contains("outbounds[0].domain_resolver: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.DialerOptions.AbstractDialerOptions.domain_resolver of type option._DomainResolveOptions"),
+            "{err}"
+        );
+
+        assert!(validate(&masque(json!({"domain_resolver": "u"}))).is_ok());
+    }
+
+    #[test]
+    fn masque_routing_mark_rules() {
+        let err = masque_err(json!({"routing_mark": null}));
+        assert!(
+            err.contains(
+                "outbounds[0].routing_mark: strconv.ParseUint: parsing \"\": invalid syntax"
+            ),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"routing_mark": 1.5}));
+        assert!(
+            err.contains("outbounds[0].routing_mark: invalid number or string mark: json: cannot unmarshal number into Go value of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"routing_mark": true}));
+        assert!(
+            err.contains("outbounds[0].routing_mark: invalid number or string mark: json: cannot unmarshal bool into Go value of type string"),
+            "{err}"
+        );
+
+        assert!(validate(&masque(json!({"routing_mark": 255}))).is_ok());
+        assert!(validate(&masque(json!({"routing_mark": "255"}))).is_ok());
+    }
+
+    #[test]
+    fn masque_network_list_rules() {
+        let err = masque_err(json!({"network_list": "icmp"}));
+        assert!(
+            err.contains("outbounds[0].network_list: unknown network: icmp"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": "4"}));
+        assert!(
+            err.contains("outbounds[0].network_list: unknown network: 4"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": [null]}));
+        assert!(
+            err.contains("outbounds[0].network_list: unknown network: "),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": ["icmp"]}));
+        assert!(
+            err.contains("outbounds[0].network_list: unknown network: icmp"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": ["icmp", "zz"]}));
+        assert!(
+            err.contains("outbounds[0].network_list: unknown network: icmp"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": ["tcp", 1]}));
+        assert!(
+            err.contains("outbounds[0].network_list: json: cannot unmarshal array into Go struct field MASQUEOutboundOptions.network_list of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": 123}));
+        assert!(
+            err.contains("outbounds[0].network_list: json: cannot unmarshal number into Go struct field MASQUEOutboundOptions.network_list of type string"),
+            "{err}"
+        );
+
+        let err = masque_err(json!({"network_list": true}));
+        assert!(
+            err.contains("outbounds[0].network_list: json: cannot unmarshal bool into Go struct field MASQUEOutboundOptions.network_list of type string"),
+            "{err}"
+        );
+
+        // prunable containers behave as absent fields
+        assert!(validate(&masque(json!({"network_list": []}))).is_ok());
+        assert!(validate(&masque(json!({"network_list": {}}))).is_ok());
+        assert!(validate(&masque(json!({"network_list": null}))).is_ok());
+        assert!(validate(&masque(json!({"network_list": ["tcp", "udp"]}))).is_ok());
+    }
+
+    #[test]
+    fn masque_prune_and_unknown_fields() {
+        // prunable unknown fields vanish before the strict decode
+        assert!(validate(&masque(json!({"zzz": {}}))).is_ok());
+        assert!(validate(&masque(json!({"zzz": []}))).is_ok());
+        assert!(validate(&masque(json!({"zzz": [[]]}))).is_ok());
+        assert!(validate(&masque(json!({"mtu": {}}))).is_ok());
+        assert!(validate(&masque(json!({"uri": null}))).is_ok());
+
+        // surviving unknown fields are rejected whatever their shape
+        for extra in [
+            json!({"zzz": 1}),
+            json!({"zzz": null}),
+            json!({"zzz": ["x"]}),
+        ] {
+            let err = masque_err(extra);
+            assert!(
+                err.contains("outbounds[0].zzz: json: unknown field \"zzz\""),
+                "{err}"
+            );
+        }
+
+        let err = masque_err(json!({"interface_name": "eth0"}));
+        assert!(err.contains("unknown field \"interface_name\""), "{err}");
+
+        // field errors are reported before unknown fields (probe p6_unknown_vs_str)
+        let err = masque_err(json!({"profile": 1, "zzz": 2}));
+        assert!(
+            err.contains("MASQUEOutboundOptions.profile of type string"),
+            "{err}"
+        );
+        let err = masque_err(json!({"profile": 1, "aaa": 2}));
+        assert!(
+            err.contains("MASQUEOutboundOptions.profile of type string"),
+            "{err}"
+        );
+
+        // error ordering inside the field pass follows the probe matrix
+        let err = masque_err(json!({"profile": 1, "mtu": -1}));
+        assert!(
+            err.contains("MASQUEOutboundOptions.profile of type string"),
+            "{err}"
+        );
+        let err = masque_err(json!({"ip": 3, "vhttp": 2}));
+        assert!(
+            err.contains("MASQUEOutboundOptions.ip of type string"),
+            "{err}"
+        );
+        let err = masque_err(json!({"network_list": "icmp", "vhttp": "bad"}));
+        assert!(err.contains("unknown network: icmp"), "{err}");
+        let err = masque_err(json!({"keep_alive_period": "bogus1", "idle_timeout": "bogus2"}));
+        assert!(
+            err.contains("keep_alive_period: time: invalid duration \"bogus1\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn masque_type_and_tag_null() {
+        // type: null falls through to the unknown-type check (pc_type_null)
+        let err = validate(&json!({"outbounds": [{"type": null, "tag": "w"}]})).unwrap_err();
+        assert!(
+            err.contains("outbounds[0]: unknown outbound type: "),
+            "{err}"
+        );
+
+        // tag: null behaves as an absent tag
+        let err = validate(&json!({"outbounds": [{"type": "masque"}]})).unwrap_err();
+        assert!(err.contains("at least one of ip/ipv6 is required"), "{err}");
+    }
+
+    #[test]
+    fn masque_server_port_generic_check() {
+        let err = masque_err(json!({"server_port": -1}));
+        assert!(err.contains("outbounds[0].server_port:"), "{err}");
+        let err = masque_err(json!({"server_port": 70000}));
+        assert!(err.contains("outbounds[0].server_port:"), "{err}");
+        // prunable/null ports skip the generic check
+        assert!(validate(&masque(json!({"server_port": null}))).is_ok());
+        assert!(validate(&masque(json!({"server_port": []}))).is_ok());
     }
 }

@@ -1,0 +1,239 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="100%" height="100%">
+  <title>Tachyon Core - Relativistic Speed &amp; Line-Rate Throughput</title>
+  <defs>
+    <!-- Dark Tech Canvas Gradient -->
+    <radialGradient id="speed-bg" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#111827" stop-opacity="0.95"/>
+      <stop offset="45%" stop-color="#090D16" stop-opacity="0.98"/>
+      <stop offset="100%" stop-color="#030712" stop-opacity="1"/>
+    </radialGradient>
+
+    <radialGradient id="speed-cyan-glow" cx="25%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00F0FF" stop-opacity="0.22"/>
+      <stop offset="60%" stop-color="#00F0FF" stop-opacity="0.03"/>
+      <stop offset="100%" stop-color="#00F0FF" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="speed-purple-glow" cx="80%" cy="70%" r="50%">
+      <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.18"/>
+      <stop offset="70%" stop-color="#8B5CF6" stop-opacity="0.02"/>
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Holographic Title Gradient -->
+    <linearGradient id="speed-title-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00F0FF"/>
+      <stop offset="35%" stop-color="#38BDF8"/>
+      <stop offset="70%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+
+    <linearGradient id="gauge-grad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="50%" stop-color="#00F0FF"/>
+      <stop offset="85%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+
+    <linearGradient id="speed-card-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#0F172A" stop-opacity="0.85"/>
+    </linearGradient>
+
+    <linearGradient id="laser-stream-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00F0FF" stop-opacity="0"/>
+      <stop offset="30%" stop-color="#00F0FF" stop-opacity="0.8"/>
+      <stop offset="70%" stop-color="#C084FC" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#00F0FF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Neon Glow Filter -->
+    <filter id="speed-glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1200" height="340">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="core-speed-glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1200" height="340">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <style>
+    @keyframes warpDash1 {
+      0% { stroke-dashoffset: 240; }
+      100% { stroke-dashoffset: 0; }
+    }
+    @keyframes warpDash2 {
+      0% { stroke-dashoffset: 180; }
+      100% { stroke-dashoffset: 0; }
+    }
+    @keyframes pulseSpeedHub {
+      0%, 100% { transform: scale(1); opacity: 0.9; }
+      50% { transform: scale(1.05); opacity: 1; filter: drop-shadow(0 0 12px #00F0FF); }
+    }
+    @keyframes speedRadarSweep {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    @keyframes beaconFast {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.2; }
+    }
+
+    .warp-track-1 { stroke-dasharray: 24 48; animation: warpDash1 1.4s linear infinite; }
+    .warp-track-2 { stroke-dasharray: 16 32; animation: warpDash2 0.9s linear infinite; }
+    .warp-track-3 { stroke-dasharray: 32 64; animation: warpDash1 2.0s linear infinite; }
+    .gauge-pulse { transform-origin: 195px 190px; animation: pulseSpeedHub 2.5s ease-in-out infinite; }
+    .radar-rot { transform-origin: 195px 190px; animation: speedRadarSweep 4s linear infinite; }
+    .beacon-fast { animation: beaconFast 1.2s ease-in-out infinite; }
+
+    .speed-title { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; font-size: 20px; fill: url(#speed-title-grad); letter-spacing: 1px; }
+    .speed-sub { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 500; font-size: 13px; fill: #94A3B8; }
+    .card-title { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 700; font-size: 13px; fill: #F8FAFC; }
+    .card-sub { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 400; font-size: 11px; fill: #94A3B8; }
+    .metric-num { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 22px; font-weight: 900; }
+    .tag-val { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10px; font-weight: 700; }
+  </style>
+
+  <!-- Background Base -->
+  <rect width="1200" height="340" rx="16" fill="url(#speed-bg)" stroke="#1E293B" stroke-width="1.5"/>
+  <rect width="1200" height="340" rx="16" fill="url(#speed-cyan-glow)"/>
+  <rect width="1200" height="340" rx="16" fill="url(#speed-purple-glow)"/>
+
+  <!-- Matrix Grid Lines -->
+  <g opacity="0.05" stroke="#FFFFFF" stroke-width="1">
+    <path d="M 0,60 L 1200,60 M 0,130 L 1200,130 M 0,200 L 1200,200 M 0,270 L 1200,270" />
+    <path d="M 120,0 L 120,340 M 240,0 L 240,340 M 360,0 L 360,340 M 480,0 L 480,340 M 600,0 L 600,340 M 720,0 L 720,340 M 840,0 L 840,340 M 960,0 L 960,340 M 1080,0 L 1080,340" />
+  </g>
+
+  <!-- Top Header -->
+  <g transform="translate(45, 30)">
+    <rect width="210" height="22" rx="11" fill="#0B132B" stroke="#00F0FF" stroke-width="1" stroke-opacity="0.6"/>
+    <circle cx="12" cy="11" r="3.5" fill="#00F0FF" class="beacon-fast"/>
+    <text x="24" y="15" font-family="ui-monospace, monospace" font-size="10" font-weight="700" fill="#00F0FF">THROUGHPUT &amp; ZERO-COPY</text>
+
+    <text x="0" y="44" class="speed-title">⚡ TACHYON RELATIVISTIC VELOCITY PIPELINE</text>
+    <text x="0" y="62" class="speed-sub">Линейная аппаратная скорость 10G, нулевое копирование в userspace и детерминированные тайминги</text>
+  </g>
+
+  <!-- ================================================================= -->
+  <!-- LEFT: LINE-RATE SPEEDOMETER HUD GAUGE -->
+  <!-- ================================================================= -->
+  <g transform="translate(195, 205)">
+    <!-- Outer Tachyon Orbit Track -->
+    <circle r="92" fill="none" stroke="#1E293B" stroke-width="6"/>
+    <!-- Animated Arc Track (270 degrees sweep) -->
+    <circle r="92" fill="none" stroke="url(#gauge-grad)" stroke-width="6" stroke-dasharray="410 170" stroke-linecap="round" filter="url(#speed-glow)"/>
+    
+    <!-- Rotating Sensor Reticle -->
+    <g class="radar-rot">
+      <circle r="72" fill="none" stroke="#334155" stroke-width="1" stroke-dasharray="6 12"/>
+      <circle cx="72" cy="0" r="3.5" fill="#00F0FF" filter="url(#core-speed-glow)"/>
+      <circle cx="-72" cy="0" r="2.5" fill="#C084FC"/>
+    </g>
+
+    <!-- Speed Ticks -->
+    <line x1="-80" y1="40" x2="-68" y2="34" stroke="#64748B" stroke-width="2"/>
+    <line x1="-80" y1="-40" x2="-68" y2="-34" stroke="#64748B" stroke-width="2"/>
+    <line x1="0" y1="-86" x2="0" y2="-74" stroke="#00F0FF" stroke-width="2"/>
+    <line x1="80" y1="-40" x2="68" y2="-34" stroke="#818CF8" stroke-width="2"/>
+    <line x1="80" y1="40" x2="68" y2="34" stroke="#C084FC" stroke-width="2"/>
+
+    <!-- Central Fusion Core -->
+    <g class="gauge-pulse">
+      <circle r="52" fill="#090E1A" stroke="#00F0FF" stroke-width="2" filter="url(#core-speed-glow)"/>
+      <circle r="42" fill="#0F172A" stroke="#38BDF8" stroke-width="1.2"/>
+      <!-- Lightning Velocity Icon -->
+      <path d="M 2,-16 L -10,2 L -1,2 L -3,18 L 11,-2 L 2,-2 Z" fill="url(#speed-title-grad)"/>
+    </g>
+
+    <!-- Speed Readout Below Needle -->
+    <text y="70" font-family="ui-monospace, monospace" font-size="11" font-weight="700" fill="#00F0FF" text-anchor="middle" letter-spacing="1">10 Gbps LINE-SPEED</text>
+  </g>
+
+  <!-- ================================================================= -->
+  <!-- CENTER: DYNAMIC WARP SPEED CONDUITS (Accelerating Streams) -->
+  <!-- ================================================================= -->
+  <g fill="none" stroke-linecap="round" transform="translate(315, 120)">
+    <!-- Stream 1 (High Top) -->
+    <path d="M 0,25 L 260,25" stroke="#1E293B" stroke-width="2"/>
+    <path d="M 0,25 L 260,25" stroke="#10B981" stroke-width="2.5" class="warp-track-2" filter="url(#speed-glow)"/>
+
+    <!-- Stream 2 (Core Beam Center) -->
+    <path d="M 0,65 L 260,65" stroke="#1E293B" stroke-width="3"/>
+    <path d="M 0,65 L 260,65" stroke="url(#laser-stream-grad)" stroke-width="3.5" class="warp-track-1" filter="url(#core-speed-glow)"/>
+
+    <!-- Stream 3 (Middle High) -->
+    <path d="M 0,105 L 260,105" stroke="#1E293B" stroke-width="2"/>
+    <path d="M 0,105 L 260,105" stroke="#00F0FF" stroke-width="2.5" class="warp-track-2" filter="url(#speed-glow)"/>
+
+    <!-- Stream 4 (Bottom Heavy) -->
+    <path d="M 0,145 L 260,145" stroke="#1E293B" stroke-width="2"/>
+    <path d="M 0,145 L 260,145" stroke="#C084FC" stroke-width="2.5" class="warp-track-3"/>
+  </g>
+
+  <!-- ================================================================= -->
+  <!-- RIGHT: 4 SPEED TELEMETRY PODS (2x2 Grid) -->
+  <!-- ================================================================= -->
+  <g transform="translate(605, 110)">
+    <!-- Pod 1: Throughput -->
+    <g transform="translate(0, 0)">
+      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#10B981" stroke-opacity="0.35" stroke-width="1.2"/>
+      <g transform="translate(14, 14)">
+        <circle cx="14" cy="14" r="12" fill="#10B981" fill-opacity="0.15"/>
+        <text x="7" y="19" font-size="14">⚡</text>
+        <text x="34" y="13" class="card-title">Wire-Speed Throughput</text>
+        <text x="34" y="26" class="tag-val" fill="#10B981">ZERO-COPY SPLICER</text>
+      </g>
+      <text x="16" y="64" class="metric-num" fill="#34D399">10 Gbps+</text>
+      <text x="140" y="64" class="card-sub">Полная скорость интерфейса</text>
+      <text x="16" y="80" class="card-sub">Перенаправление без копий в userspace</text>
+    </g>
+
+    <!-- Pod 2: Packet Forwarding Rate -->
+    <g transform="translate(285, 0)">
+      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#00F0FF" stroke-opacity="0.35" stroke-width="1.2"/>
+      <g transform="translate(14, 14)">
+        <circle cx="14" cy="14" r="12" fill="#00F0FF" fill-opacity="0.15"/>
+        <text x="7" y="19" font-size="14">🚀</text>
+        <text x="34" y="13" class="card-title">Packet Forwarding</text>
+        <text x="34" y="26" class="tag-val" fill="#38BDF8">STEADY-STATE ZERO ALLOC</text>
+      </g>
+      <text x="16" y="64" class="metric-num" fill="#00F0FF">1.48 Mpps</text>
+      <text x="142" y="64" class="card-sub">Миллионов пакетов/сек</text>
+      <text x="16" y="80" class="card-sub">Кольцевые буферы bytes::Bytes</text>
+    </g>
+
+    <!-- Pod 3: Latency Jitter -->
+    <g transform="translate(0, 106)">
+      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#8B5CF6" stroke-opacity="0.35" stroke-width="1.2"/>
+      <g transform="translate(14, 14)">
+        <circle cx="14" cy="14" r="12" fill="#8B5CF6" fill-opacity="0.15"/>
+        <text x="7" y="19" font-size="14">⏱️</text>
+        <text x="34" y="13" class="card-title">GC Latency Jitter</text>
+        <text x="34" y="26" class="tag-val" fill="#C084FC">DETERMINISTIC RAII</text>
+      </g>
+      <text x="16" y="64" class="metric-num" fill="#C084FC">0.00 ms</text>
+      <text x="122" y="64" class="card-sub">Нулевые паузы GC</text>
+      <text x="16" y="80" class="card-sub">Стабильный пинг в Discord и играх</text>
+    </g>
+
+    <!-- Pod 4: CPU Cycle Efficiency -->
+    <g transform="translate(285, 106)">
+      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#F59E0B" stroke-opacity="0.35" stroke-width="1.2"/>
+      <g transform="translate(14, 14)">
+        <circle cx="14" cy="14" r="12" fill="#F59E0B" fill-opacity="0.15"/>
+        <text x="7" y="19" font-size="14">🧠</text>
+        <text x="34" y="13" class="card-title">Router CPU Cycles</text>
+        <text x="34" y="26" class="tag-val" fill="#FBBF24">MIPS / ARM OPTIMIZED</text>
+      </g>
+      <text x="16" y="64" class="metric-num" fill="#FBBF24">&lt; 3% CPU</text>
+      <text x="120" y="64" class="card-sub">На слабых процессорах</text>
+      <text x="16" y="80" class="card-sub">LTO + opt-level=z + abort-on-panic</text>
+    </g>
+  </g>
+</svg>

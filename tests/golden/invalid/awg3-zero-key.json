@@ -1,0 +1,61 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wg",
+      "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "address": [
+        "10.77.77.2/24"
+      ],
+      "peers": [
+        {
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "allowed_ips": [
+            "0.0.0.0/0"
+          ],
+          "persistent_keepalive_interval": "25-35"
+        }
+      ],
+      "jc": 3,
+      "jmin": 60,
+      "jmax": 120,
+      "s1": 16,
+      "s2": 16,
+      "s3": 16,
+      "s4": 16,
+      "h1": 123,
+      "h2": 234,
+      "h3": 345,
+      "h4": 456,
+      "header_protection_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "content_padding_addition": "10-100",
+      "rekey_after_time": "100-120",
+      "rekey_timeout": "3-7",
+      "reject_after_time": "150-180",
+      "keepalive_timeout": "5-15",
+      "max_handshake_attempts": "15-20",
+      "random_trailers": true,
+      "disable_cookies": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

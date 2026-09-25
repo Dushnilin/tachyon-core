@@ -63,7 +63,13 @@ Most contemporary proxy cores (sing-box, sing-box-lx, Xray) are written in **Go*
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
 
-## 📊 Empirical Benchmarks
+## 📊 Performance & Line-Rate Velocity
+ 
+<div align="center">
+
+![Tachyon Speed Pipeline](assets/readme/tachyon_speed.svg)
+
+</div>
 
 Measured on real static musl builds under OpenWrt across target architectures:
 

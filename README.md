@@ -63,7 +63,13 @@
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
 
-## 📊 Эмпирические бенчмарки и замеры
+## 📊 Производительность и скорость (Line-Rate Velocity)
+
+<div align="center">
+
+![Tachyon Speed Pipeline](assets/readme/tachyon_speed.svg)
+
+</div>
 
 Замеры проведены на реальных статических musl-сборках под OpenWrt на эталонных аппаратных архитектурах:
 

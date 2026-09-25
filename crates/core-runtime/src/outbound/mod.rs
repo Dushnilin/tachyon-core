@@ -1,6 +1,7 @@
 pub mod block;
 pub mod direct;
 pub mod hysteria2;
+pub mod masque;
 pub mod proxy;
 pub mod quic;
 pub mod secure;

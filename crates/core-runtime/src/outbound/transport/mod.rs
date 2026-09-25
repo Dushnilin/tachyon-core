@@ -4,6 +4,7 @@
 mod grpc;
 pub(crate) mod h2io;
 mod http;
+pub(crate) mod xhttp;
 
 use std::collections::VecDeque;
 use std::io;
@@ -55,6 +56,7 @@ enum Kind {
         method: String,
         headers: Vec<(String, String)>,
     },
+    Xhttp(Box<xhttp::XhttpConfig>),
 }
 
 fn parse_headers(value: Option<&Value>, at: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -207,6 +209,7 @@ impl Transport {
                     headers: parse_headers(transport.get("headers"), at)?,
                 }
             }
+            "xhttp" => Kind::Xhttp(Box::new(xhttp::XhttpConfig::parse(transport)?)),
             other => anyhow::bail!("{at}: transport type {other:?} not implemented yet"),
         };
         Ok(Self { kind })
@@ -222,7 +225,7 @@ impl Transport {
     ) -> io::Result<AnyStream> {
         // sing-box defaults ALPN to h2 for grpc/http when the user set none.
         let default_alpn: &[&[u8]] = match &self.kind {
-            Kind::Grpc { .. } => &[b"h2"],
+            Kind::Grpc { .. } | Kind::Xhttp(_) => &[b"h2"],
             Kind::Http { .. } if tls.is_some() => &[b"h2"],
             _ => &[],
         };
@@ -270,6 +273,7 @@ impl Transport {
                 )
                 .await
             }
+            Kind::Xhttp(cfg) => xhttp::connect(stream, tls.is_some(), server, port, cfg).await,
         }
     }
 }

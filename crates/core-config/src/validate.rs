@@ -2102,6 +2102,296 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
     Ok(())
 }
 
+/// Reference `option.V2RayXHTTPOptions` decode + the sing-box-extended
+/// option-layer normalization gates (SPEC 002 / PARAM_MAP): modes, placements,
+/// range fields, xmux. Unknown fields reject like the strict JSON decoder;
+/// `uplink_http_method: GET` outside packet-up is the lx soft fallback (WARN
+/// at runtime, accepted at check).
+fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), String> {
+    const KNOWN: &[&str] = &[
+        "type",
+        "host",
+        "path",
+        "mode",
+        "headers",
+        "x_padding_bytes",
+        "xmux",
+        "no_grpc_header",
+        "session_placement",
+        "session_key",
+        "seq_placement",
+        "seq_key",
+        "session_table",
+        "session_length",
+        "uplink_data_placement",
+        "uplink_data_key",
+        "uplink_chunk_size",
+        "uplink_http_method",
+        "x_padding_obfs_mode",
+        "x_padding_key",
+        "x_padding_header",
+        "x_padding_placement",
+        "x_padding_method",
+        "sc_max_each_post_bytes",
+        "sc_min_posts_interval_ms",
+        "sc_max_concurrent_posts",
+        "server_max_header_bytes",
+        "no_sse_header",
+        "sc_max_buffered_posts",
+        "sc_stream_up_server_secs",
+    ];
+    for k in t.keys() {
+        if !KNOWN.contains(&k.as_str()) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    let mode = t.get("mode").and_then(Value::as_str).unwrap_or("");
+    match mode {
+        "" | "auto" | "packet-up" | "stream-up" | "stream-one" => {}
+        other => return Err(format!("v2ray-xhttp: unknown mode: {other}")),
+    }
+    for f in [
+        "host",
+        "path",
+        "session_placement",
+        "session_key",
+        "seq_placement",
+        "seq_key",
+        "session_table",
+        "session_length",
+        "uplink_data_placement",
+        "uplink_data_key",
+        "uplink_chunk_size",
+        "uplink_http_method",
+        "x_padding_bytes",
+        "x_padding_key",
+        "x_padding_header",
+        "x_padding_placement",
+        "x_padding_method",
+        "sc_max_each_post_bytes",
+        "sc_min_posts_interval_ms",
+        "sc_stream_up_server_secs",
+    ] {
+        if let Some(v) = t.get(f)
+            && !v.is_string()
+            && !v.is_null()
+        {
+            return Err(format!(
+                "{at}.{f}: json: cannot unmarshal {} into string",
+                json_kind(v)
+            ));
+        }
+    }
+    for f in ["no_grpc_header", "x_padding_obfs_mode", "no_sse_header"] {
+        if let Some(v) = t.get(f)
+            && !v.is_boolean()
+            && !v.is_null()
+        {
+            return Err(format!(
+                "{at}.{f}: json: cannot unmarshal {} into bool",
+                json_kind(v)
+            ));
+        }
+    }
+    for f in [
+        "sc_max_concurrent_posts",
+        "server_max_header_bytes",
+        "sc_max_buffered_posts",
+    ] {
+        if let Some(v) = t.get(f)
+            && !v.is_number()
+            && !v.is_null()
+        {
+            return Err(format!(
+                "{at}.{f}: json: cannot unmarshal {} into int",
+                json_kind(v)
+            ));
+        }
+    }
+    for (f, allowed, label) in [
+        (
+            "session_placement",
+            &["path", "query", "header", "cookie"][..],
+            "session placement",
+        ),
+        (
+            "seq_placement",
+            &["path", "query", "header", "cookie"][..],
+            "seq placement",
+        ),
+        (
+            "uplink_data_placement",
+            &["body", "auto", "header", "cookie"][..],
+            "uplink data placement",
+        ),
+        (
+            "x_padding_placement",
+            &["cookie", "header", "query", "queryInHeader"][..],
+            "x padding placement",
+        ),
+        (
+            "x_padding_method",
+            &["repeat-x", "tokenish"][..],
+            "x padding method",
+        ),
+    ] {
+        if let Some(v) = t.get(f).and_then(Value::as_str)
+            && !v.is_empty()
+            && !allowed.contains(&v)
+        {
+            return Err(format!("v2ray-xhttp: unsupported {label}: {v}"));
+        }
+    }
+    // header/cookie uplink payload is a packet-up-only shape (hard gate).
+    let uplink = t
+        .get("uplink_data_placement")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if matches!(uplink, "header" | "cookie") && mode != "packet-up" {
+        return Err(format!(
+            "v2ray-xhttp: uplink_data_placement can be {uplink} only in packet-up mode"
+        ));
+    }
+    // Ranged string fields: "N" | "N-M", N <= M.
+    for f in [
+        "x_padding_bytes",
+        "session_length",
+        "uplink_chunk_size",
+        "sc_max_each_post_bytes",
+        "sc_min_posts_interval_ms",
+        "sc_stream_up_server_secs",
+    ] {
+        if let Some(v) = t.get(f).and_then(Value::as_str)
+            && !v.is_empty()
+        {
+            let parts: Vec<&str> = v.split('-').collect();
+            if parts.len() > 2 {
+                return Err(format!(
+                    "{at}.{f}: invalid range \"{v}\": expected int or \"min-max\""
+                ));
+            }
+            let parse = |s: &str| -> Result<i64, String> {
+                s.trim().parse::<i64>().map_err(|_| {
+                    format!("{at}.{f}: invalid range \"{v}\": parse \"{s}\": invalid syntax")
+                })
+            };
+            let lo = parse(parts[0])?;
+            let hi = if parts.len() == 2 {
+                parse(parts[1])?
+            } else {
+                lo
+            };
+            if hi < lo {
+                return Err(format!(
+                    "{at}.{f}: invalid range \"{v}\": range start > end"
+                ));
+            }
+        }
+    }
+    // session id space: table required with a nonzero length; space >= 2^31.
+    let table = t
+        .get("session_table")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let length = t
+        .get("session_length")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !table.is_empty() || !length.is_empty() {
+        if table.is_empty() {
+            return Err(format!(
+                "{at}.session_table: required when session_length is set"
+            ));
+        }
+        let lo = length
+            .split('-')
+            .next()
+            .unwrap_or("0")
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{at}.session_length: invalid range \"{length}\""))?;
+        if lo == 0 {
+            return Err(format!("{at}.session_length: must be above 0"));
+        }
+        // id space: len(table)^min >= 2^31
+        let space = (table.chars().count() as u64).saturating_pow(lo.min(63) as u32);
+        if space < (1u64 << 31) {
+            return Err(format!(
+                "{at}.session_length: session id space {space} is too small (want >= 2^31)"
+            ));
+        }
+    }
+    // xmux
+    if let Some(xmux) = t.get("xmux") {
+        let Some(xmux) = xmux.as_object() else {
+            return Err(format!("{at}.xmux: must be a JSON object"));
+        };
+        for k in xmux.keys() {
+            if ![
+                "max_concurrency",
+                "max_connections",
+                "c_max_reuse_times",
+                "h_max_request_times",
+                "h_max_reusable_secs",
+                "h_keep_alive_period",
+            ]
+            .contains(&k.as_str())
+            {
+                return Err(format!("{at}.xmux.{k}: json: unknown field \"{k}\""));
+            }
+        }
+        let has = |f: &str| xmux.get(f).is_some_and(|v| !v.is_null());
+        if has("max_concurrency") && has("max_connections") {
+            return Err(format!(
+                "{at}.xmux: max_concurrency and max_connections are mutually exclusive"
+            ));
+        }
+        for f in [
+            "max_concurrency",
+            "max_connections",
+            "c_max_reuse_times",
+            "h_max_request_times",
+            "h_max_reusable_secs",
+        ] {
+            match xmux.get(f) {
+                None | Some(Value::Null) => {}
+                Some(Value::Number(_)) => {}
+                Some(Value::String(s)) => {
+                    let parts: Vec<&str> = s.split('-').collect();
+                    if parts.len() > 2 {
+                        return Err(format!(
+                            "{at}.xmux.{f}: invalid range \"{s}\": expected int or \"min-max\""
+                        ));
+                    }
+                }
+                Some(Value::Array(items)) => {
+                    if items.len() != 2 || items.iter().any(|v| !v.is_number()) {
+                        return Err(format!("{at}.xmux.{f}: range array must be [min, max]"));
+                    }
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{at}.xmux.{f}: json: cannot unmarshal {} into range",
+                        json_kind(other)
+                    ));
+                }
+            }
+        }
+        if let Some(v) = xmux.get("h_keep_alive_period")
+            && !v.is_number()
+            && !v.is_null()
+        {
+            return Err(format!(
+                "{at}.xmux.h_keep_alive_period: json: cannot unmarshal {} into int",
+                json_kind(v)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_outbound(
     i: usize,
     ty: &str,
@@ -2142,6 +2432,9 @@ fn validate_outbound(
         }
         if transport_ty == "quic" && !tls_enabled(obj.get("tls")) {
             return Err(format!("{at}: create client transport: quic: TLS required"));
+        }
+        if transport_ty == "xhttp" {
+            validate_xhttp_transport(transport, &format!("outbounds[{i}].transport"))?;
         }
     }
 

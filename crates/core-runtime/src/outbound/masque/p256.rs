@@ -400,6 +400,291 @@ pub(crate) fn derive_public_key(scalar: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+fn tlv(buf: &[u8], at: usize) -> Result<(u8, &'_ [u8], usize), ()> {
+    let tag = *buf.get(at).ok_or(())?;
+    let mut pos = at + 1;
+    let first = *buf.get(pos).ok_or(())?;
+    pos += 1;
+    let len = if first & 0x80 == 0 {
+        usize::from(first)
+    } else {
+        let n = usize::from(first & 0x7f);
+        if n == 0 || n > 4 {
+            return Err(());
+        }
+        let mut v = 0usize;
+        for _ in 0..n {
+            v = (v << 8) | usize::from(*buf.get(pos).ok_or(())?);
+            pos += 1;
+        }
+        v
+    };
+    let end = pos + len;
+    if end > buf.len() {
+        return Err(());
+    }
+    Ok((tag, &buf[pos..end], end))
+}
+
+/// SEC 1 `ECPrivateKey` TLV walk: SEQUENCE { INTEGER, OCTET STRING, ... }.
+/// PKCS#8 (`BEGIN PRIVATE KEY`) is unwrapped first: SEQUENCE { INTEGER,
+/// SEQ AlgorithmIdentifier, OCTET STRING (SEC 1 ECPrivateKey) }.
+pub(crate) fn sec1_scalar(der: &[u8]) -> Result<Vec<u8>, ()> {
+    let (tag, content, _) = tlv(der, 0)?;
+    if tag != 0x30 {
+        return Err(());
+    }
+    let (t1, _, n1) = tlv(content, 0)?;
+    if t1 != 0x02 {
+        return Err(());
+    }
+    let (t2, c2, n2) = tlv(content, n1)?;
+    if t2 == 0x04 {
+        return Ok(c2.to_vec());
+    }
+    if t2 == 0x30 {
+        let (t3, c3, _) = tlv(content, n2)?;
+        if t3 == 0x04 {
+            return sec1_scalar(c3);
+        }
+    }
+    Err(())
+}
+
+/// Extract the raw EC point (04||X||Y) from a PKIX (RFC 5280 SPKI) public key
+/// `SEQUENCE { SEQ { OID ecPublicKey, OID curve }, BIT STRING point }`.
+pub(crate) fn pkix_point(der: &[u8]) -> Result<Vec<u8>, ()> {
+    let (t, spki_content, _) = tlv(der, 0)?;
+    if t != 0x30 {
+        return Err(());
+    }
+    let (_, _, n_alg) = tlv(spki_content, 0)?;
+    let (t, bit, _) = tlv(spki_content, n_alg)?;
+    if t != 0x03 || bit.first() != Some(&0) {
+        return Err(());
+    }
+    Ok(bit[1..].to_vec())
+}
+
+/// Extract the raw EC point (04||X||Y) from a certificate's SPKI.
+pub(crate) fn cert_spki_point(cert_der: &[u8]) -> Result<Vec<u8>, ()> {
+    let (t, cert, _) = tlv(cert_der, 0)?;
+    if t != 0x30 {
+        return Err(());
+    }
+    let (t, tbs, _) = tlv(cert, 0)?;
+    if t != 0x30 {
+        return Err(());
+    }
+    let mut pos = 0;
+    let (tag0, _, n0) = tlv(tbs, pos)?;
+    if tag0 == 0xa0 {
+        pos = n0;
+    }
+    let mut spki = None;
+    for idx in 0..6 {
+        let (tag, _, n) = tlv(tbs, pos)?;
+        if idx == 5 && tag == 0x30 {
+            spki = Some(&tbs[pos..n]);
+        }
+        pos = n;
+    }
+    let spki = spki.ok_or(())?;
+    let (t, spki_content, _) = tlv(spki, 0)?;
+    if t != 0x30 {
+        return Err(());
+    }
+    let (_, _, n_alg) = tlv(spki_content, 0)?;
+    let (t, bit, _) = tlv(spki_content, n_alg)?;
+    if t != 0x03 || bit.first() != Some(&0) {
+        return Err(());
+    }
+    Ok(bit[1..].to_vec())
+}
+
+// --- group-order (mod n) arithmetic for ECDSA signatures -------------------
+
+/// n - 2, the exponent for the Fermat inverse.
+const N_MINUS_2: Fe = [
+    0xF3B9CAC2FC63254F,
+    0xBCE6FAADA7179E84,
+    0xFFFFFFFFFFFFFFFF,
+    0xFFFFFFFF00000000,
+];
+
+fn sub_n_limb(a: &Fe) -> Fe {
+    // a - n with a >= n (a < 2^256 < 2n, so a single subtraction suffices).
+    let mut out = [0u64; 4];
+    let mut borrow = 0i128;
+    for i in 0..4 {
+        let v = a[i] as i128 - N[i] as i128 - borrow;
+        if v < 0 {
+            out[i] = (v + (1i128 << 64)) as u64;
+            borrow = 1;
+        } else {
+            out[i] = v as u64;
+            borrow = 0;
+        }
+    }
+    out
+}
+
+fn reduce_n(a: &Fe) -> Fe {
+    if cmp(a, &N) != Ordering::Less {
+        sub_n_limb(a)
+    } else {
+        *a
+    }
+}
+
+/// Bit-serial reduction of a 512-bit product modulo n: shift-add into a
+/// 257-bit accumulator with a conditional subtraction per bit.
+fn reduce_wide_n(w: &Wide) -> Fe {
+    let mut acc = [0u64; 5];
+    for i in (0..512).rev() {
+        let bit = (w[i / 64] >> (i % 64)) & 1;
+        let mut carry = bit;
+        for limb in acc.iter_mut().take(5) {
+            let next = (*limb >> 63) & 1;
+            *limb = (*limb << 1) | carry;
+            carry = next;
+        }
+        // acc >= n ? (n padded to 5 limbs)
+        let ge = acc[4] > 0
+            || acc[3] > N[3]
+            || (acc[3] == N[3]
+                && (acc[2] > N[2]
+                    || (acc[2] == N[2] && (acc[1] > N[1] || (acc[1] == N[1] && acc[0] >= N[0])))));
+        if ge {
+            let mut borrow = 0i128;
+            for i in 0..4 {
+                let v = acc[i] as i128 - N[i] as i128 - borrow;
+                if v < 0 {
+                    acc[i] = (v + (1i128 << 64)) as u64;
+                    borrow = 1;
+                } else {
+                    acc[i] = v as u64;
+                    borrow = 0;
+                }
+            }
+            acc[4] = acc[4].wrapping_sub(borrow as u64);
+        }
+    }
+    [acc[0], acc[1], acc[2], acc[3]]
+}
+
+fn mul_mod_n(a: &Fe, b: &Fe) -> Fe {
+    reduce_wide_n(&mul(a, b))
+}
+
+/// (a + b) mod n for a, b < n: the sum is below 2n, so one conditional
+/// subtraction suffices; the 256-bit carry also implies >= n.
+fn add_mod_n(a: &Fe, b: &Fe) -> Fe {
+    let mut out = [0u64; 4];
+    let mut carry = 0u64;
+    for i in 0..4 {
+        let (s1, c1) = a[i].overflowing_add(b[i]);
+        let (s2, c2) = s1.overflowing_add(carry);
+        out[i] = s2;
+        carry = u64::from(c1) + u64::from(c2);
+    }
+    if carry > 0 || cmp(&out, &N) != Ordering::Less {
+        sub_n_limb(&out)
+    } else {
+        out
+    }
+}
+
+fn pow_mod_n(base: &Fe, exp: &Fe) -> Fe {
+    let mut result = ONE;
+    let mut b = *base;
+    for i in 0..256 {
+        let limb = exp[i / 64];
+        if (limb >> (i % 64)) & 1 == 1 {
+            result = mul_mod_n(&result, &b);
+        }
+        b = mul_mod_n(&b, &b);
+    }
+    result
+}
+
+fn inv_n(x: &Fe) -> Fe {
+    pow_mod_n(x, &N_MINUS_2)
+}
+
+/// Deterministic ECDSA (RFC 6979, P-256 with SHA-256) over `msg`.
+/// Returns `(r, s)` big-endian 32-byte integers, as used in X.509 signatures.
+pub(crate) fn ecdsa_sign_sha256(msg: &[u8], d: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), Error> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let x = from_be(d);
+    if x == ZERO {
+        return Err(Error::ZeroScalar);
+    }
+    if cmp(&x, &N) != Ordering::Less {
+        return Err(Error::ScalarOutOfRange);
+    }
+    let h = Sha256::digest(msg);
+    let z = reduce_n(&from_be(&h));
+
+    // RFC 6979 §3.2: deterministic k stream.
+    let x_octets = to_be(&x);
+    let z_octets = to_be(&z);
+    let mut k_candidate = [0u8; 32];
+    let mut v = [0x01u8; 32];
+    let mut k = [0u8; 32];
+    let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+    mac.update(&v);
+    mac.update(&[0x00]);
+    mac.update(&x_octets);
+    mac.update(&z_octets);
+    k = mac.finalize().into_bytes().into();
+    let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+    mac.update(&v);
+    v = mac.finalize().into_bytes().into();
+    let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+    mac.update(&v);
+    mac.update(&[0x01]);
+    mac.update(&x_octets);
+    mac.update(&z_octets);
+    k = mac.finalize().into_bytes().into();
+    let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+    mac.update(&v);
+    v = mac.finalize().into_bytes().into();
+
+    let (r, s) = loop {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+        mac.update(&v);
+        v = mac.finalize().into_bytes().into();
+        k_candidate.copy_from_slice(&v);
+        let kk = from_be(&k_candidate);
+        if kk != ZERO && cmp(&kk, &N) == Ordering::Less {
+            let point = scalar_mult(&to_be(&kk));
+            let (rx, _) = to_affine(&point).ok_or(Error::ZeroScalar)?;
+            let rr = reduce_n(&rx);
+            if rr != ZERO {
+                let kinv = inv_n(&kk);
+                let rd = mul_mod_n(&rr, &x);
+                let t = add_mod_n(&rd, &z);
+                let ss = mul_mod_n(&kinv, &t);
+                if ss != ZERO {
+                    break (rr, ss);
+                }
+            }
+        }
+        // RFC 6979 §3.2.h: restart with K = HMAC(K, V || 0x00), V = HMAC(K, V).
+        let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+        mac.update(&v);
+        mac.update(&[0x00]);
+        k = mac.finalize().into_bytes().into();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&k).expect("hmac key");
+        mac.update(&v);
+        v = mac.finalize().into_bytes().into();
+    };
+    Ok((to_be(&r), to_be(&s)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +754,27 @@ mod tests {
         let q = derive_public_key(&k).unwrap();
         assert_eq!(&q[1..33], &to_be(&GX));
         assert_eq!(&q[33..], &to_be(&GY));
+    }
+
+    #[test]
+    fn rfc6979_ecdsa_sign_sample() {
+        // RFC 6979 A.2.5 P-256 with SHA-256, message "sample".
+        let d = hex_decode("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721");
+        let mut d32 = [0u8; 32];
+        d32.copy_from_slice(&d);
+        let (r, s) = ecdsa_sign_sha256(b"sample", &d32).unwrap();
+        assert_eq!(
+            &r[..],
+            &hex_decode("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716")[..]
+        );
+        assert_eq!(
+            &s[..],
+            &hex_decode("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")[..]
+        );
+        // Determinism.
+        let (r2, s2) = ecdsa_sign_sha256(b"sample", &d32).unwrap();
+        assert_eq!(r, r2);
+        assert_eq!(s, s2);
     }
 
     #[test]
@@ -550,92 +856,5 @@ mod tests {
             }
         }
         out
-    }
-
-    fn tlv(buf: &[u8], at: usize) -> Result<(u8, &'_ [u8], usize), ()> {
-        let tag = *buf.get(at).ok_or(())?;
-        let mut pos = at + 1;
-        let first = *buf.get(pos).ok_or(())?;
-        pos += 1;
-        let len = if first & 0x80 == 0 {
-            usize::from(first)
-        } else {
-            let n = usize::from(first & 0x7f);
-            if n == 0 || n > 4 {
-                return Err(());
-            }
-            let mut v = 0usize;
-            for _ in 0..n {
-                v = (v << 8) | usize::from(*buf.get(pos).ok_or(())?);
-                pos += 1;
-            }
-            v
-        };
-        let end = pos + len;
-        if end > buf.len() {
-            return Err(());
-        }
-        Ok((tag, &buf[pos..end], end))
-    }
-
-    /// SEC 1 `ECPrivateKey` TLV walk: SEQUENCE { INTEGER, OCTET STRING, ... }.
-    /// PKCS#8 (`BEGIN PRIVATE KEY`) is unwrapped first: SEQUENCE { INTEGER,
-    /// SEQ AlgorithmIdentifier, OCTET STRING (SEC 1 ECPrivateKey) }.
-    fn sec1_scalar(der: &[u8]) -> Result<Vec<u8>, ()> {
-        let (tag, content, _) = tlv(der, 0)?;
-        if tag != 0x30 {
-            return Err(());
-        }
-        let (t1, _, n1) = tlv(content, 0)?;
-        if t1 != 0x02 {
-            return Err(());
-        }
-        let (t2, c2, n2) = tlv(content, n1)?;
-        if t2 == 0x04 {
-            return Ok(c2.to_vec());
-        }
-        if t2 == 0x30 {
-            let (t3, c3, _) = tlv(content, n2)?;
-            if t3 == 0x04 {
-                return sec1_scalar(c3);
-            }
-        }
-        Err(())
-    }
-
-    /// Extract the raw EC point (04||X||Y) from a certificate's SPKI.
-    fn cert_spki_point(cert_der: &[u8]) -> Result<Vec<u8>, ()> {
-        let (t, cert, _) = tlv(cert_der, 0)?;
-        if t != 0x30 {
-            return Err(());
-        }
-        let (t, tbs, _) = tlv(cert, 0)?;
-        if t != 0x30 {
-            return Err(());
-        }
-        let mut pos = 0;
-        let (tag0, _, n0) = tlv(tbs, pos)?;
-        if tag0 == 0xa0 {
-            pos = n0;
-        }
-        let mut spki = None;
-        for idx in 0..6 {
-            let (tag, _, n) = tlv(tbs, pos)?;
-            if idx == 5 && tag == 0x30 {
-                spki = Some(&tbs[pos..n]);
-            }
-            pos = n;
-        }
-        let spki = spki.ok_or(())?;
-        let (t, spki_content, _) = tlv(spki, 0)?;
-        if t != 0x30 {
-            return Err(());
-        }
-        let (_, _, n_alg) = tlv(spki_content, 0)?;
-        let (t, bit, _) = tlv(spki_content, n_alg)?;
-        if t != 0x03 || bit.first() != Some(&0) {
-            return Err(());
-        }
-        Ok(bit[1..].to_vec())
     }
 }

@@ -32,6 +32,37 @@ pub const MSG_RESPONSE: u8 = 2;
 pub const MSG_COOKIE_REPLY: u8 = 3;
 pub const MSG_TRANSPORT: u8 = 4;
 
+/// Inclusive `lo..=hi` range for an AWG magic-header type word. Plain
+/// WireGuard is the single-value range `N..=N` (types 1–4).
+pub type HeaderRange = (u32, u32);
+
+pub const HDR_INIT: HeaderRange = (MSG_INITIATION as u32, MSG_INITIATION as u32);
+pub const HDR_RESPONSE: HeaderRange = (MSG_RESPONSE as u32, MSG_RESPONSE as u32);
+pub const HDR_COOKIE: HeaderRange = (MSG_COOKIE_REPLY as u32, MSG_COOKIE_REPLY as u32);
+pub const HDR_TRANSPORT: HeaderRange = (MSG_TRANSPORT as u32, MSG_TRANSPORT as u32);
+
+/// `magicHeader.Generate()` (Leadaxe/wireguard-go device/magic-header.go):
+/// uniform pick inside the inclusive range.
+pub fn gen_type(range: HeaderRange) -> u32 {
+    let (lo, hi) = range;
+    debug_assert!(lo <= hi);
+    if lo == hi {
+        return lo;
+    }
+    let span = (hi - lo + 1) as u64;
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("getrandom");
+    lo + (u64::from_le_bytes(buf) % span) as u32
+}
+
+/// First 4 bytes of a datagram as the LE type word the device layer checks.
+pub fn type_word(msg: &[u8]) -> Option<u32> {
+    if msg.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes(msg[..4].try_into().expect("4 bytes")))
+}
+
 fn hash(data: &[u8]) -> [u8; 32] {
     Blake2s256::digest(data).into()
 }
@@ -195,13 +226,16 @@ impl Handshake {
 }
 
 /// Build a handshake initiation. `tai64n` is fixed by the caller so
-/// retransmissions carry an identical timestamp.
+/// retransmissions carry an identical timestamp. `type_word` is the AWG
+/// magic header for the initiation (pass 1 / `gen_type(HDR_INIT)` range
+/// value for plain WireGuard).
 pub fn build_initiation(
     our_static_priv: &[u8; 32],
     our_static_pub: &[u8; 32],
     peer_static_pub: &[u8; 32],
     cookie: Option<&[u8; 16]>,
     tai64n: &[u8; 12],
+    type_word: u32,
 ) -> Handshake {
     let sender_index = random_u32_nonzero();
     let e_priv = random_32();
@@ -222,8 +256,7 @@ pub fn build_initiation(
     };
 
     let mut msg = Vec::with_capacity(INITIATION_LEN);
-    msg.push(MSG_INITIATION);
-    msg.extend_from_slice(&[0, 0, 0]);
+    msg.extend_from_slice(&type_word.to_le_bytes());
     msg.extend_from_slice(&sender_index.to_le_bytes());
     msg.extend_from_slice(e_pub.as_bytes());
     h = hash_concat(&h, e_pub.as_bytes());
@@ -276,9 +309,7 @@ pub fn process_response(
     if msg.len() != RESPONSE_LEN {
         return Err("short handshake response");
     }
-    if msg[0] != MSG_RESPONSE {
-        return Err("not a handshake response");
-    }
+    // The magic-header word was range-validated by the caller's demux.
     // Handshake response layout: [4..8] = responder's sender index,
     // [8..12] = receiver (our initiation sender index).
     let receiver_index = u32::from_le_bytes(msg[8..12].try_into().unwrap());
@@ -338,6 +369,7 @@ pub fn process_response(
         recv_max: 0,
         recv_any: false,
         recv_bitmap: [0u64; 32],
+        awg_transport: HDR_TRANSPORT,
     })
 }
 
@@ -355,9 +387,16 @@ pub struct Session {
     recv_max: u64,
     recv_any: bool,
     recv_bitmap: [u64; 32],
+    /// AWG magic-header range for transport type words (plain WG: `4..=4`).
+    awg_transport: HeaderRange,
 }
 
 impl Session {
+    /// Switch the transport header to an AWG magic-header range.
+    pub fn set_awg_transport(&mut self, range: HeaderRange) {
+        self.awg_transport = range;
+    }
+
     /// Seal one inner packet into a transport message (pads to 16 bytes).
     pub fn seal(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         if self.send_counter > REJECT_AFTER_MESSAGES {
@@ -369,8 +408,7 @@ impl Session {
         let counter = self.send_counter;
         self.send_counter += 1;
         let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded.len() + 16);
-        msg.push(MSG_TRANSPORT);
-        msg.extend_from_slice(&[0, 0, 0]);
+        msg.extend_from_slice(&gen_type(self.awg_transport).to_le_bytes());
         msg.extend_from_slice(&self.remote_index.to_le_bytes());
         msg.extend_from_slice(&counter.to_le_bytes());
         msg.extend_from_slice(&aead_seal(&self.send_key, counter, &padded, &[]));
@@ -383,7 +421,9 @@ impl Session {
         if msg.len() < TRANSPORT_HEADER_LEN + 16 {
             return None;
         }
-        if msg[0] != MSG_TRANSPORT {
+        let word = type_word(msg)?;
+        let (lo, hi) = self.awg_transport;
+        if word < lo || word > hi {
             return None;
         }
         let receiver = u32::from_le_bytes(msg[4..8].try_into().unwrap());
@@ -460,9 +500,7 @@ pub fn decrypt_cookie(
     if msg.len() != COOKIE_REPLY_LEN {
         return Err("short cookie reply");
     }
-    if msg[0] != MSG_COOKIE_REPLY {
-        return Err("not a cookie reply");
-    }
+    // The magic-header word was range-validated by the caller's demux.
     let receiver = u32::from_le_bytes(msg[4..8].try_into().unwrap());
     if receiver != expect_receiver {
         return Err("cookie reply receiver index mismatch");
@@ -520,13 +558,8 @@ pub fn trim_ip_padding(padded: &[u8]) -> &[u8] {
 }
 
 /// Classify a received WireGuard message; `None` for unknown types.
-pub fn message_type(msg: &[u8]) -> Option<u8> {
-    match msg.first().copied() {
-        Some(t @ (MSG_INITIATION | MSG_RESPONSE | MSG_COOKIE_REPLY | MSG_TRANSPORT)) => Some(t),
-        _ => None,
-    }
-}
-
+/// The classification is by the leading magic-header word; plain WireGuard
+/// keeps types 1–4.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +576,7 @@ mod tests {
             pub_b.as_bytes(),
             None,
             &tai64n_now(),
+            MSG_INITIATION as u32,
         );
         let msg = hs.initiation().to_vec();
         assert_eq!(msg.len(), INITIATION_LEN);
@@ -560,6 +594,7 @@ mod tests {
             pub_b.as_bytes(),
             None,
             &tai64n_now(),
+            1,
         );
         // Same inputs → rebuild produces different ephemeral; instead patch.
         let cookie = [3u8; 16];
@@ -578,6 +613,7 @@ mod tests {
             recv_max: 0,
             recv_any: false,
             recv_bitmap: [0; 32],
+            awg_transport: HDR_TRANSPORT,
         };
         let mut b = Session {
             local_index: 2,
@@ -588,6 +624,7 @@ mod tests {
             recv_max: 0,
             recv_any: false,
             recv_bitmap: [0; 32],
+            awg_transport: HDR_TRANSPORT,
         };
         let pkt = b"hello wireguard tunnel packet";
         let msg = a.seal(pkt).expect("seal");
@@ -616,6 +653,7 @@ mod tests {
             recv_max: 0,
             recv_any: false,
             recv_bitmap: [0; 32],
+            awg_transport: HDR_TRANSPORT,
         };
         assert!(s.accept_counter(5));
         assert!(s.accept_counter(3));
@@ -656,6 +694,7 @@ mod tests {
             pub_b.as_bytes(),
             None,
             &tai64n_now(),
+            1,
         );
         let msg = hs.initiation().to_vec();
 
@@ -740,6 +779,7 @@ mod tests {
             pub_b.as_bytes(),
             None,
             &tai64n_now(),
+            1,
         );
         let msg2 = hs2.initiation().to_vec();
         let mut h = hash_concat(&hash_concat(&ck0, IDENTIFIER), pub_b.as_bytes());

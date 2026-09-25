@@ -5,6 +5,7 @@
 //! directly. Handshake/crypto lives in [`noise`]; timers and the transport
 //! session follow <https://www.wireguard.com/protocol/> (initiator side).
 
+pub mod awg;
 pub mod noise;
 
 use std::collections::{HashMap, VecDeque};
@@ -59,39 +60,6 @@ const PENDING_MAX: usize = 512;
 const EGRESS_BUF_MAX: usize = 1 << 20;
 const MAX_DATAGRAM: usize = 65_535;
 
-/// AWG-only fields; any of them set means an AmneziaWG endpoint (mirrors the
-/// check pass `awg_set` detection).
-const AWG_FIELDS: &[&str] = &[
-    "jc",
-    "jmin",
-    "jmax",
-    "s1",
-    "s2",
-    "s3",
-    "s4",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "i1",
-    "i2",
-    "i3",
-    "i4",
-    "i5",
-    "id",
-    "ip",
-    "ib",
-    "header_protection_key",
-    "content_padding_addition",
-    "rekey_after_time",
-    "rekey_timeout",
-    "reject_after_time",
-    "keepalive_timeout",
-    "max_handshake_attempts",
-    "random_trailers",
-    "disable_cookies",
-];
-
 /// Endpoint fields accepted by check but not honored by the runtime.
 const IGNORED_FIELDS: &[&str] = &[
     "udp_mapping",
@@ -145,20 +113,6 @@ fn parse_keepalive(value: Option<&Value>, at: &str) -> anyhow::Result<Option<Dur
     }
 }
 
-fn awg_field_present(map: &Map<String, Value>, key: &str) -> bool {
-    match map.get(key) {
-        None | Some(Value::Null) => false,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(Value::Bool(b)) => *b,
-        Some(_) => true,
-    }
-}
-
-fn detect_awg(map: &Map<String, Value>) -> bool {
-    AWG_FIELDS.iter().any(|f| awg_field_present(map, f))
-}
-
 #[derive(Clone, Debug)]
 struct PeerConfig {
     host: String,
@@ -180,6 +134,8 @@ struct WgConfig {
     local_addr: Ipv4Addr,
     peers: Vec<PeerConfig>,
     udp_timeout: Duration,
+    /// AmneziaWG obfuscation; `None` for a plain WireGuard endpoint.
+    awg: Option<awg::SharedParams>,
 }
 
 /// `UdpOpen` completion: local port + reply stream.
@@ -230,9 +186,7 @@ impl WireGuard {
         if obj.get("system").and_then(Value::as_bool) == Some(true) {
             anyhow::bail!("{at}: system wireguard is not implemented yet");
         }
-        if detect_awg(obj) {
-            anyhow::bail!("{at}: amneziawg wireguard is not implemented yet");
-        }
+        let awg = awg::AwgParams::from_obj(obj, at)?.map(Arc::new);
         for f in IGNORED_FIELDS {
             if obj.get(*f).is_some_and(|v| !v.is_null()) {
                 logging::warn(format_args!(
@@ -382,6 +336,7 @@ impl WireGuard {
                 local_addr,
                 peers,
                 udp_timeout,
+                awg,
             },
             shared: AsyncMutex::new(None),
         })
@@ -757,6 +712,36 @@ impl Stack {
         }
     }
 
+    /// Send a handshake initiation with AWG dressing: CPS junk datagrams
+    /// (i1–i5), junk packets (jc of jmin..=jmax bytes) and the s1 random
+    /// prefix, mirroring `SendHandshakeInitiation` in the reference device.
+    fn send_handshake_init(&self, pi: usize, init: &[u8]) {
+        let Some(params) = self.cfg.awg.as_ref() else {
+            self.send_raw(pi, init);
+            return;
+        };
+        for chain in params.ipackets.iter().flatten() {
+            let pkt = awg::render_chain(chain);
+            if !pkt.is_empty() {
+                self.send_raw(pi, &pkt);
+            }
+        }
+        for _ in 0..params.junk_count {
+            let n = awg::junk_size(params.junk_min, params.junk_max);
+            if n == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; n];
+            awg::fill_random(&mut buf);
+            self.send_raw(pi, &buf);
+        }
+        let pad = params.padding(awg::INIT);
+        let mut pkt = vec![0u8; pad + init.len()];
+        awg::fill_random(&mut pkt[..pad]);
+        pkt[pad..].copy_from_slice(init);
+        self.send_raw(pi, &pkt);
+    }
+
     /// Queue an IP packet to a peer: seal via the session or buffer until the
     /// handshake completes.
     fn xmit_to_peer(&mut self, pi: usize, pkt: Vec<u8>) {
@@ -822,14 +807,22 @@ impl Stack {
             .filter(|(_, exp)| now < *exp)
             .map(|(c, _)| c);
         let peer_pub = self.peers[pi].endpoint.public_key;
+        let init_word = noise::gen_type(
+            self.cfg
+                .awg
+                .as_ref()
+                .map(|a| a.header(awg::INIT))
+                .unwrap_or(noise::HDR_INIT),
+        );
         let hs = noise::build_initiation(
             &self.cfg.private_key,
             &self.cfg.public_key,
             &peer_pub,
             cookie.as_ref(),
             &noise::tai64n_now(),
+            init_word,
         );
-        self.send_raw(pi, hs.initiation());
+        self.send_handshake_init(pi, hs.initiation());
         logging::debug(format_args!(
             "wireguard[{}]: initiation sent idx={} peer {pi}",
             self.cfg.tag, hs.sender_index
@@ -961,17 +954,20 @@ impl Stack {
     }
 
     fn process_inbound(&mut self, buf: &[u8]) {
-        let Some(msg_type) = noise::message_type(buf) else {
+        // AWG-aware classification: the message may carry an s-padding
+        // prefix and a magic-header type word inside its configured range.
+        let Some((msg_type, padding)) = awg::demux(self.cfg.awg.as_deref(), buf) else {
             return;
         };
-        if buf.len() < 8 {
+        let msg = &buf[padding..];
+        if msg.len() < 8 {
             return;
         }
-        let recv_idx = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+        let recv_idx = u32::from_le_bytes(msg[4..8].try_into().expect("4 bytes"));
         logging::debug(format_args!(
             "wireguard[{}]: recv type={msg_type} len={} idx={recv_idx}",
             self.cfg.tag,
-            buf.len()
+            msg.len()
         ));
         match msg_type {
             noise::MSG_INITIATION => {
@@ -980,14 +976,14 @@ impl Stack {
             // Handshake response layout: [4..8] = sender (responder),
             // [8..12] = receiver (our initiation sender index).
             noise::MSG_RESPONSE => {
-                if buf.len() < 12 {
+                if msg.len() < 12 {
                     return;
                 }
-                let receiver = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
-                self.on_response(buf, receiver);
+                let receiver = u32::from_le_bytes(msg[8..12].try_into().expect("4 bytes"));
+                self.on_response(msg, receiver);
             }
-            noise::MSG_COOKIE_REPLY => self.on_cookie(buf, recv_idx),
-            noise::MSG_TRANSPORT => self.on_transport(buf, recv_idx),
+            noise::MSG_COOKIE_REPLY => self.on_cookie(msg, recv_idx),
+            noise::MSG_TRANSPORT => self.on_transport(msg, recv_idx),
             _ => {}
         }
     }
@@ -1006,7 +1002,10 @@ impl Stack {
         };
         let psk = self.peers[pi].endpoint.pre_shared_key;
         match noise::process_response(&hsrt.hs, msg, &self.cfg.public_key, psk.as_ref()) {
-            Ok(session) => {
+            Ok(mut session) => {
+                if let Some(params) = self.cfg.awg.as_ref() {
+                    session.set_awg_transport(params.header(awg::TRANSPORT));
+                }
                 logging::debug(format_args!(
                     "wireguard[{}]: handshake complete (peer {pi})",
                     self.cfg.tag
@@ -1041,7 +1040,7 @@ impl Stack {
         match noise::decrypt_cookie(msg, &peer_pub, &hsrt.hs.mac1(), recv_idx) {
             Ok(cookie) => {
                 hsrt.hs.set_cookie(&cookie);
-                self.send_raw(pi, hsrt.hs.initiation());
+                self.send_handshake_init(pi, hsrt.hs.initiation());
                 let now = Instant::now();
                 hsrt.attempt += 1;
                 hsrt.retry_at = now + REKEY_TIMEOUT + jitter();
@@ -1228,7 +1227,7 @@ impl Stack {
                     self.peers[pi].hs = None;
                     self.peers[pi].pending.clear();
                 } else {
-                    self.send_raw(pi, &initiation);
+                    self.send_handshake_init(pi, &initiation);
                     if let Some(hs) = &mut self.peers[pi].hs {
                         hs.attempt += 1;
                         hs.retry_at = now + REKEY_TIMEOUT + jitter();
@@ -1539,8 +1538,10 @@ mod tests {
     #[test]
     fn build_rejects_system_and_awg() {
         WireGuard::build(&wg_obj(json!({"system": true})), "endpoints[0]").expect_err("system");
-        WireGuard::build(&wg_obj(json!({"jc": 4})), "endpoints[0]").expect_err("awg jc");
-        WireGuard::build(&wg_obj(json!({"i1": "1"})), "endpoints[0]").expect_err("awg i1");
+        // AWG 2.0 fields parse into obfuscation params.
+        WireGuard::build(&wg_obj(json!({"jc": 4})), "endpoints[0]").expect("awg jc");
+        WireGuard::build(&wg_obj(json!({"i1": "1"})), "endpoints[0]").expect("awg i1");
+        // AWG 3.x-only features stay explicitly rejected.
         WireGuard::build(
             &wg_obj(json!({"header_protection_key": "x"})),
             "endpoints[0]",

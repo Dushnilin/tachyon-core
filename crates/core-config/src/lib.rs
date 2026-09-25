@@ -1,4 +1,5 @@
 pub mod validate;
+pub mod vless_enc;
 
 use serde::Deserialize;
 use serde_json::Value;

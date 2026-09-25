@@ -49,10 +49,6 @@ pub const AWG_FIELDS: &[&str] = &[
     "disable_cookies",
 ];
 
-/// Masquerade profiles are declarative I1 generators (SPEC 009); not
-/// implemented — rejected explicitly so obfuscation can't silently change.
-const UNSUPPORTED_FIELDS: &[&str] = &["id", "ip", "ib"];
-
 pub const INIT: usize = 0;
 pub const RESPONSE: usize = 1;
 pub const COOKIE: usize = 2;
@@ -239,13 +235,6 @@ impl AwgParams {
         if !AWG_FIELDS.iter().any(|f| awg_field_present(obj.get(*f))) {
             return Ok(None);
         }
-        for f in UNSUPPORTED_FIELDS {
-            if awg_field_present(obj.get(*f)) {
-                return Err(anyhow!(
-                    "{at}: AmneziaWG field `{f}` (masquerade profile) is not implemented yet"
-                ));
-            }
-        }
         let junk_count = uint_field(obj, "jc", 0, at)?;
         let junk_min = uint_field(obj, "jmin", 0, at)?;
         let junk_max = uint_field(obj, "jmax", 0, at)?;
@@ -301,6 +290,25 @@ impl AwgParams {
                 Some(Value::String(s)) => *slot = Some(compile_chain(s, at)?),
                 Some(_) => return Err(anyhow!("{at}: i{} must be a string", i + 1)),
             }
+        }
+        // Masquerade sugar (id/ip/ib) compiles into i1 (+i2 for ip=sip) and
+        // conflicts with explicitly configured slots (reference `masqueI1I2`).
+        let masque_str = |key: &str| -> String {
+            match obj.get(key) {
+                Some(Value::String(s)) => s.trim().to_string(),
+                _ => String::new(),
+            }
+        };
+        if let Some((c1, c2)) = super::awg_masque::masque_i1_i2(
+            &masque_str("id"),
+            &masque_str("ip"),
+            &masque_str("ib"),
+            ipackets[0].is_some(),
+            ipackets[1].is_some(),
+            at,
+        )? {
+            ipackets[0] = Some(c1);
+            ipackets[1] = Some(c2);
         }
         let bool_field = |key: &str| -> anyhow::Result<bool> {
             match obj.get(key) {

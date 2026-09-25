@@ -6,6 +6,7 @@
 //! session follow <https://www.wireguard.com/protocol/> (initiator side).
 
 pub mod awg;
+pub(crate) mod awg_masque;
 pub mod noise;
 
 use std::collections::{HashMap, VecDeque};

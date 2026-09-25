@@ -7,6 +7,7 @@
 
 pub mod awg;
 pub(crate) mod awg_masque;
+pub(crate) mod awg_quic;
 pub mod noise;
 
 use std::collections::{HashMap, VecDeque};

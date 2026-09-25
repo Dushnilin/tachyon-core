@@ -460,9 +460,17 @@ pub(crate) fn masque_i1_i2(
     }
     let _ = browser;
     match proto.as_str() {
-        "quic" => Err(anyhow!(
-            "{at}: amneziawg: QUIC masquerade profile is not implemented yet; use dns|stun|sip or an explicit i1"
-        )),
+        "quic" => {
+            if domain.is_empty() {
+                return Err(anyhow!(
+                    "{at}: amneziawg: id (masquerade domain) is required for ip=quic (it becomes the ClientHello SNI)"
+                ));
+            }
+            Ok(Some((
+                super::awg_quic::quic_initial_chain(domain, &browser)?,
+                Vec::new(),
+            )))
+        }
         "stun" => Ok(Some((stun_request_chain(), Vec::new()))),
         "dns" => {
             let domain = if domain.is_empty() {
@@ -580,8 +588,9 @@ mod tests {
         assert!(masque_i1_i2("d", "dns", "", true, false, "x").is_err());
         // missing protocol
         assert!(masque_i1_i2("d", "", "", false, false, "x").is_err());
-        // quic → explicit not-implemented
-        assert!(masque_i1_i2("d", "quic", "", false, false, "x").is_err());
+        // quic: empty id rejected (SNI required), with id → ok
+        assert!(masque_i1_i2("", "quic", "", false, false, "x").is_err());
+        assert!(masque_i1_i2("d.example.com", "quic", "", false, false, "x").is_ok());
         // browser only meaningful with quic
         assert!(masque_i1_i2("d", "dns", "chrome", false, false, "x").is_err());
         // sip fills i2; explicit i2 conflicts

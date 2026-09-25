@@ -1,0 +1,17 @@
+{
+  "outbounds": [
+    {
+      "type": "anytls",
+      "tag": "at",
+      "server": "1.2.3.4",
+      "server_port": 443,
+      "password": "pwd",
+      "min_idle_session": 1.5,
+      "tls": {
+        "enabled": true,
+        "insecure": true,
+        "server_name": "example.com"
+      }
+    }
+  ]
+}

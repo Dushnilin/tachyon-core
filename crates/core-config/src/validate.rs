@@ -133,8 +133,9 @@ const UDP_NAT_BEHAVIORS: &[&str] = &[
 /// reference network strategy values (dial.md `network_strategy`).
 const NETWORK_STRATEGIES: &[&str] = &["", "default", "hybrid", "fallback"];
 
-/// reference InterfaceType values (dial.md `network_type`).
-const INTERFACE_TYPES: &[&str] = &["", "wifi", "cellular", "ethernet", "other"];
+/// reference InterfaceType values (dial.md `network_type`). `""` is not a
+/// valid element: a toplevel `""` only passes through the base64 special case.
+const INTERFACE_TYPES: &[&str] = &["wifi", "cellular", "ethernet", "other"];
 
 const KNOWN_ROUTE_FIELDS: &[&str] = &[
     "rules",
@@ -274,9 +275,16 @@ const SS_METHODS: &[&str] = &[
 
 const UTLS_FINGERPRINTS: &[&str] = &[
     "chrome",
+    "chrome_psk",
+    "chrome_psk_shuffle",
+    "chrome_padding_psk_shuffle",
+    "chrome_pq",
+    "chrome_pq_psk",
     "firefox",
     "safari",
     "edge",
+    "360",
+    "qq",
     "ios",
     "android",
     "randomized",
@@ -431,6 +439,54 @@ const TLS_IN_FIELDS: &[&str] = &[
     "acme",
     "ech",
     "reality",
+];
+
+/// anytls outbound allowlist (reference option.AnyTLSOutboundOptions),
+/// excluding the dialer/TLS containers.
+const ANYTLS_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "tls",
+    "password",
+    "idle_session_check_interval",
+    "idle_session_timeout",
+    "min_idle_session",
+    "client_metadata",
+];
+
+/// Go `tls.CipherSuites()` names accepted by the reference TLS client init.
+const TLS_CIPHER_SUITES: &[&str] = &[
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+];
+
+/// reference `ParseTLSVersion` accepted values.
+const TLS_VERSIONS: &[&str] = &["1.0", "1.1", "1.2", "1.3"];
+
+/// reference `option.CurvePreference` names (compared case-insensitively).
+const CURVE_PREFERENCES: &[&str] = &["p256", "p384", "p521", "x25519", "x25519mlkem768"];
+
+/// reference `tlsspoof.ParseMethod` accepted values.
+const SPOOF_METHODS: &[&str] = &[
+    "",
+    "wrong-sequence",
+    "wrong-checksum",
+    "wrong-ack",
+    "wrong-md5",
+    "wrong-timestamp",
 ];
 
 /// Masque outbound allowlist (option.MASQUEOutboundOptions), excluding
@@ -1182,30 +1238,350 @@ fn validate_tls_container(value: &Value, at: &str, inbound: bool) -> Result<(), 
     if !value.is_object() {
         return Ok(());
     }
+    // reference stage-2 prune runs deep inside the container: `{}`/`[]`
+    // (including nested empties) behave as absent fields.
+    let Some(value) = deep_prune(value) else {
+        return Ok(());
+    };
+    let Some(obj) = value.as_object() else {
+        return Ok(());
+    };
     let allowed = if inbound {
         TLS_IN_FIELDS
     } else {
         TLS_OUT_FIELDS
     };
-    reject_unknown_fields_deep(value, at, allowed)?;
-    let obj = value.as_object().unwrap();
-    if let Some(f) = obj.get("fragment_fallback_delay") {
-        check_duration_field(
-            f,
-            &format!("{at}.fragment_fallback_delay"),
-            "OutboundTLSOptions",
-            "fragment_fallback_delay",
-        )?;
+
+    if !inbound {
+        const GS: &str = "OutboundTLSOptions.OutboundTLSOptionsContainer";
+        for f in [
+            "enabled",
+            "insecure",
+            "disable_sni",
+            "fragment",
+            "record_fragment",
+            "kernel_tx",
+            "kernel_rx",
+        ] {
+            if let Some(v) = obj.get(f) {
+                ep_bool(v, &format!("{at}.{f}"), GS, &format!("tls.{f}"))?;
+            }
+        }
+        for f in [
+            "server_name",
+            "engine",
+            "min_version",
+            "max_version",
+            "certificate_path",
+            "client_certificate_path",
+            "client_key_path",
+            "spoof",
+            "spoof_method",
+        ] {
+            if let Some(v) = obj.get(f) {
+                ep_str(v, &format!("{at}.{f}"), GS, &format!("tls.{f}"))?;
+            }
+        }
+        for f in [
+            "alpn",
+            "certificate",
+            "client_certificate",
+            "client_key",
+            "cipher_suites",
+        ] {
+            if let Some(v) = obj.get(f) {
+                check_listable_string(v, &format!("{at}.{f}"))?;
+            }
+        }
+        if let Some(v) = obj.get("curve_preferences") {
+            check_curve_preferences(v, &format!("{at}.curve_preferences"))?;
+        }
+        for f in [
+            "certificate_public_key_sha256",
+            "client_certificate_public_key_sha256",
+        ] {
+            if let Some(v) = obj.get(f) {
+                check_listable_bytes(v, &format!("{at}.{f}"))?;
+            }
+        }
+        if let Some(v) = obj.get("ech") {
+            validate_tls_ech_container(v, &format!("{at}.ech"))?;
+        }
+        if let Some(v) = obj.get("utls") {
+            validate_tls_utls_container(v, &format!("{at}.utls"))?;
+        }
+        if let Some(v) = obj.get("reality") {
+            validate_tls_reality_container(v, &format!("{at}.reality"))?;
+        }
     }
-    if let Some(f) = obj.get("handshake_timeout") {
-        check_duration_field(
-            f,
-            &format!("{at}.handshake_timeout"),
-            "TLSOptions",
-            "handshake_timeout",
-        )?;
+
+    for f in ["fragment_fallback_delay", "handshake_timeout"] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(
+                v,
+                &format!("{at}.{f}"),
+                "OutboundTLSOptions.OutboundTLSOptionsContainer",
+                &format!("tls.{f}"),
+            )?;
+        }
     }
+    reject_unknown_fields_deep(&value, at, allowed)?;
     Ok(())
+}
+
+/// Listable[string] decode: null/string ok; arrays validate element-wise
+/// (a null element becomes `""`); other kinds report the listable union.
+fn check_listable_string(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null | Value::String(_) => Ok(()),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::Null | Value::String(_) => {}
+                    other => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: json: cannot unmarshal {} into Go value of type string)",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type []string)"
+            ))
+        }
+    }
+}
+
+/// Listable[CurvePreference]: strings validate case-insensitively against the
+/// reference curve names; null ok; union errors mirror the reference decode.
+fn check_curve_preferences(value: &Value, at: &str) -> Result<(), String> {
+    fn known(s: &str) -> bool {
+        CURVE_PREFERENCES.iter().any(|c| c.eq_ignore_ascii_case(s))
+    }
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            if known(s) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{at}: (unknown curve name: {s} | json: cannot unmarshal string into Go value of type []option.CurvePreference)"
+                ))
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::String(s) if known(s) => {}
+                    Value::String(s) => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: unknown curve name: {s})"
+                        ));
+                    }
+                    Value::Null => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: unknown curve name: )"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: json: cannot unmarshal {} into Go value of type string)",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type []option.CurvePreference)"
+            ))
+        }
+    }
+}
+
+/// Listable[[]byte] (`certificate_public_key_sha256`): the array decode tries
+/// element-wise byte values first, then element-wise base64 strings; the union
+/// reports both attempt failures.
+fn check_listable_bytes(value: &Value, at: &str) -> Result<(), String> {
+    fn attempt_bytes(items: &[Value]) -> Result<(), String> {
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                Value::Null => {}
+                Value::Number(n)
+                    if n.as_f64()
+                        .is_some_and(|f| f.fract() == 0.0 && (0.0..=255.0).contains(&f)) => {}
+                Value::Number(_) => {
+                    return Err(format!(
+                        "[{i}]: json: cannot unmarshal number {} into Go value of type uint8",
+                        go_number_literal(item)
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "[{i}]: json: cannot unmarshal {} into Go value of type uint8",
+                        json_kind(other)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn attempt_b64(items: &[Value]) -> Result<(), String> {
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                Value::Null => {}
+                Value::String(s) => {
+                    if let Some(idx) = go_b64_error_index(s) {
+                        return Err(format!("[{i}]: illegal base64 data at input byte {idx}"));
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "[{i}]: json: cannot unmarshal {} into Go value of type []uint8",
+                        json_kind(other)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => match go_b64_error_index(s) {
+            None => Ok(()),
+            Some(idx) => Err(format!(
+                "{at}: (illegal base64 data at input byte {idx} | json: cannot unmarshal string into Go value of type [][]uint8)"
+            )),
+        },
+        Value::Array(items) => {
+            let first = attempt_bytes(items);
+            if first.is_ok() {
+                return Ok(());
+            }
+            let second = attempt_b64(items);
+            if second.is_ok() {
+                return Ok(());
+            }
+            Err(format!(
+                "{at}: ({} | {})",
+                first.unwrap_err(),
+                second.unwrap_err()
+            ))
+        }
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type []uint8 | json: cannot unmarshal {kind} into Go value of type [][]uint8)"
+            ))
+        }
+    }
+}
+
+fn validate_tls_ech_container(value: &Value, at: &str) -> Result<(), String> {
+    const GS: &str = "OutboundECHOptions.OutboundTLSOptionsContainer";
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            for f in [
+                "enabled",
+                "query_server_name",
+                "pq_signature_schemes_enabled",
+                "dynamic_record_sizing_disabled",
+            ] {
+                if let Some(v) = m.get(f) {
+                    ep_bool(v, &format!("{at}.{f}"), GS, &format!("tls.ech.{f}"))?;
+                }
+            }
+            if let Some(v) = m.get("config_path") {
+                ep_str(v, &format!("{at}.config_path"), GS, "tls.ech.config_path")?;
+            }
+            if let Some(v) = m.get("config") {
+                check_listable_string(v, &format!("{at}.config"))?;
+            }
+            reject_unknown_fields_deep(
+                value,
+                at,
+                &[
+                    "enabled",
+                    "config",
+                    "config_path",
+                    "query_server_name",
+                    "pq_signature_schemes_enabled",
+                    "dynamic_record_sizing_disabled",
+                ],
+            )?;
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            GS,
+            "tls.ech",
+            "option.OutboundECHOptions",
+        )),
+    }
+}
+
+fn validate_tls_utls_container(value: &Value, at: &str) -> Result<(), String> {
+    const GS: &str = "OutboundUTLSOptions.OutboundTLSOptionsContainer";
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            if let Some(v) = m.get("enabled") {
+                ep_bool(v, &format!("{at}.enabled"), GS, "tls.utls.enabled")?;
+            }
+            if let Some(v) = m.get("fingerprint") {
+                ep_str(v, &format!("{at}.fingerprint"), GS, "tls.utls.fingerprint")?;
+            }
+            reject_unknown_fields_deep(value, at, &["enabled", "fingerprint"])?;
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            GS,
+            "tls.utls",
+            "option.OutboundUTLSOptions",
+        )),
+    }
+}
+
+fn validate_tls_reality_container(value: &Value, at: &str) -> Result<(), String> {
+    const GS: &str = "OutboundRealityOptions.OutboundTLSOptionsContainer";
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(m) => {
+            if let Some(v) = m.get("enabled") {
+                ep_bool(v, &format!("{at}.enabled"), GS, "tls.reality.enabled")?;
+            }
+            for f in ["public_key", "short_id", "key_share"] {
+                if let Some(v) = m.get(f) {
+                    ep_str(v, &format!("{at}.{f}"), GS, &format!("tls.reality.{f}"))?;
+                }
+            }
+            reject_unknown_fields_deep(
+                value,
+                at,
+                &["enabled", "public_key", "short_id", "key_share"],
+            )?;
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            GS,
+            "tls.reality",
+            "option.OutboundRealityOptions",
+        )),
+    }
 }
 
 /// Legacy inbound fields: known keys, non-zero → legacy error (decode-time).
@@ -1921,7 +2297,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
             {
                 check_u16(port).map_err(|m| format!("outbounds[{i}].server_port: {m}"))?;
             }
-            validate_outbound(i, ty, tag, obj)?;
+            validate_outbound(i, ty, tag, obj, &dns_tags)?;
         }
     }
 
@@ -2013,7 +2389,8 @@ fn domain_resolver_server(value: &Value, at: &str) -> Result<Option<String>, Str
                 .ok_or_else(|| format!("{at}: empty domain_resolver.server"))?;
             let server = server.as_str().ok_or_else(|| {
                 format!(
-                    "{at}.server: json: cannot unmarshal number into Go struct field _DomainResolveOptions.server of type string"
+                    "{at}.server: json: cannot unmarshal {} into Go struct field _DomainResolveOptions.server of type string",
+                    json_kind(server)
                 )
             })?;
             if server.is_empty() {
@@ -2021,13 +2398,24 @@ fn domain_resolver_server(value: &Value, at: &str) -> Result<Option<String>, Str
             }
             if let Some(strategy) = map.get("strategy") {
                 let strategy = strategy.as_str().ok_or_else(|| {
-                    format!("{at}.strategy: json: cannot unmarshal into Go field of type string")
+                    format!(
+                        "{at}.strategy: json: cannot unmarshal {} into Go struct field _DomainResolveOptions.strategy of type string",
+                        json_kind(strategy)
+                    )
                 })?;
                 if !DOMAIN_STRATEGIES.contains(&strategy) {
                     return Err(format!(
                         "{at}.strategy: unknown domain strategy: {strategy}"
                     ));
                 }
+            }
+            if let Some(timeout) = map.get("timeout") {
+                check_duration_field(
+                    timeout,
+                    &format!("{at}.timeout"),
+                    "_DomainResolveOptions",
+                    "timeout",
+                )?;
             }
             Ok(Some(server.to_string()))
         }
@@ -2698,11 +3086,448 @@ fn validate_vless_encryption(obj: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_anytls_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    // reference stage-2 prune runs deep: empty containers behave as absent.
+    let pruned =
+        deep_prune(&Value::Object(obj.clone())).unwrap_or_else(|| Value::Object(Map::new()));
+    let Some(pruned) = pruned.as_object() else {
+        return Ok(());
+    };
+    let obj = pruned;
+    const ABS: &str = "AnyTLSOutboundOptions.DialerOptions.AbstractDialerOptions";
+
+    // Field checks run before the unknown-field pass (fixed order matches the
+    // observed reference probes better than the BTreeMap alphabetical walk).
+    if let Some(v) = obj.get("detour") {
+        ep_str(
+            v,
+            &format!("{at}.detour"),
+            "AnyTLSOutboundOptions.DialerOptions",
+            "detour",
+        )?;
+    }
+    for f in [
+        "bind_interface",
+        "inet4_bind_address",
+        "inet6_bind_address",
+        "protect_path",
+        "netns",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    for f in [
+        "bind_address_no_port",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "disable_tcp_keep_alive",
+        "udp_fragment",
+        "reuse_addr",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    for f in [
+        "connect_timeout",
+        "tcp_keep_alive",
+        "tcp_keep_alive_interval",
+        "fallback_delay",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), ABS, f)?;
+        }
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        match v {
+            Value::Array(_) | Value::Number(_) | Value::Bool(_) => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_resolver"),
+                    v,
+                    ABS,
+                    "domain_resolver",
+                    "option._DomainResolveOptions",
+                ));
+            }
+            _ => {
+                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+            }
+        }
+    }
+    if let Some(v) = obj.get("network_strategy") {
+        match v {
+            Value::Null => {}
+            Value::String(s) if matches!(s.as_str(), "default" | "fallback" | "hybrid") => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.network_strategy: unknown network strategy: {s}"
+                ));
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.network_strategy"),
+                    other,
+                    ABS,
+                    "network_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    for f in ["network_type", "fallback_network_type"] {
+        if let Some(v) = obj.get(f) {
+            check_interface_types(v, &format!("{at}.{f}"))?;
+        }
+    }
+    if let Some(v) = obj.get("domain_strategy") {
+        match v {
+            Value::Null => {}
+            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.domain_strategy: unknown domain strategy: {s}"
+                ));
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_strategy"),
+                    other,
+                    ABS,
+                    "domain_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("server") {
+        ep_str(
+            v,
+            &format!("{at}.server"),
+            "AnyTLSOutboundOptions.ServerOptions",
+            "server",
+        )?;
+    }
+    if let Some(v) = obj.get("tls") {
+        match v {
+            Value::Null => {}
+            Value::Object(_) => validate_tls_container(v, &format!("{at}.tls"), false)?,
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.tls"),
+                    other,
+                    "AnyTLSOutboundOptions.OutboundTLSOptionsContainer",
+                    "tls",
+                    "option.OutboundTLSOptions",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("password") {
+        ep_str(
+            v,
+            &format!("{at}.password"),
+            "AnyTLSOutboundOptions",
+            "password",
+        )?;
+    }
+    for f in ["idle_session_check_interval", "idle_session_timeout"] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), "AnyTLSOutboundOptions", f)?;
+        }
+    }
+    if let Some(v) = obj.get("min_idle_session") {
+        check_min_idle_session(v, &format!("{at}.min_idle_session"))?;
+    }
+    if let Some(v) = obj.get("client_metadata") {
+        ep_str(
+            v,
+            &format!("{at}.client_metadata"),
+            "AnyTLSOutboundOptions",
+            "client_metadata",
+        )?;
+    }
+
+    let mut allowed: Vec<&str> = ANYTLS_OUT_FIELDS.to_vec();
+    allowed.extend(DIALER_OUT_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    Ok(())
+}
+
+/// `min_idle_session`: pointer-like int — null/empty containers ok; integral
+/// numbers in Go `int` range ok; everything else reports the float64 rendering
+/// of the literal (reference custom unmarshal decodes through float64).
+fn check_min_idle_session(value: &Value, at: &str) -> Result<(), String> {
+    const GS: &str = "AnyTLSOutboundOptions";
+    match value {
+        Value::Null => Ok(()),
+        Value::Number(n) => {
+            let ok = n.as_f64().is_some_and(|f| {
+                f.fract() == 0.0 && (-9223372036854775808.0..9223372036854775808.0).contains(&f)
+            });
+            if ok {
+                Ok(())
+            } else {
+                let literal = n
+                    .as_f64()
+                    .map_or_else(|| go_number_literal(value), |f| format!("{f}"));
+                Err(format!(
+                    "{at}: json: cannot unmarshal number {literal} into Go struct field {GS}.min_idle_session of type int"
+                ))
+            }
+        }
+        other => Err(go_field_err(at, other, GS, "min_idle_session", "int")),
+    }
+}
+
+/// reference `common/tls.NewClientWithOptions` for the anytls outbound:
+/// engine dispatch → reality/utls/std client construction checks.
+fn validate_tls_client_init(obj: &Map<String, Value>, at: &str) -> Result<(), String> {
+    let tls = obj.get("tls").and_then(Value::as_object);
+    let get = |k: &str| tls.and_then(|m| m.get(k));
+
+    let engine = get("engine").and_then(Value::as_str).unwrap_or("");
+    match engine {
+        "" | "go" => {}
+        "apple" => {
+            if !cfg!(target_os = "macos") {
+                return Err(format!(
+                    "{at}: Apple TLS engine is not available on non-Apple platforms"
+                ));
+            }
+        }
+        "windows" => {
+            if !cfg!(windows) {
+                return Err(format!(
+                    "{at}: Windows TLS engine is not available on non-Windows platforms"
+                ));
+            }
+        }
+        other => return Err(format!("{at}: unknown tls engine: {other}")),
+    }
+
+    let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
+    let server_name = get("server_name").and_then(Value::as_str).unwrap_or("");
+    let sni = if server_name.is_empty() {
+        server
+    } else {
+        server_name
+    };
+    let insecure = get("insecure").and_then(Value::as_bool).unwrap_or(false);
+    let disable_sni = get("disable_sni").and_then(Value::as_bool).unwrap_or(false);
+    let spoof = get("spoof").and_then(Value::as_str).unwrap_or("");
+    let method = get("spoof_method").and_then(Value::as_str).unwrap_or("");
+    let reality_on = get("reality")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.get("enabled").and_then(Value::as_bool) == Some(true));
+    let utls_on = get("utls")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.get("enabled").and_then(Value::as_bool) == Some(true));
+
+    if reality_on {
+        if !utls_on {
+            return Err(format!("{at}: uTLS is required by reality client"));
+        }
+        if !spoof.is_empty() || !method.is_empty() {
+            return Err(format!("{at}: spoof is unsupported in reality"));
+        }
+    }
+
+    // shared checks (std/utls/reality clients share this order)
+    if sni.is_empty() && !insecure {
+        return Err(format!("{at}: missing server_name or insecure=true"));
+    }
+    if !insecure && disable_sni && reality_on {
+        return Err(format!("{at}: disable_sni is unsupported in reality"));
+    }
+
+    let cert_inline = tls_listable_join(get("certificate"));
+    let cert_path = get("certificate_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let sha_present = match get("certificate_public_key_sha256") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        _ => false,
+    };
+    if sha_present && (!cert_inline.is_empty() || !cert_path.is_empty()) {
+        return Err(format!(
+            "{at}: certificate_public_key_sha256 is conflict with certificate or certificate_path"
+        ));
+    }
+
+    for field in ["min_version", "max_version"] {
+        let v = get(field).and_then(Value::as_str).unwrap_or("");
+        if !v.is_empty() && !TLS_VERSIONS.contains(&v) {
+            return Err(format!("{at}: parse {field}: unknown tls version:{v}"));
+        }
+    }
+    if let Some(ciphers) = get("cipher_suites").and_then(Value::as_array) {
+        for c in ciphers {
+            let name = c.as_str().unwrap_or("");
+            if !TLS_CIPHER_SUITES.contains(&name) {
+                return Err(format!("{at}: unknown cipher_suite: {name}"));
+            }
+        }
+    }
+
+    let mut cert_content = cert_inline;
+    if cert_content.is_empty() && !cert_path.is_empty() {
+        cert_content = go_read_file(cert_path)
+            .map_err(|e| format!("{at}: read certificate: open {cert_path}: {e}"))?;
+    }
+    if !cert_content.is_empty() && !cert_content.contains("-----BEGIN CERTIFICATE-----") {
+        return Err(format!(
+            "{at}: failed to parse certificate:\n\n{cert_content}"
+        ));
+    }
+
+    let client_cert = tls_listable_join(get("client_certificate"));
+    let client_cert = if !client_cert.is_empty() {
+        client_cert
+    } else {
+        let p = get("client_certificate_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if p.is_empty() {
+            String::new()
+        } else {
+            go_read_file(p).map_err(|e| format!("{at}: read client certificate: open {p}: {e}"))?
+        }
+    };
+    let client_key = tls_listable_join(get("client_key"));
+    let client_key = if !client_key.is_empty() {
+        client_key
+    } else {
+        let p = get("client_key_path").and_then(Value::as_str).unwrap_or("");
+        if p.is_empty() {
+            String::new()
+        } else {
+            go_read_file(p).map_err(|e| format!("{at}: read client key: open {p}: {e}"))?
+        }
+    };
+    if !client_cert.is_empty() && !client_key.is_empty() {
+        // reference parses the x509 key pair here; parse failures are
+        // unprobed — accept and continue.
+    } else if !client_cert.is_empty() || !client_key.is_empty() {
+        return Err(format!(
+            "{at}: client certificate and client key must be provided together"
+        ));
+    }
+
+    // reference parseTLSSpoofOptions
+    if spoof.is_empty() {
+        if !method.is_empty() {
+            return Err(format!("{at}: spoof_method requires spoof"));
+        }
+    } else {
+        if !SPOOF_METHODS.contains(&method) {
+            return Err(format!("{at}: tls_spoof: unknown method: {method}"));
+        }
+        if disable_sni || sni.is_empty() || crate::netip_parse::parse_addr(sni).is_ok() {
+            return Err(format!("{at}: `spoof` requires TLS ClientHello with SNI"));
+        }
+        if spoof.eq_ignore_ascii_case(sni) {
+            return Err(format!("{at}: `spoof` must differ from `server_name`"));
+        }
+    }
+
+    if utls_on {
+        let fingerprint = get("utls")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("fingerprint"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !fingerprint.is_empty() && !UTLS_FINGERPRINTS.contains(&fingerprint) {
+            return Err(format!("{at}: unknown uTLS fingerprint: {fingerprint}"));
+        }
+        let ech_on = get("ech")
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.get("enabled").and_then(Value::as_bool) == Some(true));
+        if ech_on && reality_on {
+            return Err(format!("{at}: Reality is conflict with ECH"));
+        }
+    }
+
+    let kernel_tx = get("kernel_tx").and_then(Value::as_bool).unwrap_or(false);
+    let kernel_rx = get("kernel_rx").and_then(Value::as_bool).unwrap_or(false);
+    if (kernel_tx || kernel_rx) && !reality_on && !cfg!(target_os = "linux") {
+        return Err(format!("{at}: kTLS is only supported on Linux"));
+    }
+
+    if reality_on {
+        // reference newRealityClient: public_key → short_id → key_share → kTLS
+        let reality = get("reality").and_then(Value::as_object).unwrap();
+        let pk = reality
+            .get("public_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Some(idx) = go_b64_rawurl_error_index(pk) {
+            return Err(format!(
+                "{at}: decode public_key: illegal base64 data at input byte {idx}"
+            ));
+        }
+        if go_b64_rawurl_decoded_len(pk) != 32 {
+            return Err(format!("{at}: invalid public_key"));
+        }
+        let short_id = reality
+            .get("short_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        check_short_id(short_id).map_err(|m| format!("{at}: {m}"))?;
+        let key_share = reality
+            .get("key_share")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !matches!(key_share, "" | "hybrid" | "classical") {
+            return Err(format!(
+                "{at}: unknown reality key_share: {key_share} (expected \"hybrid\" or \"classical\")"
+            ));
+        }
+        if (kernel_tx || kernel_rx) && !cfg!(target_os = "linux") {
+            return Err(format!("{at}: kTLS is only supported on Linux"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Listable[string] → joined content (reference `strings.Join(list, "\n")`).
+fn tls_listable_join(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// reference `filemanager.ReadFile` error suffix for missing paths.
+fn go_read_file(path: &str) -> Result<String, String> {
+    std::fs::read(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .map_err(|_| {
+            if cfg!(windows) {
+                "The system cannot find the path specified.".to_string()
+            } else {
+                "no such file or directory".to_string()
+            }
+        })
+}
+
 fn validate_outbound(
     i: usize,
     ty: &str,
     tag: &str,
     obj: &Map<String, Value>,
+    dns_tags: &HashSet<String>,
 ) -> Result<(), String> {
     let at = format!("initialize outbound[{i}] {ty}[{tag}]");
 
@@ -2710,6 +3535,7 @@ fn validate_outbound(
         "hysteria2" => validate_hy2_out_decode(i, obj)?,
         "tuic" => validate_tuic_out_decode(i, obj)?,
         "masque" => validate_masque_out_decode(i, obj)?,
+        "anytls" => validate_anytls_out_decode(i, obj)?,
         "vless" => validate_vless_encryption(obj)?,
         _ => {}
     }
@@ -2867,6 +3693,32 @@ fn validate_outbound(
                 && !TUIC_CC_ALGS.contains(&cc)
             {
                 return Err(format!("{at}: unknown congestion control algorithm: {cc}"));
+            }
+        }
+        "anytls" => {
+            // reference protocol/anytls NewOutbound: TLS required → tfo →
+            // NewClientWithOptions (TLS client checks) → dialer setup.
+            if obj.get("tcp_fast_open").and_then(Value::as_bool) == Some(true) {
+                return Err(format!(
+                    "{at}: tcp_fast_open is not supported with anytls outbound"
+                ));
+            }
+            validate_tls_client_init(obj, &at)?;
+            // reference dialer: a domain server resolves through the
+            // configured domain_resolver tag at initialize.
+            let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
+            if !server.is_empty()
+                && crate::netip_parse::parse_addr(server).is_err()
+                && let Some(dr) = obj.get("domain_resolver")
+                && !prunes_value(dr)
+            {
+                let tag = domain_resolver_server(dr, &format!("outbounds[{i}].domain_resolver"))?;
+                if let Some(tag) = tag
+                    && !tag.is_empty()
+                    && !dns_tags.contains(&tag)
+                {
+                    return Err(format!("{at}: domain resolver not found: {tag}"));
+                }
             }
         }
         _ => {}
@@ -3287,6 +4139,41 @@ fn prunes_value(value: &Value) -> bool {
     }
 }
 
+/// reference stage-2 prune, applied recursively: drop every prunable child,
+/// then re-evaluate the parent (a container whose children all prune prunes
+/// itself). `null` and scalars survive; returns `None` when the subtree prunes.
+fn deep_prune(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, v) in map {
+                if let Some(v) = deep_prune(v) {
+                    out.insert(k.clone(), v);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(Value::Object(out))
+            }
+        }
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for v in items {
+                if let Some(v) = deep_prune(v) {
+                    out.push(v);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(Value::Array(out))
+            }
+        }
+        other => Some(other.clone()),
+    }
+}
+
 /// Go `json: cannot unmarshal <kind> into Go struct field <gs>.<f> of type <ty>`.
 fn go_field_err(at: &str, value: &Value, go_struct: &str, field: &str, ty: &str) -> String {
     format!(
@@ -3446,6 +4333,29 @@ fn go_b64_error_index(s: &str) -> Option<usize> {
 /// base64 decode for endpoint keys: `None` = valid, `Some(idx)` = Go error index.
 fn go_b64_check(s: &str) -> Option<usize> {
     go_b64_error_index(s)
+}
+
+/// Go `base64.RawURLEncoding` first-error index: URL alphabet without
+/// padding; `len % 4 == 1` is rejected at the trailing byte.
+fn go_b64_rawurl_error_index(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let is_rawurl = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_';
+    if let Some(i) = b.iter().position(|c| !is_rawurl(*c)) {
+        return Some(i);
+    }
+    if b.len() % 4 == 1 {
+        return Some(b.len() - 1);
+    }
+    None
+}
+
+/// decoded length of a valid RawURL base64 string.
+fn go_b64_rawurl_decoded_len(s: &str) -> usize {
+    match s.len() % 4 {
+        2 => s.len() / 4 * 3 + 1,
+        3 => s.len() / 4 * 3 + 2,
+        _ => s.len() / 4 * 3,
+    }
 }
 
 /// reference `option.AWGRange` decode (`normalizeAWGRange`): canonical
@@ -3694,23 +4604,43 @@ fn check_udp_nat(value: &Value, at: &str, go_struct: &str, field: &str) -> Resul
     }
 }
 
-/// `network_type` / `fallback_network_type`: listable InterfaceType.
+/// `network_type` / `fallback_network_type`: listable InterfaceType. The
+/// reference decodes the toplevel value as a single InterfaceType first, then
+/// as a slice (where a plain string goes through the base64 special case for
+/// byte-like slices) and reports the union of both failures.
 fn check_interface_types(value: &Value, at: &str) -> Result<(), String> {
     match value {
-        Value::String(s) if INTERFACE_TYPES.contains(&s.as_str()) => Ok(()),
-        Value::String(s) => Err(format!(
-            "{at}: (unknown interface type: {s} | illegal base64 data at input byte {})",
-            go_b64_error_index(s).unwrap_or(0)
-        )),
+        Value::String(s) => {
+            if INTERFACE_TYPES.contains(&s.as_str()) {
+                Ok(())
+            } else if go_b64_error_index(s).is_none() {
+                // path2: string → []byte base64 special case succeeds
+                Ok(())
+            } else {
+                Err(format!(
+                    "{at}: (unknown interface type: {s} | illegal base64 data at input byte {})",
+                    go_b64_error_index(s).unwrap_or(0)
+                ))
+            }
+        }
         Value::Array(items) => {
-            for item in items {
+            for (i, item) in items.iter().enumerate() {
                 match item {
                     Value::String(s) if INTERFACE_TYPES.contains(&s.as_str()) => {}
-                    Value::String(s) => return Err(format!("{at}: unknown interface type: {s}")),
-                    v if is_zero_json(v) => {}
+                    Value::String(s) => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: unknown interface type: {s})"
+                        ));
+                    }
+                    // null → UnmarshalJSON(null) → lookup of `""`
+                    Value::Null => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: unknown interface type: )"
+                        ));
+                    }
                     other => {
                         return Err(format!(
-                            "{at}: json: cannot unmarshal {} into Go value of type string",
+                            "{at}: (json: cannot unmarshal array into Go value of type string | [{i}]: json: cannot unmarshal {} into Go value of type string)",
                             json_kind(other)
                         ));
                     }
@@ -4336,14 +5266,15 @@ fn check_u16(value: &Value) -> Result<(), String> {
 }
 
 fn check_short_id(short_id: &str) -> Result<(), String> {
+    // reference checks the length cap before hex.Decode (SPEC 090).
+    if short_id.len() > 16 {
+        return Err("invalid short_id".to_string());
+    }
     if !short_id.len().is_multiple_of(2) {
         return Err("decode short_id: encoding/hex: odd length hex string".to_string());
     }
     if !short_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("decode short_id: encoding/hex: invalid byte".to_string());
-    }
-    if short_id.len() / 2 > 8 {
-        return Err("invalid short_id".to_string());
     }
     Ok(())
 }

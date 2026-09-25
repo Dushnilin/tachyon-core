@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 450" width="100%" height="100%">
-  <title>tachyon-core - Sing-Box-LX Compatible Proxy Core in Rust</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" width="100%" height="100%">
+  <title>tachyon-core - Rust Proxy Core for Routers</title>
   <defs>
     <!-- Background Space Gradients -->
     <radialGradient id="bg-space" cx="50%" cy="30%" r="80%">
@@ -36,22 +36,19 @@
     <!-- Glow & Shadow Filters -->
     <filter id="neon-glow" x="-30%" y="-30%" width="160%" height="160%">
       <feGaussianBlur stdDeviation="6" result="blur1" />
-      <feGaussianBlur stdDeviation="15" result="blur2" />
       <feMerge>
-        <feMergeNode in="blur2" />
         <feMergeNode in="blur1" />
         <feMergeNode in="SourceGraphic" />
       </feMerge>
     </filter>
 
     <filter id="core-glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feGaussianBlur stdDeviation="10" result="blur" />
       <feComposite in="SourceGraphic" in2="blur" operator="over" />
     </filter>
   </defs>
 
   <style>
-    /* CSS Animations for GitHub SVG Rendering */
     @keyframes rotateClockwise {
       from { transform: rotate(0deg); }
       to { transform: rotate(360deg); }
@@ -67,7 +64,7 @@
     }
     @keyframes pulseCore {
       0%, 100% { transform: scale(1); opacity: 0.85; }
-      50% { transform: scale(1.08); opacity: 1; filter: drop-shadow(0 0 20px #00F0FF); }
+      50% { transform: scale(1.08); opacity: 1; filter: drop-shadow(0 0 16px #00F0FF); }
     }
     @keyframes beaconBlink {
       0%, 100% { opacity: 1; transform: scale(1); }
@@ -82,199 +79,172 @@
       50% { stroke: rgba(0, 240, 255, 0.7); }
     }
 
-    .core-ring-1 { transform-origin: 970px 190px; animation: rotateClockwise 22s linear infinite; }
-    .core-ring-2 { transform-origin: 970px 190px; animation: rotateCounter 15s linear infinite; }
-    .core-ring-3 { transform-origin: 970px 190px; animation: rotateClockwise 30s linear infinite; }
-    .pulse-hub { transform-origin: 970px 190px; animation: pulseCore 3.5s ease-in-out infinite; }
+    .core-ring-1 { transform-origin: 960px 200px; animation: rotateClockwise 22s linear infinite; }
+    .core-ring-2 { transform-origin: 960px 200px; animation: rotateCounter 15s linear infinite; }
+    .core-ring-3 { transform-origin: 960px 200px; animation: rotateClockwise 30s linear infinite; }
+    .pulse-hub { transform-origin: 960px 200px; animation: pulseCore 3.5s ease-in-out infinite; }
     .beacon-dot { animation: beaconBlink 2s ease-in-out infinite; }
-    .radar-wave { transform-origin: 970px 190px; animation: signalWave 3s cubic-bezier(0.1, 0.8, 0.3, 1) infinite; }
-    .radar-wave-delayed { transform-origin: 970px 190px; animation: signalWave 3s cubic-bezier(0.1, 0.8, 0.3, 1) 1.5s infinite; }
+    .radar-wave { transform-origin: 960px 200px; animation: signalWave 3s cubic-bezier(0.1, 0.8, 0.3, 1) infinite; }
+    .radar-wave-delayed { transform-origin: 960px 200px; animation: signalWave 3s cubic-bezier(0.1, 0.8, 0.3, 1) 1.5s infinite; }
     
     .stream-fast { stroke-dasharray: 20 80; animation: flowPacket 3.2s linear infinite; }
     .stream-slow { stroke-dasharray: 30 120; animation: flowPacket 4.8s linear infinite; }
     .hud-card { animation: hudCardPulse 4s ease-in-out infinite; }
 
-    .title-main { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; font-size: 64px; fill: url(#holo-title); letter-spacing: 2px; }
-    .subtitle-text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 600; font-size: 19px; fill: #E2E8F0; letter-spacing: -0.2px; }
-    .desc-text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 400; font-size: 14px; fill: #94A3B8; }
-    .hud-label { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #64748B; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-    .hud-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; fill: #00F0FF; font-weight: 700; }
-    .card-h { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 700; font-size: 14px; fill: #F8FAFC; }
-    .card-p { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 400; font-size: 12px; fill: #94A3B8; }
+    .title-main { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; font-size: 56px; fill: url(#holo-title); letter-spacing: 2px; }
+    .subtitle-text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 600; font-size: 17px; fill: #E2E8F0; }
+    .hud-label { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #64748B; font-weight: 600; letter-spacing: 0.5px; }
+    .hud-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; fill: #00F0FF; font-weight: 700; }
+    .tile-h { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 700; font-size: 14px; fill: #F8FAFC; }
+    .tile-sub { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 600; }
   </style>
 
   <!-- Canvas Surface -->
-  <rect width="1200" height="450" rx="18" fill="url(#bg-space)"/>
-  <rect width="1200" height="450" rx="18" fill="url(#cyan-glow)"/>
-  <rect width="1200" height="450" rx="18" fill="url(#purple-glow)"/>
+  <rect width="1200" height="420" rx="18" fill="url(#bg-space)"/>
+  <rect width="1200" height="420" rx="18" fill="url(#cyan-glow)"/>
+  <rect width="1200" height="420" rx="18" fill="url(#purple-glow)"/>
 
   <!-- High-Tech Matrix Grid -->
-  <g opacity="0.06" stroke="#FFFFFF" stroke-width="1">
-    <path d="M 0,75 L 1200,75 M 0,150 L 1200,150 M 0,225 L 1200,225 M 0,300 L 1200,300 M 0,375 L 1200,375" />
-    <path d="M 120,0 L 120,450 M 240,0 L 240,450 M 360,0 L 360,450 M 480,0 L 480,450 M 600,0 L 600,450 M 720,0 L 720,450 M 840,0 L 840,450 M 960,0 L 960,450 M 1080,0 L 1080,450" />
+  <g opacity="0.05" stroke="#FFFFFF" stroke-width="1">
+    <path d="M 0,70 L 1200,70 M 0,140 L 1200,140 M 0,210 L 1200,210 M 0,280 L 1200,280 M 0,350 L 1200,350" />
+    <path d="M 120,0 L 120,420 M 240,0 L 240,420 M 360,0 L 360,420 M 480,0 L 480,420 M 600,0 L 600,420 M 720,0 L 720,420 M 840,0 L 840,420 M 960,0 L 960,420 M 1080,0 L 1080,420" />
   </g>
 
-  <!-- Interactive Data Circuit Tracks (Animated Streams) -->
+  <!-- Animated Data Streams -->
   <g fill="none" stroke-linecap="round">
-    <!-- Outer Track Top -->
-    <path d="M 60,70 L 680,70 Q 730,70 760,100 L 840,180" stroke="#1E293B" stroke-width="2"/>
-    <path d="M 60,70 L 680,70 Q 730,70 760,100 L 840,180" stroke="#00F0FF" stroke-width="2" class="stream-fast" filter="url(#core-glow)"/>
+    <path d="M 60,65 L 680,65 Q 730,65 760,95 L 840,175" stroke="#1E293B" stroke-width="2"/>
+    <path d="M 60,65 L 680,65 Q 730,65 760,95 L 840,175" stroke="#00F0FF" stroke-width="2" class="stream-fast" filter="url(#core-glow)"/>
 
-    <!-- Track Middle -->
-    <path d="M 520,190 L 830,190" stroke="#1E293B" stroke-width="2"/>
-    <path d="M 520,190 L 830,190" stroke="#818CF8" stroke-width="2" class="stream-slow"/>
-
-    <!-- Track Bottom -->
-    <path d="M 60,305 L 700,305 Q 750,305 780,275 L 850,205" stroke="#1E293B" stroke-width="2"/>
-    <path d="M 60,305 L 700,305 Q 750,305 780,275 L 850,205" stroke="#10B981" stroke-width="2" class="stream-fast"/>
+    <path d="M 520,200 L 830,200" stroke="#1E293B" stroke-width="2"/>
+    <path d="M 520,200 L 830,200" stroke="#818CF8" stroke-width="2" class="stream-slow"/>
   </g>
 
   <!-- ================================================================= -->
-  <!-- RIGHT SIDE: ANIMATED TACHYON REACTOR CORE & TELEMETRY HUD -->
+  <!-- RIGHT SIDE: TACHYON REACTOR CORE & TELEMETRY -->
   <!-- ================================================================= -->
   <g id="tachyon-core-system">
     <!-- Pulsing Radar Waves -->
-    <circle cx="970" cy="190" r="10" fill="none" stroke="#00F0FF" stroke-width="1.5" class="radar-wave"/>
-    <circle cx="970" cy="190" r="10" fill="none" stroke="#818CF8" stroke-width="1.5" class="radar-wave-delayed"/>
+    <circle cx="960" cy="200" r="10" fill="none" stroke="#00F0FF" stroke-width="1.5" class="radar-wave"/>
+    <circle cx="960" cy="200" r="10" fill="none" stroke="#818CF8" stroke-width="1.5" class="radar-wave-delayed"/>
 
-    <!-- Orbit Ring 3 (Outer Data Nodes) -->
+    <!-- Orbit Ring 3 -->
     <g class="core-ring-3">
-      <circle cx="970" cy="190" r="145" fill="none" stroke="#334155" stroke-width="1.2" stroke-dasharray="10 14"/>
-      <circle cx="1115" cy="190" r="5" fill="#38BDF8" filter="url(#core-glow)"/>
-      <circle cx="825" cy="190" r="4" fill="#C084FC"/>
-      <circle cx="970" cy="45" r="4" fill="#10B981"/>
+      <circle cx="960" cy="200" r="140" fill="none" stroke="#334155" stroke-width="1.2" stroke-dasharray="10 14"/>
+      <circle cx="1100" cy="200" r="5" fill="#38BDF8" filter="url(#core-glow)"/>
+      <circle cx="820" cy="200" r="4" fill="#C084FC"/>
+      <circle cx="960" cy="60" r="4" fill="#10B981"/>
     </g>
 
-    <!-- Orbit Ring 2 (Segmented Gyro) -->
+    <!-- Orbit Ring 2 -->
     <g class="core-ring-2">
-      <circle cx="970" cy="190" r="110" fill="none" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="2" stroke-dasharray="70 20 30 15"/>
-      <rect x="965" y="78" width="10" height="4" rx="2" fill="#00F0FF"/>
-      <rect x="965" y="298" width="10" height="4" rx="2" fill="#818CF8"/>
+      <circle cx="960" cy="200" r="105" fill="none" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="2" stroke-dasharray="60 20 30 15"/>
+      <rect x="955" y="93" width="10" height="4" rx="2" fill="#00F0FF"/>
+      <rect x="955" y="303" width="10" height="4" rx="2" fill="#818CF8"/>
     </g>
 
-    <!-- Orbit Ring 1 (Inner Laser Track) -->
+    <!-- Orbit Ring 1 -->
     <g class="core-ring-1">
-      <circle cx="970" cy="190" r="75" fill="none" stroke="#818CF8" stroke-width="2.5" stroke-dasharray="45 15"/>
-      <circle cx="1045" cy="190" r="6" fill="#00F0FF" filter="url(#core-glow)"/>
-      <circle cx="895" cy="190" r="5" fill="#10B981"/>
+      <circle cx="960" cy="200" r="70" fill="none" stroke="#818CF8" stroke-width="2" stroke-dasharray="40 15"/>
+      <circle cx="1030" cy="200" r="5" fill="#00F0FF" filter="url(#core-glow)"/>
+      <circle cx="890" cy="200" r="4" fill="#10B981"/>
     </g>
 
-    <!-- Central Fusion Hub with Tachyon Lightning/Particle -->
+    <!-- Central Hub with Lightning Icon -->
     <g class="pulse-hub">
-      <circle cx="970" cy="190" r="42" fill="#0F172A" stroke="#00F0FF" stroke-width="2.5"/>
-      <circle cx="970" cy="190" r="32" fill="#1E1B4B" stroke="#818CF8" stroke-width="1.5"/>
-      <path d="M 972,168 L 958,190 L 968,190 L 966,212 L 984,186 L 974,186 Z" fill="url(#holo-title)" filter="url(#core-glow)"/>
+      <circle cx="960" cy="200" r="40" fill="#0F172A" stroke="#00F0FF" stroke-width="2"/>
+      <circle cx="960" cy="200" r="30" fill="#1E1B4B" stroke="#818CF8" stroke-width="1.5"/>
+      <path d="M 962,180 L 950,199 L 958,199 L 956,218 L 972,195 L 964,195 Z" fill="url(#holo-title)" filter="url(#core-glow)"/>
     </g>
 
-    <!-- Clean Telemetry Badges (Floating around core) -->
-    <g transform="translate(850, 48)">
-      <rect width="120" height="32" rx="6" fill="#0B132B" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="1"/>
-      <text x="10" y="14" class="hud-label">IDLE RAM</text>
-      <text x="10" y="26" class="hud-value" fill="#10B981">2.4 MB RSS</text>
-      <circle cx="102" cy="16" r="4" fill="#10B981" class="beacon-dot"/>
+    <!-- Clean Floating Telemetry Badges (Calculated Non-Overlapping Positions) -->
+    <!-- Badge 1: Top Left -->
+    <g transform="translate(810, 60)">
+      <rect width="130" height="34" rx="8" fill="#0B132B" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="1"/>
+      <circle cx="14" cy="17" r="4" fill="#10B981" class="beacon-dot"/>
+      <text x="26" y="15" class="hud-label">RAM (RSS)</text>
+      <text x="26" y="28" class="hud-value" fill="#10B981">2.4 MB</text>
     </g>
 
-    <g transform="translate(1015, 75)">
-      <rect width="115" height="32" rx="6" fill="#0B132B" stroke="#818CF8" stroke-opacity="0.4" stroke-width="1"/>
-      <text x="10" y="14" class="hud-label">STRIPPED</text>
-      <text x="10" y="26" class="hud-value" fill="#38BDF8">3.5 MB MUSL</text>
-      <circle cx="98" cy="16" r="4" fill="#38BDF8"/>
+    <!-- Badge 2: Right Center -->
+    <g transform="translate(1030, 183)">
+      <rect width="125" height="34" rx="8" fill="#0B132B" stroke="#818CF8" stroke-opacity="0.4" stroke-width="1"/>
+      <circle cx="14" cy="17" r="4" fill="#38BDF8"/>
+      <text x="26" y="15" class="hud-label">BINARY</text>
+      <text x="26" y="28" class="hud-value" fill="#38BDF8">3.5 MB MUSL</text>
     </g>
 
-    <g transform="translate(1005, 290)">
-      <rect width="125" height="32" rx="6" fill="#0B132B" stroke="#10B981" stroke-opacity="0.4" stroke-width="1"/>
-      <text x="10" y="14" class="hud-label">GC PAUSES</text>
-      <text x="10" y="26" class="hud-value" fill="#00F0FF">0.00 ms (ZERO)</text>
-      <circle cx="108" cy="16" r="4" fill="#00F0FF" class="beacon-dot"/>
+    <!-- Badge 3: Bottom Left -->
+    <g transform="translate(810, 315)">
+      <rect width="135" height="34" rx="8" fill="#0B132B" stroke="#10B981" stroke-opacity="0.4" stroke-width="1"/>
+      <circle cx="14" cy="17" r="4" fill="#00F0FF" class="beacon-dot"/>
+      <text x="26" y="15" class="hud-label">GC PAUSES</text>
+      <text x="26" y="28" class="hud-value" fill="#00F0FF">0.00 ms (ZERO)</text>
     </g>
   </g>
 
   <!-- ================================================================= -->
-  <!-- LEFT SIDE: TITLE, TAGS & CORE MISSION -->
+  <!-- LEFT SIDE: TITLE, SUBTITLE & 3 SPACIOUS TILES -->
   <!-- ================================================================= -->
-  <g transform="translate(60, 55)">
+  <g transform="translate(60, 48)">
     <!-- Top System Live Badge -->
     <g transform="translate(0, 0)">
-      <rect width="320" height="28" rx="14" fill="#0F172A" stroke="#38BDF8" stroke-opacity="0.5" stroke-width="1"/>
-      <circle cx="16" cy="14" r="5" fill="#10B981" class="beacon-dot"/>
-      <text x="30" y="18" class="hud-value" fill="#38BDF8">OPENWRT 23.05 - 25.X &amp; SNAPSHOT</text>
+      <rect width="320" height="26" rx="13" fill="#0F172A" stroke="#38BDF8" stroke-opacity="0.5" stroke-width="1"/>
+      <circle cx="14" cy="13" r="4" fill="#10B981" class="beacon-dot"/>
+      <text x="26" y="17" class="hud-value" fill="#38BDF8">OPENWRT 23.05 - 25.X &amp; SNAPSHOT</text>
     </g>
 
-    <!-- Main Title with Glowing Shadow -->
-    <text x="0" y="86" class="title-main" filter="url(#neon-glow)">TACHYON CORE</text>
-    <text x="0" y="86" class="title-main">TACHYON CORE</text>
+    <!-- Main Title -->
+    <text x="0" y="78" class="title-main" filter="url(#neon-glow)">TACHYON CORE</text>
+    <text x="0" y="78" class="title-main">TACHYON CORE</text>
 
-    <!-- Subtitles -->
-    <text x="0" y="122" class="subtitle-text">sing-box-lx compatible proxy core in Rust, built for routers</text>
-    <text x="0" y="146" class="desc-text">Ультралегковесное ядро сетевого прокси без рантайма Go и пауз сборщика мусора</text>
+    <!-- Subtitle -->
+    <text x="0" y="112" class="subtitle-text">sing-box-lx compatible proxy core in Rust, built for routers</text>
 
-    <!-- Feature Quick Pills -->
-    <g transform="translate(0, 175)">
-      <!-- Pill 1 -->
+    <!-- 4 Quick Pills -->
+    <g transform="translate(0, 142)">
       <g transform="translate(0, 0)">
+        <rect width="125" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
+        <text x="12" y="17" class="hud-value" fill="#38BDF8">⚡ 100% Rust</text>
+      </g>
+      <g transform="translate(135, 0)">
         <rect width="135" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
-        <text x="10" y="17" class="hud-value" fill="#38BDF8">⚡ 100% Rust</text>
+        <text x="12" y="17" class="hud-value" fill="#10B981">🧠 2.4 MB RAM</text>
       </g>
-      <!-- Pill 2 -->
-      <g transform="translate(145, 0)">
-        <rect width="130" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
-        <text x="10" y="17" class="hud-value" fill="#10B981">🧠 2.4 MB RAM</text>
+      <g transform="translate(280, 0)">
+        <rect width="135" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
+        <text x="12" y="17" class="hud-value" fill="#C084FC">📦 3.5 MB Musl</text>
       </g>
-      <!-- Pill 3 -->
-      <g transform="translate(285, 0)">
-        <rect width="150" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
-        <text x="10" y="17" class="hud-value" fill="#C084FC">📦 3.5 MB Musl</text>
-      </g>
-      <!-- Pill 4 -->
-      <g transform="translate(445, 0)">
-        <rect width="145" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
-        <text x="10" y="17" class="hud-value" fill="#FF8A65">🛡️ Zero-GC</text>
+      <g transform="translate(425, 0)">
+        <rect width="135" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
+        <text x="12" y="17" class="hud-value" fill="#FF8A65">🛡️ Zero-GC</text>
       </g>
     </g>
-  </g>
 
-  <!-- ================================================================= -->
-  <!-- BOTTOM ROW: 4 ARCHITECTURAL PILLARS (Glassmorphism Cards) -->
-  <!-- ================================================================= -->
-  <g transform="translate(60, 325)">
-    <!-- Card 1: Zero-GC Runtime -->
-    <g transform="translate(0, 0)">
-      <rect width="255" height="95" rx="10" fill="url(#card-grad)" stroke="#38BDF8" stroke-opacity="0.25" stroke-width="1" class="hud-card"/>
-      <circle cx="28" cy="28" r="14" fill="#0284C7" fill-opacity="0.2"/>
-      <text x="21" y="34" font-size="16">⚡</text>
-      <text x="50" y="32" class="card-h">Zero-GC Runtime</text>
-      <text x="16" y="58" class="card-p">Детерминированный RAII, 0 мс</text>
-      <text x="16" y="76" class="card-p">задержек GC, плоский пинг</text>
-    </g>
+    <!-- 3 Spacious, Clean Architectural Tiles (No Overlapping, Pure Essence) -->
+    <g transform="translate(0, 215)">
+      <!-- Tile 1 -->
+      <g transform="translate(0, 0)">
+        <rect width="205" height="88" rx="10" fill="url(#card-grad)" stroke="#38BDF8" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
+        <text x="16" y="32" class="tile-h">⚡ Zero-GC Runtime</text>
+        <text x="16" y="54" class="tile-sub" fill="#38BDF8">0.00 ms GC PAUSES</text>
+        <text x="16" y="70" class="tile-sub" fill="#64748B">Deterministic RAII</text>
+      </g>
 
-    <!-- Card 2: Flash-Optimized -->
-    <g transform="translate(275, 0)">
-      <rect width="255" height="95" rx="10" fill="url(#card-grad)" stroke="#818CF8" stroke-opacity="0.25" stroke-width="1" class="hud-card"/>
-      <circle cx="28" cy="28" r="14" fill="#6366F1" fill-opacity="0.2"/>
-      <text x="21" y="34" font-size="16">📦</text>
-      <text x="50" y="32" class="card-h">Flash-Optimized</text>
-      <text x="16" y="58" class="card-p">3.5 МБ musl static, установка</text>
-      <text x="16" y="76" class="card-p">во флеш 16–32 МБ без USB</text>
-    </g>
+      <!-- Tile 2 -->
+      <g transform="translate(220, 0)">
+        <rect width="205" height="88" rx="10" fill="url(#card-grad)" stroke="#818CF8" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
+        <text x="16" y="32" class="tile-h">📦 Flash-Optimized</text>
+        <text x="16" y="54" class="tile-sub" fill="#818CF8">3.5 MB MUSL STATIC</text>
+        <text x="16" y="70" class="tile-sub" fill="#64748B">Fits 16–32 MB Flash</text>
+      </g>
 
-    <!-- Card 3: Next-Gen Stealth -->
-    <g transform="translate(550, 0)">
-      <rect width="255" height="95" rx="10" fill="url(#card-grad)" stroke="#C084FC" stroke-opacity="0.25" stroke-width="1" class="hud-card"/>
-      <circle cx="28" cy="28" r="14" fill="#9333EA" fill-opacity="0.2"/>
-      <text x="21" y="34" font-size="16">🛡️</text>
-      <text x="50" y="32" class="card-h">Next-Gen Stealth</text>
-      <text x="16" y="58" class="card-p">VLESS ML-KEM-768, AWG 2/3,</text>
-      <text x="16" y="76" class="card-p">REALITY uTLS &amp; XHTTP</text>
-    </g>
-
-    <!-- Card 4: Drop-In sing-box -->
-    <g transform="translate(825, 0)">
-      <rect width="255" height="95" rx="10" fill="url(#card-grad)" stroke="#10B981" stroke-opacity="0.25" stroke-width="1" class="hud-card"/>
-      <circle cx="28" cy="28" r="14" fill="#059669" fill-opacity="0.2"/>
-      <text x="21" y="34" font-size="16">🔌</text>
-      <text x="50" y="32" class="card-h">Drop-In sing-box</text>
-      <text x="16" y="58" class="card-p">100% совместимость с JSON</text>
-      <text x="16" y="76" class="card-p">и CLI sing-box &amp; Tachyon ucode</text>
+      <!-- Tile 3 -->
+      <g transform="translate(440, 0)">
+        <rect width="215" height="88" rx="10" fill="url(#card-grad)" stroke="#C084FC" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
+        <text x="16" y="32" class="tile-h">🛡️ Next-Gen Stealth</text>
+        <text x="16" y="54" class="tile-sub" fill="#C084FC">POST-QUANTUM VLESS</text>
+        <text x="16" y="70" class="tile-sub" fill="#64748B">AmneziaWG 2/3 · REALITY</text>
+      </g>
     </g>
   </g>
 </svg>

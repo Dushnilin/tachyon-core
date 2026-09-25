@@ -1574,14 +1574,19 @@ fn validate_masque_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), 
             "udp_fragment",
         )?;
     }
-    for f in [
-        "fragment_fallback_delay",
-        "keep_alive_period",
-        "idle_timeout",
-    ] {
+    for f in ["fragment_fallback_delay", "keep_alive_period"] {
         if let Some(v) = obj.get(f) {
             check_duration_field(v, &format!("{at}.{f}"), "MASQUEOutboundOptions", f)?;
         }
+    }
+    // lx 1.14.2-lx.3: `idle_timeout` is a pointer — null means "absent".
+    if let Some(v) = obj.get("idle_timeout").filter(|v| !v.is_null()) {
+        check_duration_field(
+            v,
+            &format!("{at}.idle_timeout"),
+            "MASQUEOutboundOptions",
+            "idle_timeout",
+        )?;
     }
     for f in [
         "connect_timeout",
@@ -5656,11 +5661,8 @@ mod tests {
             "{err}"
         );
 
-        let err = masque_err(json!({"idle_timeout": null}));
-        assert!(
-            err.contains("outbounds[0].idle_timeout: time: invalid duration \"\""),
-            "{err}"
-        );
+        // lx 1.14.2-lx.3: idle_timeout is a pointer — null means absent.
+        assert!(validate(&masque(json!({"idle_timeout": null}))).is_ok());
 
         let err = masque_err(json!({"udp_fragment": 1}));
         assert!(

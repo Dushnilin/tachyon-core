@@ -1,42 +1,44 @@
 {
   "log": {
-    "level": "info"
+    "level": "warn"
   },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
   "endpoints": [
     {
       "type": "wireguard",
-      "tag": "awg3-ep",
-      "system": false,
-      "mtu": 1376,
+      "tag": "wg",
+      "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
       "address": [
-        "10.8.1.7/32"
+        "10.77.77.2/24"
       ],
-      "private_key": "usPnwgHGqzDYkuwUcDe4nXqj6ZyxL3g0uNwwcsSjqcs=",
       "peers": [
         {
-          "address": "192.0.2.1",
-          "port": 30565,
-          "public_key": "xlTvw9l0d9JrgoGuqTNIcl4MCnEa/MSeC52DrCHxw3A=",
-          "pre_shared_key": "hHv0e7RbIHsa1BgrTXOXC4JqCGzCDPTwMQDQzG/x10s=",
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
           "allowed_ips": [
-            "0.0.0.0/0",
-            "::/0"
+            "0.0.0.0/0"
           ],
           "persistent_keepalive_interval": "25-35"
         }
       ],
-      "jc": 4,
-      "jmin": 10,
-      "jmax": 50,
-      "s1": 55,
-      "s2": 42,
-      "s3": 40,
-      "s4": 12,
-      "h1": 1,
-      "h2": 2,
-      "h3": 3,
-      "h4": 4,
-      "header_protection_key": "u6cLR2E8b5w1Yl4xC3hVJ0yF7dQmZ2sKt9eGaWn8pRo=",
+      "jc": 3,
+      "jmin": 60,
+      "jmax": 120,
+      "s1": 16,
+      "s2": 16,
+      "s3": 16,
+      "s4": 16,
+      "h1": 123,
+      "h2": 234,
+      "h3": 345,
+      "h4": 456,
+      "header_protection_key": "pBNb5h0hRWf3C6dpIVR2Tb7YwpH4THRscWhF1RV4Xgc=",
       "content_padding_addition": "10-100",
       "rekey_after_time": "100-120",
       "rekey_timeout": "3-7",
@@ -54,11 +56,6 @@
     }
   ],
   "route": {
-    "rules": [
-      {
-        "inbound": [],
-        "outbound": "awg3-ep"
-      }
-    ]
+    "final": "direct"
   }
 }

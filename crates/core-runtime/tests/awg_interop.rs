@@ -196,16 +196,6 @@ async fn socks_roundtrip(proxy: SocketAddr, target: SocketAddr, label: &str) -> 
 
 #[tokio::test]
 async fn interop_awg_wireguard() {
-    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
-        return;
-    };
-    let ref_bin = ref_bin.to_string_lossy().into_owned();
-
-    let our_priv = [0x33u8; 32];
-    let ref_priv = [0x44u8; 32];
-    let our_pub = b64(&x25519_pub(&our_priv));
-    let ref_pub = b64(&x25519_pub(&ref_priv));
-
     // Shared AWG 2.0 obfuscation for both endpoints. h1..h4 are
     // single-value ranges so both sides agree on the exact type words;
     // s2 dresses the responder's reply; i1 exercises our CPS chain
@@ -222,10 +212,55 @@ async fn interop_awg_wireguard() {
         "h4": 456,
         "i1": "<b 0xcafebabe><r 16><t>"
     });
+    run_awg_interop("awg", &awg).await;
+}
+
+/// Full AWG 3.x surface: header protection (ChaCha20 keystream keyed by the
+/// first 12 bytes of the s-padding), content-padding addition, random
+/// trailers, disabled cookies, ranged timing overrides and a ranged
+/// persistent keepalive.
+#[tokio::test]
+async fn interop_awg3_wireguard() {
+    let awg = json!({
+        "jc": 3,
+        "jmin": 60,
+        "jmax": 120,
+        "s1": 16,
+        "s2": 16,
+        "s3": 16,
+        "s4": 16,
+        "h1": 123,
+        "h2": 234,
+        "h3": 345,
+        "h4": 456,
+        "header_protection_key": "pBNb5h0hRWf3C6dpIVR2Tb7YwpH4THRscWhF1RV4Xgc=",
+        "content_padding_addition": "10-100",
+        "rekey_after_time": "100-120",
+        "rekey_timeout": "3-7",
+        "reject_after_time": "150-180",
+        "keepalive_timeout": "5-15",
+        "max_handshake_attempts": "15-20",
+        "random_trailers": true,
+        "disable_cookies": true,
+        "i1": "<b 0xcafebabe><r 16><t>"
+    });
+    run_awg_interop("awg3", &awg).await;
+}
+
+async fn run_awg_interop(label: &str, awg: &Value) {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    let ref_bin = ref_bin.to_string_lossy().into_owned();
+
+    let our_priv = [0x33u8; 32];
+    let ref_priv = [0x44u8; 32];
+    let our_pub = b64(&x25519_pub(&our_priv));
+    let ref_pub = b64(&x25519_pub(&ref_priv));
 
     let ref_port = free_port();
     let echo_port = spawn_echo().await;
-    eprintln!("awg: starting ref on {ref_port}, echo on {echo_port}");
+    eprintln!("{label}: starting ref on {ref_port}, echo on {echo_port}");
     let _server = start_ref(
         &ref_bin,
         &json!({
@@ -238,7 +273,8 @@ async fn interop_awg_wireguard() {
                 "listen_port": ref_port,
                 "peers": [{
                     "public_key": our_pub,
-                    "allowed_ips": ["0.0.0.0/0", "10.77.77.2/32"]
+                    "allowed_ips": ["0.0.0.0/0", "10.77.77.2/32"],
+                    "persistent_keepalive_interval": "25-35"
                 }],
                 "jc": awg["jc"],
                 "jmin": awg["jmin"],
@@ -257,9 +293,9 @@ async fn interop_awg_wireguard() {
     );
     assert!(
         wait_listening(ref_port).await,
-        "awg: reference server did not start"
+        "{label}: reference server did not start"
     );
-    eprintln!("awg: ref up on {ref_port}");
+    eprintln!("{label}: ref up on {ref_port}");
 
     let instance = core_runtime::start(&json!({
         "log": {"level": "debug"},
@@ -293,7 +329,7 @@ async fn interop_awg_wireguard() {
     .await
     .expect("start tachyon-core");
     let proxy = instance.inbound_addrs()[0].1;
-    eprintln!("awg: box up, proxy {proxy}");
+    eprintln!("{label}: box up, proxy {proxy}");
 
     // Primary target: the host LAN address — a "remote" destination from the
     // reference's point of view. Fallback: loopback.
@@ -305,10 +341,10 @@ async fn interop_awg_wireguard() {
 
     let mut ok = false;
     for target in attempts {
-        eprintln!("awg: roundtrip via {target}");
+        eprintln!("{label}: roundtrip via {target}");
         let result = tokio::time::timeout(
             Duration::from_secs(25),
-            socks_roundtrip(proxy, target, "awg"),
+            socks_roundtrip(proxy, target, label),
         )
         .await;
         match result {
@@ -316,12 +352,12 @@ async fn interop_awg_wireguard() {
                 ok = true;
                 break;
             }
-            Ok(Err(e)) => eprintln!("awg: attempt {target} failed: {e}"),
-            Err(_) => eprintln!("awg: attempt {target} timed out"),
+            Ok(Err(e)) => eprintln!("{label}: attempt {target} failed: {e}"),
+            Err(_) => eprintln!("{label}: attempt {target} timed out"),
         }
     }
 
     instance.shutdown();
-    assert!(ok, "awg: all roundtrip attempts failed");
-    eprintln!("awg: roundtrip ok, shutting down");
+    assert!(ok, "{label}: all roundtrip attempts failed");
+    eprintln!("{label}: roundtrip ok, shutting down");
 }

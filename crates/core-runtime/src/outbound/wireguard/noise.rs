@@ -19,7 +19,7 @@ const LABEL_COOKIE: &[u8] = b"cookie--";
 pub const INITIATION_LEN: usize = 148;
 pub const RESPONSE_LEN: usize = 92;
 pub const COOKIE_REPLY_LEN: usize = 64;
-const TRANSPORT_HEADER_LEN: usize = 16;
+pub const TRANSPORT_HEADER_LEN: usize = 16;
 /// `offsetof(handshake_initiation, mac1)`.
 const MAC1_OFFSET_INIT: usize = 116;
 /// `offsetof(handshake_initiation, mac2)`.
@@ -399,12 +399,19 @@ impl Session {
 
     /// Seal one inner packet into a transport message (pads to 16 bytes).
     pub fn seal(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        let pad = (16 - (packet.len() % 16)) % 16;
+        self.seal_raw(packet, packet.len() + pad)
+    }
+
+    /// Seal with an explicit final plaintext length (AWG 3.x content
+    /// padding / trailers replace the multiple-of-16 alignment).
+    pub fn seal_raw(&mut self, packet: &[u8], padded_len: usize) -> Option<Vec<u8>> {
         if self.send_counter > REJECT_AFTER_MESSAGES {
             return None;
         }
+        debug_assert!(padded_len >= packet.len());
         let mut padded = packet.to_vec();
-        let pad = (16 - (padded.len() % 16)) % 16;
-        padded.resize(padded.len() + pad, 0);
+        padded.resize(padded_len, 0);
         let counter = self.send_counter;
         self.send_counter += 1;
         let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded.len() + 16);

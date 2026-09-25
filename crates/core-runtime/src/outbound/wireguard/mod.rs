@@ -90,24 +90,39 @@ fn b64_key(value: &str, at: &str) -> anyhow::Result<[u8; 32]> {
     Ok(arr)
 }
 
-fn parse_keepalive(value: Option<&Value>, at: &str) -> anyhow::Result<Option<Duration>> {
+/// Persistent keepalive as an inclusive seconds range (`N`, `N-M`); AWG 3.x
+/// re-picks from the range every time the timer arms.
+fn parse_keepalive(value: Option<&Value>, at: &str) -> anyhow::Result<Option<(u32, u32)>> {
+    let parse_part = |part: &str| -> anyhow::Result<u32> {
+        part.trim()
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("{at}: invalid persistent_keepalive_interval {part:?}"))
+    };
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => {
             let secs = n.as_u64().unwrap_or(0);
-            Ok((secs > 0).then(|| Duration::from_secs(secs)))
+            Ok((secs > 0).then_some((secs as u32, secs as u32)))
         }
         Some(Value::String(s)) => {
             let s = s.trim();
-            if let Some((first, _)) = s.split_once('-') {
-                let secs: u64 = first
-                    .trim()
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("{at}: invalid keepalive interval {s:?}"))?;
-                return Ok((secs > 0).then(|| Duration::from_secs(secs)));
+            if s.is_empty() {
+                return Ok(None);
             }
-            let d = parse_duration(value, Duration::ZERO, at)?;
-            Ok((!d.is_zero()).then_some(d))
+            let (lo, hi) = match s.split_once('-') {
+                Some((a, b)) => (parse_part(a)?, parse_part(b)?),
+                None => match parse_part(s) {
+                    Ok(v) => (v, v),
+                    // Go duration string ("45s"), accepted by the lx.8 option
+                    Err(_) => {
+                        let d = parse_duration(value, Duration::ZERO, at)?;
+                        let v = d.as_secs() as u32;
+                        (v, v)
+                    }
+                },
+            };
+            let (lo, hi) = (lo.min(hi), lo.max(hi));
+            Ok((lo > 0).then_some((lo, hi)))
         }
         Some(_) => anyhow::bail!("{at}: invalid persistent_keepalive_interval"),
     }
@@ -120,7 +135,7 @@ struct PeerConfig {
     public_key: [u8; 32],
     pre_shared_key: Option<[u8; 32]>,
     allowed_ips: Vec<(u32, u8)>,
-    keepalive: Option<Duration>,
+    keepalive: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -548,6 +563,9 @@ struct HsRuntime {
 
 struct PeerRt {
     endpoint: PeerConfig,
+    /// AWG 3.x UDP window: the largest datagram seen on this peer in either
+    /// direction; bounds content-padding additions and random trailers.
+    udp_window: u32,
     resolved: Option<SocketAddr>,
     resolve_at: Option<Instant>,
     session: Option<noise::Session>,
@@ -565,6 +583,7 @@ impl PeerRt {
     fn new(endpoint: PeerConfig) -> Self {
         Self {
             endpoint,
+            udp_window: awg::DEFAULT_UDP_WINDOW,
             resolved: None,
             resolve_at: None,
             session: None,
@@ -736,16 +755,65 @@ impl Stack {
             self.send_raw(pi, &buf);
         }
         let pad = params.padding(awg::INIT);
+        let window = self.peers[pi].udp_window;
         let mut pkt = vec![0u8; pad + init.len()];
         awg::fill_random(&mut pkt[..pad]);
         pkt[pad..].copy_from_slice(init);
+        if params.random_trailers {
+            let at = pkt.len();
+            pkt.resize(at + awg::trailer_len(window, pad + init.len()), 0);
+            awg::fill_random(&mut pkt[at..]);
+        }
+        if let Some(key) = &params.header_protection {
+            // The keystream nonce is the first 12 bytes of the datagram —
+            // the s1 random prefix; only the message itself is masked.
+            let nonce = pkt[..12].to_vec();
+            awg::mask_header(key, &nonce, &mut pkt[pad..pad + init.len()]);
+        }
         self.send_raw(pi, &pkt);
+    }
+
+    /// Seal one transport datagram with AWG 3.x dressing: content padding or
+    /// a random trailer inside the AEAD, the s4 random prefix in front, and
+    /// the header masked by the header-protection keystream.
+    fn seal_transport(&mut self, pi: usize, pkt: &[u8]) -> Option<Vec<u8>> {
+        let params = self.cfg.awg.clone();
+        let pad_len = params.as_ref().map(|a| {
+            awg::transport_padding(
+                a,
+                self.peers[pi].udp_window,
+                pkt.len(),
+                a.padding(awg::TRANSPORT),
+            )
+        });
+        let session = self.peers[pi].session.as_mut()?;
+        let msg = match (&params, pad_len) {
+            (None, _) => session.seal(pkt)?,
+            (Some(_), Some(pad_len)) => session.seal_raw(pkt, pkt.len() + pad_len)?,
+            (Some(_), None) => return None,
+        };
+        let mut out = msg;
+        if let Some(a) = params.as_ref() {
+            let s4 = a.padding(awg::TRANSPORT);
+            if s4 > 0 {
+                let mut dressed = vec![0u8; s4 + out.len()];
+                awg::fill_random(&mut dressed[..s4]);
+                dressed[s4..].copy_from_slice(&out);
+                out = dressed;
+            }
+            if let Some(key) = &a.header_protection {
+                let nonce = out[..12].to_vec();
+                awg::mask_header(key, &nonce, &mut out[s4..s4 + 16]);
+            }
+            self.peers[pi].udp_window = self.peers[pi].udp_window.max(out.len() as u32);
+        }
+        Some(out)
     }
 
     /// Queue an IP packet to a peer: seal via the session or buffer until the
     /// handshake completes.
     fn xmit_to_peer(&mut self, pi: usize, pkt: Vec<u8>) {
-        let sealed = self.peers[pi].session.as_mut().and_then(|s| s.seal(&pkt));
+        let sealed = self.seal_transport(pi, &pkt);
         match sealed {
             Some(msg) => {
                 self.send_raw(pi, &msg);
@@ -955,15 +1023,43 @@ impl Stack {
 
     fn process_inbound(&mut self, buf: &[u8]) {
         // AWG-aware classification: the message may carry an s-padding
-        // prefix and a magic-header type word inside its configured range.
-        let Some((msg_type, padding)) = awg::demux(self.cfg.awg.as_deref(), buf) else {
+        // prefix, a masked magic-header type word and a random trailer.
+        let known_index = |idx: u32| self.index_peer.contains_key(&idx);
+        let Some((msg_type, padding)) = awg::demux(self.cfg.awg.as_deref(), buf, &known_index)
+        else {
             return;
         };
-        let msg = &buf[padding..];
+        let mut msg = buf[padding..].to_vec();
+        if let Some(a) = self.cfg.awg.as_ref()
+            && let Some(key) = &a.header_protection
+        {
+            let canon = match msg_type {
+                noise::MSG_INITIATION => noise::INITIATION_LEN,
+                noise::MSG_RESPONSE => noise::RESPONSE_LEN,
+                noise::MSG_COOKIE_REPLY => noise::COOKIE_REPLY_LEN,
+                _ => noise::TRANSPORT_HEADER_LEN,
+            };
+            let end = canon.min(msg.len());
+            awg::mask_header(key, &buf[..12], &mut msg[..end]);
+        }
+        if msg_type != noise::MSG_TRANSPORT {
+            // Fixed-size handshake kinds: drop the AWG 3.x random trailer.
+            let canon = match msg_type {
+                noise::MSG_INITIATION => noise::INITIATION_LEN,
+                noise::MSG_RESPONSE => noise::RESPONSE_LEN,
+                _ => noise::COOKIE_REPLY_LEN,
+            };
+            msg.truncate(canon.min(msg.len()));
+        }
         if msg.len() < 8 {
             return;
         }
         let recv_idx = u32::from_le_bytes(msg[4..8].try_into().expect("4 bytes"));
+        if msg_type == noise::MSG_TRANSPORT
+            && let Some(&pi) = self.index_peer.get(&recv_idx)
+        {
+            self.peers[pi].udp_window = self.peers[pi].udp_window.max(buf.len() as u32);
+        }
         logging::debug(format_args!(
             "wireguard[{}]: recv type={msg_type} len={} idx={recv_idx}",
             self.cfg.tag,
@@ -980,10 +1076,10 @@ impl Stack {
                     return;
                 }
                 let receiver = u32::from_le_bytes(msg[8..12].try_into().expect("4 bytes"));
-                self.on_response(msg, receiver);
+                self.on_response(&msg, receiver);
             }
-            noise::MSG_COOKIE_REPLY => self.on_cookie(msg, recv_idx),
-            noise::MSG_TRANSPORT => self.on_transport(msg, recv_idx),
+            noise::MSG_COOKIE_REPLY => self.on_cookie(&msg, recv_idx),
+            noise::MSG_TRANSPORT => self.on_transport(&msg, recv_idx),
             _ => {}
         }
     }
@@ -1030,6 +1126,9 @@ impl Stack {
     }
 
     fn on_cookie(&mut self, msg: &[u8], recv_idx: u32) {
+        if self.cfg.awg.as_ref().is_some_and(|a| a.disable_cookies) {
+            return;
+        }
         let Some(&pi) = self.index_peer.get(&recv_idx) else {
             return;
         };
@@ -1221,23 +1320,43 @@ impl Stack {
                 .filter(|h| now >= h.retry_at)
                 .map(|h| (h.attempt, h.started, h.hs.initiation().to_vec()));
             if let Some((attempt, started, initiation)) = retry {
-                if attempt >= REKEY_ATTEMPT_COUNT
-                    || now.duration_since(started) >= REKEY_ATTEMPT_TIME
-                {
+                // AWG 3.x: rekey_timeout / max_handshake_attempts ranges are
+                // re-picked per attempt cycle.
+                let rekey_timeout = self
+                    .cfg
+                    .awg
+                    .as_ref()
+                    .map(|a| awg::pick_secs(a.rekey_timeout, REKEY_TIMEOUT.as_secs()))
+                    .unwrap_or(REKEY_TIMEOUT);
+                let max_attempts = self
+                    .cfg
+                    .awg
+                    .as_ref()
+                    .map(|a| awg::pick_opt(a.max_handshake_attempts, REKEY_ATTEMPT_COUNT))
+                    .unwrap_or(REKEY_ATTEMPT_COUNT);
+                if attempt >= max_attempts || now.duration_since(started) >= REKEY_ATTEMPT_TIME {
                     self.peers[pi].hs = None;
                     self.peers[pi].pending.clear();
                 } else {
                     self.send_handshake_init(pi, &initiation);
                     if let Some(hs) = &mut self.peers[pi].hs {
                         hs.attempt += 1;
-                        hs.retry_at = now + REKEY_TIMEOUT + jitter();
+                        hs.retry_at = now + rekey_timeout + jitter();
                     }
                 }
             }
 
+            // AWG 3.x: keychain expiry = reject_after_time.Hi.
+            let reject_after = self
+                .cfg
+                .awg
+                .as_ref()
+                .and_then(|a| a.reject_after_time)
+                .map(|(_, hi)| Duration::from_secs(hi as u64))
+                .unwrap_or(REJECT_AFTER_TIME);
             if self.peers[pi].session.is_some()
                 && let Some(lr) = self.peers[pi].last_recv
-                && now.duration_since(lr) >= REJECT_AFTER_TIME
+                && now.duration_since(lr) >= reject_after
             {
                 self.peers[pi].session = None;
                 self.peers[pi].session_since = None;
@@ -1248,22 +1367,29 @@ impl Stack {
                 self.start_hs(pi);
             }
 
+            let rekey_after = self
+                .cfg
+                .awg
+                .as_ref()
+                .map(|a| awg::pick_secs(a.rekey_after_time, REKEY_AFTER_TIME.as_secs()))
+                .unwrap_or(REKEY_AFTER_TIME);
             if self.peers[pi].session.is_some()
                 && self.peers[pi].hs.is_none()
                 && let Some(since) = self.peers[pi].session_since
-                && now.duration_since(since) >= REKEY_AFTER_TIME
+                && now.duration_since(since) >= rekey_after
             {
                 self.start_hs(pi);
             }
 
-            if let Some(interval) = self.peers[pi].endpoint.keepalive
+            if let Some(range) = self.peers[pi].endpoint.keepalive
                 && self.peers[pi].session.is_some()
             {
+                let interval = Duration::from_secs(awg::pick_opt(Some(range), 0) as u64);
                 let due = self.peers[pi]
                     .last_sent
                     .is_none_or(|t| now.duration_since(t) >= interval);
                 if due && self.peers[pi].hs.is_none() {
-                    let confirm = self.peers[pi].session.as_mut().and_then(|s| s.seal(&[]));
+                    let confirm = self.seal_transport(pi, &[]);
                     if let Some(msg) = confirm {
                         self.send_raw(pi, &msg);
                         self.peers[pi].last_sent = Some(Instant::now());
@@ -1274,7 +1400,7 @@ impl Stack {
             if self.peers[pi].flush && self.peers[pi].session.is_some() {
                 self.peers[pi].flush = false;
                 // Key confirmation: an empty transport packet right away.
-                let confirm = self.peers[pi].session.as_mut().and_then(|s| s.seal(&[]));
+                let confirm = self.seal_transport(pi, &[]);
                 if let Some(msg) = confirm {
                     self.send_raw(pi, &msg);
                     self.peers[pi].last_sent = Some(Instant::now());
@@ -1312,7 +1438,8 @@ impl Stack {
                 if let Some(lr) = peer.last_recv {
                     consider(lr + REJECT_AFTER_TIME);
                 }
-                if let Some(interval) = peer.endpoint.keepalive {
+                if let Some(range) = peer.endpoint.keepalive {
+                    let interval = Duration::from_secs(awg::pick_opt(Some(range), 0) as u64);
                     if let Some(sent) = peer.last_sent {
                         consider(sent + interval);
                     } else {
@@ -1531,7 +1658,7 @@ mod tests {
         assert_eq!(wg.cfg.mtu, DEFAULT_MTU);
         assert_eq!(wg.cfg.peers.len(), 1);
         assert_eq!(wg.cfg.peers[0].port, DEFAULT_PORT);
-        assert_eq!(wg.cfg.peers[0].keepalive, Some(Duration::from_secs(25)));
+        assert_eq!(wg.cfg.peers[0].keepalive, Some((25, 25)));
         assert_eq!(wg.cfg.peers[0].allowed_ips, vec![(0, 0)]);
     }
 
@@ -1573,19 +1700,19 @@ mod tests {
         let at = "t";
         assert_eq!(
             parse_keepalive(Some(&json!(30)), at).unwrap(),
-            Some(Duration::from_secs(30))
+            Some((30, 30))
         );
         assert_eq!(
             parse_keepalive(Some(&json!("30")), at).unwrap(),
-            Some(Duration::from_secs(30))
+            Some((30, 30))
         );
         assert_eq!(
             parse_keepalive(Some(&json!("30-60")), at).unwrap(),
-            Some(Duration::from_secs(30))
+            Some((30, 60))
         );
         assert_eq!(
             parse_keepalive(Some(&json!("45s")), at).unwrap(),
-            Some(Duration::from_secs(45))
+            Some((45, 45))
         );
         assert_eq!(parse_keepalive(Some(&json!(0)), at).unwrap(), None);
         assert_eq!(parse_keepalive(None, at).unwrap(), None);

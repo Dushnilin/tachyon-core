@@ -31,6 +31,12 @@ Engineered specifically for **OpenWrt** routers and embedded network appliances 
 * 🔒 **Pure Rust No-C Cryptography**: Independent of `ring` and BoringSSL/CGO, compiling cleanly for 32-bit softfloat MIPS without toolchain failures.
 * 🔌 **Native Tachyon Integration**: Direct drop-in for the [Tachyon](https://github.com/Dushnilin/tachyon) OpenWrt ecosystem (`variant: rs` in LuCI / ucode orchestration).
 
+<div align="center">
+
+![Tachyon Particle](assets/readme/tachyon_particle.svg)
+
+</div>
+
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>

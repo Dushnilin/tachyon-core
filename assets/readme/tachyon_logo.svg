@@ -1,0 +1,232 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="100%" height="100%">
+  <title>Tachyon 3D Logo - Hyper-Dimensional Quantum Singularity</title>
+  <defs>
+    <!-- Deep Space Background -->
+    <radialGradient id="logo-bg" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#0B132B" stop-opacity="0.95"/>
+      <stop offset="50%" stop-color="#050811" stop-opacity="0.98"/>
+      <stop offset="100%" stop-color="#02040A" stop-opacity="1"/>
+    </radialGradient>
+
+    <!-- Core Plasma Light -->
+    <radialGradient id="plasma-core-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="25%" stop-color="#00F0FF" stop-opacity="0.95"/>
+      <stop offset="55%" stop-color="#38BDF8" stop-opacity="0.6"/>
+      <stop offset="80%" stop-color="#818CF8" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#C084FC" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- 3D Facet Shading Gradients (Left Crystal) -->
+    <!-- Top-Outer Facet (Dark Titanium with subtle sky reflection) -->
+    <linearGradient id="facet-l-top-outer" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="60%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+
+    <!-- Top-Inner Facet (Catching specular glow from core) -->
+    <linearGradient id="facet-l-top-inner" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0284C7"/>
+      <stop offset="40%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#475569"/>
+    </linearGradient>
+
+    <!-- Bottom-Outer Facet (Deep Obsidian Shadow) -->
+    <linearGradient id="facet-l-bot-outer" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+
+    <!-- Bottom-Inner Facet (Reflecting Cyan Core) -->
+    <linearGradient id="facet-l-bot-inner" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00F0FF" stop-opacity="0.7"/>
+      <stop offset="50%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+
+    <!-- 3D Facet Shading Gradients (Right Crystal) -->
+    <linearGradient id="facet-r-top-outer" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#475569"/>
+      <stop offset="60%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+
+    <linearGradient id="facet-r-top-inner" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#818CF8"/>
+      <stop offset="40%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#334155"/>
+    </linearGradient>
+
+    <linearGradient id="facet-r-bot-outer" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+
+    <linearGradient id="facet-r-bot-inner" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C084FC" stop-opacity="0.7"/>
+      <stop offset="50%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+
+    <!-- Wordmark Hologram -->
+    <linearGradient id="holo-brand" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00F0FF"/>
+      <stop offset="50%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+
+    <!-- Filters -->
+    <filter id="bloom-strong" filterUnits="userSpaceOnUse" x="0" y="0" width="600" height="600">
+      <feGaussianBlur stdDeviation="6" result="b1"/>
+      <feGaussianBlur stdDeviation="18" result="b2"/>
+      <feGaussianBlur stdDeviation="45" result="b3"/>
+      <feMerge>
+        <feMergeNode in="b3"/>
+        <feMergeNode in="b2"/>
+        <feMergeNode in="b1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="specular-edge" filterUnits="userSpaceOnUse" x="0" y="0" width="600" height="600">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <style>
+    @keyframes spinClockwise {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    @keyframes spinCounter {
+      from { transform: rotate(360deg); }
+      to { transform: rotate(0deg); }
+    }
+    @keyframes pulse3D {
+      0%, 100% { transform: scale(1); filter: drop-shadow(0 0 25px rgba(0, 240, 255, 0.4)); }
+      50% { transform: scale(1.04); filter: drop-shadow(0 0 50px rgba(56, 189, 248, 0.8)); }
+    }
+    @keyframes coreFlicker {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.65; transform: scale(0.92); }
+    }
+
+    .emblem-group { transform-origin: 300px 240px; animation: pulse3D 3.5s ease-in-out infinite; }
+    .ring-orbit-1 { transform-origin: 300px 240px; animation: spinClockwise 20s linear infinite; }
+    .ring-orbit-2 { transform-origin: 300px 240px; animation: spinCounter 14s linear infinite; }
+    .core-pulse { transform-origin: 300px 240px; animation: coreFlicker 2.2s ease-in-out infinite; }
+
+    .brand-title {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Outfit', 'Inter', sans-serif;
+      font-weight: 900;
+      font-size: 42px;
+      letter-spacing: 12px;
+    }
+    .brand-sub {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-weight: 700;
+      font-size: 11px;
+      letter-spacing: 4px;
+    }
+  </style>
+
+  <!-- Deep Obsidian Canvas -->
+  <rect width="600" height="600" rx="24" fill="url(#logo-bg)"/>
+
+  <!-- Subtle Horizon Floor Reflection / Radial Glow -->
+  <ellipse cx="300" cy="420" rx="180" ry="24" fill="#00F0FF" fill-opacity="0.08" filter="url(#bloom-strong)"/>
+  <ellipse cx="300" cy="420" rx="120" ry="14" fill="#38BDF8" fill-opacity="0.12"/>
+
+  <!-- ================================================================= -->
+  <!-- 3D ORBITING QUANTUM FIELD RINGS -->
+  <!-- ================================================================= -->
+  <g class="ring-orbit-1" opacity="0.6">
+    <ellipse cx="300" cy="240" rx="170" ry="55" fill="none" stroke="#38BDF8" stroke-width="1.2" stroke-dasharray="14 20" transform="rotate(-25 300 240)"/>
+    <circle cx="435" cy="180" r="4" fill="#00F0FF" filter="url(#bloom-strong)"/>
+    <circle cx="165" cy="300" r="3.5" fill="#C084FC" filter="url(#bloom-strong)"/>
+  </g>
+
+  <g class="ring-orbit-2" opacity="0.5">
+    <ellipse cx="300" cy="240" rx="150" ry="45" fill="none" stroke="#818CF8" stroke-width="1.4" stroke-dasharray="60 30 15 15" transform="rotate(35 300 240)"/>
+    <circle cx="410" cy="320" r="4" fill="#38BDF8" filter="url(#bloom-strong)"/>
+    <circle cx="190" cy="160" r="3" fill="#FFFFFF" filter="url(#bloom-strong)"/>
+  </g>
+
+  <!-- ================================================================= -->
+  <!-- 3D TACHYON EMBLEM (TWIN INTERLOCKING OBSIDIAN DIAMONDS) -->
+  <!-- ================================================================= -->
+  <g class="emblem-group">
+    <!-- Ambient Plasma Halo behind crystals -->
+    <circle cx="300" cy="240" r="110" fill="url(#plasma-core-glow)"/>
+
+    <!-- Left Faceted Obsidian Crystal (3D Prism) -->
+    <g id="left-crystal">
+      <!-- Facet 1: Top-Outer -->
+      <polygon points="240,110 155,225 230,220" fill="url(#facet-l-top-outer)" stroke="#38BDF8" stroke-width="0.8" stroke-opacity="0.4"/>
+
+      <!-- Facet 2: Top-Inner (Facing Singularity) -->
+      <polygon points="240,110 230,220 285,225" fill="url(#facet-l-top-inner)" stroke="#00F0FF" stroke-width="1.2" stroke-opacity="0.75"/>
+
+      <!-- Facet 3: Bottom-Outer -->
+      <polygon points="155,225 240,340 230,220" fill="url(#facet-l-bot-outer)" stroke="#1E293B" stroke-width="0.8"/>
+
+      <!-- Facet 4: Bottom-Inner (Reflecting Core Light) -->
+      <polygon points="285,225 240,340 230,220" fill="url(#facet-l-bot-inner)" stroke="#00F0FF" stroke-width="1.2" stroke-opacity="0.8"/>
+
+      <!-- Specular Highlight Crest Ridge -->
+      <line x1="240" y1="110" x2="240" y2="340" stroke="#FFFFFF" stroke-width="1.2" stroke-opacity="0.4" stroke-linecap="round"/>
+    </g>
+
+    <!-- Right Faceted Obsidian Crystal (3D Prism) -->
+    <g id="right-crystal">
+      <!-- Facet 1: Top-Outer -->
+      <polygon points="360,110 445,225 370,220" fill="url(#facet-r-top-outer)" stroke="#818CF8" stroke-width="0.8" stroke-opacity="0.4"/>
+
+      <!-- Facet 2: Top-Inner (Facing Singularity) -->
+      <polygon points="360,110 370,220 315,225" fill="url(#facet-r-top-inner)" stroke="#C084FC" stroke-width="1.2" stroke-opacity="0.75"/>
+
+      <!-- Facet 3: Bottom-Outer -->
+      <polygon points="445,225 360,340 370,220" fill="url(#facet-r-bot-outer)" stroke="#1E293B" stroke-width="0.8"/>
+
+      <!-- Facet 4: Bottom-Inner (Reflecting Core Light) -->
+      <polygon points="315,225 360,340 370,220" fill="url(#facet-r-bot-inner)" stroke="#C084FC" stroke-width="1.2" stroke-opacity="0.8"/>
+
+      <!-- Specular Highlight Crest Ridge -->
+      <line x1="360" y1="110" x2="360" y2="340" stroke="#FFFFFF" stroke-width="1.2" stroke-opacity="0.4" stroke-linecap="round"/>
+    </g>
+
+    <!-- Central Quantum Singularity (Fusion Horizon) -->
+    <g class="core-pulse">
+      <!-- Cherenkov Diamond Portal -->
+      <polygon points="300,175 345,240 300,305 255,240" fill="#0B132B" stroke="#00F0FF" stroke-width="2.2" filter="url(#bloom-strong)"/>
+
+      <!-- Inner Hyper-Octagram Core -->
+      <polygon points="300,195 312,225 340,240 312,255 300,285 288,255 260,240 288,225" fill="#111827" stroke="#38BDF8" stroke-width="1.8"/>
+
+      <!-- Intense Central Laser Singularity -->
+      <circle cx="300" cy="240" r="12" fill="#FFFFFF" filter="url(#bloom-strong)"/>
+      <circle cx="300" cy="240" r="6" fill="#00F0FF"/>
+
+      <!-- Horizontal Event Horizon Rays -->
+      <line x1="210" y1="240" x2="390" y2="240" stroke="#FFFFFF" stroke-width="1.5" stroke-opacity="0.9" filter="url(#bloom-strong)"/>
+      <line x1="250" y1="240" x2="350" y2="240" stroke="#00F0FF" stroke-width="3" stroke-linecap="round"/>
+    </g>
+  </g>
+
+  <!-- ================================================================= -->
+  <!-- FUTURISTIC 3D BRAND TYPOGRAPHY -->
+  <!-- ================================================================= -->
+  <g transform="translate(300, 490)" text-anchor="middle">
+    <!-- Brand Name with Glow Shadow -->
+    <text y="0" class="brand-title" fill="url(#holo-brand)" filter="url(#bloom-strong)" opacity="0.6">TACHYON</text>
+    <text y="0" class="brand-title" fill="url(#holo-brand)">TACHYON</text>
+
+    <!-- Subtitle Telemetry -->
+    <text y="32" class="brand-sub" fill="#64748B">QUANTUM RELATIVISTIC CORE &#160;•&#160; v &gt; c</text>
+  </g>
+</svg>

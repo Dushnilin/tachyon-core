@@ -46,6 +46,24 @@
       <feGaussianBlur stdDeviation="10" result="blur" />
       <feComposite in="SourceGraphic" in2="blur" operator="over" />
     </filter>
+
+    <!-- Miniature 3D Tachyon Brand Logo Symbol -->
+    <g id="tachyon-mini-logo">
+      <circle cx="10" cy="10" r="9" fill="#00F0FF" fill-opacity="0.12"/>
+      <!-- Left 3D Obsidian Facet -->
+      <polygon points="6,3 2,10 6,17 6,10" fill="#1E293B" stroke="#38BDF8" stroke-width="0.6"/>
+      <polygon points="6,3 6,10 9,10" fill="#334155" stroke="#00F0FF" stroke-width="0.6"/>
+      <polygon points="2,10 6,17 6,10" fill="#0F172A" stroke="#1E293B" stroke-width="0.6"/>
+      <polygon points="9,10 6,17 6,10" fill="#0284C7" stroke="#00F0FF" stroke-width="0.6"/>
+      <!-- Right 3D Obsidian Facet -->
+      <polygon points="14,3 18,10 14,17 14,10" fill="#1E293B" stroke="#818CF8" stroke-width="0.6"/>
+      <polygon points="14,3 14,10 11,10" fill="#334155" stroke="#C084FC" stroke-width="0.6"/>
+      <polygon points="18,10 14,17 14,10" fill="#0F172A" stroke="#1E293B" stroke-width="0.6"/>
+      <polygon points="11,10 14,17 14,10" fill="#7C3AED" stroke="#C084FC" stroke-width="0.6"/>
+      <!-- Central Singularity Core -->
+      <polygon points="10,6 13,10 10,14 7,10" fill="#00F0FF" stroke="#FFFFFF" stroke-width="0.8"/>
+      <circle cx="10" cy="10" r="1.5" fill="#FFFFFF"/>
+    </g>
   </defs>
 
   <style>
@@ -220,12 +238,13 @@
       </g>
     </g>
 
-    <!-- 3 Spacious, Clean Architectural Tiles (No Overlapping, Pure Essence) -->
+    <!-- 3 Spacious, Clean Architectural Tiles (With Tachyon 3D Logo on Each Card) -->
     <g transform="translate(0, 215)">
       <!-- Tile 1 -->
       <g transform="translate(0, 0)">
         <rect width="205" height="88" rx="10" fill="url(#card-grad)" stroke="#38BDF8" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
-        <text x="16" y="32" class="tile-h">⚡ Zero-GC Runtime</text>
+        <use href="#tachyon-mini-logo" x="14" y="15"/>
+        <text x="40" y="30" class="tile-h">Zero-GC Runtime</text>
         <text x="16" y="54" class="tile-sub" fill="#38BDF8">0.00 ms GC PAUSES</text>
         <text x="16" y="70" class="tile-sub" fill="#64748B">Deterministic RAII</text>
       </g>
@@ -233,7 +252,8 @@
       <!-- Tile 2 -->
       <g transform="translate(220, 0)">
         <rect width="205" height="88" rx="10" fill="url(#card-grad)" stroke="#818CF8" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
-        <text x="16" y="32" class="tile-h">📦 Flash-Optimized</text>
+        <use href="#tachyon-mini-logo" x="14" y="15"/>
+        <text x="40" y="30" class="tile-h">Flash-Optimized</text>
         <text x="16" y="54" class="tile-sub" fill="#818CF8">3.5 MB MUSL STATIC</text>
         <text x="16" y="70" class="tile-sub" fill="#64748B">Fits 16–32 MB Flash</text>
       </g>
@@ -241,7 +261,8 @@
       <!-- Tile 3 -->
       <g transform="translate(440, 0)">
         <rect width="215" height="88" rx="10" fill="url(#card-grad)" stroke="#C084FC" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
-        <text x="16" y="32" class="tile-h">🛡️ Next-Gen Stealth</text>
+        <use href="#tachyon-mini-logo" x="14" y="15"/>
+        <text x="40" y="30" class="tile-h">Next-Gen Stealth</text>
         <text x="16" y="54" class="tile-sub" fill="#C084FC">POST-QUANTUM VLESS</text>
         <text x="16" y="70" class="tile-sub" fill="#64748B">AmneziaWG 2/3 · REALITY</text>
       </g>

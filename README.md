@@ -31,6 +31,12 @@
 * 🔒 **Чистый Rust без C-зависимостей (No-C Crypto)**: независимость от `ring` и BoringSSL/CGO, сборка под 32-битный softfloat MIPS без сбоев компиляции.
 * 🔌 **Нативная интеграция в экосистему [Tachyon](https://github.com/Dushnilin/tachyon)**: прямая поддержка оркестрации LuCI Web UI и ucode-скриптов (`generator.uc`, `watchdog.uc`).
 
+<div align="center">
+
+![Tachyon Particle](assets/readme/tachyon_particle.svg)
+
+</div>
+
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>

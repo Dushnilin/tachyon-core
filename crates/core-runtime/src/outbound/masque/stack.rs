@@ -23,9 +23,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::logging;
 
-use super::MasqueCfg;
 use super::h2::H2Conn;
 use super::h3::H3Conn;
+use crate::outbound::fptn::FptnConn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -37,10 +37,20 @@ const CMD_QUEUE: usize = 256;
 const REPLY_QUEUE: usize = 64;
 const EGRESS_BUF_MAX: usize = 1 << 20;
 
+/// Stack tunables shared by every tunnel flavor (masque CONNECT-IP, fptn).
+pub(crate) struct StackCfg {
+    pub tag: String,
+    pub mtu: usize,
+    pub local_addr: Ipv4Addr,
+    pub local_cidr: IpCidr,
+    pub idle_timeout: Option<Duration>,
+}
+
 /// Established CONNECT-IP tunnel, chosen by `vhttp`.
 pub(crate) enum Leg {
     H3(H3Conn),
     H2(H2Conn),
+    Fptn(FptnConn),
 }
 
 impl Leg {
@@ -48,6 +58,7 @@ impl Leg {
         match self {
             Leg::H3(conn) => conn.read_packet().await,
             Leg::H2(conn) => conn.read_packet().await,
+            Leg::Fptn(conn) => conn.read_packet().await,
         }
     }
 
@@ -55,6 +66,7 @@ impl Leg {
         match self {
             Leg::H3(conn) => conn.write_packet(pkt).await,
             Leg::H2(conn) => conn.write_packet(pkt).await,
+            Leg::Fptn(conn) => conn.write_packet(pkt).await,
         }
     }
 
@@ -62,6 +74,7 @@ impl Leg {
         match self {
             Leg::H3(conn) => conn.close(),
             Leg::H2(conn) => conn.close(),
+            Leg::Fptn(conn) => conn.close(),
         }
     }
 }
@@ -197,7 +210,7 @@ impl Device for MasqueDevice {
 }
 
 struct Stack {
-    cfg: Arc<MasqueCfg>,
+    cfg: Arc<StackCfg>,
     device: MasqueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -509,7 +522,7 @@ impl Stack {
 /// drops (`rx` closed), the leg dies, or the idle window elapses — the next
 /// dial rebuilds everything.
 pub(crate) async fn run(
-    cfg: Arc<MasqueCfg>,
+    cfg: Arc<StackCfg>,
     mut leg: Leg,
     mut rx: mpsc::Receiver<Cmd>,
 ) -> io::Result<()> {

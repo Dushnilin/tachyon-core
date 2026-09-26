@@ -226,6 +226,13 @@ pub fn expand(root: &Value) -> Result<Option<Value>, String> {
                     outbound.insert((*key).to_string(), value.clone());
                 }
             }
+            // Per-server knobs set once on the token outbound apply to every
+            // expanded member.
+            for key in ["obfuscation", "sni", "mtu", "network_list"] {
+                if let Some(value) = obj.get(key) {
+                    outbound.insert(key.to_string(), value.clone());
+                }
+            }
             members.push(Value::String(member_tag));
             expanded.push(Value::Object(outbound));
         }
@@ -432,6 +439,25 @@ mod tests {
              "username": "u", "password": "p"},
         ]});
         assert!(expand(&root).unwrap().is_none());
+    }
+
+    #[test]
+    fn expand_propagates_per_server_knobs() {
+        let root = json!({"outbounds": [
+            {"type": "fptn", "tag": "vpn", "token": token_brotli(two_servers()),
+             "obfuscation": "none", "sni": "sni.example", "mtu": 1400,
+             "network_list": ["tcp"]},
+        ]});
+        let expanded = expand(&root).unwrap().expect("fptn entry present");
+        let list = expanded["outbounds"].as_array().expect("array");
+        let members: Vec<&Value> = list.iter().filter(|o| o["type"] == "fptn").collect();
+        assert_eq!(members.len(), 2);
+        for member in members {
+            assert_eq!(member["obfuscation"], json!("none"));
+            assert_eq!(member["sni"], json!("sni.example"));
+            assert_eq!(member["mtu"], json!(1400));
+            assert_eq!(member["network_list"], json!(["tcp"]));
+        }
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "d",
+      "proxy_protocol": 1
+    }
+  ]
+}

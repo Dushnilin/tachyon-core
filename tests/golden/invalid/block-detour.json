@@ -1,0 +1,12 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "block",
+      "tag": "b",
+      "detour": "x"
+    }
+  ]
+}

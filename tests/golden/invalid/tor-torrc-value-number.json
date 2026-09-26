@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "tor",
+      "tag": "t",
+      "torrc": {
+        "SocksPort": 5
+      }
+    }
+  ]
+}

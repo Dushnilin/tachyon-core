@@ -1,0 +1,26 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "chain",
+      "tag": "c",
+      "outbounds": [
+        "d",
+        "d2"
+      ],
+      "strip": {
+        "bad.key": true
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "d"
+    },
+    {
+      "type": "direct",
+      "tag": "d2"
+    }
+  ]
+}

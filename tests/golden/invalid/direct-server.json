@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "d",
+      "server": "127.0.0.1",
+      "server_port": 1080
+    }
+  ]
+}

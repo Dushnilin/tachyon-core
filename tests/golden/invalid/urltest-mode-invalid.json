@@ -1,0 +1,19 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "u",
+      "outbounds": [
+        "d"
+      ],
+      "mode": "bogus"
+    },
+    {
+      "type": "direct",
+      "tag": "d"
+    }
+  ]
+}

@@ -617,6 +617,113 @@ const SNELL_OUT_FIELDS: &[&str] = &[
 /// Snell inbound base allowlist (`option.AbstractSnellInboundOptions`).
 const SNELL_IN_FIELDS: &[&str] = &["type", "tag", "version", "psk", "users"];
 
+// Plain outbound field sets (reference option/*.go: DialerOptions +
+// ServerOptions + OutboundTLSOptionsContainer are appended at decode time).
+const SOCKS_OUT_FIELDS: &[&str] = &["version", "username", "password", "network", "udp_over_tcp"];
+const HTTP_OUT_FIELDS: &[&str] = &["username", "password", "path", "headers"];
+const SS_OUT_FIELDS: &[&str] = &[
+    "method",
+    "password",
+    "plugin",
+    "plugin_opts",
+    "network",
+    "udp_over_tcp",
+    "multiplex",
+];
+const SHADOWTLS_OUT_FIELDS: &[&str] = &["version", "password"];
+const VMESS_OUT_FIELDS: &[&str] = &[
+    "uuid",
+    "security",
+    "alter_id",
+    "global_padding",
+    "authenticated_length",
+    "network",
+    "packet_encoding",
+    "multiplex",
+    "transport",
+];
+const VLESS_OUT_FIELDS: &[&str] = &[
+    "uuid",
+    "flow",
+    "encryption",
+    "network",
+    "packet_encoding",
+    "multiplex",
+    "transport",
+];
+const TROJAN_OUT_FIELDS: &[&str] = &["password", "network", "multiplex", "transport"];
+const HYSTERIA_OUT_FIELDS: &[&str] = &[
+    "server_ports",
+    "hop_interval",
+    "up",
+    "up_mbps",
+    "down",
+    "down_mbps",
+    "obfs",
+    "auth",
+    "auth_str",
+    "recv_window_conn",
+    "recv_window",
+    "disable_mtu_discovery",
+    "network",
+];
+const NAIVE_OUT_FIELDS: &[&str] = &[
+    "username",
+    "password",
+    "insecure_concurrency",
+    "extra_headers",
+    "stream_receive_window",
+    "udp_over_tcp",
+    "quic",
+    "quic_congestion_control",
+    "quic_session_receive_window",
+];
+const SSH_OUT_FIELDS: &[&str] = &[
+    "user",
+    "password",
+    "private_key",
+    "private_key_path",
+    "private_key_passphrase",
+    "host_key",
+    "host_key_algorithms",
+    "client_version",
+    "cipher",
+    "mac",
+    "kex_algorithm",
+];
+const DIRECT_OUT_FIELDS: &[&str] = &["override_address", "override_port", "proxy_protocol"];
+const TOR_OUT_FIELDS: &[&str] = &["executable_path", "extra_args", "data_directory", "torrc"];
+const SELECTOR_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "outbounds",
+    "default",
+    "interrupt_exist_connections",
+];
+const URLTEST_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "outbounds",
+    "url",
+    "interval",
+    "tolerance",
+    "idle_timeout",
+    "interrupt_exist_connections",
+    "mode",
+    "balancer",
+    "passive_check",
+];
+const CHAIN_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "outbounds",
+    "idle_timeout",
+    "strip_evasion",
+    "strip",
+    "rewrite",
+    "interrupt_exist_connections",
+];
+
 const BBR_PROFILES: &[&str] = &["standard", "conservative", "aggressive"];
 const TUIC_CC_ALGS: &[&str] = &["cubic", "new_reno", "bbr"];
 const TUIC_UDP_RELAY_MODES: &[&str] = &["native", "quic"];
@@ -912,8 +1019,25 @@ fn check_network(value: &Value, at: &str, go_struct: &str) -> Result<(), String>
 /// Int field: number OK; null/[] no-op; bool/string → cannot unmarshal.
 fn check_int_field(value: &Value, at: &str, go_struct: &str, go_field: &str) -> Result<(), String> {
     match value {
-        Value::Null | Value::Array(_) => Ok(()),
-        Value::Number(_) => Ok(()),
+        Value::Null => Ok(()),
+        Value::Array(_) => Err(format!(
+            "{at}: json: cannot unmarshal array into Go struct field {go_struct}.{go_field} of type int"
+        )),
+        Value::Number(n) => {
+            // reference decode parses numbers through float64: a fraction, a
+            // magnitude beyond int64, or a non-integer literal is rejected.
+            match n.as_f64() {
+                Some(f)
+                    if f.fract() == 0.0
+                        && (-9223372036854775808.0f64..9223372036854775808.0f64).contains(&f) =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "{at}: json: cannot unmarshal number {n} into Go struct field {go_struct}.{go_field} of type int"
+                )),
+            }
+        }
         Value::Bool(_) => Err(format!(
             "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.{go_field} of type int"
         )),
@@ -922,6 +1046,39 @@ fn check_int_field(value: &Value, at: &str, go_struct: &str, go_field: &str) -> 
         )),
         Value::Object(_) => Err(format!(
             "{at}: json: cannot unmarshal object into Go struct field {go_struct}.{go_field} of type int"
+        )),
+    }
+}
+
+/// Unsigned integer field at decode: null OK; a number must be a
+/// non-negative integer within the Go uint range for `bits`; other kinds and
+/// out-of-range numbers report the reference Go unmarshal error including the
+/// offending number.
+fn check_uint_field(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    go_field: &str,
+    bits: u64,
+) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Number(n) => {
+            let max: u64 = if bits == 8 {
+                u8::MAX as u64
+            } else {
+                u32::MAX as u64
+            };
+            match n.as_u64() {
+                Some(v) if v <= max => Ok(()),
+                _ => Err(format!(
+                    "{at}: json: cannot unmarshal number {n} into Go struct field {go_struct}.{go_field} of type uint{bits}"
+                )),
+            }
+        }
+        other => Err(format!(
+            "{at}: json: cannot unmarshal {} into Go struct field {go_struct}.{go_field} of type uint{bits}",
+            json_kind(other)
         )),
     }
 }
@@ -3009,6 +3166,129 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
 /// range fields, xmux. Unknown fields reject like the strict JSON decoder;
 /// `uplink_http_method: GET` outside packet-up is the lx soft fallback (WARN
 /// at runtime, accepted at check).
+/// V2Ray transport container (http/ws/quic/grpc/httpupgrade): unknown-field
+/// rejection against the per-type struct plus value-kind checks. `xhttp` has
+/// its own validator.
+fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Result<(), String> {
+    const HTTP: &[&str] = &[
+        "type",
+        "host",
+        "path",
+        "method",
+        "headers",
+        "idle_timeout",
+        "ping_timeout",
+    ];
+    const WS: &[&str] = &[
+        "type",
+        "path",
+        "headers",
+        "max_early_data",
+        "early_data_header_name",
+    ];
+    const QUIC: &[&str] = &["type"];
+    const GRPC: &[&str] = &[
+        "type",
+        "service_name",
+        "idle_timeout",
+        "ping_timeout",
+        "permit_without_stream",
+    ];
+    const HTTPUP: &[&str] = &["type", "host", "path", "headers"];
+    let allowed = match tty {
+        "http" => HTTP,
+        "ws" => WS,
+        "quic" => QUIC,
+        "grpc" => GRPC,
+        _ => HTTPUP,
+    };
+    reject_unknown_fields(t, allowed, at)?;
+    match tty {
+        "http" => {
+            if let Some(v) = t.get("host") {
+                check_listable_string(v, &format!("{at}.host"))?;
+            }
+            for f in ["path", "method"] {
+                if let Some(v) = t.get(f) {
+                    check_string_field(v, &format!("{at}.{f}"), "V2RayHTTPOptions", f)?;
+                }
+            }
+            if let Some(v) = t.get("headers") {
+                check_http_header(v, &format!("{at}.headers"), "V2RayHTTPOptions", "headers")?;
+            }
+            for f in ["idle_timeout", "ping_timeout"] {
+                if let Some(v) = t.get(f) {
+                    check_duration_field(v, &format!("{at}.{f}"), "V2RayHTTPOptions", f)?;
+                }
+            }
+        }
+        "ws" => {
+            for f in ["path", "early_data_header_name"] {
+                if let Some(v) = t.get(f) {
+                    check_string_field(v, &format!("{at}.{f}"), "V2RayWebsocketOptions", f)?;
+                }
+            }
+            if let Some(v) = t.get("max_early_data") {
+                check_uint_field(
+                    v,
+                    &format!("{at}.max_early_data"),
+                    "V2RayWebsocketOptions",
+                    "max_early_data",
+                    32,
+                )?;
+            }
+            if let Some(v) = t.get("headers") {
+                check_http_header(
+                    v,
+                    &format!("{at}.headers"),
+                    "V2RayWebsocketOptions",
+                    "headers",
+                )?;
+            }
+        }
+        "grpc" => {
+            if let Some(v) = t.get("service_name") {
+                check_string_field(
+                    v,
+                    &format!("{at}.service_name"),
+                    "V2RayGRPCOptions",
+                    "service_name",
+                )?;
+            }
+            for f in ["idle_timeout", "ping_timeout"] {
+                if let Some(v) = t.get(f) {
+                    check_duration_field(v, &format!("{at}.{f}"), "V2RayGRPCOptions", f)?;
+                }
+            }
+            if let Some(v) = t.get("permit_without_stream") {
+                ep_bool(
+                    v,
+                    &format!("{at}.permit_without_stream"),
+                    "V2RayGRPCOptions",
+                    "permit_without_stream",
+                )?;
+            }
+        }
+        "httpupgrade" => {
+            for f in ["host", "path"] {
+                if let Some(v) = t.get(f) {
+                    check_string_field(v, &format!("{at}.{f}"), "V2RayHTTPUpgradeOptions", f)?;
+                }
+            }
+            if let Some(v) = t.get("headers") {
+                check_http_header(
+                    v,
+                    &format!("{at}.headers"),
+                    "V2RayHTTPUpgradeOptions",
+                    "headers",
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), String> {
     const KNOWN: &[&str] = &[
         "type",
@@ -3752,9 +4032,6 @@ fn go_read_file(path: &str) -> Result<String, String> {
 fn validate_snell_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     const ABSO: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions";
-    const DIAL: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions.DialerOptions";
-    const ABS: &str =
-        "_SnellOutboundOptions.AbstractSnellOutboundOptions.DialerOptions.AbstractDialerOptions";
     const SRV: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions.ServerOptions";
 
     // pass 1: base + dialer field types.
@@ -3775,114 +4052,11 @@ fn validate_snell_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), S
     if let Some(v) = obj.get("server") {
         ep_str(v, &format!("{at}.server"), SRV, "server")?;
     }
-    if let Some(v) = obj.get("detour") {
-        ep_str(v, &format!("{at}.detour"), DIAL, "detour")?;
-    }
-    for f in [
-        "bind_interface",
-        "inet4_bind_address",
-        "inet6_bind_address",
-        "protect_path",
-        "netns",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_str(v, &format!("{at}.{f}"), ABS, f)?;
-        }
-    }
-    // reference parses inet4/inet6 bind addresses at decode (netip.Addr).
-    for f in ["inet4_bind_address", "inet6_bind_address"] {
-        if let Some(Value::String(s)) = obj.get(f)
-            && !valid_netip_addr(s)
-        {
-            return Err(format!("{at}.{f}: ParseAddr({s:?}): unable to parse IP"));
-        }
-    }
-    for f in [
-        "bind_address_no_port",
-        "tcp_fast_open",
-        "tcp_multi_path",
-        "disable_tcp_keep_alive",
-        "udp_fragment",
-        "reuse_addr",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_bool(v, &format!("{at}.{f}"), ABS, f)?;
-        }
-    }
-    for f in [
-        "connect_timeout",
-        "tcp_keep_alive",
-        "tcp_keep_alive_interval",
-        "fallback_delay",
-    ] {
-        if let Some(v) = obj.get(f) {
-            check_duration_field(v, &format!("{at}.{f}"), ABS, f)?;
-        }
-    }
-    if let Some(v) = obj.get("routing_mark") {
-        check_routing_mark(v, &format!("{at}.routing_mark"))?;
-    }
-    if let Some(v) = obj.get("domain_resolver") {
-        match v {
-            Value::Array(_) | Value::Number(_) | Value::Bool(_) => {
-                return Err(go_field_err(
-                    &format!("{at}.domain_resolver"),
-                    v,
-                    ABS,
-                    "domain_resolver",
-                    "option._DomainResolveOptions",
-                ));
-            }
-            _ => {
-                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
-            }
-        }
-    }
-    if let Some(v) = obj.get("network_strategy") {
-        match v {
-            Value::Null => {}
-            Value::String(s) if NETWORK_STRATEGIES.contains(&s.as_str()) => {}
-            Value::String(s) => {
-                return Err(format!(
-                    "{at}.network_strategy: unknown network strategy: {s}"
-                ));
-            }
-            other => {
-                return Err(go_field_err(
-                    &format!("{at}.network_strategy"),
-                    other,
-                    ABS,
-                    "network_strategy",
-                    "string",
-                ));
-            }
-        }
-    }
-    if let Some(v) = obj.get("domain_strategy") {
-        match v {
-            Value::Null => {}
-            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
-            Value::String(s) => {
-                return Err(format!(
-                    "{at}.domain_strategy: unknown domain strategy: {s}"
-                ));
-            }
-            other => {
-                return Err(go_field_err(
-                    &format!("{at}.domain_strategy"),
-                    other,
-                    ABS,
-                    "domain_strategy",
-                    "string",
-                ));
-            }
-        }
-    }
-    for f in ["network_type", "fallback_network_type"] {
-        if let Some(v) = obj.get(f) {
-            check_interface_types(v, &format!("{at}.{f}"))?;
-        }
-    }
+    check_dialer_fields(
+        &at,
+        obj,
+        "_SnellOutboundOptions.AbstractSnellOutboundOptions",
+    )?;
 
     // pass 2: version switch.
     let version = snell_version(obj);
@@ -3977,6 +4151,633 @@ fn valid_netip_addr(s: &str) -> bool {
     addr.parse::<IpAddr>().is_ok()
 }
 
+/// Dialer field value checks for the plain outbounds; `prefix` is the Go
+/// struct that embeds `DialerOptions` (e.g. `SOCKSOutboundOptions`).
+fn check_dialer_fields(at: &str, obj: &Map<String, Value>, prefix: &str) -> Result<(), String> {
+    let dial = format!("{prefix}.DialerOptions");
+    let abs = format!("{dial}.AbstractDialerOptions");
+    if let Some(v) = obj.get("detour") {
+        ep_str(v, &format!("{at}.detour"), &dial, "detour")?;
+    }
+    for f in [
+        "bind_interface",
+        "inet4_bind_address",
+        "inet6_bind_address",
+        "protect_path",
+        "netns",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), &abs, f)?;
+        }
+    }
+    // reference parses inet4/inet6 bind addresses at decode (netip.Addr).
+    for f in ["inet4_bind_address", "inet6_bind_address"] {
+        if let Some(Value::String(s)) = obj.get(f)
+            && !valid_netip_addr(s)
+        {
+            return Err(format!("{at}.{f}: ParseAddr({s:?}): unable to parse IP"));
+        }
+    }
+    for f in [
+        "bind_address_no_port",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "disable_tcp_keep_alive",
+        "udp_fragment",
+        "reuse_addr",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), &abs, f)?;
+        }
+    }
+    for f in [
+        "connect_timeout",
+        "tcp_keep_alive",
+        "tcp_keep_alive_interval",
+        "fallback_delay",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), &abs, f)?;
+        }
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+    if let Some(v) = obj.get("domain_resolver") {
+        match v {
+            Value::Array(_) | Value::Number(_) | Value::Bool(_) => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_resolver"),
+                    v,
+                    &abs,
+                    "domain_resolver",
+                    "option._DomainResolveOptions",
+                ));
+            }
+            _ => {
+                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
+            }
+        }
+    }
+    if let Some(v) = obj.get("network_strategy") {
+        match v {
+            Value::Null => {}
+            Value::String(s) if NETWORK_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.network_strategy: unknown network strategy: {s}"
+                ));
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.network_strategy"),
+                    other,
+                    &abs,
+                    "network_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("domain_strategy") {
+        match v {
+            Value::Null => {}
+            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.domain_strategy: unknown domain strategy: {s}"
+                ));
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_strategy"),
+                    other,
+                    &abs,
+                    "domain_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    for f in ["network_type", "fallback_network_type"] {
+        if let Some(v) = obj.get(f) {
+            check_interface_types(v, &format!("{at}.{f}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `option.UDPOverTCPOptions`: bool or strict {enabled, version} object.
+fn check_udp_over_tcp(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null | Value::Bool(_) => Ok(()),
+        Value::Object(map) => {
+            reject_unknown_fields(map, &["enabled", "version"], at)?;
+            if let Some(v) = map.get("enabled") {
+                ep_bool(v, &format!("{at}.enabled"), "UDPOverTCPOptions", "enabled")?;
+            }
+            if let Some(v) = map.get("version")
+                && check_u16(v).is_err()
+            {
+                return Err(format!(
+                    "{at}.version: json: cannot unmarshal value into Go struct field UDPOverTCPOptions.version of type uint8"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            "UDPOverTCPOptions",
+            "udp_over_tcp",
+            "value",
+        )),
+    }
+}
+
+/// `option.OutboundMultiplexOptions` (+ nested brutal).
+fn check_out_multiplex(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(map) => {
+            reject_unknown_fields(
+                map,
+                &[
+                    "enabled",
+                    "protocol",
+                    "max_connections",
+                    "min_streams",
+                    "max_streams",
+                    "padding",
+                    "brutal",
+                ],
+                at,
+            )?;
+            for f in ["enabled", "padding"] {
+                if let Some(v) = map.get(f) {
+                    ep_bool(v, &format!("{at}.{f}"), "OutboundMultiplexOptions", f)?;
+                }
+            }
+            if let Some(v) = map.get("protocol") {
+                ep_str(
+                    v,
+                    &format!("{at}.protocol"),
+                    "OutboundMultiplexOptions",
+                    "protocol",
+                )?;
+            }
+            for f in ["max_connections", "min_streams", "max_streams"] {
+                if let Some(v) = map.get(f) {
+                    check_int_field(v, &format!("{at}.{f}"), "OutboundMultiplexOptions", f)?;
+                }
+            }
+            if let Some(brutal) = map.get("brutal")
+                && !brutal.is_null()
+            {
+                let bat = format!("{at}.brutal");
+                match brutal {
+                    Value::Object(bm) => {
+                        reject_unknown_fields(bm, &["enabled", "up_mbps", "down_mbps"], &bat)?;
+                        if let Some(v) = bm.get("enabled") {
+                            ep_bool(v, &format!("{bat}.enabled"), "BrutalOptions", "enabled")?;
+                        }
+                        for f in ["up_mbps", "down_mbps"] {
+                            if let Some(v) = bm.get(f) {
+                                check_int_field(v, &format!("{bat}.{f}"), "BrutalOptions", f)?;
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(go_field_err(
+                            &bat,
+                            other,
+                            "BrutalOptions",
+                            "brutal",
+                            "value",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            "OutboundMultiplexOptions",
+            "multiplex",
+            "value",
+        )),
+    }
+}
+
+fn check_http_header(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(map) => {
+            for (k, v) in map {
+                check_listable_string(v, &format!("{at}.{k}"))?;
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(
+            at,
+            other,
+            go_struct,
+            field,
+            "option.HTTPHeader",
+        )),
+    }
+}
+
+/// Decode for the plain outbounds without a bespoke validator: allowed-field
+/// rejection + per-type value checks + shared dialer/tls containers.
+fn validate_plain_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let (protocol, go_base, has_tls, has_quic): (&[&str], &str, bool, bool) = match ty {
+        "socks" => (SOCKS_OUT_FIELDS, "SOCKSOutboundOptions", false, false),
+        "http" => (HTTP_OUT_FIELDS, "HTTPOutboundOptions", true, false),
+        "shadowsocks" => (SS_OUT_FIELDS, "ShadowsocksOutboundOptions", false, false),
+        "shadowtls" => (
+            SHADOWTLS_OUT_FIELDS,
+            "ShadowTLSOutboundOptions",
+            true,
+            false,
+        ),
+        "vmess" => (VMESS_OUT_FIELDS, "VMessOutboundOptions", true, false),
+        "vless" => (VLESS_OUT_FIELDS, "VLESSOutboundOptions", true, false),
+        "trojan" => (TROJAN_OUT_FIELDS, "TrojanOutboundOptions", true, false),
+        "hysteria" => (HYSTERIA_OUT_FIELDS, "HysteriaOutboundOptions", true, true),
+        "naive" => (NAIVE_OUT_FIELDS, "NaiveOutboundOptions", true, false),
+        "ssh" => (SSH_OUT_FIELDS, "SSHOutboundOptions", false, false),
+        other => return Err(format!("{at}: unsupported plain outbound type: {other}")),
+    };
+    let mut allowed: Vec<&str> = protocol.to_vec();
+    allowed.extend(DIALER_OUT_FIELDS);
+    allowed.extend(["type", "tag", "server", "server_port"]);
+    if has_tls {
+        allowed.push("tls");
+    }
+    if has_quic {
+        allowed.extend(QUIC_OUT_FIELDS);
+    }
+    reject_unknown_fields(obj, &allowed, &at)?;
+
+    let strings: &[&str] = match ty {
+        "socks" => &["version", "username", "password"],
+        "http" => &["username", "password", "path"],
+        "shadowsocks" => &["method", "password", "plugin", "plugin_opts"],
+        "shadowtls" => &["password"],
+        "vmess" => &["uuid", "security", "packet_encoding"],
+        "vless" => &["uuid", "flow", "encryption", "packet_encoding"],
+        "trojan" => &["password"],
+        "naive" => &["username", "password", "quic_congestion_control"],
+        "ssh" => &[
+            "user",
+            "password",
+            "private_key_path",
+            "private_key_passphrase",
+            "client_version",
+        ],
+        "hysteria" => &["obfs", "auth_str"],
+        _ => &[],
+    };
+    for f in strings {
+        if let Some(v) = obj.get(*f) {
+            ep_str(v, &format!("{at}.{f}"), go_base, f)?;
+        }
+    }
+    for f in match ty {
+        "vmess" => &["alter_id"][..],
+        "naive" => &["insecure_concurrency"][..],
+        "hysteria" => &["up_mbps", "down_mbps", "recv_window_conn", "recv_window"][..],
+        "shadowtls" => &["version"][..],
+        _ => &[],
+    } {
+        if let Some(v) = obj.get(*f) {
+            check_int_field(v, &format!("{at}.{f}"), go_base, f)?;
+        }
+    }
+    for f in match ty {
+        "vmess" => &["global_padding", "authenticated_length"][..],
+        "naive" => &["quic"][..],
+        _ => &[],
+    } {
+        if let Some(v) = obj.get(*f) {
+            ep_bool(v, &format!("{at}.{f}"), go_base, f)?;
+        }
+    }
+    if matches!(
+        ty,
+        "socks" | "shadowsocks" | "vmess" | "vless" | "trojan" | "hysteria"
+    ) && let Some(v) = obj.get("network")
+    {
+        snell_network(v, &format!("{at}.network"), go_base)?;
+    }
+    if matches!(ty, "ssh") {
+        for f in [
+            "private_key",
+            "host_key",
+            "host_key_algorithms",
+            "cipher",
+            "mac",
+            "kex_algorithm",
+        ] {
+            if let Some(v) = obj.get(f) {
+                check_listable_string(v, &format!("{at}.{f}"))?;
+            }
+        }
+    }
+    if ty == "hysteria"
+        && let Some(v) = obj.get("server_ports")
+    {
+        check_listable_string(v, &format!("{at}.server_ports"))?;
+    }
+    if ty == "hysteria"
+        && let Some(v) = obj.get("hop_interval")
+    {
+        check_duration_field(v, &format!("{at}.hop_interval"), go_base, "hop_interval")?;
+    }
+    if ty == "naive" {
+        for f in ["stream_receive_window", "quic_session_receive_window"] {
+            if let Some(v) = obj.get(f) {
+                check_memory_bytes(v, &format!("{at}.{f}"), go_base, f)?;
+            }
+        }
+        if let Some(v) = obj.get("extra_headers") {
+            check_http_header(v, &format!("{at}.extra_headers"), go_base, "extra_headers")?;
+        }
+    }
+    if ty == "http"
+        && let Some(v) = obj.get("headers")
+    {
+        check_http_header(v, &format!("{at}.headers"), go_base, "headers")?;
+    }
+    if matches!(ty, "socks" | "shadowsocks" | "naive")
+        && let Some(v) = obj.get("udp_over_tcp")
+    {
+        check_udp_over_tcp(v, &format!("{at}.udp_over_tcp"))?;
+    }
+    if matches!(ty, "shadowsocks" | "vmess" | "vless" | "trojan")
+        && let Some(v) = obj.get("multiplex")
+    {
+        check_out_multiplex(v, &format!("{at}.multiplex"))?;
+    }
+    if has_tls
+        && let Some(tls) = obj.get("tls")
+        && !tls.is_null()
+    {
+        if !tls.is_object() {
+            return Err(go_field_err(
+                &format!("{at}.tls"),
+                tls,
+                go_base,
+                "tls",
+                "OutboundTLSOptions",
+            ));
+        }
+        validate_tls_container(tls, &format!("{at}.tls"), false)?;
+    }
+    check_dialer_fields(&at, obj, go_base)?;
+    Ok(())
+}
+
+fn validate_direct_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let mut allowed: Vec<&str> = DIALER_OUT_FIELDS.to_vec();
+    allowed.extend(DIRECT_OUT_FIELDS);
+    allowed.extend(["type", "tag"]);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    if let Some(v) = obj.get("proxy_protocol") {
+        check_uint_field(
+            v,
+            &format!("{at}.proxy_protocol"),
+            "_DirectOutboundOptions",
+            "proxy_protocol",
+            8,
+        )?;
+    }
+    if let Some(v) = obj.get("override_address") {
+        ep_str(
+            v,
+            &format!("{at}.override_address"),
+            "_DirectOutboundOptions",
+            "override_address",
+        )?;
+    }
+    if let Some(v) = obj.get("override_port") {
+        check_u16(v).map_err(|m| format!("{at}.override_port: {m}"))?;
+    }
+    check_dialer_fields(&at, obj, "_DirectOutboundOptions")?;
+    //nolint:staticcheck
+    let override_address = obj
+        .get("override_address")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let override_port = obj
+        .get("override_port")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if !override_address.is_empty() || override_port != 0 {
+        return Err(format!(
+            "{at}: destination override fields in direct outbound are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, use route options instead"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let mut allowed: Vec<&str> = DIALER_OUT_FIELDS.to_vec();
+    allowed.extend(TOR_OUT_FIELDS);
+    allowed.extend(["type", "tag"]);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    for f in ["executable_path", "data_directory"] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), "TorOutboundOptions", f)?;
+        }
+    }
+    if let Some(v) = obj.get("extra_args") {
+        check_listable_string(v, &format!("{at}.extra_args"))?;
+    }
+    if let Some(v) = obj.get("torrc")
+        && !v.is_null()
+    {
+        let Some(m) = v.as_object() else {
+            return Err(go_field_err(
+                &format!("{at}.torrc"),
+                v,
+                "TorOutboundOptions",
+                "torrc",
+                "map[string]string",
+            ));
+        };
+        for (k, item) in m {
+            if !item.is_string() && !item.is_null() {
+                return Err(go_field_err(
+                    &format!("{at}.torrc.{k}"),
+                    item,
+                    "TorOutboundOptions",
+                    "torrc",
+                    "string",
+                ));
+            }
+        }
+    }
+    check_dialer_fields(&at, obj, "TorOutboundOptions")?;
+    Ok(())
+}
+
+fn validate_group_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let allowed: &[&str] = match ty {
+        "selector" => SELECTOR_OUT_FIELDS,
+        "urltest" => URLTEST_OUT_FIELDS,
+        _ => CHAIN_OUT_FIELDS,
+    };
+    reject_unknown_fields(obj, allowed, &at)?;
+    match ty {
+        "selector" => {
+            if let Some(v) = obj.get("default") {
+                ep_str(
+                    v,
+                    &format!("{at}.default"),
+                    "SelectorOutboundOptions",
+                    "default",
+                )?;
+            }
+            if let Some(v) = obj.get("interrupt_exist_connections") {
+                ep_bool(
+                    v,
+                    &format!("{at}.interrupt_exist_connections"),
+                    "SelectorOutboundOptions",
+                    "interrupt_exist_connections",
+                )?;
+            }
+        }
+        "urltest" => {
+            for f in ["url", "mode"] {
+                if let Some(v) = obj.get(f) {
+                    ep_str(v, &format!("{at}.{f}"), "URLTestOutboundOptions", f)?;
+                }
+            }
+            for f in ["interval", "idle_timeout"] {
+                if let Some(v) = obj.get(f) {
+                    check_duration_field(v, &format!("{at}.{f}"), "URLTestOutboundOptions", f)?;
+                }
+            }
+            if let Some(v) = obj.get("tolerance") {
+                check_u16(v).map_err(|m| format!("{at}.tolerance: {m}"))?;
+            }
+            for f in ["interrupt_exist_connections", "passive_check"] {
+                if let Some(v) = obj.get(f) {
+                    ep_bool(v, &format!("{at}.{f}"), "URLTestOutboundOptions", f)?;
+                }
+            }
+            if let Some(bal) = obj.get("balancer")
+                && !bal.is_null()
+            {
+                let bat = format!("{at}.balancer");
+                if !bal.is_object() {
+                    return Err(go_field_err(
+                        &bat,
+                        bal,
+                        "URLTestOutboundOptions",
+                        "balancer",
+                        "option.URLTestBalancerOptions",
+                    ));
+                }
+                let bm = bal.as_object().expect("checked above");
+                reject_unknown_fields(bm, &["pool", "pool_tolerance", "sticky_hash"], &bat)?;
+                if let Some(v) = bm.get("pool") {
+                    check_int_field(v, &format!("{bat}.pool"), "URLTestBalancerOptions", "pool")?;
+                }
+                if let Some(v) = bm.get("pool_tolerance") {
+                    check_u16(v).map_err(|m| format!("{bat}.pool_tolerance: {m}"))?;
+                }
+                if let Some(v) = bm.get("sticky_hash") {
+                    let gs = "URLTestBalancerOptions.balancer.sticky_hash";
+                    match v {
+                        Value::Array(items) => {
+                            for (idx, item) in items.iter().enumerate() {
+                                if !item.is_string() && !item.is_null() {
+                                    return Err(format!(
+                                        "{bat}.sticky_hash[{idx}]: json: cannot unmarshal {} into Go struct field {gs} of type string",
+                                        json_kind(item)
+                                    ));
+                                }
+                            }
+                        }
+                        Value::Null => {}
+                        other => {
+                            return Err(format!(
+                                "{bat}.sticky_hash: json: cannot unmarshal {} into Go struct field {gs} of type []string",
+                                json_kind(other)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            if let Some(v) = obj.get("idle_timeout") {
+                check_duration_field(
+                    v,
+                    &format!("{at}.idle_timeout"),
+                    "ChainOutboundOptions",
+                    "idle_timeout",
+                )?;
+            }
+            if let Some(v) = obj.get("interrupt_exist_connections") {
+                ep_bool(
+                    v,
+                    &format!("{at}.interrupt_exist_connections"),
+                    "ChainOutboundOptions",
+                    "interrupt_exist_connections",
+                )?;
+            }
+            if let Some(v) = obj.get("strip_evasion") {
+                ep_bool(
+                    v,
+                    &format!("{at}.strip_evasion"),
+                    "ChainOutboundOptions",
+                    "strip_evasion",
+                )?;
+            }
+            for f in ["strip", "rewrite"] {
+                if let Some(v) = obj.get(f)
+                    && !v.is_null()
+                {
+                    let Some(m) = v.as_object() else {
+                        return Err(go_field_err(
+                            &format!("{at}.{f}"),
+                            v,
+                            "ChainOutboundOptions",
+                            f,
+                            "value",
+                        ));
+                    };
+                    // strip values are map[string]bool; rewrite values are
+                    // opaque to the reference decode (no kind check).
+                    if f == "strip" {
+                        for (k, item) in m {
+                            if !item.is_boolean() && !item.is_null() {
+                                return Err(go_field_err(
+                                    &format!("{at}.strip[\"{k}\"]"),
+                                    item,
+                                    "ChainOutboundOptions",
+                                    "strip",
+                                    "bool",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_outbound(
     i: usize,
     ty: &str,
@@ -3992,7 +4793,19 @@ fn validate_outbound(
         "masque" => validate_masque_out_decode(i, obj)?,
         "anytls" => validate_anytls_out_decode(i, obj)?,
         "snell" => validate_snell_out_decode(i, obj)?,
-        "vless" => validate_vless_encryption(obj)?,
+        "socks" | "http" | "shadowsocks" | "shadowtls" | "vmess" | "vless" | "trojan"
+        | "hysteria" | "naive" | "ssh" => {
+            validate_plain_out_decode(i, ty, obj)?;
+            if ty == "vless" {
+                validate_vless_encryption(obj)?;
+            }
+        }
+        "direct" => validate_direct_out_decode(i, obj)?,
+        "block" => {
+            reject_unknown_fields(obj, &["type", "tag"], &format!("outbounds[{i}]"))?;
+        }
+        "tor" => validate_tor_out_decode(i, obj)?,
+        "selector" | "urltest" | "chain" => validate_group_out_decode(i, ty, obj)?,
         _ => {}
     }
     if let Some(base) = SERVER_OUT_BASES
@@ -4038,6 +4851,15 @@ fn validate_outbound(
         }
         if transport_ty == "xhttp" {
             validate_xhttp_transport(transport, &format!("outbounds[{i}].transport"))?;
+        } else if matches!(
+            transport_ty,
+            "http" | "ws" | "quic" | "grpc" | "httpupgrade"
+        ) {
+            validate_v2ray_transport(
+                transport_ty,
+                transport,
+                &format!("outbounds[{i}].transport"),
+            )?;
         }
     }
 
@@ -4046,6 +4868,101 @@ fn validate_outbound(
     }
 
     match ty {
+        "socks" => {
+            if let Some(Value::String(s)) = obj.get("version")
+                && !matches!(s.as_str(), "" | "4" | "4a" | "5")
+            {
+                return Err(format!("{at}: unknown socks version: {s}"));
+            }
+        }
+        "vmess" => {
+            if let Some(Value::String(s)) = obj.get("security")
+                && !matches!(
+                    s.as_str(),
+                    "" | "auto" | "zero" | "none" | "aes-128-gcm" | "chacha20-poly1305"
+                )
+            {
+                return Err(format!("{at}: vmess: unsupported security type: {s}"));
+            }
+            if let Some(Value::String(s)) = obj.get("packet_encoding")
+                && !matches!(s.as_str(), "" | "packetaddr" | "xudp")
+            {
+                return Err(format!("{at}: unknown packet encoding: {s}"));
+            }
+        }
+        "vless" => {
+            if let Some(Value::String(s)) = obj.get("packet_encoding")
+                && !matches!(s.as_str(), "" | "packetaddr" | "xudp")
+            {
+                return Err(format!("{at}: unknown packet encoding: {s}"));
+            }
+        }
+        "urltest" => {
+            if let Some(Value::String(s)) = obj.get("mode")
+                && !matches!(s.as_str(), "" | "least_test" | "round_robin")
+            {
+                return Err(format!("{at}: unknown urltest mode: {s}"));
+            }
+            let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("");
+            if let Some(bal) = obj.get("balancer")
+                && !bal.is_null()
+            {
+                // reference badjson round-trip: `{}` and `{"sticky_hash": []}`
+                // collapse to an absent balancer pointer; any other key means
+                // the balancer is present.
+                let bm = bal.as_object().expect("decode checked above");
+                let present = !bm.is_empty()
+                    && !(bm.len() == 1
+                        && matches!(bm.get("sticky_hash"), Some(Value::Array(a)) if a.is_empty()));
+                if mode != "round_robin" {
+                    if present {
+                        return Err(format!(
+                            "{at}: urltest: balancer is only valid with mode: round_robin"
+                        ));
+                    }
+                } else if present {
+                    if let Some(n) = bm.get("pool").and_then(Value::as_i64)
+                        && n < 0
+                    {
+                        return Err(format!("{at}: urltest balancer.pool must be >= 1"));
+                    }
+                    if let Some(Value::Array(items)) = bm.get("sticky_hash") {
+                        let mut vals: Vec<&str> = Vec::new();
+                        for item in items {
+                            vals.push(match item {
+                                Value::String(s) => s.as_str(),
+                                _ => "",
+                            });
+                        }
+                        let none_ok = vals.len() == 1 && vals[0] == "none";
+                        if !vals.is_empty() && !none_ok {
+                            for c in &vals {
+                                if *c == "none" {
+                                    return Err(format!(
+                                        "{at}: urltest sticky_hash: \"none\" must be the only component (it disables stickiness)"
+                                    ));
+                                }
+                                if !matches!(
+                                    *c,
+                                    "process" | "domain" | "source_ip" | "dest_ip" | "dest_port"
+                                ) {
+                                    return Err(format!(
+                                        "{at}: unknown urltest sticky_hash component: {c}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(n) = bm.get("pool_tolerance").and_then(Value::as_u64)
+                        && n > 15000
+                    {
+                        return Err(format!(
+                            "{at}: urltest balancer.pool_tolerance is in milliseconds and must be <= 15000 (alive delays cap at the 15s probe timeout); use 0 for first-live mode"
+                        ));
+                    }
+                }
+            }
+        }
         "hysteria2" => {
             let realm = obj.get("realm");
             let has_server = obj
@@ -4208,6 +5125,23 @@ fn validate_outbound(
                 }
             }
         }
+        "direct" => {
+            // reference NewOutbound: detour is rejected in direct context.
+            if obj
+                .get("detour")
+                .and_then(Value::as_str)
+                .is_some_and(|d| !d.is_empty())
+            {
+                return Err(format!("{at}: `detour` is not supported in direct context"));
+            }
+            if let Some(Value::Number(n)) = obj.get("proxy_protocol")
+                && n.as_u64().is_some_and(|v| v != 0)
+            {
+                return Err(format!(
+                    "{at}: Proxy Protocol is deprecated and removed in sing-box 1.6.0"
+                ));
+            }
+        }
         "chain" => {
             let count = obj
                 .get("outbounds")
@@ -4215,6 +5149,22 @@ fn validate_outbound(
                 .map_or(0, Vec::len);
             if count < 2 {
                 return Err(format!("{at}: chain requires at least 2 outbounds"));
+            }
+            if let Some(Value::Object(m)) = obj.get("strip") {
+                const STRIP_KEYS: &[&str] = &[
+                    "multiplex.padding",
+                    "tls.fragment",
+                    "tls.utls",
+                    "xhttp.padding",
+                ];
+                for k in m.keys() {
+                    if !STRIP_KEYS.contains(&k.as_str()) {
+                        return Err(format!(
+                            "{at}: strip: unknown key {k} (known: {})",
+                            STRIP_KEYS.join(", ")
+                        ));
+                    }
+                }
             }
         }
         "masque" => {

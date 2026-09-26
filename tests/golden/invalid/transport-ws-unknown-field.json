@@ -1,0 +1,19 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "o",
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "transport": {
+        "type": "ws",
+        "path": "/ws",
+        "foo": 1
+      }
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 pub mod asn1_x509;
+pub mod fptn;
 pub mod netip_parse;
 pub mod validate;
 pub mod vless_enc;
@@ -47,10 +48,17 @@ pub fn parse_slice(bytes: &[u8]) -> Result<Config, serde_json::Error> {
 }
 
 /// Full `sing-box check` equivalent: schema parse + semantic validation.
+/// FPTN token outbounds are validated as written, then expanded into
+/// per-server outbounds + urltest group and validated again.
 pub fn check_str(raw: &str) -> Result<(), String> {
     parse_str(raw).map_err(|e| e.to_string())?;
     let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
-    validate::validate(&value)
+    validate::validate(&value)?;
+    match fptn::expand(&value) {
+        Ok(Some(expanded)) => validate::validate(&expanded),
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

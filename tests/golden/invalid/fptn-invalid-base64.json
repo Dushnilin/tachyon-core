@@ -1,0 +1,12 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "fptn",
+      "tag": "vpn",
+      "token": "fptnb:!!!not-base64!!!"
+    }
+  ]
+}

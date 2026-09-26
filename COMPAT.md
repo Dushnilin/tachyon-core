@@ -62,6 +62,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `masque` / `warp` | planned | lx |
 | `anytls`, `snell`, `mieru`, `sudoku`, `openvpn`, `tailscale` | planned | extended/lx |
 | `chain` | planned | lx multi-hop |
+| `fptn` (tachyon extension) | partial | `fptn:`/`fptnb:` token outbound: parse + check-time expansion into per-server outbounds + urltest group (`tests/golden/ext/`); runtime + clash_api exposure planned — the reference rejects `type: fptn` as unknown, so this type has no differential parity |
 
 ## Inbound types
 

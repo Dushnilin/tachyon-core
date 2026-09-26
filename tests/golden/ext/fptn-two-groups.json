@@ -1,0 +1,44 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "d",
+        "server": "1.1.1.1"
+      }
+    ]
+  },
+  "outbounds": [
+    {
+      "type": "fptn",
+      "tag": "eu",
+      "token": "fptnb:G+gBYBwHzjkv7qLVkEU/K5E9kGhO5aPbe2BbNAKHkkCtdVi6+o6cA70erdEj06JBz98BjyeJsnntEu9+YSk2H5sHbo17mIqCnocIvJkK+0lwrTDJVlEk1SHNiJEA0H5adtvrMdWJPqHV1Ibw/Q9Y7USLMU6MZir0d/DeVS6nsF0iQnu8B+wl51kKmvOb0S0us+ZAMxTj/nJJEDcxJUswudRaEsSM4//ieL6+bs/zaVsCS1uAqPUwY9AUu81KKGuOQsDaAQ",
+      "domain_resolver": "d"
+    },
+    {
+      "type": "fptn",
+      "tag": "us",
+      "token": "fptn:eyJ2ZXJzaW9uIjoxLCJzZXJ2aWNlX25hbWUiOiJURVNULlNFUlZJQ0UiLCJ1c2VybmFtZSI6InVzZXItdGVzdCIsInBhc3N3b3JkIjoicHctdGVzdCIsInNlcnZlcnMiOlt7Im5hbWUiOiJBbHBoYS0xIiwiaG9zdCI6Im5vZGUtYS5leGFtcGxlLm9yZyIsInBvcnQiOjQ0MywibWQ1X2ZpbmdlcnByaW50IjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQifSx7Im5hbWUiOiJCZXRhLTIiLCJob3N0Ijoibm9kZS1iLmV4YW1wbGUub3JnIiwicG9ydCI6NDQzLCJtZDVfZmluZ2VycHJpbnQiOiJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZSJ9XX0",
+      "detour": "direct"
+    },
+    {
+      "type": "selector",
+      "tag": "sel",
+      "outbounds": [
+        "eu/Alpha-1",
+        "us/Beta-2"
+      ],
+      "default": "eu/Alpha-1"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "sel"
+  }
+}

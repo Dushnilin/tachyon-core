@@ -252,6 +252,7 @@ const KNOWN_OUTBOUND_TYPES: &[&str] = &[
     "ssh",
     "snell",
     "wireguard",
+    "fptn",
     "dns",
 ];
 
@@ -343,7 +344,7 @@ const SERVER_OUT_BASES: &[(&str, &str)] = &[
     ("ssh", "SSHOutboundOptions"),
 ];
 
-const DIALER_OUT_FIELDS: &[&str] = &[
+pub(crate) const DIALER_OUT_FIELDS: &[&str] = &[
     "detour",
     "bind_interface",
     "inet4_bind_address",
@@ -4627,6 +4628,59 @@ fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
     Ok(())
 }
 
+fn validate_fptn_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    if !obj.contains_key("server") {
+        let mut allowed: Vec<&str> = vec!["type", "tag", "token"];
+        allowed.extend_from_slice(DIALER_OUT_FIELDS);
+        reject_unknown_fields(obj, &allowed, &at)?;
+        match obj.get("token") {
+            Some(Value::String(s)) if !s.is_empty() => {}
+            Some(Value::String(_)) | None | Some(Value::Null) => {
+                return Err(format!("{at}: missing token"));
+            }
+            Some(_) => return Err(format!("{at}.token: must be a string")),
+        }
+        return Ok(());
+    }
+    let mut allowed: Vec<&str> = vec![
+        "type",
+        "tag",
+        "server",
+        "server_port",
+        "username",
+        "password",
+        "md5_fingerprint",
+    ];
+    allowed.extend_from_slice(DIALER_OUT_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    match obj.get("server") {
+        Some(Value::String(s)) if !s.is_empty() => {}
+        Some(Value::String(_)) | None | Some(Value::Null) => {
+            return Err(format!("{at}: missing server"));
+        }
+        Some(_) => return Err(format!("{at}.server: must be a string")),
+    }
+    if matches!(obj.get("server_port"), None | Some(Value::Null)) {
+        return Err(format!("{at}: missing server_port"));
+    }
+    for field in ["username", "password"] {
+        match obj.get(field) {
+            Some(Value::String(s)) if !s.is_empty() => {}
+            Some(Value::String(_)) | None | Some(Value::Null) => {
+                return Err(format!("{at}: missing {field}"));
+            }
+            Some(_) => return Err(format!("{at}.{field}: must be a string")),
+        }
+    }
+    if let Some(v) = obj.get("md5_fingerprint").filter(|v| !v.is_null())
+        && !v.is_string()
+    {
+        return Err(format!("{at}.md5_fingerprint: must be a string"));
+    }
+    Ok(())
+}
+
 fn validate_group_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     let allowed: &[&str] = match ty {
@@ -4793,6 +4847,7 @@ fn validate_outbound(
         "masque" => validate_masque_out_decode(i, obj)?,
         "anytls" => validate_anytls_out_decode(i, obj)?,
         "snell" => validate_snell_out_decode(i, obj)?,
+        "fptn" => validate_fptn_out_decode(i, obj)?,
         "socks" | "http" | "shadowsocks" | "shadowtls" | "vmess" | "vless" | "trojan"
         | "hysteria" | "naive" | "ssh" => {
             validate_plain_out_decode(i, ty, obj)?;
@@ -5092,6 +5147,22 @@ fn validate_outbound(
             validate_tls_client_init(obj, &at)?;
             // reference dialer: a domain server resolves through the
             // configured domain_resolver tag at initialize.
+            let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
+            if !server.is_empty()
+                && crate::netip_parse::parse_addr(server).is_err()
+                && let Some(dr) = obj.get("domain_resolver")
+                && !prunes_value(dr)
+            {
+                let tag = domain_resolver_server(dr, &format!("outbounds[{i}].domain_resolver"))?;
+                if let Some(tag) = tag
+                    && !tag.is_empty()
+                    && !dns_tags.contains(&tag)
+                {
+                    return Err(format!("{at}: domain resolver not found: {tag}"));
+                }
+            }
+        }
+        "fptn" => {
             let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
             if !server.is_empty()
                 && crate::netip_parse::parse_addr(server).is_err()

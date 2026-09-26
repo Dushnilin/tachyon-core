@@ -1,7 +1,9 @@
 //! Golden corpus contract:
-//! every config under `../tests/golden/{lx,tachyon}` must pass
+//! every config under `../tests/golden/{lx,tachyon,ext}` must pass
 //! `core_config::check_str` (schema + semantic validation), and every config
-//! under `../tests/golden/invalid` must fail it.
+//! under `../tests/golden/invalid` must fail it. `ext/` holds tachyon-core
+//! extensions (e.g. `fptn` token outbounds) that the reference sing-box
+//! rejects as unknown types, so the differential harness skips that dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,6 +65,11 @@ fn golden_lx_configs_pass_check() {
 #[test]
 fn golden_tachyon_configs_pass_check() {
     assert_accepts("tachyon");
+}
+
+#[test]
+fn golden_ext_configs_pass_check() {
+    assert_accepts("ext");
 }
 
 #[test]

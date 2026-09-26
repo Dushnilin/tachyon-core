@@ -1,0 +1,16 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "fptn",
+      "tag": "vpn",
+      "token": "fptnb:G+gBYBwHzjkv7qLVkEU/K5E9kGhO5aPbe2BbNAKHkkCtdVi6+o6cA70erdEj06JBz98BjyeJsnntEu9+YSk2H5sHbo17mIqCnocIvJkK+0lwrTDJVlEk1SHNiJEA0H5adtvrMdWJPqHV1Ibw/Q9Y7USLMU6MZir0d/DeVS6nsF0iQnu8B+wl51kKmvOb0S0us+ZAMxTj/nJJEDcxJUswudRaEsSM4//ieL6+bs/zaVsCS1uAqPUwY9AUu81KKGuOQsDaAQ",
+      "server": "1.2.3.4",
+      "server_port": 443,
+      "username": "u",
+      "password": "p"
+    }
+  ]
+}

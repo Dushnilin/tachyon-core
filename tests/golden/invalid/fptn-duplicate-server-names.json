@@ -1,0 +1,12 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "fptn",
+      "tag": "vpn",
+      "token": "fptnb:G5gAgJwHdoP1xUQggH03qvdpQ2lbZE/OpcfYHeYin2NqHRaari0SQ7NVJ8cBhp7KvwXyLZG2a0q5DfG5XQhGJTBMuEvxpN/FJAKi/cnMw5IHsIrBzYOXgNn8seEJatIP"
+    }
+  ]
+}

@@ -2083,7 +2083,7 @@ fn validate_masque_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), 
         }
     }
     if let Some(v) = obj.get("network_list") {
-        check_masque_network_list(v, &format!("{at}.network_list"))?;
+        check_network_list(v, &format!("{at}.network_list"), "MASQUEOutboundOptions")?;
     }
     for f in [
         "vhttp",
@@ -2216,7 +2216,8 @@ fn validate_masque_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), 
 /// `network_list` (Listable[string] at decode): null OK; string validated
 /// against tcp/udp; an array of strings/nulls validates element-wise (a null
 /// element becomes `""`), any other array shape reports the array kind.
-fn check_masque_network_list(value: &Value, at: &str) -> Result<(), String> {
+/// `opts` is the Go struct name used in unmarshal-style error messages.
+fn check_network_list(value: &Value, at: &str, opts: &str) -> Result<(), String> {
     match value {
         Value::Null => Ok(()),
         Value::String(s) => {
@@ -2228,13 +2229,7 @@ fn check_masque_network_list(value: &Value, at: &str) -> Result<(), String> {
         }
         Value::Array(items) => {
             if !items.iter().all(|v| v.is_string() || v.is_null()) {
-                return Err(go_field_err(
-                    at,
-                    value,
-                    "MASQUEOutboundOptions",
-                    "network_list",
-                    "string",
-                ));
+                return Err(go_field_err(at, value, opts, "network_list", "string"));
             }
             for item in items {
                 let s = item.as_str().unwrap_or("");
@@ -2244,13 +2239,7 @@ fn check_masque_network_list(value: &Value, at: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(go_field_err(
-            at,
-            other,
-            "MASQUEOutboundOptions",
-            "network_list",
-            "string",
-        )),
+        other => Err(go_field_err(at, other, opts, "network_list", "string")),
     }
 }
 
@@ -4628,11 +4617,43 @@ fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
     Ok(())
 }
 
+/// Censorship strategy knob shared by both fptn forms (token and server).
+fn check_fptn_obfuscation(obj: &Map<String, Value>, at: &str) -> Result<(), String> {
+    if let Some(v) = obj.get("obfuscation").filter(|v| !v.is_null()) {
+        match v.as_str() {
+            Some("tls" | "tls_obfuscator" | "kTlsObfuscator" | "none" | "sni" | "kSni") => {}
+            Some(_) => {
+                return Err(format!(
+                    "{at}.obfuscation: invalid value (expected \"tls\" or \"none\")"
+                ));
+            }
+            None => return Err(format!("{at}.obfuscation: must be a string")),
+        }
+    }
+    Ok(())
+}
+
 fn validate_fptn_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
+    check_fptn_obfuscation(obj, &at)?;
+    if let Some(v) = obj.get("sni").filter(|v| !v.is_null())
+        && !v.is_string()
+    {
+        return Err(format!("{at}.sni: must be a string"));
+    }
+    if let Some(v) = obj.get("mtu").filter(|v| !v.is_null())
+        && !v.is_u64()
+    {
+        return Err(format!("{at}.mtu: must be an integer"));
+    }
+    if let Some(v) = obj.get("network_list") {
+        check_network_list(v, &format!("{at}.network_list"), "FPTNOutboundOptions")?;
+    }
     if !obj.contains_key("server") {
         let mut allowed: Vec<&str> = vec!["type", "tag", "token"];
         allowed.extend_from_slice(DIALER_OUT_FIELDS);
+        // Set-once knobs copied to every expanded member by `fptn::expand`.
+        allowed.extend_from_slice(&["obfuscation", "sni", "mtu", "network_list"]);
         reject_unknown_fields(obj, &allowed, &at)?;
         match obj.get("token") {
             Some(Value::String(s)) if !s.is_empty() => {}
@@ -4651,6 +4672,10 @@ fn validate_fptn_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), St
         "username",
         "password",
         "md5_fingerprint",
+        "sni",
+        "mtu",
+        "network_list",
+        "obfuscation",
     ];
     allowed.extend_from_slice(DIALER_OUT_FIELDS);
     reject_unknown_fields(obj, &allowed, &at)?;
@@ -7868,6 +7893,79 @@ mod tests {
 
         let err = masque_err(json!({"ip": "bogus", "vhttp": "bad"}));
         assert!(err.contains("invalid vhttp: bad"), "{err}");
+    }
+
+    #[test]
+    fn fptn_extra_fields_and_obfuscation_rules() {
+        let server_form = |extra: Value| {
+            let mut ob = json!({
+                "type": "fptn", "tag": "x", "server": "1.2.3.4", "server_port": 443,
+                "username": "u", "password": "p"
+            });
+            if let (Some(dst), Some(src)) = (ob.as_object_mut(), extra.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            validate(&json!({"outbounds": [ob]})).unwrap_err()
+        };
+        let token_form = |extra: Value| {
+            let mut ob = json!({"type": "fptn", "tag": "x", "token": "fptn:zz"});
+            if let (Some(dst), Some(src)) = (ob.as_object_mut(), extra.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            validate(&json!({"outbounds": [ob]})).unwrap_err()
+        };
+
+        // Both forms accept the runtime knobs.
+        assert!(
+            validate(&json!({"outbounds": [{
+                "type": "fptn", "tag": "x", "server": "1.2.3.4", "server_port": 443,
+                "username": "u", "password": "p", "sni": "sni.example", "mtu": 1400,
+                "network_list": ["tcp"], "obfuscation": "tls"
+            }]}))
+            .is_ok()
+        );
+        assert!(
+            validate(&json!({"outbounds": [{
+                "type": "fptn", "tag": "x", "token": "fptn:zz",
+                "sni": "sni.example", "mtu": 1400, "network_list": "udp",
+                "obfuscation": "none"
+            }]}))
+            .is_ok()
+        );
+
+        let err = server_form(json!({"obfuscation": "bogus"}));
+        assert!(
+            err.contains("outbounds[0].obfuscation: invalid value"),
+            "{err}"
+        );
+        let err = token_form(json!({"obfuscation": 1}));
+        assert!(
+            err.contains("outbounds[0].obfuscation: must be a string"),
+            "{err}"
+        );
+        let err = server_form(json!({"sni": 5}));
+        assert!(err.contains("outbounds[0].sni: must be a string"), "{err}");
+        let err = server_form(json!({"mtu": "big"}));
+        assert!(
+            err.contains("outbounds[0].mtu: must be an integer"),
+            "{err}"
+        );
+        let err = server_form(json!({"network_list": ["icmp"]}));
+        assert!(
+            err.contains("outbounds[0].network_list: unknown network: icmp"),
+            "{err}"
+        );
+        let err = server_form(json!({"network_list": [1]}));
+        assert!(
+            err.contains("FPTNOutboundOptions.network_list"),
+            "expected FPTN struct name in {err}"
+        );
+        let err = token_form(json!({"fptn_unknown": 1}));
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]

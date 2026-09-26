@@ -4,6 +4,7 @@
 pub mod rule;
 pub mod sniff;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -25,6 +26,7 @@ use crate::inbound::Conn;
 use crate::logging;
 use crate::outbound::block::Block;
 use crate::outbound::direct::Direct;
+use crate::outbound::fptn::Fptn;
 use crate::outbound::hysteria2::Hysteria2;
 use crate::outbound::masque::Masque;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
@@ -110,6 +112,7 @@ pub enum Outbound {
     Trojan(Trojan),
     Vmess(Vmess),
     Hysteria2(Hysteria2),
+    Fptn(Fptn),
     Masque(Masque),
     Tuic(Tuic),
     WireGuard(WireGuard),
@@ -141,6 +144,7 @@ impl Outbound {
             Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
             Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
             Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
+            Outbound::Fptn(fptn) => fptn.connect(target).await.map(Conn::Plain),
             Outbound::Masque(masque) => masque.connect(target).await.map(Conn::Plain),
             Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
@@ -158,6 +162,7 @@ impl Outbound {
         match self {
             Outbound::Direct(direct) => direct.connect_udp(target).await,
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
+            Outbound::Fptn(fptn) => fptn.connect_udp(target).await,
             Outbound::Masque(masque) => masque.connect_udp(target).await,
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
@@ -189,6 +194,7 @@ impl Outbound {
             "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
             "vmess" => Ok(Outbound::Vmess(Vmess::build(obj, at)?)),
             "hysteria2" => Ok(Outbound::Hysteria2(Hysteria2::build(obj, at)?)),
+            "fptn" => Ok(Outbound::Fptn(Fptn::build(obj, at)?)),
             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
             "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
@@ -324,6 +330,13 @@ impl Router {
 
 impl Router {
     pub fn new(root: &Value) -> anyhow::Result<Arc<Router>> {
+        // Token outbounds (`{"type":"fptn","token":…}`) expand into one
+        // member outbound per server plus a urltest group first.
+        let expanded = core_config::fptn::expand(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let root: Cow<'_, Value> = match expanded {
+            Some(value) => Cow::Owned(value),
+            None => Cow::Borrowed(root),
+        };
         let defaults = RouteDefaults::parse(root.get("route"))?;
         if let Some(tag) = &defaults.default_domain_resolver {
             crate::dns::set_default_domain_resolver(Some(tag.clone()));

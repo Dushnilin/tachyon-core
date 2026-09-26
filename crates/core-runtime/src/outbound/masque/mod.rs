@@ -19,7 +19,7 @@ mod huffman;
 mod p256;
 mod profile;
 mod qpack;
-mod stack;
+pub(crate) mod stack;
 mod static_tables;
 mod tls;
 
@@ -43,7 +43,7 @@ use crate::outbound::quic::udp_loopback_pair;
 use crate::outbound::urltest::parse_duration;
 
 use profile::{MasqueKeys, Profile, parse_keys, parse_profile};
-use stack::{Cmd, Leg, run};
+use stack::{Cmd, Leg, StackCfg, run};
 use tls::MasqueTls;
 
 const AUTO_H3: u8 = 0;
@@ -634,7 +634,13 @@ impl Masque {
             cmd_tx: tx,
             next_id: AtomicU32::new(1),
         });
-        let cfg = Arc::clone(&self.cfg);
+        let cfg = Arc::new(StackCfg {
+            tag: self.cfg.tag.clone(),
+            mtu: self.cfg.mtu,
+            local_addr: self.cfg.local_addr,
+            local_cidr: self.cfg.local_cidr,
+            idle_timeout: self.cfg.idle_timeout,
+        });
         tokio::spawn(async move {
             if let Err(e) = run(cfg, leg, rx).await {
                 logging::error(format_args!("masque stack exited: {e}"));
@@ -802,7 +808,7 @@ impl Masque {
     }
 }
 
-async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
+pub(crate) async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
@@ -823,7 +829,7 @@ async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::other(format!("no address for {host}")))
 }
 
-async fn resolve_target(target: &Target) -> io::Result<SocketAddr> {
+pub(crate) async fn resolve_target(target: &Target) -> io::Result<SocketAddr> {
     match target {
         Target::Ip(addr) => Ok(*addr),
         Target::Domain(host, port) => resolve_host(host, *port).await,

@@ -31,7 +31,7 @@ fn credentials(obj: &serde_json::Map<String, Value>) -> Option<(String, String)>
     Some((username.to_string(), password.to_string()))
 }
 
-fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     match target {
         Target::Ip(addr) => match addr.ip() {

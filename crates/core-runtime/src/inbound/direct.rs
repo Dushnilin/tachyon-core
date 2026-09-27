@@ -62,22 +62,67 @@ impl Direct {
         }
         let (ip, port) = parse_listen(obj, &at)?;
 
-        // Bind TCP first (or UDP alone) so both can share one ephemeral port
-        // when listen_port is 0.
-        let listener = if want_tcp {
-            Some(TcpListener::bind(SocketAddr::new(ip, port)).await?)
-        } else {
-            None
+        // When listen_port is 0 both protocols have to share one port. Bind
+        // UDP first: Windows allocates ephemeral ports from a range that can be
+        // excluded for UDP, and a TCP-first pick then fails the UDP bind with
+        // WSAEACCES. Retrying covers ports that are free for UDP but taken for
+        // TCP.
+        let (listener, udp) = match (want_tcp, want_udp, port) {
+            (true, true, 0) => {
+                let mut last_error: Option<io::Error> = None;
+                let mut bound = None;
+                for _ in 0..8 {
+                    let udp_sock = match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
+                        Ok(sock) => sock,
+                        Err(e) => {
+                            last_error = Some(e);
+                            break;
+                        }
+                    };
+                    let chosen = udp_sock.local_addr()?.port();
+                    match TcpListener::bind(SocketAddr::new(ip, chosen)).await {
+                        Ok(tcp) => {
+                            bound = Some((Some(tcp), Some(Arc::new(udp_sock))));
+                            break;
+                        }
+                        Err(e) => last_error = Some(e),
+                    }
+                }
+                match bound {
+                    Some(pair) => pair,
+                    None => {
+                        return Err(last_error
+                            .unwrap_or_else(|| {
+                                io::Error::other("direct inbound: no shared tcp/udp port")
+                            })
+                            .into());
+                    }
+                }
+            }
+            _ => {
+                let listener = if want_tcp {
+                    Some(TcpListener::bind(SocketAddr::new(ip, port)).await?)
+                } else {
+                    None
+                };
+                let bound_port = match &listener {
+                    Some(l) => l.local_addr()?.port(),
+                    None => port,
+                };
+                let udp = if want_udp {
+                    Some(Arc::new(
+                        UdpSocket::bind(SocketAddr::new(ip, bound_port)).await?,
+                    ))
+                } else {
+                    None
+                };
+                (listener, udp)
+            }
         };
-        let bound_port = match &listener {
-            Some(l) => l.local_addr()?.port(),
-            None => port,
-        };
-        let udp = if want_udp {
-            let sock = UdpSocket::bind(SocketAddr::new(ip, bound_port)).await?;
-            Some(Arc::new(sock))
-        } else {
-            None
+        let bound_port = match (&listener, &udp) {
+            (Some(l), _) => l.local_addr()?.port(),
+            (None, Some(s)) => s.local_addr()?.port(),
+            (None, None) => port,
         };
 
         let addr_override = obj.get("override_address").and_then(Value::as_str);

@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-out",
+      "server": "example.com",
+      "server_port": 8443,
+      "password": "secret"
+    }
+  ]
+}

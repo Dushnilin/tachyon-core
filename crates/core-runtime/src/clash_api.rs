@@ -552,6 +552,7 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
         Outbound::WireGuard(_) => "WireGuard",
         Outbound::OpenVpn(_) => "OpenVPN",
         Outbound::Naive(_) => "NaiveProxy",
+        Outbound::AnyTls(_) => "AnyTLS",
         Outbound::Urltest(_) => "URLTest",
         Outbound::Selector(_) => "Selector",
     }

@@ -2508,8 +2508,16 @@ pub fn validate(root: &Value) -> Result<(), String> {
         })?;
         // reference: whole config decodes before any endpoint initializes, so
         // decode checks for every endpoint run first, then the initialize pass.
-        let mut initialized: Vec<(usize, String)> = Vec::new();
-        for (i, entry) in entries.iter().enumerate() {
+        let mut initialized: Vec<(usize, String, String)> = Vec::new();
+        for (i, raw) in entries.iter().enumerate() {
+            // reference stage-2 prune runs before every option decode: empty
+            // containers behave as absent (whole entries keep their shape).
+            let entry = if raw.is_object() {
+                deep_prune(raw).unwrap_or_else(|| Value::Object(Map::new()))
+            } else {
+                raw.clone()
+            };
+            let entry = &entry;
             let obj = entry.as_object().ok_or_else(|| {
                 format!(
                     "endpoints[{i}]: json: cannot unmarshal {} into Go struct field _Options.endpoints of type option._Endpoint",
@@ -2526,7 +2534,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
                     ));
                 }
             };
-            if ty != "wireguard" {
+            if !ENDPOINT_TYPES.contains(&ty) {
                 return Err(format!("endpoints[{i}]: unknown endpoint type: {ty}"));
             }
             let tag = match obj.get("tag") {
@@ -2542,12 +2550,18 @@ pub fn validate(root: &Value) -> Result<(), String> {
             if !tag.is_empty() && !outbound_tags.insert(tag.to_string()) {
                 return Err(format!("duplicate outbound/endpoint tag: {tag}"));
             }
-            endpoint_decode(i, obj)?;
-            initialized.push((i, tag.to_string()));
+            endpoint_decode(i, obj, ty)?;
+            initialized.push((i, tag.to_string(), ty.to_string()));
         }
-        for (i, tag) in initialized {
-            let obj = entries[i].as_object().expect("validated above");
-            endpoint_initialize(i, &tag, obj)?;
+        for (i, tag, ty) in initialized {
+            let raw = &entries[i];
+            let entry = if raw.is_object() {
+                deep_prune(raw).unwrap_or_else(|| Value::Object(Map::new()))
+            } else {
+                raw.clone()
+            };
+            let obj = entry.as_object().expect("validated above");
+            endpoint_initialize(i, &tag, obj, &ty)?;
         }
     }
 
@@ -6323,7 +6337,7 @@ fn check_interface_types(value: &Value, at: &str) -> Result<(), String> {
 }
 
 /// reference `option.AmneziaWGOptions` + wireguard root decode checks.
-fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+fn wireguard_endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("endpoints[{i}]");
     for key in obj.keys() {
         let k = key.as_str();
@@ -6333,8 +6347,6 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     }
     const WG: &str = "WireGuardEndpointOptions";
     const AWG: &str = "WireGuardEndpointOptions.AmneziaWGOptions";
-    const DIAL: &str = "WireGuardEndpointOptions.DialerOptions";
-    const ABS: &str = "WireGuardEndpointOptions.DialerOptions.AbstractDialerOptions";
 
     if let Some(v) = obj.get("system") {
         ep_bool(v, &format!("{at}.system"), WG, "system")?;
@@ -6426,6 +6438,22 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
         endpoint_peers_decode(i, v)?;
     }
 
+    endpoint_dial_decode(
+        &at,
+        obj,
+        "WireGuardEndpointOptions.DialerOptions",
+        "WireGuardEndpointOptions.DialerOptions.AbstractDialerOptions",
+    )
+}
+
+/// shared dial fields: `DialerOptions` + `DialerOptions.AbstractDialerOptions`
+/// of every endpoint entry (wireguard, openvpn, tailscale, openconnect).
+fn endpoint_dial_decode(
+    at: &str,
+    obj: &Map<String, Value>,
+    dial: &str,
+    abs: &str,
+) -> Result<(), String> {
     // shared dial fields.
     for f in [
         "bind_interface",
@@ -6435,7 +6463,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
         "protect_path",
     ] {
         if let Some(v) = obj.get(f) {
-            ep_str(v, &format!("{at}.{f}"), ABS, f)?;
+            ep_str(v, &format!("{at}.{f}"), abs, f)?;
         }
     }
     for f in [
@@ -6447,7 +6475,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
         "reuse_addr",
     ] {
         if let Some(v) = obj.get(f) {
-            ep_bool(v, &format!("{at}.{f}"), ABS, f)?;
+            ep_bool(v, &format!("{at}.{f}"), abs, f)?;
         }
     }
     for f in [
@@ -6457,7 +6485,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
         "fallback_delay",
     ] {
         if let Some(v) = obj.get(f) {
-            check_duration_field(v, &format!("{at}.{f}"), ABS, f)?;
+            check_duration_field(v, &format!("{at}.{f}"), abs, f)?;
         }
     }
     if let Some(v) = obj.get("detour") {
@@ -6468,7 +6496,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
                 return Err(go_field_err(
                     &format!("{at}.detour"),
                     other,
-                    DIAL,
+                    dial,
                     "detour",
                     "string",
                 ));
@@ -6489,7 +6517,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
                 return Err(go_field_err(
                     &format!("{at}.domain_resolver"),
                     other,
-                    ABS,
+                    abs,
                     "domain_resolver",
                     "option._DomainResolveOptions",
                 ));
@@ -6509,7 +6537,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
                 return Err(go_field_err(
                     &format!("{at}.network_strategy"),
                     other,
-                    ABS,
+                    abs,
                     "network_strategy",
                     "string",
                 ));
@@ -6529,7 +6557,7 @@ fn endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
                 return Err(go_field_err(
                     &format!("{at}.domain_strategy"),
                     other,
-                    ABS,
+                    abs,
                     "domain_strategy",
                     "string",
                 ));
@@ -6680,7 +6708,11 @@ fn endpoint_str<'a>(obj: &'a Map<String, Value>, key: &str) -> &'a str {
 
 /// reference initialize pass: private key → AWG (`awgIpcLines`) → addresses →
 /// peers, mirroring `protocol/wireguard/endpoint.go` + `device_awg.go`.
-fn endpoint_initialize(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
+fn wireguard_endpoint_initialize(
+    i: usize,
+    tag: &str,
+    obj: &Map<String, Value>,
+) -> Result<(), String> {
     let at = format!("initialize endpoint[{i}] wireguard[{tag}]");
     let private_key = endpoint_str(obj, "private_key");
     if private_key.is_empty() {
@@ -8611,5 +8643,5387 @@ mod tests {
         // prunable/null ports skip the generic check
         assert!(validate(&masque(json!({"server_port": null}))).is_ok());
         assert!(validate(&masque(json!({"server_port": []}))).is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint types beyond wireguard: openvpn-client / openvpn-server /
+// tailscale / openconnect. Field sets and init chains mirror the reference
+// (option/openvpn.go, option/tailscale.go, option/openconnect.go,
+// protocol/openvpn/{client,server}.go, sing-openvpn options_validation.go).
+// Probed message matrix lives in the tests at the bottom of this file.
+// ---------------------------------------------------------------------------
+
+const ENDPOINT_TYPES: &[&str] = &[
+    "wireguard",
+    "openvpn-client",
+    "openvpn-server",
+    "tailscale",
+    "openconnect",
+];
+
+const OVPN_CLIENT: &str = "OpenVPNClientEndpointOptions";
+const OVPN_SERVER: &str = "OpenVPNServerEndpointOptions";
+const TS_EP: &str = "TailscaleEndpointOptions";
+const OC_EP: &str = "OpenConnectEndpointOptions";
+
+/// reference `option.OpenVPNClientEndpointOptions` + wrapper + embedded
+/// `OpenVPNEndpointOptions`/`ServerOptions`/`OpenVPNEndpointOptions.dialer`
+/// (dial fields come from `DIALER_OUT_FIELDS`).
+const KNOWN_OVPN_CLIENT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "system",
+    "name",
+    "mtu",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "udp_timeout",
+    "server",
+    "server_port",
+    "mode",
+    "network",
+    "servers",
+    "remote_random",
+    "address",
+    "peer_address",
+    "peer_address_ipv6",
+    "topology",
+    "username",
+    "password",
+    "auth_retry",
+    "static_challenge",
+    "static_challenge_echo",
+    "static_key",
+    "static_key_path",
+    "key_direction",
+    "tls",
+    "cipher",
+    "data_ciphers",
+    "data_ciphers_fallback",
+    "auth",
+    "mss_fix",
+    "mss_fix_disabled",
+    "mss_fix_mode",
+    "fragment",
+    "replay_window",
+    "replay_window_time",
+    "compression",
+    "compression_lzo",
+    "allow_compression",
+    "route_no_pull",
+    "pull_filters",
+    "routes",
+    "route_gateway",
+    "route_metric",
+    "redirect_gateway",
+    "redirect_gateway_flags",
+    "redirect_private",
+    "block_ipv6",
+    "ping_interval",
+    "ping_restart",
+    "ping_restart_disabled",
+    "renegotiate_interval",
+    "renegotiate_disabled",
+    "renegotiate_bytes",
+    "renegotiate_packets",
+    "tls_timeout",
+    "handshake_window",
+    "explicit_exit_notify",
+];
+
+/// reference `option.OpenVPNServerEndpointOptions`: ListenOptions (incl. the
+/// embedded InboundOptions decode fields) + `OpenVPNEndpointOptions` +
+/// server fields. No dialer fields on the server side.
+const KNOWN_OVPN_SERVER_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "listen",
+    "listen_port",
+    "bind_interface",
+    "routing_mark",
+    "reuse_addr",
+    "netns",
+    "disable_tcp_keep_alive",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "udp_fragment",
+    "udp_timeout",
+    "detour",
+    "proxy_protocol",
+    "proxy_protocol_accept_no_header",
+    "sniff",
+    "sniff_override_destination",
+    "sniff_timeout",
+    "domain_strategy",
+    "udp_disable_domain_unmapping",
+    "system",
+    "name",
+    "mtu",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "mode",
+    "network",
+    "remote",
+    "remote_port",
+    "max_clients",
+    "address",
+    "peer_address",
+    "peer_address_ipv6",
+    "topology",
+    "duplicate_cn",
+    "users",
+    "static_key",
+    "static_key_path",
+    "key_direction",
+    "tls",
+    "cipher",
+    "data_ciphers",
+    "data_ciphers_fallback",
+    "auth",
+    "mss_fix",
+    "mss_fix_disabled",
+    "mss_fix_mode",
+    "replay_window",
+    "replay_window_time",
+    "push",
+    "ping_interval",
+    "ping_restart",
+    "renegotiate_interval",
+    "renegotiate_disabled",
+    "renegotiate_bytes",
+    "renegotiate_packets",
+    "handshake_window",
+];
+
+/// reference `option.TailscaleEndpointOptions` + wrapper.
+const KNOWN_TAILSCALE_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "state_directory",
+    "auth_key",
+    "control_url",
+    "ephemeral",
+    "hostname",
+    "accept_routes",
+    "exit_node",
+    "exit_node_allow_lan_access",
+    "advertise_routes",
+    "advertise_exit_node",
+    "advertise_tags",
+    "listen_port",
+    "relay_server_port",
+    "relay_server_static_endpoints",
+    "system_interface",
+    "system_interface_name",
+    "system_interface_mtu",
+    "udp_timeout",
+    "ssh_server",
+    "taildrop_directory",
+];
+
+/// reference `option.OpenConnectEndpointOptions` + wrapper.
+const KNOWN_OPENCONNECT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "system",
+    "name",
+    "udp_timeout",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "server",
+    "flavor",
+    "username",
+    "password",
+    "auth_group",
+    "cookie",
+    "token",
+    "reported_os",
+    "user_agent",
+    "version",
+    "local_hostname",
+    "mobile",
+    "csd",
+    "hip",
+    "tncc",
+    "fortinet_host_check",
+    "no_udp",
+    "dtls_local_port",
+    "compression_disabled",
+    "compression_mode",
+    "ipv6_disabled",
+    "http_keepalive_disabled",
+    "xml_post_disabled",
+    "external_auth_disabled",
+    "password_authentication_disabled",
+    "tcp_keep_alive_enabled",
+    "pfs",
+    "mtu",
+    "base_mtu",
+    "dpd_interval",
+    "reconnect_timeout",
+    "trojan_interval",
+    "queue_length",
+    "allow_insecure_crypto",
+    "tls",
+    "form_entries",
+];
+
+const KNOWN_OVPN_TLS_OUT_FIELDS: &[&str] = &[
+    "server_name",
+    "server_name_type",
+    "certificate",
+    "certificate_path",
+    "client_certificate",
+    "client_certificate_path",
+    "client_key",
+    "client_key_path",
+    "peer_fingerprint",
+    "crl_path",
+    "remote_certificate_ku",
+    "remote_certificate_eku",
+    "remote_certificate_tls",
+    "certificate_profile",
+    "ns_certificate_type",
+    "version_min",
+    "version_max",
+    "cipher",
+    "groups",
+    "control_wrap",
+];
+
+const KNOWN_OVPN_TLS_IN_FIELDS: &[&str] = &[
+    "certificate",
+    "certificate_path",
+    "key",
+    "key_path",
+    "client_certificate",
+    "client_certificate_path",
+    "verify_client_certificate",
+    "client_name",
+    "client_name_type",
+    "peer_fingerprint",
+    "crl_path",
+    "remote_certificate_ku",
+    "remote_certificate_eku",
+    "remote_certificate_tls",
+    "certificate_profile",
+    "ns_certificate_type",
+    "version_min",
+    "version_max",
+    "cipher",
+    "groups",
+    "control_wrap",
+];
+
+const KNOWN_OVPN_CWRAP_FIELDS: &[&str] = &["type", "key", "key_path", "direction"];
+const KNOWN_OVPN_CWRAP_IN_FIELDS: &[&str] =
+    &["type", "key", "key_path", "direction", "force_cookie"];
+const KNOWN_OVPN_REMOTE_FIELDS: &[&str] = &["server", "server_port", "network"];
+const KNOWN_OVPN_PULL_FILTER_FIELDS: &[&str] = &["action", "text"];
+const KNOWN_OVPN_USER_FIELDS: &[&str] = &["username", "password"];
+const KNOWN_OVPN_PUSH_FIELDS: &[&str] = &[
+    "routes",
+    "dns",
+    "dns_servers",
+    "search_domains",
+    "dhcp_options",
+    "redirect_gateway",
+    "redirect_gateway_flags",
+    "block_outside_dns",
+    "ping_interval",
+    "ping_restart",
+];
+const KNOWN_OVPN_PUSH_DNS_SERVER_FIELDS: &[&str] = &[
+    "priority",
+    "addresses",
+    "resolve_domains",
+    "dnssec",
+    "transport",
+    "sni",
+];
+const KNOWN_TS_SSH_FIELDS: &[&str] = &[
+    "enabled",
+    "disable_pty",
+    "disable_sftp",
+    "disable_forwarding",
+];
+const KNOWN_OC_TOKEN_FIELDS: &[&str] = &[
+    "mode",
+    "secret",
+    "secret_path",
+    "pin",
+    "password",
+    "device_id",
+    "counter",
+];
+const KNOWN_OC_TLS_FIELDS: &[&str] = &[
+    "insecure",
+    "server_name",
+    "peer_fingerprint",
+    "system_trust_disabled",
+    "certificate_authority",
+    "certificate_authority_path",
+    "client_certificate",
+    "client_certificate_path",
+    "client_key",
+    "client_key_path",
+    "client_key_password",
+    "mca_certificate",
+    "mca_certificate_path",
+    "mca_key",
+    "mca_key_path",
+    "mca_key_password",
+];
+const KNOWN_OC_MOBILE_FIELDS: &[&str] = &["platform_version", "device_type", "device_unique_id"];
+const KNOWN_OC_WRAPPER_FIELDS: &[&str] = &["wrapper_path"];
+const KNOWN_OC_TNCC_FIELDS: &[&str] = &[
+    "wrapper_path",
+    "device_id",
+    "user_agent",
+    "machine_identification_enabled",
+    "certificates",
+];
+const KNOWN_OC_TNCC_CERT_FIELDS: &[&str] = &["certificate", "certificate_path"];
+const KNOWN_OC_FORTINET_FIELDS: &[&str] = &["hostcheck", "check_virtual_desktop"];
+const KNOWN_OC_FORM_ENTRY_FIELDS: &[&str] =
+    &["form_id", "submission_key", "name", "value", "promote"];
+
+/// canonical data-cipher names accepted by the reference
+/// (`sing-openvpn validateDataCipherName`).
+const OVPN_CANONICAL_CIPHERS: &[&str] = &[
+    "",
+    "BF-CBC",
+    "DES-CBC",
+    "DES-EDE-CBC",
+    "DES-EDE3-CBC",
+    "CAST5-CBC",
+    "AES-128-CBC",
+    "AES-192-CBC",
+    "AES-256-CBC",
+    "ARIA-128-CBC",
+    "ARIA-192-CBC",
+    "ARIA-256-CBC",
+    "CAMELLIA-128-CBC",
+    "CAMELLIA-192-CBC",
+    "CAMELLIA-256-CBC",
+    "SEED-CBC",
+    "SM4-CBC",
+    "AES-128-GCM",
+    "AES-192-GCM",
+    "AES-256-GCM",
+    "CHACHA20-POLY1305",
+    "NONE",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_CCM_SHA256",
+    "TLS_AES_128_CCM_8_SHA256",
+];
+
+/// ciphers usable in static_key mode (`staticCipherKeySize`).
+const OVPN_STATIC_CIPHERS: &[&str] = &[
+    "BF-CBC",
+    "DES-CBC",
+    "DES-EDE-CBC",
+    "DES-EDE3-CBC",
+    "CAST5-CBC",
+    "AES-128-CBC",
+    "AES-192-CBC",
+    "AES-256-CBC",
+    "ARIA-128-CBC",
+    "ARIA-192-CBC",
+    "ARIA-256-CBC",
+    "CAMELLIA-128-CBC",
+    "CAMELLIA-192-CBC",
+    "CAMELLIA-256-CBC",
+    "SEED-CBC",
+    "SM4-CBC",
+    "NONE",
+];
+
+const OVPN_AUTH_DIGESTS: &[&str] = &[
+    "",
+    "SHA1",
+    "SHA224",
+    "SHA256",
+    "SHA384",
+    "SHA512",
+    "RIPEMD160",
+    "MD5",
+    "NONE",
+];
+
+const OVPN_CLIENT_PROTOCOLS: &[&str] = &["", "udp", "udp4", "udp6", "tcp", "tcp4", "tcp6"];
+const OVPN_SERVER_PROTOCOLS: &[&str] = &["", "udp", "tcp"];
+const OVPN_MODES: &[&str] = &["", "tls", "static_key"];
+const OVPN_TOPOLOGIES: &[&str] = &["", "net30", "p2p", "subnet"];
+const OVPN_KEY_DIRECTIONS: &[&str] = &["", "server", "client"];
+const OVPN_AUTH_RETRIES: &[&str] = &["", "none", "nointeract", "interact"];
+const OVPN_PULL_FILTER_ACTIONS: &[&str] = &["accept", "ignore", "reject"];
+const OC_FLAVORS: &[&str] = &["", "anyconnect", "gp", "fortinet", "f5", "pulse", "nc"];
+const OVPN_REMOTE_CERT_TLS: &[&str] = &["", "server", "client", "none"];
+const OVPN_TLS_VERIFY_X509: &[&str] = &["", "subject", "name", "name-prefix"];
+const OVPN_NS_CERT_TYPES: &[&str] = &["", "server", "client"];
+const OVPN_MSS_FIX_MODES: &[&str] = &["", "mtu", "fixed"];
+
+fn endpoint_decode(i: usize, obj: &Map<String, Value>, ty: &str) -> Result<(), String> {
+    match ty {
+        "wireguard" => wireguard_endpoint_decode(i, obj),
+        "openvpn-client" => openvpn_client_decode(i, obj),
+        "openvpn-server" => openvpn_server_decode(i, obj),
+        "tailscale" => tailscale_decode(i, obj),
+        "openconnect" => openconnect_decode(i, obj),
+        _ => Err(format!("endpoints[{i}]: unknown endpoint type: {ty}")),
+    }
+}
+
+fn openvpn_client_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("endpoints[{i}]");
+    for key in obj.keys() {
+        let k = key.as_str();
+        if !KNOWN_OVPN_CLIENT_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    let epc = format!("{OVPN_CLIENT}.OpenVPNEndpointOptions");
+    if let Some(v) = obj.get("system") {
+        ep_bool(v, &format!("{at}.system"), &epc, "system")?;
+    }
+    if let Some(v) = obj.get("name") {
+        ep_str(v, &format!("{at}.name"), &epc, "name")?;
+    }
+    if let Some(v) = obj.get("mtu") {
+        ep_unsigned(v, &format!("{at}.mtu"), &epc, "mtu", u32::MAX as u64)?;
+    }
+    if let Some(v) = obj.get("udp_mapping") {
+        check_udp_nat(v, &format!("{at}.udp_mapping"), &epc, "udp_mapping")?;
+    }
+    if let Some(v) = obj.get("udp_filtering") {
+        check_udp_nat(v, &format!("{at}.udp_filtering"), &epc, "udp_filtering")?;
+    }
+    if let Some(v) = obj.get("udp_nat_max") {
+        ep_unsigned(
+            v,
+            &format!("{at}.udp_nat_max"),
+            &epc,
+            "udp_nat_max",
+            u32::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("udp_timeout") {
+        check_duration_field(v, &format!("{at}.udp_timeout"), OVPN_CLIENT, "udp_timeout")?;
+    }
+    let srv = format!("{OVPN_CLIENT}.ServerOptions");
+    if let Some(v) = obj.get("server") {
+        ep_str(v, &format!("{at}.server"), &srv, "server")?;
+    }
+    if let Some(v) = obj.get("server_port") {
+        ep_unsigned(
+            v,
+            &format!("{at}.server_port"),
+            &srv,
+            "server_port",
+            u16::MAX as u64,
+        )?;
+    }
+    for f in [
+        "mode",
+        "network",
+        "topology",
+        "username",
+        "password",
+        "auth_retry",
+        "static_challenge",
+        "key_direction",
+        "cipher",
+        "auth",
+        "mss_fix_mode",
+        "compression",
+        "compression_lzo",
+        "allow_compression",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
+        }
+    }
+    for f in [
+        "static_challenge_echo",
+        "remote_random",
+        "route_no_pull",
+        "redirect_gateway",
+        "redirect_private",
+        "block_ipv6",
+        "ping_restart_disabled",
+        "renegotiate_disabled",
+        "mss_fix_disabled",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
+        }
+    }
+    for f in [
+        "mss_fix",
+        "fragment",
+        "replay_window",
+        "route_metric",
+        "explicit_exit_notify",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_unsigned(v, &format!("{at}.{f}"), OVPN_CLIENT, f, u32::MAX as u64)?;
+        }
+    }
+    for f in ["renegotiate_bytes", "renegotiate_packets"] {
+        if let Some(v) = obj.get(f) {
+            check_u64_field(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
+        }
+    }
+    for f in [
+        "replay_window_time",
+        "ping_interval",
+        "ping_restart",
+        "renegotiate_interval",
+        "tls_timeout",
+        "handshake_window",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
+        }
+    }
+    if let Some(v) = obj.get("address") {
+        check_prefix_list(v, &format!("{at}.address"))?;
+    }
+    if let Some(v) = obj.get("routes") {
+        check_prefix_list(v, &format!("{at}.routes"))?;
+    }
+    for f in ["peer_address", "peer_address_ipv6", "route_gateway"] {
+        if let Some(v) = obj.get(f) {
+            check_addr_field(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
+        }
+    }
+    if let Some(v) = obj.get("data_ciphers") {
+        check_listable_string(v, &format!("{at}.data_ciphers"))?;
+    }
+    if let Some(v) = obj.get("data_ciphers_fallback") {
+        ep_str(
+            v,
+            &format!("{at}.data_ciphers_fallback"),
+            OVPN_CLIENT,
+            "data_ciphers_fallback",
+        )?;
+    }
+    if let Some(v) = obj.get("static_key") {
+        check_listable_string(v, &format!("{at}.static_key"))?;
+    }
+    if let Some(v) = obj.get("static_key_path") {
+        ep_str(
+            v,
+            &format!("{at}.static_key_path"),
+            OVPN_CLIENT,
+            "static_key_path",
+        )?;
+    }
+    if let Some(v) = obj.get("redirect_gateway_flags") {
+        check_listable_string(v, &format!("{at}.redirect_gateway_flags"))?;
+    }
+    if let Some(v) = obj.get("servers") {
+        openvpn_servers_decode(i, v)?;
+    }
+    if let Some(v) = obj.get("pull_filters") {
+        openvpn_pull_filters_decode(i, v)?;
+    }
+    if let Some(v) = obj.get("tls") {
+        openvpn_client_tls_decode(i, v)?;
+    }
+    endpoint_dial_decode(
+        &at,
+        obj,
+        &format!("{OVPN_CLIENT}.DialerOptions"),
+        &format!("{OVPN_CLIENT}.DialerOptions.AbstractDialerOptions"),
+    )
+}
+
+fn openvpn_servers_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].servers");
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OVPN_CLIENT,
+                "servers",
+                "[]option.OpenVPNRemoteOptions",
+            ));
+        }
+    };
+    for (n, item) in items.iter().enumerate() {
+        let path = format!("{at}[{n}]");
+        let m = match item {
+            Value::Object(m) => m,
+            other => {
+                return Err(format!(
+                    "{path}: json: cannot unmarshal {} into Go value of type option.OpenVPNRemoteOptions",
+                    json_kind(other)
+                ));
+            }
+        };
+        for key in m.keys() {
+            let k = key.as_str();
+            if !KNOWN_OVPN_REMOTE_FIELDS.contains(&k) {
+                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
+            }
+        }
+        let srv = "OpenVPNRemoteOptions.servers.ServerOptions";
+        if let Some(v) = m.get("server") {
+            ep_str(v, &format!("{path}.server"), srv, "server")?;
+        }
+        if let Some(v) = m.get("server_port") {
+            ep_unsigned(
+                v,
+                &format!("{path}.server_port"),
+                srv,
+                "server_port",
+                u16::MAX as u64,
+            )?;
+        }
+        if let Some(v) = m.get("network") {
+            ep_str(
+                v,
+                &format!("{path}.network"),
+                "OpenVPNRemoteOptions",
+                "servers.network",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn openvpn_pull_filters_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].pull_filters");
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OVPN_CLIENT,
+                "pull_filters",
+                "[]option.OpenVPNPullFilterOptions",
+            ));
+        }
+    };
+    for (n, item) in items.iter().enumerate() {
+        let path = format!("{at}[{n}]");
+        let m = match item {
+            Value::Object(m) => m,
+            other => {
+                return Err(format!(
+                    "{path}: json: cannot unmarshal {} into Go value of type option.OpenVPNPullFilterOptions",
+                    json_kind(other)
+                ));
+            }
+        };
+        for key in m.keys() {
+            let k = key.as_str();
+            if !KNOWN_OVPN_PULL_FILTER_FIELDS.contains(&k) {
+                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
+            }
+        }
+        for f in KNOWN_OVPN_PULL_FILTER_FIELDS {
+            if let Some(v) = m.get(*f) {
+                ep_str(v, &format!("{path}.{f}"), "OpenVPNPullFilterOptions", f)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn openvpn_client_tls_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].tls");
+    let m = match value {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OVPN_CLIENT,
+                "tls",
+                "option.OpenVPNOutboundTLSOptions",
+            ));
+        }
+    };
+    for key in m.keys() {
+        let k = key.as_str();
+        if !KNOWN_OVPN_TLS_OUT_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    for f in [
+        "server_name",
+        "server_name_type",
+        "certificate_path",
+        "client_certificate_path",
+        "client_key_path",
+        "crl_path",
+        "remote_certificate_eku",
+        "remote_certificate_tls",
+        "certificate_profile",
+        "ns_certificate_type",
+        "version_min",
+        "version_max",
+        "cipher",
+        "groups",
+    ] {
+        if let Some(v) = m.get(f) {
+            ep_str(v, &format!("{at}.{f}"), OVPN_CLIENT, &format!("tls.{f}"))?;
+        }
+    }
+    for f in [
+        "certificate",
+        "client_certificate",
+        "client_key",
+        "peer_fingerprint",
+        "remote_certificate_ku",
+    ] {
+        if let Some(v) = m.get(f) {
+            check_listable_string(v, &format!("{at}.{f}"))?;
+        }
+    }
+    if let Some(v) = m.get("control_wrap") {
+        openvpn_control_wrap_decode(i, v, false)?;
+    }
+    Ok(())
+}
+
+fn openvpn_server_tls_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].tls");
+    let m = match value {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OVPN_SERVER,
+                "tls",
+                "option.OpenVPNInboundTLSOptions",
+            ));
+        }
+    };
+    for key in m.keys() {
+        let k = key.as_str();
+        if !KNOWN_OVPN_TLS_IN_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    for f in [
+        "certificate_path",
+        "key_path",
+        "client_certificate_path",
+        "verify_client_certificate",
+        "client_name",
+        "client_name_type",
+        "crl_path",
+        "remote_certificate_eku",
+        "remote_certificate_tls",
+        "certificate_profile",
+        "ns_certificate_type",
+        "version_min",
+        "version_max",
+        "cipher",
+        "groups",
+    ] {
+        if let Some(v) = m.get(f) {
+            ep_str(v, &format!("{at}.{f}"), OVPN_SERVER, &format!("tls.{f}"))?;
+        }
+    }
+    for f in [
+        "certificate",
+        "key",
+        "client_certificate",
+        "peer_fingerprint",
+        "remote_certificate_ku",
+    ] {
+        if let Some(v) = m.get(f) {
+            check_listable_string(v, &format!("{at}.{f}"))?;
+        }
+    }
+    if let Some(v) = m.get("control_wrap") {
+        openvpn_control_wrap_decode(i, v, true)?;
+    }
+    Ok(())
+}
+
+fn openvpn_control_wrap_decode(i: usize, value: &Value, inbound: bool) -> Result<(), String> {
+    let at = format!("endpoints[{i}].tls.control_wrap");
+    let m = match value {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                if inbound { OVPN_SERVER } else { OVPN_CLIENT },
+                "tls.control_wrap",
+                if inbound {
+                    "option.OpenVPNInboundControlWrapOptions"
+                } else {
+                    "option.OpenVPNControlWrapOptions"
+                },
+            ));
+        }
+    };
+    let known: &[&str] = if inbound {
+        KNOWN_OVPN_CWRAP_IN_FIELDS
+    } else {
+        KNOWN_OVPN_CWRAP_FIELDS
+    };
+    for key in m.keys() {
+        let k = key.as_str();
+        if !known.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    for f in ["type", "direction"] {
+        if let Some(v) = m.get(f) {
+            ep_str(
+                v,
+                &format!("{at}.{f}"),
+                if inbound { OVPN_SERVER } else { OVPN_CLIENT },
+                &format!("tls.control_wrap.{f}"),
+            )?;
+        }
+    }
+    for f in ["key", "key_path"] {
+        if let Some(v) = m.get(f) {
+            check_listable_string(v, &format!("{at}.{f}"))?;
+        }
+    }
+    if inbound && let Some(v) = m.get("force_cookie") {
+        ep_bool(
+            v,
+            &format!("{at}.force_cookie"),
+            OVPN_SERVER,
+            "tls.control_wrap.force_cookie",
+        )?;
+    }
+    Ok(())
+}
+
+fn openvpn_server_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("endpoints[{i}]");
+    for key in obj.keys() {
+        let k = key.as_str();
+        if !KNOWN_OVPN_SERVER_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    let listen = format!("{OVPN_SERVER}.ListenOptions");
+    if let Some(v) = obj.get("listen") {
+        ep_str(v, &format!("{at}.listen"), &listen, "listen")?;
+    }
+    if let Some(v) = obj.get("listen_port") {
+        ep_unsigned(
+            v,
+            &format!("{at}.listen_port"),
+            &listen,
+            "listen_port",
+            u16::MAX as u64,
+        )?;
+    }
+    for f in ["bind_interface", "netns"] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), &listen, f)?;
+        }
+    }
+    if let Some(v) = obj.get("routing_mark") {
+        check_routing_mark(v, &format!("{at}.routing_mark"))?;
+    }
+    for f in [
+        "reuse_addr",
+        "disable_tcp_keep_alive",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "udp_fragment",
+        "proxy_protocol",
+        "proxy_protocol_accept_no_header",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), &listen, f)?;
+        }
+    }
+    for f in ["tcp_keep_alive", "tcp_keep_alive_interval", "udp_timeout"] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), &listen, f)?;
+        }
+    }
+    if let Some(v) = obj.get("detour") {
+        match v {
+            Value::String(_) | Value::Null => {}
+            Value::Object(map) if map.is_empty() => {}
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.detour"),
+                    other,
+                    &listen,
+                    "detour",
+                    "string",
+                ));
+            }
+        }
+    }
+    let inb = format!("{OVPN_SERVER}.ListenOptions.InboundOptions");
+    if let Some(v) = obj.get("sniff") {
+        ep_bool(v, &format!("{at}.sniff"), &inb, "sniff")?;
+    }
+    if let Some(v) = obj.get("sniff_override_destination") {
+        ep_bool(
+            v,
+            &format!("{at}.sniff_override_destination"),
+            &inb,
+            "sniff_override_destination",
+        )?;
+    }
+    if let Some(v) = obj.get("sniff_timeout") {
+        check_duration_field(v, &format!("{at}.sniff_timeout"), &inb, "sniff_timeout")?;
+    }
+    if let Some(v) = obj.get("udp_disable_domain_unmapping") {
+        ep_bool(
+            v,
+            &format!("{at}.udp_disable_domain_unmapping"),
+            &inb,
+            "udp_disable_domain_unmapping",
+        )?;
+    }
+    if let Some(v) = obj.get("domain_strategy") {
+        match v {
+            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
+            Value::String(s) => {
+                return Err(format!(
+                    "{at}.domain_strategy: unknown domain strategy: {s}"
+                ));
+            }
+            x if is_zero_json(x) => {}
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.domain_strategy"),
+                    other,
+                    &inb,
+                    "domain_strategy",
+                    "string",
+                ));
+            }
+        }
+    }
+    let epc = format!("{OVPN_SERVER}.OpenVPNEndpointOptions");
+    if let Some(v) = obj.get("system") {
+        ep_bool(v, &format!("{at}.system"), &epc, "system")?;
+    }
+    if let Some(v) = obj.get("name") {
+        ep_str(v, &format!("{at}.name"), &epc, "name")?;
+    }
+    if let Some(v) = obj.get("mtu") {
+        ep_unsigned(v, &format!("{at}.mtu"), &epc, "mtu", u32::MAX as u64)?;
+    }
+    if let Some(v) = obj.get("udp_mapping") {
+        check_udp_nat(v, &format!("{at}.udp_mapping"), &epc, "udp_mapping")?;
+    }
+    if let Some(v) = obj.get("udp_filtering") {
+        check_udp_nat(v, &format!("{at}.udp_filtering"), &epc, "udp_filtering")?;
+    }
+    if let Some(v) = obj.get("udp_nat_max") {
+        ep_unsigned(
+            v,
+            &format!("{at}.udp_nat_max"),
+            &epc,
+            "udp_nat_max",
+            u32::MAX as u64,
+        )?;
+    }
+    for f in [
+        "mode",
+        "network",
+        "remote",
+        "topology",
+        "key_direction",
+        "cipher",
+        "auth",
+        "mss_fix_mode",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), OVPN_SERVER, f)?;
+        }
+    }
+    for f in ["duplicate_cn", "mss_fix_disabled"] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), OVPN_SERVER, f)?;
+        }
+    }
+    if let Some(v) = obj.get("remote_port") {
+        ep_unsigned(
+            v,
+            &format!("{at}.remote_port"),
+            OVPN_SERVER,
+            "remote_port",
+            u16::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("max_clients") {
+        ep_int(v, &format!("{at}.max_clients"), OVPN_SERVER, "max_clients")?;
+    }
+    for f in ["mss_fix", "replay_window"] {
+        if let Some(v) = obj.get(f) {
+            ep_unsigned(v, &format!("{at}.{f}"), OVPN_SERVER, f, u32::MAX as u64)?;
+        }
+    }
+    for f in ["renegotiate_bytes", "renegotiate_packets"] {
+        if let Some(v) = obj.get(f) {
+            check_u64_field(v, &format!("{at}.{f}"), OVPN_SERVER, f)?;
+        }
+    }
+    for f in [
+        "replay_window_time",
+        "ping_interval",
+        "ping_restart",
+        "renegotiate_interval",
+        "handshake_window",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), OVPN_SERVER, f)?;
+        }
+    }
+    if let Some(v) = obj.get("address") {
+        check_prefix_list(v, &format!("{at}.address"))?;
+    }
+    for f in ["peer_address", "peer_address_ipv6"] {
+        if let Some(v) = obj.get(f) {
+            check_addr_field(v, &format!("{at}.{f}"), OVPN_SERVER, f)?;
+        }
+    }
+    if let Some(v) = obj.get("data_ciphers") {
+        check_listable_string(v, &format!("{at}.data_ciphers"))?;
+    }
+    if let Some(v) = obj.get("data_ciphers_fallback") {
+        ep_str(
+            v,
+            &format!("{at}.data_ciphers_fallback"),
+            OVPN_SERVER,
+            "data_ciphers_fallback",
+        )?;
+    }
+    if let Some(v) = obj.get("static_key") {
+        check_listable_string(v, &format!("{at}.static_key"))?;
+    }
+    if let Some(v) = obj.get("static_key_path") {
+        ep_str(
+            v,
+            &format!("{at}.static_key_path"),
+            OVPN_SERVER,
+            "static_key_path",
+        )?;
+    }
+    if let Some(v) = obj.get("users") {
+        openvpn_users_decode(i, v)?;
+    }
+    if let Some(v) = obj.get("push") {
+        openvpn_push_decode(i, v)?;
+    }
+    if let Some(v) = obj.get("tls") {
+        openvpn_server_tls_decode(i, v)?;
+    }
+    Ok(())
+}
+
+fn openvpn_users_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].users");
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OVPN_SERVER,
+                "users",
+                "[]auth.User",
+            ));
+        }
+    };
+    for (n, item) in items.iter().enumerate() {
+        let path = format!("{at}[{n}]");
+        let m = match item {
+            Value::Object(m) => m,
+            other => {
+                return Err(format!(
+                    "{path}: json: cannot unmarshal {} into Go value of type auth.User",
+                    json_kind(other)
+                ));
+            }
+        };
+        for key in m.keys() {
+            let k = key.as_str();
+            if !KNOWN_OVPN_USER_FIELDS.contains(&k) {
+                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
+            }
+        }
+        for f in KNOWN_OVPN_USER_FIELDS {
+            if let Some(v) = m.get(*f) {
+                ep_str(v, &format!("{path}.{f}"), "User", f)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn openvpn_push_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].push");
+    let m = match value {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OVPN_SERVER,
+                "push",
+                "option.OpenVPNPushOptions",
+            ));
+        }
+    };
+    for key in m.keys() {
+        let k = key.as_str();
+        if !KNOWN_OVPN_PUSH_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    if let Some(v) = m.get("routes") {
+        check_prefix_list(v, &format!("{at}.routes"))?;
+    }
+    if let Some(v) = m.get("dns") {
+        check_listable_addr(v, &format!("{at}.dns"))?;
+    }
+    if let Some(v) = m.get("search_domains") {
+        check_listable_string(v, &format!("{at}.search_domains"))?;
+    }
+    if let Some(v) = m.get("dhcp_options") {
+        check_listable_string(v, &format!("{at}.dhcp_options"))?;
+    }
+    if let Some(v) = m.get("redirect_gateway_flags") {
+        check_listable_string(v, &format!("{at}.redirect_gateway_flags"))?;
+    }
+    for f in ["redirect_gateway", "block_outside_dns"] {
+        if let Some(v) = m.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), "OpenVPNPushOptions", f)?;
+        }
+    }
+    for f in ["ping_interval", "ping_restart"] {
+        if let Some(v) = m.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), "OpenVPNPushOptions", f)?;
+        }
+    }
+    if let Some(v) = m.get("dns_servers") {
+        openvpn_push_dns_servers_decode(i, v)?;
+    }
+    Ok(())
+}
+
+fn openvpn_push_dns_servers_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].push.dns_servers");
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                "OpenVPNPushOptions",
+                "dns_servers",
+                "[]option.OpenVPNPushDNSServerOptions",
+            ));
+        }
+    };
+    for (n, item) in items.iter().enumerate() {
+        let path = format!("{at}[{n}]");
+        let m = match item {
+            Value::Object(m) => m,
+            other => {
+                return Err(format!(
+                    "{path}: json: cannot unmarshal {} into Go value of type option.OpenVPNPushDNSServerOptions",
+                    json_kind(other)
+                ));
+            }
+        };
+        for key in m.keys() {
+            let k = key.as_str();
+            if !KNOWN_OVPN_PUSH_DNS_SERVER_FIELDS.contains(&k) {
+                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
+            }
+        }
+        if let Some(v) = m.get("priority") {
+            ep_int(
+                v,
+                &format!("{path}.priority"),
+                "OpenVPNPushDNSServerOptions",
+                "priority",
+            )?;
+        }
+        for f in ["addresses", "resolve_domains"] {
+            if let Some(v) = m.get(f) {
+                check_listable_string(v, &format!("{path}.{f}"))?;
+            }
+        }
+        for f in ["dnssec", "transport", "sni"] {
+            if let Some(v) = m.get(f) {
+                ep_str(v, &format!("{path}.{f}"), "OpenVPNPushDNSServerOptions", f)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("endpoints[{i}]");
+    for key in obj.keys() {
+        let k = key.as_str();
+        if !KNOWN_TAILSCALE_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    for f in [
+        "state_directory",
+        "auth_key",
+        "control_url",
+        "hostname",
+        "exit_node",
+        "system_interface_name",
+        "taildrop_directory",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), TS_EP, f)?;
+        }
+    }
+    if let Some(v) = obj.get("exit_node_allow_lan_access") {
+        ep_bool(
+            v,
+            &format!("{at}.exit_node_allow_lan_access"),
+            TS_EP,
+            "exit_node_allow_lan_access",
+        )?;
+    }
+    for f in [
+        "ephemeral",
+        "accept_routes",
+        "advertise_exit_node",
+        "system_interface",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), TS_EP, f)?;
+        }
+    }
+    if let Some(v) = obj.get("listen_port") {
+        ep_unsigned(
+            v,
+            &format!("{at}.listen_port"),
+            TS_EP,
+            "listen_port",
+            u16::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("relay_server_port") {
+        match v {
+            Value::Number(_) | Value::Null => {
+                ep_unsigned(
+                    v,
+                    &format!("{at}.relay_server_port"),
+                    TS_EP,
+                    "relay_server_port",
+                    u16::MAX as u64,
+                )?;
+            }
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.relay_server_port"),
+                    other,
+                    TS_EP,
+                    "relay_server_port",
+                    "uint16",
+                ));
+            }
+        }
+    }
+    if let Some(v) = obj.get("system_interface_mtu") {
+        ep_unsigned(
+            v,
+            &format!("{at}.system_interface_mtu"),
+            TS_EP,
+            "system_interface_mtu",
+            u32::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("udp_timeout") {
+        check_duration_field(v, &format!("{at}.udp_timeout"), TS_EP, "udp_timeout")?;
+    }
+    if let Some(v) = obj.get("advertise_routes")
+        && !v.is_null()
+    {
+        if v.is_array() {
+            check_prefix_list(v, &format!("{at}.advertise_routes"))?;
+        } else {
+            return Err(format!(
+                "{at}.advertise_routes: json: cannot unmarshal {} into Go struct field TailscaleEndpointOptions.advertise_routes of type []netip.Prefix",
+                json_kind(v)
+            ));
+        }
+    }
+    if let Some(v) = obj.get("advertise_tags") {
+        check_listable_string(v, &format!("{at}.advertise_tags"))?;
+    }
+    if let Some(v) = obj.get("relay_server_static_endpoints")
+        && !v.is_null()
+    {
+        if v.is_array() {
+            check_listable_addr_port(v, &format!("{at}.relay_server_static_endpoints"))?;
+        } else {
+            return Err(format!(
+                "{at}.relay_server_static_endpoints: json: cannot unmarshal {} into Go struct field TailscaleEndpointOptions.relay_server_static_endpoints of type []netip.AddrPort",
+                json_kind(v)
+            ));
+        }
+    }
+    if let Some(v) = obj.get("ssh_server") {
+        tailscale_ssh_server_decode(i, v)?;
+    }
+    endpoint_dial_decode(
+        &at,
+        obj,
+        &format!("{TS_EP}.DialerOptions"),
+        &format!("{TS_EP}.DialerOptions.AbstractDialerOptions"),
+    )
+}
+
+fn tailscale_ssh_server_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].ssh_server");
+    match value {
+        Value::Bool(_) | Value::Null => Ok(()),
+        Value::Object(m) => {
+            for key in m.keys() {
+                let k = key.as_str();
+                if !KNOWN_TS_SSH_FIELDS.contains(&k) {
+                    return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+                }
+            }
+            for f in KNOWN_TS_SSH_FIELDS {
+                if let Some(v) = m.get(*f) {
+                    ep_bool(v, &format!("{at}.{f}"), "TailscaleSSHServerOptions", f)?;
+                }
+            }
+            Ok(())
+        }
+        other => Err(go_field_err(
+            &at,
+            other,
+            TS_EP,
+            "ssh_server",
+            "option._TailscaleSSHServerOptions",
+        )),
+    }
+}
+
+fn openconnect_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("endpoints[{i}]");
+    for key in obj.keys() {
+        let k = key.as_str();
+        if !KNOWN_OPENCONNECT_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    if let Some(v) = obj.get("system") {
+        ep_bool(v, &format!("{at}.system"), OC_EP, "system")?;
+    }
+    if let Some(v) = obj.get("name") {
+        ep_str(v, &format!("{at}.name"), OC_EP, "name")?;
+    }
+    if let Some(v) = obj.get("mtu") {
+        ep_unsigned(v, &format!("{at}.mtu"), OC_EP, "mtu", u32::MAX as u64)?;
+    }
+    if let Some(v) = obj.get("base_mtu") {
+        ep_unsigned(
+            v,
+            &format!("{at}.base_mtu"),
+            OC_EP,
+            "base_mtu",
+            u32::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("dtls_local_port") {
+        ep_unsigned(
+            v,
+            &format!("{at}.dtls_local_port"),
+            OC_EP,
+            "dtls_local_port",
+            u16::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("queue_length") {
+        ep_unsigned(
+            v,
+            &format!("{at}.queue_length"),
+            OC_EP,
+            "queue_length",
+            u32::MAX as u64,
+        )?;
+    }
+    if let Some(v) = obj.get("udp_mapping") {
+        check_udp_nat(v, &format!("{at}.udp_mapping"), OC_EP, "udp_mapping")?;
+    }
+    if let Some(v) = obj.get("udp_filtering") {
+        check_udp_nat(v, &format!("{at}.udp_filtering"), OC_EP, "udp_filtering")?;
+    }
+    if let Some(v) = obj.get("udp_nat_max") {
+        ep_unsigned(
+            v,
+            &format!("{at}.udp_nat_max"),
+            OC_EP,
+            "udp_nat_max",
+            u32::MAX as u64,
+        )?;
+    }
+    for f in [
+        "server",
+        "flavor",
+        "username",
+        "password",
+        "auth_group",
+        "cookie",
+        "reported_os",
+        "user_agent",
+        "version",
+        "local_hostname",
+        "compression_mode",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_str(v, &format!("{at}.{f}"), OC_EP, f)?;
+        }
+    }
+    for f in [
+        "no_udp",
+        "compression_disabled",
+        "ipv6_disabled",
+        "http_keepalive_disabled",
+        "xml_post_disabled",
+        "external_auth_disabled",
+        "password_authentication_disabled",
+        "tcp_keep_alive_enabled",
+        "pfs",
+        "allow_insecure_crypto",
+    ] {
+        if let Some(v) = obj.get(f) {
+            ep_bool(v, &format!("{at}.{f}"), OC_EP, f)?;
+        }
+    }
+    for f in [
+        "udp_timeout",
+        "dpd_interval",
+        "reconnect_timeout",
+        "trojan_interval",
+    ] {
+        if let Some(v) = obj.get(f) {
+            check_duration_field(v, &format!("{at}.{f}"), OC_EP, f)?;
+        }
+    }
+    if let Some(v) = obj.get("token") {
+        openconnect_object_decode(
+            i,
+            v,
+            "token",
+            OC_EP,
+            "option.OpenConnectTokenOptions",
+            KNOWN_OC_TOKEN_FIELDS,
+        )?;
+    }
+    if let Some(v) = obj.get("mobile") {
+        openconnect_object_decode(
+            i,
+            v,
+            "mobile",
+            OC_EP,
+            "option.OpenConnectMobileOptions",
+            KNOWN_OC_MOBILE_FIELDS,
+        )?;
+    }
+    if let Some(v) = obj.get("csd") {
+        openconnect_object_decode(
+            i,
+            v,
+            "csd",
+            OC_EP,
+            "option.OpenConnectCSDOptions",
+            KNOWN_OC_WRAPPER_FIELDS,
+        )?;
+    }
+    if let Some(v) = obj.get("hip") {
+        openconnect_object_decode(
+            i,
+            v,
+            "hip",
+            OC_EP,
+            "option.OpenConnectHIPOptions",
+            KNOWN_OC_WRAPPER_FIELDS,
+        )?;
+    }
+    if let Some(v) = obj.get("fortinet_host_check") {
+        openconnect_object_decode(
+            i,
+            v,
+            "fortinet_host_check",
+            OC_EP,
+            "option.OpenConnectFortinetHostCheckOptions",
+            KNOWN_OC_FORTINET_FIELDS,
+        )?;
+    }
+    if let Some(v) = obj.get("tncc") {
+        openconnect_tncc_decode(i, v)?;
+    }
+    if let Some(v) = obj.get("tls") {
+        openconnect_object_decode(
+            i,
+            v,
+            "tls",
+            OC_EP,
+            "option.OpenConnectTLSOptions",
+            KNOWN_OC_TLS_FIELDS,
+        )?;
+    }
+    if let Some(v) = obj.get("form_entries") {
+        openconnect_form_entries_decode(i, v)?;
+    }
+    endpoint_dial_decode(
+        &at,
+        obj,
+        &format!("{OC_EP}.DialerOptions"),
+        &format!("{OC_EP}.DialerOptions.AbstractDialerOptions"),
+    )
+}
+
+fn openconnect_object_decode(
+    i: usize,
+    value: &Value,
+    field: &str,
+    outer: &str,
+    go_ty: &str,
+    known: &[&str],
+) -> Result<(), String> {
+    let at = format!("endpoints[{i}].{field}");
+    let m = match value {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(&at, other, outer, field, go_ty));
+        }
+    };
+    for key in m.keys() {
+        let k = key.as_str();
+        if !known.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    for k in known {
+        if let Some(v) = m.get(*k) {
+            match v {
+                Value::Bool(_) | Value::Null => {}
+                Value::Number(_) if *k == "counter" => {}
+                Value::String(_) => {}
+                x if is_zero_json(x) => {}
+                other => {
+                    let ty = if *k == "counter" { "uint64" } else { "string" };
+                    return Err(go_field_err(
+                        &format!("{at}.{k}"),
+                        other,
+                        outer,
+                        &format!("{field}.{k}"),
+                        ty,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn openconnect_tncc_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].tncc");
+    let m = match value {
+        Value::Object(m) => m,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OC_EP,
+                "tncc",
+                "option.OpenConnectTNCCOptions",
+            ));
+        }
+    };
+    for key in m.keys() {
+        let k = key.as_str();
+        if !KNOWN_OC_TNCC_FIELDS.contains(&k) {
+            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
+        }
+    }
+    for f in ["wrapper_path", "device_id", "user_agent"] {
+        if let Some(v) = m.get(f) {
+            ep_str(v, &format!("{at}.{f}"), OC_EP, &format!("tncc.{f}"))?;
+        }
+    }
+    if let Some(v) = m.get("machine_identification_enabled") {
+        ep_bool(
+            v,
+            &format!("{at}.machine_identification_enabled"),
+            OC_EP,
+            "tncc.machine_identification_enabled",
+        )?;
+    }
+    if let Some(v) = m.get("certificates") {
+        let items = match v {
+            Value::Array(items) => items,
+            Value::Null => return Ok(()),
+            other => {
+                return Err(go_field_err(
+                    &format!("{at}.certificates"),
+                    other,
+                    OC_EP,
+                    "tncc.certificates",
+                    "[]option.OpenConnectTNCCCertificateOptions",
+                ));
+            }
+        };
+        for (n, item) in items.iter().enumerate() {
+            let path = format!("{at}.certificates[{n}]");
+            let cm = match item {
+                Value::Object(cm) => cm,
+                other => {
+                    return Err(format!(
+                        "{path}: json: cannot unmarshal {} into Go value of type option.OpenConnectTNCCCertificateOptions",
+                        json_kind(other)
+                    ));
+                }
+            };
+            for key in cm.keys() {
+                let k = key.as_str();
+                if !KNOWN_OC_TNCC_CERT_FIELDS.contains(&k) {
+                    return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
+                }
+            }
+            if let Some(cv) = cm.get("certificate") {
+                check_listable_string(cv, &format!("{path}.certificate"))?;
+            }
+            if let Some(cv) = cm.get("certificate_path") {
+                ep_str(
+                    cv,
+                    &format!("{path}.certificate_path"),
+                    "OpenConnectTNCCCertificateOptions",
+                    "certificate_path",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn openconnect_form_entries_decode(i: usize, value: &Value) -> Result<(), String> {
+    let at = format!("endpoints[{i}].form_entries");
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Null => return Ok(()),
+        other => {
+            return Err(go_field_err(
+                &at,
+                other,
+                OC_EP,
+                "form_entries",
+                "[]option.OpenConnectFormEntryOptions",
+            ));
+        }
+    };
+    for (n, item) in items.iter().enumerate() {
+        let path = format!("{at}[{n}]");
+        let m = match item {
+            Value::Object(m) => m,
+            other => {
+                return Err(format!(
+                    "{path}: json: cannot unmarshal {} into Go value of type option.OpenConnectFormEntryOptions",
+                    json_kind(other)
+                ));
+            }
+        };
+        for key in m.keys() {
+            let k = key.as_str();
+            if !KNOWN_OC_FORM_ENTRY_FIELDS.contains(&k) {
+                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
+            }
+        }
+        for &f in KNOWN_OC_FORM_ENTRY_FIELDS {
+            if let Some(v) = m.get(f) {
+                match f {
+                    "promote" => {
+                        ep_bool(v, &format!("{path}.{f}"), "OpenConnectFormEntryOptions", f)?
+                    }
+                    _ => ep_str(v, &format!("{path}.{f}"), "OpenConnectFormEntryOptions", f)?,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `uint64` struct field: non-negative numbers OK.
+fn check_u64_field(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        v if is_zero_json(v) => Ok(()),
+        Value::Number(n) if n.as_u64().is_some() => Ok(()),
+        Value::Number(_) => Err(format!(
+            "{at}: json: cannot unmarshal number {} into Go struct field {go_struct}.{field} of type uint64",
+            go_number_literal(value)
+        )),
+        other => Err(go_field_err(at, other, go_struct, field, "uint64")),
+    }
+}
+
+/// `*badoption.Addr` struct field: null / string / empty object OK.
+fn check_addr_field(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            if s.parse::<std::net::IpAddr>().is_ok() {
+                Ok(())
+            } else {
+                Err(format!("{at}: ParseAddr({s:?}): unable to parse IP"))
+            }
+        }
+        Value::Object(m) if m.is_empty() => Ok(()),
+        other => Err(go_field_err(at, other, go_struct, field, "netip.Addr")),
+    }
+}
+
+/// `badoption.Listable[netip.Addr]` decode: single address or array; the
+/// reference union error keeps both attempts (`... | ParseAddr(...): ...`).
+fn check_listable_addr(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            if s.parse::<std::net::IpAddr>().is_ok() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{at}: (netip.ParseAddr({s:?}): unable to parse IP | json: cannot unmarshal string into Go value of type **netip.Addr)"
+                ))
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::Null => {}
+                    Value::String(s) if s.parse::<std::net::IpAddr>().is_ok() => {}
+                    Value::String(s) => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type **netip.Addr | ParseAddr({s:?}): unable to parse IP)"
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type **netip.Addr | json: cannot unmarshal {} into Go value of type netip.Addr)",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type **netip.Addr)"
+            ))
+        }
+    }
+}
+
+/// `badoption.Listable[netip.AddrPort]` decode.
+fn check_listable_addr_port(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null | Value::String(_) => Ok(()),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::Null | Value::String(_) => {}
+                    other => {
+                        return Err(format!(
+                            "{at}: (json: cannot unmarshal array into Go value of type **netip.AddrPort | [{i}]: json: cannot unmarshal {} into Go value of type netip.AddrPort)",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type **netip.AddrPort)"
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint initialize pass for openvpn-client / openvpn-server / tailscale /
+// openconnect (wireguard keeps its own initializer). Orders and messages are
+// byte-for-byte from sbx-src protocol/openvpn/{client,server}.go,
+// protocol/openconnect/client.go, protocol/tailscale/endpoint.go and
+// sing-openvpn options_validation.go / compression_options.go /
+// allow_compression.go / client_supervisor.go / tls_config.go /
+// peer_certificate_verifier.go, plus sing-openconnect client.go /
+// tls_config.go / http_client.go / flavor.go. Probed matrix: probe_ep/*.
+// ---------------------------------------------------------------------------
+
+/// reference `validateDataCipherName` switch — exactly the first 22 entries
+/// of the decode-time canonical list (TLS_* suite names are NOT data ciphers).
+fn ovpn_is_data_cipher(name: &str) -> bool {
+    OVPN_CANONICAL_CIPHERS[..22].contains(&name)
+}
+
+const OVPN_TLS_CERT_PROFILES: &[&str] = &["", "legacy", "preferred", "insecure", "suiteb"];
+const OVPN_ALLOW_COMPRESSION: &[&str] = &["", "no", "asym", "yes"];
+const OVPN_CLIENT_CERT_POLICY: &[&str] = &["", "require", "optional", "none"];
+const OC_COMPRESSION_MODES: &[&str] = &["stateless", "all"];
+const OC_TOKEN_MODES: &[&str] = &["totp", "hotp", "stoken", "oidc"];
+const OC_PROTOCOL_BAD: &[char] = &['\x00', '\r', '\n'];
+
+/// `openSSLKeyPurposeNames` (peer_certificate_verifier.go).
+const OVPN_EKU_NAMES: &[&str] = &[
+    "server",
+    "client",
+    "TLS Web Server Authentication",
+    "TLS Web Client Authentication",
+    "Code Signing",
+    "E-mail Protection",
+    "IPSec End System",
+    "IPSec Tunnel",
+    "IPSec User",
+    "Time Stamping",
+    "OCSP Signing",
+    "Any Extended Key Usage",
+    "Microsoft Server Gated Crypto",
+    "Netscape Server Gated Crypto",
+    "Microsoft Commercial Code Signing",
+    "Microsoft Individual Code Signing",
+];
+
+/// `tlsCipherTranslationTable`: OpenSSL name + Go `tls.CipherSuiteName` name.
+const OVPN_TLS_CIPHER_SUITE_NAMES: &[&str] = &[
+    "RC4-SHA",
+    "DES-CBC3-SHA",
+    "AES128-SHA",
+    "AES256-SHA",
+    "AES128-SHA256",
+    "AES128-GCM-SHA256",
+    "AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-ECDSA-RC4-SHA",
+    "ECDHE-RSA-RC4-SHA",
+    "ECDHE-RSA-DES-CBC3-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "TLS_RSA_WITH_RC4_128_SHA",
+    "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+    "TLS_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+    "TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+    "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
+/// `tlsGroupAliases` keys.
+const OVPN_TLS_GROUP_ALIASES: &[&str] = &[
+    "X25519",
+    "CURVE25519",
+    "SECP256R1",
+    "PRIME256V1",
+    "P-256",
+    "NISTP256",
+    "SECP384R1",
+    "P-384",
+    "NISTP384",
+    "SECP521R1",
+    "P-521",
+    "NISTP521",
+];
+
+/// reference `box.go`: empty endpoint tag falls back to the entry index, and
+/// every NewEndpoint error is wrapped `initialize endpoint[{i}]{type}[{tag}]`.
+fn endpoint_initialize(
+    i: usize,
+    tag: &str,
+    obj: &Map<String, Value>,
+    ty: &str,
+) -> Result<(), String> {
+    let tag = if tag.is_empty() {
+        i.to_string()
+    } else {
+        tag.to_string()
+    };
+    if ty == "wireguard" {
+        // the wireguard initializer builds its own identical prefix.
+        return wireguard_endpoint_initialize(i, &tag, obj);
+    }
+    let result = match ty {
+        "openvpn-client" => openvpn_client_initialize(i, &tag, obj),
+        "openvpn-server" => openvpn_server_initialize(i, &tag, obj),
+        "tailscale" => tailscale_initialize(i, &tag, obj),
+        "openconnect" => openconnect_initialize(i, &tag, obj),
+        other => return Err(format!("endpoints[{i}]: unknown endpoint type: {other}")),
+    };
+    result.map_err(|e| format!("initialize endpoint[{i}] {ty}[{tag}]: {e}"))
+}
+
+fn ep_bool_val(obj: &Map<String, Value>, key: &str) -> bool {
+    obj.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn ep_u64_val(obj: &Map<String, Value>, key: &str) -> u64 {
+    obj.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// duration field → nanoseconds (decode already rejected bad text).
+fn ep_ns(obj: &Map<String, Value>, key: &str) -> i128 {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .and_then(go_duration_ns)
+        .unwrap_or(0)
+}
+
+/// nested object present (post-prune: non-null only; `tls: {}` prunes to nil).
+fn ovpn_nested_present(obj: &Map<String, Value>, key: &str) -> bool {
+    matches!(obj.get(key), Some(v) if !v.is_null() && !prunes_value(v))
+}
+
+/// `badoption.Listable` length: string (even `""`) → 1, array → len, else 0.
+fn ovpn_listable_len(value: Option<&Value>) -> usize {
+    match value {
+        Some(Value::String(_)) => 1,
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    }
+}
+
+fn ovpn_listable_values(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// reference `materialSource`: inline list joined with `\n`.
+fn ovpn_material_content(value: Option<&Value>) -> String {
+    tls_listable_join(value)
+}
+
+fn ovpn_material_is_set(content: &str, path: &str) -> bool {
+    !content.is_empty() || !path.is_empty()
+}
+
+/// `material.Validate`: conflict only.
+fn ovpn_material_source(name: &str, value: Option<&Value>, path: &str) -> Result<String, String> {
+    let content = ovpn_material_content(value);
+    if !path.is_empty() && !content.is_empty() {
+        return Err(format!("material path and content are both set: {name}"));
+    }
+    Ok(content)
+}
+
+fn ovpn_required_material_source(
+    name: &str,
+    value: Option<&Value>,
+    path: &str,
+) -> Result<String, String> {
+    let content = ovpn_material_source(name, value, path)?;
+    if !ovpn_material_is_set(&content, path) {
+        return Err(format!("missing `{name}` or `{name}_path`"));
+    }
+    Ok(content)
+}
+
+/// `keyDirectionValue` (protocol/openvpn/endpoint.go).
+fn ovpn_key_direction_value(direction: &str) -> Result<i32, String> {
+    if !OVPN_KEY_DIRECTIONS.contains(&direction) {
+        return Err(format!(
+            "unsupported key direction: {direction} (expected \"server\" or \"client\")"
+        ));
+    }
+    Ok(match direction {
+        "" => -1,
+        "server" => 0,
+        _ => 1,
+    })
+}
+
+/// control-wrap activity: `Type/Key/KeyPath/Direction` (+ `ForceCookie` server-side).
+fn ovpn_control_wrap_active(wrap: &Map<String, Value>, force_cookie_counts: bool) -> bool {
+    let wrap_type = wrap.get("type").and_then(Value::as_str).unwrap_or("");
+    let key_path = wrap.get("key_path").and_then(Value::as_str).unwrap_or("");
+    let direction = wrap.get("direction").and_then(Value::as_str).unwrap_or("");
+    !wrap_type.is_empty()
+        || ovpn_listable_len(wrap.get("key")) > 0
+        || !key_path.is_empty()
+        || !direction.is_empty()
+        || (force_cookie_counts && ep_bool_val(wrap, "force_cookie"))
+}
+
+/// reference `validateDataCipherName` + `tlsStreamCipherSpec` stream fallback.
+fn ovpn_cipher_name_ok(cipher: &str) -> bool {
+    if ovpn_is_data_cipher(cipher) {
+        return true;
+    }
+    let base = cipher
+        .strip_suffix("-CFB")
+        .or_else(|| cipher.strip_suffix("-OFB"));
+    match base {
+        Some(base) => OVPN_STATIC_CIPHERS.contains(&format!("{base}-CBC").as_str()),
+        None => false,
+    }
+}
+
+/// reference `validateDataChannelNames`.
+fn ovpn_validate_data_channel_names(
+    options_name: &str,
+    cipher: &str,
+    ciphers: &[String],
+    fallback: &str,
+    auth: &str,
+) -> Result<(), String> {
+    if !ovpn_cipher_name_ok(cipher) {
+        return Err(format!(
+            "{options_name}.Cipher must use a canonical OpenVPN cipher name"
+        ));
+    }
+    for (idx, data_cipher) in ciphers.iter().enumerate() {
+        if data_cipher.is_empty() {
+            return Err(format!("{options_name}.Ciphers[{idx}] must not be empty"));
+        }
+        if !ovpn_cipher_name_ok(data_cipher) {
+            return Err(format!(
+                "{options_name}.Ciphers[{idx}] must use a canonical OpenVPN cipher name"
+            ));
+        }
+    }
+    if !ovpn_cipher_name_ok(fallback) {
+        return Err(format!(
+            "{options_name}.FallbackCipher must use a canonical OpenVPN cipher name"
+        ));
+    }
+    if !OVPN_AUTH_DIGESTS.contains(&auth) {
+        return Err(format!(
+            "{options_name}.Auth must use a canonical OpenVPN digest name"
+        ));
+    }
+    Ok(())
+}
+
+/// reference `validateDataChannelPolicy`.
+fn ovpn_validate_data_channel_policy(
+    options_name: &str,
+    mss_fix: u64,
+    mss_fix_disabled: bool,
+    mss_fix_mode: &str,
+    replay_window: u64,
+    replay_window_time_ns: i128,
+) -> Result<(), String> {
+    if mss_fix > 0 && mss_fix_disabled {
+        return Err(format!(
+            "{options_name}.MSSFix conflicts with MSSFixDisabled"
+        ));
+    }
+    if mss_fix_disabled && !mss_fix_mode.is_empty() {
+        return Err(format!(
+            "{options_name}.MSSFixMode conflicts with MSSFixDisabled"
+        ));
+    }
+    if mss_fix == 0 && !mss_fix_mode.is_empty() {
+        return Err(format!("{options_name}.MSSFixMode requires MSSFix"));
+    }
+    if !OVPN_MSS_FIX_MODES.contains(&mss_fix_mode) {
+        return Err(format!("{options_name}.MSSFixMode must be mtu or fixed"));
+    }
+    if replay_window > 65536 {
+        return Err(format!("{options_name}.ReplayWindow must not exceed 65536"));
+    }
+    if !(0..=600_000_000_000).contains(&replay_window_time_ns) {
+        return Err(format!(
+            "{options_name}.ReplayWindowTime must be between 0s and 600s"
+        ));
+    }
+    if replay_window_time_ns % 1_000_000_000 != 0 {
+        return Err(format!(
+            "{options_name}.ReplayWindowTime must use whole seconds"
+        ));
+    }
+    Ok(())
+}
+
+/// `strconv.ParseUint(value, 16, 64)` error text (base-16, no sign/prefix).
+fn ovpn_parse_hex_u64(value: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || !value.bytes().all(|b| b.is_ascii_hexdigit())
+        || value.starts_with('+')
+        || value.starts_with('-')
+    {
+        return Err(format!(
+            "strconv.ParseUint: parsing \"{value}\": invalid syntax"
+        ));
+    }
+    let digits = value.trim_start_matches('0');
+    if digits.len() > 16 {
+        return Err(format!(
+            "strconv.ParseUint: parsing \"{value}\": value out of range"
+        ));
+    }
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    u64::from_str_radix(digits, 16)
+        .map_err(|_| format!("strconv.ParseUint: parsing \"{value}\": value out of range"))
+}
+
+/// `parseRemoteCertKeyUsages`.
+fn ovpn_validate_ku_values(values: &[String]) -> Result<(), String> {
+    for value in values {
+        if value.is_empty() {
+            return Err("empty key usage hex".to_string());
+        }
+        ovpn_parse_hex_u64(value)?;
+    }
+    Ok(())
+}
+
+/// `parseObjectIdentifier`: error text replaced by the caller.
+fn ovpn_parse_object_identifier(value: &str) -> Result<(), ()> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() < 2 {
+        return Err(());
+    }
+    let mut components = Vec::with_capacity(parts.len());
+    for part in parts {
+        if part.is_empty() {
+            return Err(());
+        }
+        // Go strconv.Atoi: optional sign, base-10 digits.
+        let (sign, digits) = match part.strip_prefix('-') {
+            Some(rest) => (-1i64, rest),
+            None => match part.strip_prefix('+') {
+                Some(rest) => (1i64, rest),
+                None => (1i64, part),
+            },
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+        let component: i64 = digits
+            .parse::<i64>()
+            .map_err(|_| ())?
+            .checked_mul(sign)
+            .ok_or(())?;
+        if component < 0 {
+            return Err(());
+        }
+        components.push(component as u64);
+    }
+    if components[0] > 2 || (components[0] < 2 && components[1] > 39) {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// `parseRemoteCertExtKeyUsage`.
+fn ovpn_validate_eku_value(value: &str) -> Result<(), String> {
+    if value.is_empty() || OVPN_EKU_NAMES.contains(&value) {
+        return Ok(());
+    }
+    ovpn_parse_object_identifier(value)
+        .map_err(|_| format!("unsupported remote-cert-eku value: {value}"))
+}
+
+/// `validateTLSOptionNames` (client library order, `ClientOptions.TLS` names).
+/// `remote_certificate_tls` is an endpoint enum; after it passes, the library
+/// `expandRemoteCertTLS` check never fails.
+#[allow(clippy::too_many_arguments)]
+fn ovpn_validate_tls_option_names(
+    verify_x509_type: &str,
+    peer_fingerprints: &[String],
+    remote_cert_ku: &[String],
+    remote_cert_eku: &str,
+    ns_cert_type: &str,
+    version_min: &str,
+    version_max: &str,
+    cert_profile: &str,
+    tls_cipher: &str,
+    tls_groups: &str,
+) -> Result<(), String> {
+    if !OVPN_TLS_VERIFY_X509.contains(&verify_x509_type) {
+        return Err(
+            "ClientOptions.TLS.VerifyX509Type must be subject, name, or name-prefix".to_string(),
+        );
+    }
+    for (idx, fingerprint) in peer_fingerprints.iter().enumerate() {
+        let ok = fingerprint.len() == 64
+            && fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !ok {
+            return Err(format!(
+                "ClientOptions.TLS.PeerFingerprint[{idx}] must be canonical lowercase hex"
+            ));
+        }
+    }
+    ovpn_validate_ku_values(remote_cert_ku)?;
+    ovpn_validate_eku_value(remote_cert_eku)?;
+    if !OVPN_NS_CERT_TYPES.contains(&ns_cert_type) {
+        return Err("ClientOptions.TLS.NSCertificateType must be server or client".to_string());
+    }
+    // resolveTLSVersionBounds: min token, then max token.
+    ovpn_parse_tls_version_token(version_min)?;
+    ovpn_parse_tls_version_token(version_max)?;
+    let parsed_min = match version_min {
+        "" => 0x0303u16,
+        "1.0" => 0x0301,
+        "1.1" => 0x0302,
+        "1.2" => 0x0303,
+        _ => 0x0304,
+    };
+    let parsed_max = match version_max {
+        "" => 0,
+        "1.0" => 0x0301,
+        "1.1" => 0x0302,
+        "1.2" => 0x0303,
+        _ => 0x0304,
+    };
+    if parsed_max != 0 && parsed_max < parsed_min {
+        return Err("tls-version-min bigger than tls-version-max".to_string());
+    }
+    if !OVPN_TLS_CERT_PROFILES.contains(&cert_profile) {
+        return Err(format!("unknown tls-cert-profile value: {cert_profile}"));
+    }
+    if !tls_cipher.is_empty() {
+        for token in tls_cipher.split(':') {
+            if token.is_empty() {
+                return Err("tls-cipher contains an empty cipher suite".to_string());
+            }
+            if !OVPN_TLS_CIPHER_SUITE_NAMES.contains(&token) {
+                return Err(format!("unsupported tls-cipher name: {token}"));
+            }
+        }
+    }
+    if !tls_groups.is_empty() {
+        for token in tls_groups.split(':') {
+            if token.is_empty() {
+                return Err("tls-groups contains an empty group name".to_string());
+            }
+            if !OVPN_TLS_GROUP_ALIASES.contains(&token) {
+                return Err(format!("unsupported tls-groups name: {token}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ovpn_parse_tls_version_token(token: &str) -> Result<(), String> {
+    match token {
+        "" | "1.0" | "1.1" | "1.2" | "1.3" => Ok(()),
+        other => Err(format!("unknown tls-version parameter: {other}")),
+    }
+}
+
+/// `validateTLSCredentialSet` with `requireCertAndKey = false` (client).
+fn ovpn_validate_tls_credential_set(
+    mode: &str,
+    ca_set: bool,
+    cert_set: bool,
+    key_set: bool,
+    fingerprint_set: bool,
+) -> Result<(), String> {
+    if !ca_set && !cert_set && !key_set && !fingerprint_set {
+        if mode == "tls" {
+            return Err(
+                "tls mode: either certificate-authority or peer-fingerprint must be configured"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if mode != "tls" {
+        return Err(
+            "option is not supported yet: certificate material outside tls mode".to_string(),
+        );
+    }
+    if cert_set != key_set {
+        return Err("certificate and key must both be set or both omitted".to_string());
+    }
+    Ok(())
+}
+
+/// `validateClientPolicyOptions`.
+fn ovpn_validate_client_policy_options(
+    topology: &str,
+    auth_retry: &str,
+    pull_filters: &[Map<String, Value>],
+    fragment: u64,
+) -> Result<(), String> {
+    if !OVPN_TOPOLOGIES.contains(&topology) {
+        return Err("ClientOptions.Tunnel.Topology must be net30, p2p, or subnet".to_string());
+    }
+    if !OVPN_AUTH_RETRIES.contains(&auth_retry) {
+        return Err(
+            "ClientOptions.Authentication.AuthRetry must be none, nointeract, or interact"
+                .to_string(),
+        );
+    }
+    for (idx, filter) in pull_filters.iter().enumerate() {
+        let action = filter.get("action").and_then(Value::as_str).unwrap_or("");
+        if !OVPN_PULL_FILTER_ACTIONS.contains(&action) {
+            return Err(format!(
+                "ClientOptions.Pull.Filters[{idx}].Action must be accept, ignore, or reject"
+            ));
+        }
+        let text = filter.get("text").and_then(Value::as_str).unwrap_or("");
+        if text.is_empty() {
+            return Err(format!(
+                "ClientOptions.Pull.Filters[{idx}].Text must not be empty"
+            ));
+        }
+    }
+    if fragment > 0 && fragment < 68 {
+        return Err("ClientOptions.DataChannel.Fragment must be zero or at least 68".to_string());
+    }
+    Ok(())
+}
+
+/// `validateDurationOption`.
+fn ovpn_validate_duration_option(name: &str, value_ns: i128) -> Result<(), String> {
+    if value_ns < 0 {
+        return Err(format!("{name} must not be negative"));
+    }
+    if value_ns > 0 && value_ns < 1_000_000_000 {
+        return Err(format!("{name} must be zero or at least 1s"));
+    }
+    Ok(())
+}
+
+/// `validatePingDurationOption`.
+fn ovpn_validate_ping_duration_option(name: &str, value_ns: i128) -> Result<(), String> {
+    ovpn_validate_duration_option(name, value_ns)?;
+    if value_ns % 1_000_000_000 != 0 {
+        return Err(format!("{name} must use whole seconds"));
+    }
+    Ok(())
+}
+
+/// `validateClientDurationOptions`.
+fn ovpn_validate_client_duration_options(obj: &Map<String, Value>) -> Result<(), String> {
+    let reneg = ep_ns(obj, "renegotiate_interval");
+    let reneg_disabled = ep_bool_val(obj, "renegotiate_disabled");
+    if reneg_disabled && reneg > 0 {
+        return Err(
+            "ClientOptions.Timing.RenegotiationInterval conflicts with RenegotiationDisabled"
+                .to_string(),
+        );
+    }
+    ovpn_validate_duration_option("ClientOptions.Timing.RenegotiationInterval", reneg)?;
+    ovpn_validate_ping_duration_option(
+        "ClientOptions.Timing.PingInterval",
+        ep_ns(obj, "ping_interval"),
+    )?;
+    ovpn_validate_ping_duration_option(
+        "ClientOptions.Timing.PingRestart",
+        ep_ns(obj, "ping_restart"),
+    )?;
+    if ep_bool_val(obj, "ping_restart_disabled") && ep_ns(obj, "ping_restart") > 0 {
+        return Err(
+            "ClientOptions.Timing.PingRestart conflicts with PingRestartDisabled".to_string(),
+        );
+    }
+    ovpn_validate_duration_option("ClientOptions.Timing.TLSTimeout", ep_ns(obj, "tls_timeout"))?;
+    ovpn_validate_duration_option(
+        "ClientOptions.Timing.HandWindow",
+        ep_ns(obj, "handshake_window"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// openvpn client library phase helpers: compression, allow-compression,
+// remotes (resolveClientRemotes) — sing-openvpn compression_options.go,
+// allow_compression.go, client_supervisor.go.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Default)]
+struct OvpnCompressionSettings {
+    alg: u8, // 0 none, 1 stub, 2 lzo, 3 lz4, 4 stub-v2, 5 lz4-v2
+    swap: bool,
+    adaptive: bool,
+    asymmetric: bool,
+}
+
+/// reference `compressionSettings.apply` for the `compress` directive.
+fn ovpn_apply_compress(settings: &mut OvpnCompressionSettings, value: &str) -> Result<(), String> {
+    match value {
+        "" | "stub" => {
+            settings.alg = 1;
+            settings.swap = true;
+        }
+        "stub-v2" => settings.alg = 4,
+        "lzo" => {
+            settings.alg = 2;
+            settings.adaptive = false;
+            settings.swap = false;
+        }
+        "lz4" => {
+            settings.alg = 3;
+            settings.swap = true;
+        }
+        "lz4-v2" => settings.alg = 5,
+        "migrate" | "none" | "no" | "disabled" | "off" => {
+            *settings = OvpnCompressionSettings::default();
+        }
+        other => {
+            return Err(format!("unsupported compression option: compress {other}"));
+        }
+    }
+    Ok(())
+}
+
+/// reference `compressionSettings.apply` for the `comp-lzo` directive.
+fn ovpn_apply_comp_lzo(settings: &mut OvpnCompressionSettings, value: &str) -> Result<(), String> {
+    settings.swap = false;
+    match value {
+        "" | "adaptive" => {
+            settings.alg = 2;
+            settings.adaptive = true;
+            settings.asymmetric = false;
+        }
+        "yes" => {
+            settings.alg = 2;
+            settings.adaptive = false;
+            settings.asymmetric = false;
+        }
+        "asym" => {
+            settings.alg = 2;
+            settings.adaptive = false;
+            settings.asymmetric = true;
+        }
+        "no" => {
+            settings.alg = 1;
+            settings.adaptive = false;
+        }
+        "none" | "disabled" | "off" => {
+            *settings = OvpnCompressionSettings::default();
+        }
+        other => {
+            return Err(format!("unsupported compression option: comp-lzo {other}"));
+        }
+    }
+    Ok(())
+}
+
+fn ovpn_non_stub(settings: &OvpnCompressionSettings) -> bool {
+    matches!(settings.alg, 2 | 3 | 5)
+}
+
+/// `resolveCompressionSettings` + `resolveEffectiveAllowCompressionPolicy`.
+fn ovpn_resolve_compression(obj: &Map<String, Value>) -> Result<(), String> {
+    let compression = obj
+        .get("compression")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let compression_lzo = obj
+        .get("compression_lzo")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut settings = OvpnCompressionSettings::default();
+    if !compression.is_empty() {
+        ovpn_apply_compress(&mut settings, &compression)?;
+    }
+    if !compression_lzo.is_empty() {
+        ovpn_apply_comp_lzo(&mut settings, &compression_lzo)?;
+    }
+    let allow = obj
+        .get("allow_compression")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if allow.is_empty() {
+        return Ok(());
+    }
+    if !OVPN_ALLOW_COMPRESSION.contains(&allow) {
+        return Err("invalid allow-compression value".to_string());
+    }
+    if allow == "no" && ovpn_non_stub(&settings) {
+        return Err(
+            "allow-compression no conflicts with statically enabled compression".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// endpoint-side remote list: global protocol defaults to `udp`.
+struct OvpnRemote {
+    host: String,
+    port: u64,
+    protocol: String,
+}
+
+fn ovpn_build_remotes(obj: &Map<String, Value>) -> (String, Vec<OvpnRemote>) {
+    let network = endpoint_str(obj, "network");
+    let global = if network.is_empty() {
+        "udp".to_string()
+    } else {
+        network.to_string()
+    };
+    if let Some(server) = obj.get("server").and_then(Value::as_str) {
+        return (
+            global,
+            vec![OvpnRemote {
+                host: server.to_string(),
+                port: obj.get("server_port").and_then(Value::as_u64).unwrap_or(0),
+                protocol: endpoint_str(obj, "network").to_string(),
+            }],
+        );
+    }
+    let mut remotes = Vec::new();
+    if let Some(Value::Array(items)) = obj.get("servers") {
+        for entry in items {
+            let Value::Object(remote) = entry else {
+                continue;
+            };
+            remotes.push(OvpnRemote {
+                host: endpoint_str(remote, "server").to_string(),
+                port: remote
+                    .get("server_port")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                protocol: endpoint_str(remote, "network").to_string(),
+            });
+        }
+    }
+    (global, remotes)
+}
+
+/// `resolveTransportProtocol`: concrete endpoint values never use "".
+fn ovpn_resolve_transport_protocol(protocol: &str) -> Result<(), String> {
+    if !protocol.is_empty() && OVPN_CLIENT_PROTOCOLS.contains(&protocol) {
+        Ok(())
+    } else {
+        Err("unsupported openvpn protocol".to_string())
+    }
+}
+
+/// `resolveClientRemotes`: global enum → per-remote host → port → enum.
+fn ovpn_resolve_client_remotes(global: &str, remotes: &[OvpnRemote]) -> Result<(), String> {
+    ovpn_resolve_transport_protocol(global)?;
+    for (idx, remote) in remotes.iter().enumerate() {
+        let host = remote.host.as_str();
+        if host.is_empty()
+            || host.contains([' ', '\t', '\r', '\n'])
+            || host.starts_with('[')
+            || host.ends_with(']')
+        {
+            return Err(format!(
+                "option is not supported yet: invalid remote host at index {idx}"
+            ));
+        }
+        if remote.port == 0 {
+            return Err(format!(
+                "option is not supported yet: empty remote port at index {idx}"
+            ));
+        }
+        let protocol = if remote.protocol.is_empty() {
+            global
+        } else {
+            remote.protocol.as_str()
+        };
+        ovpn_resolve_transport_protocol(protocol)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// openvpn-client initialize — sbx-src protocol/openvpn/client.go
+// buildClientOptions (157) → buildClientTunnelOptions (407) →
+// buildStaticKeyClientOptions (316) / tls branch (181) → NewClient library
+// phase (sing-openvpn client.go NewClient → validateImplementedClientOptions).
+// ---------------------------------------------------------------------------
+
+fn openvpn_client_initialize(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let _ = (i, tag);
+    let mode = endpoint_str(obj, "mode");
+    let mode = if mode.is_empty() { "tls" } else { mode };
+    if !OVPN_MODES.contains(&mode) {
+        return Err(format!(
+            "unsupported mode: {mode} (expected \"tls\" or \"static_key\")"
+        ));
+    }
+    let server = endpoint_str(obj, "server");
+    let servers = match obj.get("servers") {
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    };
+    if !server.is_empty() && servers > 0 {
+        return Err("`server` is conflict with `servers`".to_string());
+    }
+    if server.is_empty() && servers == 0 {
+        return Err("missing `server` or `servers`".to_string());
+    }
+    let (global_protocol, remotes) = ovpn_build_remotes(obj);
+
+    // buildClientTunnelOptions(options, mode == static_key)
+    let peer4 = endpoint_str(obj, "peer_address");
+    if !peer4.is_empty() && parse_ip_addr(peer4) != Some(true) {
+        return Err("`peer_address` must be an IPv4 address".to_string());
+    }
+    let peer6 = endpoint_str(obj, "peer_address_ipv6");
+    if !peer6.is_empty() && parse_ip_addr(peer6) != Some(false) {
+        return Err("`peer_address_ipv6` must be an IPv6 address".to_string());
+    }
+    let mut addresses: Vec<String> = Vec::new();
+    if let Some(Value::Array(items)) = obj.get("address") {
+        for item in items {
+            match item.as_str() {
+                Some(s) => addresses.push(s.to_string()),
+                None => return Err("`address[0]` is invalid".to_string()),
+            }
+        }
+    }
+    let mut has4 = false;
+    let mut has6 = false;
+    for (addr_index, address) in addresses.iter().enumerate() {
+        let host = address.split('/').next().unwrap_or("");
+        match parse_ip_addr(host) {
+            Some(true) => has4 = true,
+            Some(false) => has6 = true,
+            None => return Err(format!("`address[{addr_index}]` is invalid")),
+        }
+    }
+    if mode == "static_key" {
+        if addresses.is_empty() {
+            return Err("missing `address` in `static_key` mode".to_string());
+        }
+        if has4 && peer4.is_empty() {
+            return Err(
+                "missing `peer_address` for the IPv4 tunnel address in `static_key` mode"
+                    .to_string(),
+            );
+        }
+        if has6 && peer6.is_empty() {
+            return Err(
+                "missing `peer_address_ipv6` for the IPv6 tunnel address in `static_key` mode"
+                    .to_string(),
+            );
+        }
+        if !peer4.is_empty() && !has4 {
+            return Err(
+                "`peer_address` requires an IPv4 tunnel `address` in `static_key` mode".to_string(),
+            );
+        }
+        if !peer6.is_empty() && !has6 {
+            return Err(
+                "`peer_address_ipv6` requires an IPv6 tunnel `address` in `static_key` mode"
+                    .to_string(),
+            );
+        }
+    }
+
+    if mode == "static_key" {
+        openvpn_client_static_options(obj)?;
+    } else {
+        openvpn_client_tls_options(obj)?;
+    }
+
+    // NewClient library phase (endpoint defaults guarantee non-empty values).
+    ovpn_resolve_client_remotes(&global_protocol, &remotes)?;
+    let fragment = ep_u64_val(obj, "fragment");
+    if fragment > 0
+        && remotes.iter().any(|remote| {
+            let protocol = if remote.protocol.is_empty() {
+                global_protocol.as_str()
+            } else {
+                remote.protocol.as_str()
+            };
+            protocol.starts_with("tcp")
+        })
+    {
+        return Err("option is not supported yet: fragment with tcp remote".to_string());
+    }
+    ovpn_resolve_compression(obj)?;
+    ovpn_validate_client_duration_options(obj)?;
+    let cipher = endpoint_str(obj, "cipher");
+    let data_ciphers = ovpn_listable_values(obj.get("data_ciphers"));
+    let data_ciphers_fallback = endpoint_str(obj, "data_ciphers_fallback");
+    let auth = endpoint_str(obj, "auth");
+    ovpn_validate_data_channel_names(
+        "ClientOptions.DataChannel",
+        cipher,
+        &data_ciphers,
+        data_ciphers_fallback,
+        auth,
+    )?;
+    ovpn_validate_data_channel_policy(
+        "ClientOptions.DataChannel",
+        ep_u64_val(obj, "mss_fix"),
+        ep_bool_val(obj, "mss_fix_disabled"),
+        endpoint_str(obj, "mss_fix_mode"),
+        ep_u64_val(obj, "replay_window"),
+        ep_ns(obj, "replay_window_time"),
+    )?;
+    if mode == "static_key" {
+        if cipher.is_empty() {
+            return Err(
+                "ClientOptions.DataChannel.Cipher is required in static_key mode".to_string(),
+            );
+        }
+        if !OVPN_STATIC_CIPHERS.contains(&cipher) {
+            return Err(format!(
+                "ClientOptions.DataChannel.Cipher is not supported in static_key mode: {cipher}"
+            ));
+        }
+        if !data_ciphers.is_empty() || !data_ciphers_fallback.is_empty() {
+            return Err(
+                "option is not supported yet: data_ciphers in static_key mode; use Cipher"
+                    .to_string(),
+            );
+        }
+    }
+
+    // ClientTLSOptions inputs (tls branch filled them; static mode keeps "").
+    let tls = match obj.get("tls") {
+        Some(Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    let tls_get = |key: &str| -> String {
+        tls.and_then(|m| m.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut verify_x509_type = tls_get("server_name_type");
+    if verify_x509_type.is_empty() && !tls_get("server_name").is_empty() {
+        verify_x509_type = "name".to_string();
+    }
+    let peer_fingerprints = ovpn_listable_values(tls.and_then(|m| m.get("peer_fingerprint")));
+    let remote_cert_ku = ovpn_listable_values(tls.and_then(|m| m.get("remote_certificate_ku")));
+    ovpn_validate_tls_option_names(
+        &verify_x509_type,
+        &peer_fingerprints,
+        &remote_cert_ku,
+        &tls_get("remote_certificate_eku"),
+        &tls_get("ns_certificate_type"),
+        &tls_get("version_min"),
+        &tls_get("version_max"),
+        &tls_get("certificate_profile"),
+        &tls_get("cipher"),
+        &tls_get("groups"),
+    )?;
+
+    // validateTLSCredentialSet(mode, ..., requireCertAndKey=false)
+    let ca_content = tls_listable_join(tls.and_then(|m| m.get("certificate")));
+    let ca_path = tls_get("certificate_path");
+    let cert_content = tls_listable_join(tls.and_then(|m| m.get("client_certificate")));
+    let cert_path = tls_get("client_certificate_path");
+    let key_content = tls_listable_join(tls.and_then(|m| m.get("client_key")));
+    let key_path = tls_get("client_key_path");
+    ovpn_validate_tls_credential_set(
+        mode,
+        ovpn_material_is_set(&ca_content, &ca_path),
+        ovpn_material_is_set(&cert_content, &cert_path),
+        ovpn_material_is_set(&key_content, &key_path),
+        !peer_fingerprints.is_empty(),
+    )?;
+
+    let topology = endpoint_str(obj, "topology");
+    let auth_retry = endpoint_str(obj, "auth_retry");
+    let mut pull_filters: Vec<Map<String, Value>> = Vec::new();
+    if let Some(Value::Array(items)) = obj.get("pull_filters") {
+        for item in items {
+            if let Value::Object(m) = item {
+                pull_filters.push(m.clone());
+            }
+        }
+    }
+    ovpn_validate_client_policy_options(topology, auth_retry, &pull_filters, fragment)
+}
+
+/// buildStaticKeyClientOptions (client.go:316).
+fn openvpn_client_static_options(obj: &Map<String, Value>) -> Result<(), String> {
+    if ovpn_nested_present(obj, "tls") {
+        return Err("`tls` options are not supported in `static_key` mode".to_string());
+    }
+    let auth_retry = endpoint_str(obj, "auth_retry");
+    if !endpoint_str(obj, "username").is_empty()
+        || !endpoint_str(obj, "password").is_empty()
+        || (!auth_retry.is_empty() && auth_retry != "none")
+        || !endpoint_str(obj, "static_challenge").is_empty()
+        || ep_bool_val(obj, "static_challenge_echo")
+    {
+        return Err(
+            "username/password authentication is not supported in `static_key` mode".to_string(),
+        );
+    }
+    if ep_bool_val(obj, "route_no_pull") || ovpn_listable_len(obj.get("pull_filters")) > 0 {
+        return Err("pull options are not supported in `static_key` mode".to_string());
+    }
+    if ep_ns(obj, "renegotiate_interval") != 0
+        || ep_bool_val(obj, "renegotiate_disabled")
+        || ep_u64_val(obj, "renegotiate_bytes") != 0
+        || ep_u64_val(obj, "renegotiate_packets") != 0
+        || ep_ns(obj, "tls_timeout") != 0
+        || ep_ns(obj, "handshake_window") != 0
+    {
+        return Err(
+            "TLS timing and renegotiation options are not supported in `static_key` mode"
+                .to_string(),
+        );
+    }
+    if ovpn_listable_len(obj.get("data_ciphers")) > 0
+        || !endpoint_str(obj, "data_ciphers_fallback").is_empty()
+    {
+        return Err(
+            "`data_ciphers` and `data_ciphers_fallback` are not supported in `static_key` mode; use `cipher`"
+                .to_string(),
+        );
+    }
+    ovpn_required_material_source(
+        "static_key",
+        obj.get("static_key"),
+        endpoint_str(obj, "static_key_path"),
+    )?;
+    ovpn_key_direction_value(endpoint_str(obj, "key_direction"))?;
+    Ok(())
+}
+
+/// tls branch (client.go:181).
+fn openvpn_client_tls_options(obj: &Map<String, Value>) -> Result<(), String> {
+    if !ovpn_nested_present(obj, "tls") {
+        return Err("missing `tls` options".to_string());
+    }
+    if ovpn_listable_len(obj.get("static_key")) > 0
+        || !endpoint_str(obj, "static_key_path").is_empty()
+    {
+        return Err(
+            "`static_key` and `static_key_path` are only supported in `static_key` mode"
+                .to_string(),
+        );
+    }
+    if !endpoint_str(obj, "key_direction").is_empty() {
+        return Err(
+            "`key_direction` is only supported in `static_key` mode; use `tls.control_wrap.direction` for `tls_auth`"
+                .to_string(),
+        );
+    }
+    if !endpoint_str(obj, "cipher").is_empty() {
+        return Err(
+            "`cipher` is only supported in `static_key` mode; use `data_ciphers` or `data_ciphers_fallback` in TLS mode"
+                .to_string(),
+        );
+    }
+    let tls = match obj.get("tls") {
+        Some(Value::Object(m)) => m,
+        _ => return Err("missing `tls` options".to_string()),
+    };
+    ovpn_material_source(
+        "tls.certificate",
+        tls.get("certificate"),
+        &tls_str(tls, "certificate_path"),
+    )?;
+    ovpn_material_source(
+        "tls.client_certificate",
+        tls.get("client_certificate"),
+        &tls_str(tls, "client_certificate_path"),
+    )?;
+    ovpn_material_source(
+        "tls.client_key",
+        tls.get("client_key"),
+        &tls_str(tls, "client_key_path"),
+    )?;
+    // control wrap
+    if let Some(Value::Object(wrap)) = tls.get("control_wrap")
+        && ovpn_control_wrap_active(wrap, false)
+    {
+        let control_key = ovpn_required_material_source(
+            "tls.control_wrap.key",
+            wrap.get("key"),
+            &tls_str(wrap, "key_path"),
+        )?;
+        let _ = control_key;
+        let wrap_type = tls_str(wrap, "type");
+        let direction = tls_str(wrap, "direction");
+        match wrap_type.as_str() {
+            "tls_auth" => {
+                ovpn_key_direction_value(&direction)?;
+            }
+            "tls_crypt" | "tls_crypt_v2" => {
+                if !direction.is_empty() {
+                    return Err(
+                        "`tls.control_wrap.direction` is only supported by `tls_auth`".to_string(),
+                    );
+                }
+            }
+            "" => return Err("missing control wrap type".to_string()),
+            other => return Err(format!("unknown control wrap type: {other}")),
+        }
+    }
+    let remote_certificate_tls = tls_str(tls, "remote_certificate_tls");
+    if !OVPN_REMOTE_CERT_TLS.contains(&remote_certificate_tls.as_str()) {
+        return Err(format!(
+            "invalid `tls.remote_certificate_tls`: {remote_certificate_tls}"
+        ));
+    }
+    let remote_certificate_eku = tls_str(tls, "remote_certificate_eku");
+    if !remote_certificate_eku.is_empty() && !remote_certificate_tls.is_empty() {
+        return Err(
+            "`tls.remote_certificate_eku` is conflict with `tls.remote_certificate_tls`"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn tls_str(map: &Map<String, Value>, key: &str) -> String {
+    map.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// openvpn-server initialize — sbx-src protocol/openvpn/server.go
+// NewServerEndpoint → buildServerOptions (264) at check time; the ovpn.NewServer
+// library (validateImplementedServerOptions / validateServerTunnelOptions /
+// validateServerResourceOptions / applyServerPush DNSSEC etc.) runs at Start()
+// and is unreachable during `check`.
+// ---------------------------------------------------------------------------
+
+fn openvpn_server_initialize(
+    _i: usize,
+    _tag: &str,
+    obj: &Map<String, Value>,
+) -> Result<(), String> {
+    let mode = endpoint_str(obj, "mode");
+    let mode = if mode.is_empty() { "tls" } else { mode };
+    if !OVPN_MODES.contains(&mode) {
+        return Err(format!(
+            "unsupported mode: {mode} (expected \"tls\" or \"static_key\")"
+        ));
+    }
+    let mut addresses: Vec<String> = Vec::new();
+    if let Some(Value::Array(items)) = obj.get("address") {
+        for item in items {
+            match item.as_str() {
+                Some(s) => addresses.push(s.to_string()),
+                None => return Err("server address[0] is invalid".to_string()),
+            }
+        }
+    }
+    if addresses.is_empty() {
+        return Err("missing server address".to_string());
+    }
+    // validateServerAddresses: sequential duplicate/validity scan.
+    let mut has4 = false;
+    let mut has6 = false;
+    for (addr_index, address) in addresses.iter().enumerate() {
+        let host = address.split('/').next().unwrap_or("");
+        match parse_ip_addr(host) {
+            Some(true) => {
+                if has4 {
+                    return Err("multiple IPv4 server address pools are not supported".to_string());
+                }
+                has4 = true;
+            }
+            Some(false) => {
+                if has6 {
+                    return Err("multiple IPv6 server address pools are not supported".to_string());
+                }
+                has6 = true;
+            }
+            None => return Err(format!("server address[{addr_index}] is invalid")),
+        }
+    }
+    let topology = endpoint_str(obj, "topology");
+    if !OVPN_TOPOLOGIES.contains(&topology) {
+        return Err(format!(
+            "invalid topology {topology}, allowed values: subnet, p2p, net30"
+        ));
+    }
+    let network = endpoint_str(obj, "network");
+    if !OVPN_SERVER_PROTOCOLS.contains(&network) {
+        return Err(format!("unsupported network: {network}"));
+    }
+    let protocol = if network.is_empty() { "udp" } else { network };
+
+    if mode == "static_key" {
+        return openvpn_server_static_options(obj, protocol, &addresses, has4, has6);
+    }
+
+    if !ovpn_nested_present(obj, "tls") {
+        return Err("missing `tls` options".to_string());
+    }
+    if ovpn_listable_len(obj.get("static_key")) > 0
+        || !endpoint_str(obj, "static_key_path").is_empty()
+        || !endpoint_str(obj, "key_direction").is_empty()
+        || !endpoint_str(obj, "cipher").is_empty()
+        || !endpoint_str(obj, "remote").is_empty()
+        || obj.get("remote_port").and_then(Value::as_u64).unwrap_or(0) != 0
+        || obj
+            .get("peer_address")
+            .is_some_and(|v| !prunes_value(v) && !v.is_null())
+        || obj
+            .get("peer_address_ipv6")
+            .is_some_and(|v| !prunes_value(v) && !v.is_null())
+    {
+        return Err("static-key server options require `mode: static_key`".to_string());
+    }
+    openvpn_server_tls_options(obj)?;
+    openvpn_server_push_options(obj)
+}
+
+/// buildStaticKeyServerOptions (server.go:346).
+fn openvpn_server_static_options(
+    obj: &Map<String, Value>,
+    protocol: &str,
+    addresses: &[String],
+    has4: bool,
+    has6: bool,
+) -> Result<(), String> {
+    if ovpn_nested_present(obj, "tls") {
+        return Err("`tls` options are not supported in `static_key` mode".to_string());
+    }
+    if ovpn_listable_len(obj.get("users")) > 0 || ep_bool_val(obj, "duplicate_cn") {
+        return Err("user authentication is not supported in `static_key` mode".to_string());
+    }
+    if ovpn_nested_present(obj, "push") {
+        return Err("push options are not supported in `static_key` mode".to_string());
+    }
+    if ep_ns(obj, "renegotiate_interval") != 0
+        || ep_bool_val(obj, "renegotiate_disabled")
+        || ep_u64_val(obj, "renegotiate_bytes") != 0
+        || ep_u64_val(obj, "renegotiate_packets") != 0
+        || ep_ns(obj, "handshake_window") != 0
+    {
+        return Err(
+            "TLS timing and renegotiation options are not supported in `static_key` mode"
+                .to_string(),
+        );
+    }
+    if ovpn_listable_len(obj.get("data_ciphers")) > 0
+        || !endpoint_str(obj, "data_ciphers_fallback").is_empty()
+    {
+        return Err(
+            "`data_ciphers` and `data_ciphers_fallback` are not supported in `static_key` mode; use `cipher`"
+                .to_string(),
+        );
+    }
+    ovpn_required_material_source(
+        "static_key",
+        obj.get("static_key"),
+        endpoint_str(obj, "static_key_path"),
+    )?;
+    ovpn_key_direction_value(endpoint_str(obj, "key_direction"))?;
+    let peer4 = endpoint_str(obj, "peer_address");
+    if !peer4.is_empty() && parse_ip_addr(peer4) != Some(true) {
+        return Err("`peer_address` must be an IPv4 address".to_string());
+    }
+    let peer6 = endpoint_str(obj, "peer_address_ipv6");
+    if !peer6.is_empty() && parse_ip_addr(peer6) != Some(false) {
+        return Err("`peer_address_ipv6` must be an IPv6 address".to_string());
+    }
+    let _ = addresses;
+    if has4 && peer4.is_empty() {
+        return Err("missing `peer_address` for the IPv4 static-key tunnel".to_string());
+    }
+    if has6 && peer6.is_empty() {
+        return Err("missing `peer_address_ipv6` for the IPv6 static-key tunnel".to_string());
+    }
+    if !peer4.is_empty() && !has4 {
+        return Err(
+            "`peer_address` requires an IPv4 tunnel `address` in `static_key` mode".to_string(),
+        );
+    }
+    if !peer6.is_empty() && !has6 {
+        return Err(
+            "`peer_address_ipv6` requires an IPv6 tunnel `address` in `static_key` mode"
+                .to_string(),
+        );
+    }
+    let remote = endpoint_str(obj, "remote");
+    let remote_port = obj.get("remote_port").and_then(Value::as_u64).unwrap_or(0);
+    if protocol == "udp" {
+        if remote.is_empty() || remote_port == 0 {
+            return Err(
+                "`remote` and `remote_port` are required for a UDP static-key server".to_string(),
+            );
+        }
+    } else if !remote.is_empty() || remote_port != 0 {
+        return Err(
+            "`remote` and `remote_port` are only used by a UDP static-key server".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// tls branch (server.go:297) — buildServerTLSOptions (442).
+fn openvpn_server_tls_options(obj: &Map<String, Value>) -> Result<(), String> {
+    let tls = match obj.get("tls") {
+        Some(Value::Object(m)) => m,
+        _ => return Err("missing `tls` options".to_string()),
+    };
+    let tls_str_of = |map: &Map<String, Value>, key: &str| -> String {
+        map.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let vcc = tls_str_of(tls, "verify_client_certificate");
+    if !OVPN_CLIENT_CERT_POLICY.contains(&vcc.as_str()) {
+        return Err(format!(
+            "invalid client certificate policy {vcc}, allowed values: require, optional, none"
+        ));
+    }
+    ovpn_required_material_source(
+        "tls.certificate",
+        tls.get("certificate"),
+        &tls_str_of(tls, "certificate_path"),
+    )?;
+    ovpn_required_material_source("tls.key", tls.get("key"), &tls_str_of(tls, "key_path"))?;
+    ovpn_material_source(
+        "tls.client_certificate",
+        tls.get("client_certificate"),
+        &tls_str_of(tls, "client_certificate_path"),
+    )?;
+    let remote_certificate_tls = tls_str_of(tls, "remote_certificate_tls");
+    if !OVPN_REMOTE_CERT_TLS.contains(&remote_certificate_tls.as_str()) {
+        return Err(format!(
+            "invalid `tls.remote_certificate_tls`: {remote_certificate_tls}"
+        ));
+    }
+    let remote_certificate_eku = tls_str_of(tls, "remote_certificate_eku");
+    if !remote_certificate_eku.is_empty() && !remote_certificate_tls.is_empty() {
+        return Err(
+            "`tls.remote_certificate_eku` is conflict with `tls.remote_certificate_tls`"
+                .to_string(),
+        );
+    }
+    // control wrap: activity includes force_cookie on the server.
+    if let Some(Value::Object(wrap)) = tls.get("control_wrap")
+        && ovpn_control_wrap_active(wrap, true)
+    {
+        let wrap_key = ovpn_required_material_source(
+            "tls.control_wrap.key",
+            wrap.get("key"),
+            &tls_str_of(wrap, "key_path"),
+        )?;
+        let _ = wrap_key;
+        let wrap_type = tls_str_of(wrap, "type");
+        let direction = tls_str_of(wrap, "direction");
+        let force_cookie = ep_bool_val(wrap, "force_cookie");
+        match wrap_type.as_str() {
+            "tls_auth" => {
+                if force_cookie {
+                    return Err(
+                        "`tls.control_wrap.force_cookie` is only supported by `tls_crypt_v2`"
+                            .to_string(),
+                    );
+                }
+                ovpn_key_direction_value(&direction)?;
+            }
+            "tls_crypt" => {
+                if !direction.is_empty() {
+                    return Err(
+                        "`tls.control_wrap.direction` is only supported by `tls_auth`".to_string(),
+                    );
+                }
+                if force_cookie {
+                    return Err(
+                        "`tls.control_wrap.force_cookie` is only supported by `tls_crypt_v2`"
+                            .to_string(),
+                    );
+                }
+            }
+            "tls_crypt_v2" => {
+                if !direction.is_empty() {
+                    return Err(
+                        "`tls.control_wrap.direction` is only supported by `tls_auth`".to_string(),
+                    );
+                }
+            }
+            "" => return Err("missing control wrap type".to_string()),
+            other => return Err(format!("unknown control wrap type: {other}")),
+        }
+    }
+    Ok(())
+}
+
+/// applyServerPushOptions (server.go:536) — endpoint-stage errors only.
+fn openvpn_server_push_options(obj: &Map<String, Value>) -> Result<(), String> {
+    let Some(Value::Object(push)) = obj.get("push") else {
+        return Ok(());
+    };
+    if let Some(Value::Array(dns_servers)) = push.get("dns_servers") {
+        for (server_index, server) in dns_servers.iter().enumerate() {
+            let Value::Object(server) = server else {
+                continue;
+            };
+            if let Some(Value::Array(items)) = server.get("addresses") {
+                for (address_index, item) in items.iter().enumerate() {
+                    let value = item.as_str().unwrap_or("");
+                    if !ovpn_push_dns_addr_ok(value) {
+                        return Err(format!(
+                            "invalid push.dns_servers[{server_index}].addresses[{address_index}]: {value}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// netip.ParseAddr / ParseAddrPort with a non-zero port requirement.
+fn ovpn_push_dns_addr_ok(value: &str) -> bool {
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return matches!(port.parse::<u16>(), Ok(p) if p != 0);
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    if host.contains(':') || host.parse::<std::net::Ipv4Addr>().is_err() {
+        return false;
+    }
+    matches!(port.parse::<u16>(), Ok(p) if p != 0)
+}
+
+// ---------------------------------------------------------------------------
+// tailscale initialize — sbx-src/protocol/tailscale/endpoint.go NewEndpoint.
+// ---------------------------------------------------------------------------
+
+fn tailscale_initialize(_i: usize, _tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    // ssh_server.enabled runs adapter.CheckSecurityFeature — a runtime
+    // platform feature check that passes for the reference in check mode.
+    if let Some(Value::Array(items)) = obj.get("advertise_routes") {
+        for item in items {
+            let Some(s) = item.as_str() else { continue };
+            let Some((host, bits)) = s.split_once('/') else {
+                continue;
+            };
+            let unspecified = if host.contains(':') {
+                host.parse::<std::net::Ipv6Addr>()
+                    .map(|a| a.is_unspecified())
+                    .unwrap_or(false)
+            } else {
+                host.parse::<std::net::Ipv4Addr>()
+                    .map(|a| a.is_unspecified())
+                    .unwrap_or(false)
+            };
+            if unspecified && bits == "0" {
+                return Err(
+                    "`advertise_routes` cannot be default, use `advertise_exit_node` instead."
+                        .to_string(),
+                );
+            }
+        }
+    } else if let Some(Value::String(s)) = obj.get("advertise_routes") {
+        let Some((host, bits)) = s.split_once('/') else {
+            return Ok(());
+        };
+        let unspecified = if host.contains(':') {
+            host.parse::<std::net::Ipv6Addr>()
+                .map(|a| a.is_unspecified())
+                .unwrap_or(false)
+        } else {
+            host.parse::<std::net::Ipv4Addr>()
+                .map(|a| a.is_unspecified())
+                .unwrap_or(false)
+        };
+        if unspecified && bits == "0" {
+            return Err(
+                "`advertise_routes` cannot be default, use `advertise_exit_node` instead."
+                    .to_string(),
+            );
+        }
+    }
+    if ep_bool_val(obj, "advertise_exit_node") && !endpoint_str(obj, "exit_node").is_empty() {
+        return Err(
+            "cannot advertise an exit node and use an exit node at the same time.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// openconnect initialize — sbx-src/protocol/openconnect/client.go NewEndpoint
+// (keepalive → url.Parse → materials) + sing-openconnect NewClient
+// (defaults → token → validateClientOptions → parseServerURL → buildClientTLS →
+// flavor).
+// ---------------------------------------------------------------------------
+
+fn openconnect_initialize(_i: usize, _tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let keep_alive_enabled = ep_bool_val(obj, "tcp_keep_alive_enabled")
+        || ep_ns(obj, "tcp_keep_alive") != 0
+        || ep_ns(obj, "tcp_keep_alive_interval") != 0;
+    if keep_alive_enabled && ep_bool_val(obj, "disable_tcp_keep_alive") {
+        return Err("tcp_keep_alive_enabled conflicts with disable_tcp_keep_alive".to_string());
+    }
+    // CheckSecurityFeature for csd/hip/tncc wrapper paths is a runtime check.
+    let server = endpoint_str(obj, "server");
+    oc_check_url_parse(server)?;
+    // buildClientOptions material sources (validate-only).
+    let tls = match obj.get("tls") {
+        Some(Value::Object(m)) => m,
+        _ => &Map::new(),
+    };
+    oc_material_source(
+        "tls.certificate_authority",
+        tls.get("certificate_authority"),
+        &oc_str(tls, "certificate_authority_path"),
+    )?;
+    oc_material_source(
+        "tls.client_certificate",
+        tls.get("client_certificate"),
+        &oc_str(tls, "client_certificate_path"),
+    )?;
+    oc_material_source(
+        "tls.client_key",
+        tls.get("client_key"),
+        &oc_str(tls, "client_key_path"),
+    )?;
+    oc_material_source(
+        "tls.mca_certificate",
+        tls.get("mca_certificate"),
+        &oc_str(tls, "mca_certificate_path"),
+    )?;
+    oc_material_source(
+        "tls.mca_key",
+        tls.get("mca_key"),
+        &oc_str(tls, "mca_key_path"),
+    )?;
+    if let Some(Value::Object(tncc)) = obj.get("tncc")
+        && let Some(Value::Array(certs)) = tncc.get("certificates")
+    {
+        for (cert_index, cert) in certs.iter().enumerate() {
+            let Value::Object(cert) = cert else { continue };
+            oc_material_source(
+                &format!("tncc.certificates[{cert_index}].certificate"),
+                cert.get("certificate"),
+                &oc_str(cert, "certificate_path"),
+            )?;
+        }
+    }
+
+    // openconnect.NewClient
+    if server.is_empty() {
+        return Err("missing openconnect server".to_string());
+    }
+    let token = match obj.get("token") {
+        Some(Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    let token_secret = token.map(|m| oc_str(m, "secret")).unwrap_or_default();
+    let token_secret_path = token.map(|m| oc_str(m, "secret_path")).unwrap_or_default();
+    if !token_secret_path.is_empty() {
+        if !token_secret.is_empty() {
+            return Err("token secret and secret path cannot both be configured".to_string());
+        }
+        go_read_file(&token_secret_path).map_err(|e| {
+            format!("load token secret: read openconnect material: open {token_secret_path}: {e}")
+        })?;
+    }
+    oc_validate_client_options(obj)?;
+
+    // parseServerURL(options.Server)
+    oc_check_server_url(server)?;
+
+    // buildClientTLS(options.TLSConfig)
+    oc_build_client_tls(tls)?;
+
+    // newFlavorFrontend(options.Flavor) — flavor defaults to "anyconnect".
+    let flavor = endpoint_str(obj, "flavor");
+    if !OC_FLAVORS.contains(&flavor) {
+        return Err(format!("unsupported openconnect flavor: {flavor}"));
+    }
+    Ok(())
+}
+
+fn oc_str(map: &Map<String, Value>, key: &str) -> String {
+    map.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// reference `materialSource` (sing-openconnect material.go).
+fn oc_material_source(name: &str, value: Option<&Value>, path: &str) -> Result<String, String> {
+    let content = tls_listable_join(value);
+    if !path.is_empty() && !content.is_empty() {
+        return Err(format!("material path and content are both set: {name}"));
+    }
+    Ok(content)
+}
+
+/// reference `validateClientOptions` (sing-openconnect client.go:202).
+fn oc_validate_client_options(obj: &Map<String, Value>) -> Result<(), String> {
+    // char scan: fixed order (Go map iteration is randomized; DTLS cipher
+    // fields do not exist in the endpoint options).
+    for (name, key) in [
+        ("local hostname", "local_hostname"),
+        ("user agent", "user_agent"),
+        ("version", "version"),
+    ] {
+        let value = oc_str(obj, key);
+        if value.chars().any(|c| OC_PROTOCOL_BAD.contains(&c)) {
+            return Err(format!("{name} contains an invalid protocol character"));
+        }
+    }
+    if let Some(Value::Object(mobile)) = obj.get("mobile") {
+        for (name, key) in [
+            ("mobile platform version", "platform_version"),
+            ("mobile device type", "device_type"),
+            ("mobile device unique ID", "device_unique_id"),
+        ] {
+            let value = oc_str(mobile, key);
+            if value.is_empty() {
+                return Err(format!("{name} cannot be empty"));
+            }
+            if value.chars().any(|c| OC_PROTOCOL_BAD.contains(&c)) {
+                return Err(format!("{name} contains an invalid protocol character"));
+            }
+        }
+    }
+    if ep_ns(obj, "reconnect_timeout") < 0 {
+        return Err("reconnect timeout cannot be negative".to_string());
+    }
+    if ep_ns(obj, "trojan_interval") < 0 {
+        return Err("trojan interval cannot be negative".to_string());
+    }
+    let dpd = ep_ns(obj, "dpd_interval");
+    if !(0..=4_611_686_018_427_387_903).contains(&dpd) {
+        return Err("DPD interval is outside the supported range".to_string());
+    }
+    let mtu = ep_u64_val(obj, "mtu");
+    let base_mtu = ep_u64_val(obj, "base_mtu");
+    if mtu > 65535 || base_mtu > 65535 {
+        return Err("MTU exceeds wire limit".to_string());
+    }
+    // queue_length: u32 can never exceed usize::MAX/2 on supported targets.
+    let raw_mode = oc_str(obj, "compression_mode");
+    let mode = if raw_mode.is_empty() {
+        "stateless"
+    } else {
+        raw_mode.as_str()
+    };
+    if !OC_COMPRESSION_MODES.contains(&mode) {
+        return Err(format!("unsupported compression mode: {mode}"));
+    }
+    if ep_bool_val(obj, "compression_disabled") && mode != "stateless" {
+        return Err(format!(
+            "compression_disabled conflicts with compression mode {mode}"
+        ));
+    }
+    if let Some(Value::Array(entries)) = obj.get("form_entries") {
+        for entry in entries {
+            let Value::Object(entry) = entry else {
+                continue;
+            };
+            let submission_key = oc_str(entry, "submission_key");
+            let form_id = oc_str(entry, "form_id");
+            let name = oc_str(entry, "name");
+            if submission_key.is_empty() && (form_id.is_empty() || name.is_empty()) {
+                return Err(
+                    "form entry requires a submission key or a form ID and field name".to_string(),
+                );
+            }
+            if ep_bool_val(entry, "promote") && !oc_str(entry, "value").is_empty() {
+                return Err("promoted form entry cannot also provide a value".to_string());
+            }
+        }
+    }
+    if let Some(Value::Object(token)) = obj.get("token") {
+        let secret = oc_str(token, "secret");
+        let secret_path = oc_str(token, "secret_path");
+        if secret.is_empty() && secret_path.is_empty() {
+            return Err("software token requires a secret".to_string());
+        }
+        let mode = oc_str(token, "mode");
+        if !OC_TOKEN_MODES.contains(&mode.as_str()) {
+            return Err(format!(
+                "unsupported openconnect software token mode: {mode}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// reference `parseServerURL` (sing-openconnect http_client.go:18).
+fn oc_check_server_url(server: &str) -> Result<(), String> {
+    let url = if server.contains("://") {
+        server.to_string()
+    } else {
+        format!("https://{server}")
+    };
+    let rest = match url.find("://") {
+        Some(idx) => &url[idx + 3..],
+        None => url.as_str(),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(idx) => (Some(&authority[..idx]), &authority[idx + 1..]),
+        None => (None, authority),
+    };
+    let (host, port) = if let Some(stripped) = hostport.strip_prefix('[') {
+        match stripped.split_once("]:") {
+            Some((host, port)) => (host, Some(port)),
+            None => (stripped, None),
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            _ => (hostport, None),
+        }
+    };
+    let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
+    if scheme != "https" || host.is_empty() {
+        return Err("server must be an HTTPS host".to_string());
+    }
+    if userinfo.is_some() {
+        return Err("server must not contain URL user information".to_string());
+    }
+    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let after_authority = &url[scheme_end + authority.len()..];
+    if after_authority.contains('?') || after_authority.contains('#') {
+        return Err("server must not contain a query or fragment".to_string());
+    }
+    let _ = port;
+    Ok(())
+}
+
+/// reference endpoint-side `url.Parse` (client.go:133) — best-effort: control
+/// characters and a non-numeric port are the reachable failures.
+fn oc_check_url_parse(server: &str) -> Result<(), String> {
+    let url = if server.contains("://") {
+        server.to_string()
+    } else {
+        format!("https://{server}")
+    };
+    if url.chars().any(|c| c < '\x20' || c == '\x7f') {
+        return Err(format!(
+            "parse server: parse {url:?}: net/url: invalid control character in URL"
+        ));
+    }
+    let rest = match url.find("://") {
+        Some(idx) => &url[idx + 3..],
+        None => url.as_str(),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let hostport = match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    };
+    if !hostport.starts_with('[') {
+        if let Some((_, port)) = hostport.rsplit_once(':')
+            && !port.is_empty()
+            && !port.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(format!(
+                "parse server: parse {url:?}: invalid port \":{port}\" after host"
+            ));
+        }
+    } else if let Some(rest) = hostport.strip_prefix('[')
+        && let Some((_, port)) = rest.split_once("]:")
+        && !port.is_empty()
+        && !port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!(
+            "parse server: parse {url:?}: invalid port \":{port}\" after host"
+        ));
+    }
+    Ok(())
+}
+
+/// reference `buildClientTLS` (sing-openconnect tls_config.go:43).
+fn oc_build_client_tls(tls: &Map<String, Value>) -> Result<(), String> {
+    let ca = tls_listable_join(tls.get("certificate_authority"));
+    let ca_path = oc_str(tls, "certificate_authority_path");
+    if !ca.is_empty() || !ca_path.is_empty() {
+        let content = if !ca_path.is_empty() {
+            go_read_file(&ca_path).map_err(|e| {
+                format!(
+                    "load TLS certificate authority: read openconnect material: open {ca_path}: {e}"
+                )
+            })?
+        } else {
+            ca.clone()
+        };
+        if !oc_pem_has_certificate(&content) {
+            return Err("invalid openconnect TLS material: certificate authority".to_string());
+        }
+    }
+    oc_load_optional_certificate(
+        tls,
+        "client_certificate",
+        "client_certificate_path",
+        "client_key",
+        "client_key_path",
+        "client_key_password",
+        "client",
+    )?;
+    oc_load_optional_certificate(
+        tls,
+        "mca_certificate",
+        "mca_certificate_path",
+        "mca_key",
+        "mca_key_path",
+        "mca_key_password",
+        "MCA",
+    )?;
+    // certificate expiry warnings / MinVersion / cipher / PFS are driven by
+    // fields the endpoint never sets (defaults cannot fail).
+    let fingerprints = ovpn_listable_values(tls.get("peer_fingerprint"));
+    for value in &fingerprints {
+        oc_parse_peer_fingerprint(value)?;
+    }
+    Ok(())
+}
+
+/// reference `loadOptionalCertificate` (tls_config.go:669).
+fn oc_load_optional_certificate(
+    tls: &Map<String, Value>,
+    cert_key: &str,
+    cert_path_key: &str,
+    key_key: &str,
+    key_path_key: &str,
+    password_key: &str,
+    name: &str,
+) -> Result<(), String> {
+    let cert_content = tls_listable_join(tls.get(cert_key));
+    let cert_path = oc_str(tls, cert_path_key);
+    let key_content = tls_listable_join(tls.get(key_key));
+    let key_path = oc_str(tls, key_path_key);
+    let cert_set = !cert_content.is_empty() || !cert_path.is_empty();
+    let key_set = !key_content.is_empty() || !key_path.is_empty();
+    if cert_set != key_set {
+        return Err(format!(
+            "invalid openconnect TLS material: {name} certificate and key must both be set"
+        ));
+    }
+    if !cert_set {
+        return Ok(());
+    }
+    let cert_pem = if !cert_path.is_empty() {
+        go_read_file(&cert_path).map_err(|e| {
+            format!("load {name} certificate: read openconnect material: open {cert_path}: {e}")
+        })?
+    } else {
+        cert_content
+    };
+    let key_pem = if !key_path.is_empty() {
+        go_read_file(&key_path).map_err(|e| {
+            format!("load {name} key: read openconnect material: open {key_path}: {e}")
+        })?
+    } else {
+        key_content
+    };
+    let password = oc_str(tls, password_key);
+    oc_decrypt_key_pem(&key_pem, &password).map_err(|e| format!("decrypt {name} key: {e}"))?;
+    if !oc_pem_has_certificate(&cert_pem) {
+        return Err(format!(
+            "parse {name} certificate and key: x509: failed to find any PEM data in certificate input"
+        ));
+    }
+    if !oc_pem_has_private_key(&key_pem) {
+        return Err(format!(
+            "parse {name} certificate and key: x509: failed to find any PEM data in key input"
+        ));
+    }
+    // certificate/key DER match cannot be verified without crypto parsing —
+    // documented GAP; probing uses non-PEM material that fails above.
+    Ok(())
+}
+
+/// reference `decryptPrivateKeyPEM` (tls_config.go:695) — password checks only.
+fn oc_decrypt_key_pem(content: &str, password: &str) -> Result<(), String> {
+    for block in oc_pem_blocks(content) {
+        if block.0 == "ENCRYPTED PRIVATE KEY" && password.is_empty() {
+            return Err("encrypted PKCS#8 private key requires a password".to_string());
+        }
+        if block.2 && password.is_empty() {
+            return Err("encrypted private key requires a password".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// minimal PEM scanner: (type, base64 body, legacy_encrypted_header).
+fn oc_pem_blocks(content: &str) -> Vec<(String, String, bool)> {
+    let mut blocks = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx].trim_end_matches('\r');
+        if let Some(ty) = line
+            .strip_prefix("-----BEGIN ")
+            .and_then(|s| s.strip_suffix("-----"))
+        {
+            if ty.is_empty() || ty.contains(' ') || ty.contains(':') {
+                idx += 1;
+                continue;
+            }
+            let mut body_lines: Vec<&str> = Vec::new();
+            let mut legacy_encrypted = false;
+            let mut in_headers = true;
+            let mut j = idx + 1;
+            let mut closed = false;
+            while j < lines.len() {
+                let cur = lines[j].trim_end_matches('\r');
+                if cur.starts_with("-----END ") {
+                    closed = true;
+                    break;
+                }
+                if in_headers {
+                    if cur.trim().is_empty() {
+                        in_headers = false;
+                    } else if cur.starts_with("Proc-Type:") && cur.contains("ENCRYPTED") {
+                        legacy_encrypted = true;
+                    } else if cur.contains(':') && !cur.starts_with("-----") {
+                        // PEM header line.
+                    } else {
+                        in_headers = false;
+                        body_lines.push(cur);
+                    }
+                } else {
+                    body_lines.push(cur);
+                }
+                j += 1;
+            }
+            if closed {
+                blocks.push((ty.to_string(), body_lines.concat(), legacy_encrypted));
+                idx = j + 1;
+                continue;
+            }
+        }
+        idx += 1;
+    }
+    blocks
+}
+
+fn oc_pem_has_certificate(content: &str) -> bool {
+    matches!(
+        oc_pem_blocks(content).first(),
+        Some((ty, body, _)) if ty == "CERTIFICATE" && oc_base64_ok(body)
+    )
+}
+
+fn oc_pem_has_private_key(content: &str) -> bool {
+    matches!(
+        oc_pem_blocks(content).first(),
+        Some((ty, body, _))
+            if matches!(ty.as_str(), "PRIVATE KEY" | "RSA PRIVATE KEY" | "EC PRIVATE KEY")
+                && oc_base64_ok(body)
+    )
+}
+
+/// conservative base64 validity (std alphabet, padding only at the end).
+fn oc_base64_ok(body: &str) -> bool {
+    let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if body.is_empty() {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let mut padding = 0;
+    for (idx, b) in bytes.iter().enumerate() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
+                if padding > 0 {
+                    return false;
+                }
+            }
+            b'=' => {
+                padding += 1;
+                if idx < bytes.len() - 2 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    padding <= 2
+}
+
+/// reference `parsePeerFingerprint` (tls_config.go:233).
+fn oc_parse_peer_fingerprint(value: &str) -> Result<(), String> {
+    let mut encoded: &str = value;
+    let mut maximum_length = 40usize;
+    let mut case_sensitive = false;
+    if let Some(rest) = value.strip_prefix("sha1:") {
+        encoded = rest;
+    } else if let Some(rest) = value.strip_prefix("sha256:") {
+        encoded = rest;
+        maximum_length = 64;
+    } else if let Some(rest) = value.strip_prefix("pin-sha256:") {
+        encoded = rest;
+        maximum_length = 44;
+        case_sensitive = true;
+    } else if value.contains(':') {
+        return Err(format!(
+            "unsupported server certificate fingerprint: {value}"
+        ));
+    }
+    if encoded.len() < 4 || encoded.len() > maximum_length {
+        return Err(format!("invalid server certificate fingerprint: {value}"));
+    }
+    if case_sensitive {
+        for (idx, ch) in encoded.char_indices() {
+            let ok = ch.is_ascii_alphanumeric() || ch == '+' || ch == '/';
+            if !ok && (ch != '=' || idx < encoded.len().saturating_sub(2)) {
+                return Err(format!("invalid server certificate fingerprint: {value}"));
+            }
+        }
+        if encoded.len() == maximum_length {
+            let decoded = oc_base64_strict_decode(encoded);
+            if decoded.as_deref().map(|d| d.len()) != Some(32) {
+                return Err(format!("invalid server certificate fingerprint: {value}"));
+            }
+        }
+    } else {
+        if !encoded.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("invalid server certificate fingerprint: {value}"));
+        }
+    }
+    Ok(())
+}
+
+/// strict base64 std decode (non-zero trailing bits rejected), 32-byte check.
+fn oc_base64_strict_decode(input: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == b'=' {
+            if idx < bytes.len() - 2 {
+                return None;
+            }
+            if !bits.is_multiple_of(8) && (buf & ((1 << bits) - 1)) != 0 {
+                return None;
+            }
+            continue;
+        }
+        let val = ALPHABET.iter().position(|a| a == b)? as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    if out.len() != 32 {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod endpoint_probe_parity_tests {
+    use super::validate;
+    use serde_json::Value;
+
+    fn cfg(raw: &str) -> Value {
+        serde_json::from_str(raw).expect("probe json")
+    }
+
+    #[test]
+    fn parity_ep_type_missing() {
+        let err = validate(&cfg(
+            r#"{"log":{"level":"warn"},"endpoints":[{"tag":"x"}]}"#,
+        ))
+        .unwrap_err();
+        assert_eq!(err, r#"endpoints[0]: unknown endpoint type: "#);
+    }
+
+    #[test]
+    fn parity_ep_type_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"endpoints":[5]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0]: json: cannot unmarshal number into Go struct field _Options.endpoints of type option._Endpoint"#
+        );
+    }
+
+    #[test]
+    fn parity_ep_unknown() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"bogus","tag":"x"}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0]: unknown endpoint type: bogus"#);
+    }
+
+    #[test]
+    fn parity_oc_badfield() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","nope":1}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].nope: json: unknown field "nope""#);
+    }
+
+    #[test]
+    fn parity_oc_clientcert_only() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","tls":{"client_certificate":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: invalid openconnect TLS material: client certificate and key must both be set"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_compmode_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","compression_mode":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: unsupported compression mode: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_flavor_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","flavor":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: unsupported openconnect flavor: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_flavor_garbca() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","flavor":"bogus","tls":{"certificate_authority":"garbage"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: invalid openconnect TLS material: certificate authority"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_full() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"vpn.example.com","username":"u","password":"p"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_oc_garbca() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","tls":{"certificate_authority":"garbage"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: invalid openconnect TLS material: certificate authority"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_http_scheme() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"http://example.com"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: server must be an HTTPS host"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_keepalive_conflict() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","tcp_keep_alive_enabled":true,"disable_tcp_keep_alive":true}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: tcp_keep_alive_enabled conflicts with disable_tcp_keep_alive"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_mtu_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","mtu":"abc"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].mtu: json: cannot unmarshal string into Go struct field OpenConnectEndpointOptions.mtu of type uint32"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_noserver() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: missing openconnect server"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_server_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].server: json: cannot unmarshal number into Go struct field OpenConnectEndpointOptions.server of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_tls_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","tls":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].tls: json: cannot unmarshal number into Go struct field OpenConnectEndpointOptions.tls of type option.OpenConnectTLSOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_tlsemt() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","tls":{}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_oc_token_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","token":{"nope":1}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].token.nope: json: unknown field "nope""#
+        );
+    }
+
+    #[test]
+    fn parity_oc_token_badmode() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","token":{"mode":"bogus","secret":"abc"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: unsupported openconnect software token mode: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_token_nosecret() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","token":{"mode":"totp"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: software token requires a secret"#
+        );
+    }
+
+    #[test]
+    fn parity_oc_token_path_conflict() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","token":{"secret":"abc","secret_path":"/nonexistent"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: token secret and secret path cannot both be configured"#
+        );
+    }
+
+    #[test]
+    fn parity_openconnect_min() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"vpn.example.com"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_c_addr_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"address":"notprefix"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].address: (netip.ParsePrefix("notprefix"): no '/' | json: cannot unmarshal string into Go value of type []netip.Prefix)"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_badfield_nested() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"nope":1}}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].tls.nope: json: unknown field "nope""#);
+    }
+
+    #[test]
+    fn parity_ovpn_c_conflict() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","servers":[{"server":"1.2.3.4"}]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: `server` is conflict with `servers`"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_full_static() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.DataChannel.Cipher is required in static_key mode"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_legacy_outbound() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"openvpn","tag":"ovpn","server":"1.2.3.4","server_port":1194}]}"#)).unwrap_err();
+        assert_eq!(err, r#"outbounds[0]: unknown outbound type: openvpn"#);
+    }
+
+    #[test]
+    fn parity_ovpn_c_mode_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].mode: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.mode of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_mtu_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mtu":"abc"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].mtu: json: cannot unmarshal string into Go struct field OpenVPNClientEndpointOptions.OpenVPNEndpointOptions.mtu of type uint32"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_net_badenum() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"network":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_no_tag_badfield() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","server":"1.2.3.4","nope":1}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].nope: json: unknown field "nope""#);
+    }
+
+    #[test]
+    fn parity_ovpn_c_notag() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","server":"1.2.3.4","server_port":1194,"tls":{}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[0]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_servers_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","servers":[{"server":"1.2.3.4","server_port":"x"}]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].servers[0].server_port: json: cannot unmarshal string into Go struct field OpenVPNRemoteOptions.servers.ServerOptions.server_port of type uint16"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_addr() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `peer_address` for the IPv4 tunnel address in `static_key` mode"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_addr_key() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"static_key":"<static>"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `peer_address` for the IPv4 tunnel address in `static_key` mode"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_full2() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cipher":"aes-128-cbc"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.DataChannel.Cipher must use a canonical OpenVPN cipher name"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_kd_tls() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","key_direction":"bogus","tls":null}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unsupported key direction: bogus (expected "server" or "client")"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_peer() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `static_key` or `static_key_path`"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_tlsemt() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","tls":{}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.DataChannel.Cipher is required in static_key mode"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_static_tlsset() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","tls":{"server_name":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: `tls` options are not supported in `static_key` mode"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_ca() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_ca_addr() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.6/24"]}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_cert() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.6/24"]}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].tls.key: json: unknown field "key""#);
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_empty() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_empty_cwrap() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"control_wrap":{}}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_full() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"insecure":true},"address":["10.8.0.6/24"]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].tls.insecure: json: unknown field "insecure""#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_netbad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"network":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.6/24"]}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].tls.key: json: unknown field "key""#);
+    }
+
+    #[test]
+    fn parity_ovpn_c_tls_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].tls: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.tls of type option.OpenVPNOutboundTLSOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_c_unknown_nested_s0() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","servers":[{"server":"1.2.3.4","nope":1}]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].servers[0].nope: json: unknown field "nope""#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_badmode() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: unsupported mode: bogus (expected "tls" or "static_key")"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_min() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_noserver() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `server` or `servers`"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_servers() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","servers":[{"server":"1.2.3.4","server_port":1194}]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_static() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `address` in `static_key` mode"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_tls() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"tls"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_client_unknown() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"unknown_field":1}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].unknown_field: json: unknown field "unknown_field""#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_full_static() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"mode":"static_key","address":["10.8.0.1/24"],"peer_address":"10.8.0.2","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: `remote` and `remote_port` are required for a UDP static-key server"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_listen() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_mtu_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"mtu":"abc"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].mtu: json: cannot unmarshal string into Go struct field OpenVPNServerEndpointOptions.OpenVPNEndpointOptions.mtu of type uint32"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_net_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"network":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.1/24"]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: unsupported network: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_noaddr_tls() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_static() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"mode":"static_key","address":["10.8.0.1/24"],"static_key":"<static>"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing `peer_address` for the IPv4 static-key tunnel"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_static_full2() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"mode":"static_key","address":["10.8.0.1/24"],"peer_address":"10.8.0.2","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","remote":"1.2.3.4","remote_port":1194}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_s_static_pushty() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"peer_address":"10.8.0.2","static_key":"aaaa","mode":"static_key","remote":"1.2.3.4","remote_port":1194,"push":{}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_s_static_tlsemt() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"peer_address":"10.8.0.2","static_key":"aaaa","mode":"static_key","remote":"1.2.3.4","remote_port":1194,"tls":{}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_s_tls_cert() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.1/24"]}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ovpn_s_tls_empty() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"tls":{}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_s_tls_vccbogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"tls":{"verify_client_certificate":"bogus","certificate":"x","key":"y"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[o]: invalid client certificate policy bogus, allowed values: require, optional, none"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_server_min() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_ovpn_server_nolisten() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_allow_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"allow_compression":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: invalid allow-compression value"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_allow_no_lz4() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"allow_compression":"no","compression":"lz4","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: allow-compression no conflicts with statically enabled compression"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_authretry() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"auth_retry":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.Authentication.AuthRetry must be none, nointeract, or interact"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_badkey_material() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"garbage"}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_c_bindnum() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"bind_interface":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].bind_interface: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.DialerOptions.AbstractDialerOptions.bind_interface of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_certkey_mismatch() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","client_certificate":"y"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: certificate and key must both be set or both omitted"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_cipher_vs_auth() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"data_ciphers":["bogus"],"auth_retry":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.DataChannel.Ciphers[0] must use a canonical OpenVPN cipher name"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_comp_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"compression":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unsupported compression option: compress bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_cto_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"connect_timeout":"zz"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].connect_timeout: time: invalid duration "zz""#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ddr() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"domain_resolver":"nosuch"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_eku_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_eku":"bogus"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unsupported remote-cert-eku value: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_eku_dot() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_eku":"1.2.999.1"}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_c_expanded_none() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_tls":"bogus"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: invalid `tls.remote_certificate_tls`: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_frag_tcp() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"network":"tcp","fragment":100,"tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: option is not supported yet: fragment with tcp remote"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_groups_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","groups":"BOGUS"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unsupported tls-groups name: BOGUS"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_grouptoken_empty() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","groups":""}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_c_kd_static_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","key_direction":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unsupported key direction: bogus (expected "server" or "client")"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_kd_tls_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"key_direction":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: `key_direction` is only supported in `static_key` mode; use `tls.control_wrap.direction` for `tls_auth`"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ku_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_ku":["zz"]}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: strconv.ParseUint: parsing "zz": invalid syntax"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ku_empty() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_ku":[""]}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: empty key usage hex"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ku_nohex() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_ku":["AB"]}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_c_netbogus_tls() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"network":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: unsupported openvpn protocol"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_netstrat() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"network_strategy":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].network_strategy: unknown network strategy: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_noport() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_noport2() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: option is not supported yet: empty remote port at index 0"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ns_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","ns_certificate_type":"bogus"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.TLS.NSCertificateType must be server or client"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ping_half() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"ping_interval":"0.5s","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.Timing.PingInterval must be zero or at least 1s"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_ping_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"ping_interval":5,"tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].ping_interval: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.ping_interval of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_prof_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","certificate_profile":"bogus"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unknown tls-cert-profile value: bogus"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_reneg_conf() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"renegotiate_interval":"3600s","renegotiate_disabled":true,"tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.Timing.RenegotiationInterval conflicts with RenegotiationDisabled"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_reneg_neg() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"renegotiate_interval":"-1s","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.Timing.RenegotiationInterval must not be negative"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_rmarkneg() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"routing_mark":-1}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].routing_mark: invalid number or string mark: json: cannot unmarshal number into Go value of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_snatype_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","server_name_type":"bogus"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.TLS.VerifyX509Type must be subject, name, or name-prefix"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_tlscipher_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","cipher":"BOGUS"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unsupported tls-cipher name: BOGUS"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_tlsversion_maxbad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","version_min":"1.3","version_max":"1.2"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: tls-version-min bigger than tls-version-max"#
+        );
+    }
+
+    #[test]
+    fn parity_q_c_vermin_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","version_min":"9.9"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[o]: unknown tls-version parameter: 9.9"#
+        );
+    }
+
+    #[test]
+    fn parity_q_cipher_upper() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cipher":"AES-128-CBC"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_cwrap_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n","control_wrap":{"nope":1}}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].tls.control_wrap.nope: json: unknown field "nope""#
+        );
+    }
+
+    #[test]
+    fn parity_q_oc_bindnum() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","bind_interface":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].bind_interface: json: cannot unmarshal number into Go struct field OpenConnectEndpointOptions.DialerOptions.AbstractDialerOptions.bind_interface of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_q_oc_flavor_noserver() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","flavor":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openconnect[oc]: missing openconnect server"#
+        );
+    }
+
+    #[test]
+    fn parity_q_peer_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"peer_address":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].peer_address: ParseAddr("bogus"): unable to parse IP"#
+        );
+    }
+
+    #[test]
+    fn parity_q_peer_empty() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"peer_address":"","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].peer_address: ParseAddr(""): unable to parse IP"#
+        );
+    }
+
+    #[test]
+    fn parity_q_push_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"push":{"nope":1}}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].push.nope: json: unknown field "nope""#);
+    }
+
+    #[test]
+    fn parity_q_route_gw_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"route_gateway":"zz","tls":{"certificate":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].route_gateway: ParseAddr("zz"): unable to parse IP"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_bindnum() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"bind_interface":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].bind_interface: json: cannot unmarshal number into Go struct field OpenVPNServerEndpointOptions.ListenOptions.bind_interface of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_dnsaddr_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"tls":{"certificate":"x","key":"y"},"push":{"dns_servers":[{"addresses":["notaddr"]}]}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[o]: invalid push.dns_servers[0].addresses[0]: notaddr"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_dnsaddr_port0() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"tls":{"certificate":"x","key":"y"},"push":{"dns_servers":[{"addresses":["1.1.1.1:0"]}]}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[o]: invalid push.dns_servers[0].addresses[0]: 1.1.1.1:0"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_empty_addr() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","address":[],"tls":{"certificate":"x","key":"y"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_push_dsn_bogus() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"tls":{"certificate":"x","key":"y"},"push":{"dns_servers":[{"dnssec":"bogus"}]}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_s_push_prio_bad() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"tls":{"certificate":"x","key":"y"},"push":{"dns_servers":[{"priority":200,"addresses":["1.1.1.1"]}]}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_s_static_ciphempty() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"mode":"static_key","peer_address":"10.8.0.2","static_key":"aaaa","remote":"1.2.3.4","remote_port":1194,"cipher":"bogus"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_s_tls_empty2() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.0.0.1/24"],"tls":{}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_topnet_both() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-server","tag":"o","address":["10.8.0.1/24"],"topology":"bogus","network":"bogus","tls":{"certificate":"x","key":"y"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[o]: invalid topology bogus, allowed values: subnet, p2p, net30"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_topology_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"topology":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: invalid topology bogus, allowed values: subnet, p2p, net30"#
+        );
+    }
+
+    #[test]
+    fn parity_q_s_users_empty() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"users":[]}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_server_proxy_proto() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"proxy_protocol":true}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_server_sniff() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"sniff":true}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_srv_detour() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"detour":"direct"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_srv_domain_strategy() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"domain_strategy":"prefer_ipv4"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_srv_fastopen() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"fast_open":true}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].fast_open: json: unknown field "fast_open""#
+        );
+    }
+
+    #[test]
+    fn parity_q_srv_networking() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"sniff_override_destination":true}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_srv_tfo() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"tfo":true}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].tfo: json: unknown field "tfo""#);
+    }
+
+    #[test]
+    fn parity_q_tls_ca_only() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n"}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_tls_sni_only() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"server_name":"x"}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: tls mode: either certificate-authority or peer-fingerprint must be configured"#
+        );
+    }
+
+    #[test]
+    fn parity_q_ts_ssh_false() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","ssh_server":false}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_q_users_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"users":[{"nope":1}]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].users[0].nope: json: unknown field "nope""#
+        );
+    }
+
+    #[test]
+    fn parity_r_addr_arrelem() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"address":["ok/24"]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].address: (json: cannot unmarshal array into Go value of type **netip.Prefix | netip.ParsePrefix("ok/24"): ParseAddr("ok"): unable to parse IP)"#
+        );
+    }
+
+    #[test]
+    fn parity_r_c_ping() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"ping_interval":"abc"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].ping_interval: time: invalid duration "abc""#
+        );
+    }
+
+    #[test]
+    fn parity_r_c_routes_elem() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"routes":["bad"]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].routes: (json: cannot unmarshal array into Go value of type **netip.Prefix | netip.ParsePrefix("bad"): no '/')"#
+        );
+    }
+
+    #[test]
+    fn parity_r_cwrap_empty() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","control_wrap":{}}}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_r_fingerprint() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"peer_fingerprint":["zz"]}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.TLS.PeerFingerprint[0] must be canonical lowercase hex"#
+        );
+    }
+
+    #[test]
+    fn parity_r_kd_bogus() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"key_direction":"bogus"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_r_listen_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":5,"listen_port":1194}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].listen: json: cannot unmarshal number into Go struct field OpenVPNServerEndpointOptions.ListenOptions.listen of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_r_mssfix() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mss_fix_disabled":true}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
+        );
+    }
+
+    #[test]
+    fn parity_r_oc_form_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","form_entries":"y"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].form_entries: json: cannot unmarshal string into Go struct field OpenConnectEndpointOptions.form_entries of type []option.OpenConnectFormEntryOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_r_pullfilters_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"pull_filters":"x"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].pull_filters: json: cannot unmarshal string into Go struct field OpenVPNClientEndpointOptions.pull_filters of type []option.OpenVPNPullFilterOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_r_push_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"push":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].push: json: cannot unmarshal number into Go struct field OpenVPNServerEndpointOptions.push of type option.OpenVPNPushOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_r_s_push_dns() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"push":{"dns":["notaddr"]}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].push.dns: (json: cannot unmarshal array into Go value of type **netip.Addr | ParseAddr("notaddr"): unable to parse IP)"#
+        );
+    }
+
+    #[test]
+    fn parity_r_servers_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"servers":"x"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].servers: json: cannot unmarshal string into Go struct field OpenVPNClientEndpointOptions.servers of type []option.OpenVPNRemoteOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_r_statickey_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"static_key":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].static_key: (json: cannot unmarshal number into Go value of type string | json: cannot unmarshal number into Go value of type []string)"#
+        );
+    }
+
+    #[test]
+    fn parity_r_statickey_obj() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"static_key":{"a":1}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].static_key: (json: cannot unmarshal object into Go value of type string | json: cannot unmarshal object into Go value of type []string)"#
+        );
+    }
+
+    #[test]
+    fn parity_r_ts_ctrl() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","control_url":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].control_url: json: cannot unmarshal number into Go struct field TailscaleEndpointOptions.control_url of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_r_ts_ssh_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","ssh_server":"x"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].ssh_server: json: cannot unmarshal string into Go struct field TailscaleEndpointOptions.ssh_server of type option._TailscaleSSHServerOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_r_users_pw() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"users":[{"username":"u","password":"p"}]}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"initialize endpoint[0] openvpn-server[ovpns]: missing server address"#
+        );
+    }
+
+    #[test]
+    fn parity_r_users_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"users":"x"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].users: json: cannot unmarshal string into Go struct field OpenVPNServerEndpointOptions.users of type []auth.User"#
+        );
+    }
+
+    #[test]
+    fn parity_tailscale_min() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ts_adv_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","advertise_routes":"x"}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].advertise_routes: json: cannot unmarshal string into Go struct field TailscaleEndpointOptions.advertise_routes of type []netip.Prefix"#
+        );
+    }
+
+    #[test]
+    fn parity_ts_authkey_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","auth_key":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].auth_key: json: cannot unmarshal number into Go struct field TailscaleEndpointOptions.auth_key of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_ts_badfield() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","nope":1}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].nope: json: unknown field "nope""#);
+    }
+
+    #[test]
+    fn parity_ts_full() {
+        let result = validate(&cfg(
+            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","auth_key":"tskey-auth-123","hostname":"owrt"}]}"#,
+        ));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn parity_ts_hostname_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","hostname":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].hostname: json: cannot unmarshal number into Go struct field TailscaleEndpointOptions.hostname of type string"#
+        );
+    }
+
+    #[test]
+    fn parity_ts_mtu_str() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","mtu":"abc"}]}"#)).unwrap_err();
+        assert_eq!(err, r#"endpoints[0].mtu: json: unknown field "mtu""#);
+    }
+
+    #[test]
+    fn parity_ts_relay_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","relay_server_static_endpoints":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].relay_server_static_endpoints: json: cannot unmarshal number into Go struct field TailscaleEndpointOptions.relay_server_static_endpoints of type []netip.AddrPort"#
+        );
+    }
+
+    #[test]
+    fn parity_ts_ssh_num() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","ssh_server":5}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].ssh_server: json: cannot unmarshal number into Go struct field TailscaleEndpointOptions.ssh_server of type option._TailscaleSSHServerOptions"#
+        );
+    }
+
+    #[test]
+    fn parity_ts_ssh_obj_bad() {
+        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","ssh_server":{"nope":1}}]}"#)).unwrap_err();
+        assert_eq!(
+            err,
+            r#"endpoints[0].ssh_server.nope: json: unknown field "nope""#
+        );
     }
 }

@@ -197,11 +197,9 @@ mod tests {
     }
 
     /// The registry is process-global: serialize the tests inside this binary.
-    fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("guard")
+    fn guard() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     /// Distinct destination per call so parallel tests can find their entry.
@@ -220,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_tracks_counters_and_close() {
-        let _serial = guard();
+        let _serial = guard().lock().await;
         let handle = ConnHandle::open(meta());
         let signal = handle.close_signal();
         handle.add_upload(10);
@@ -248,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_wakes_every_relay() {
-        let _serial = guard();
+        let _serial = guard().lock().await;
         let first = ConnHandle::open(meta());
         let second = ConnHandle::open(meta());
         let first_signal = first.close_signal();
@@ -266,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_handle_removes_the_entry() {
-        let _serial = guard();
+        let _serial = guard().lock().await;
         let destination = "dropped.example.com:443";
         assert!(
             !snapshot()

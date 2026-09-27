@@ -44,9 +44,21 @@ fn corpus_files(dir_name: &str) -> Vec<PathBuf> {
     files
 }
 
+/// Corpus entries the current platform rejects by design: `routing_mark` and
+/// the other dialer gates exist on Linux only (common/dialer.New).
+const PLATFORM_SKIPPED: &[&str] = &["tachyon/f1-exit-gate.json"];
+
 fn assert_accepts(dir_name: &str) {
     use_workspace_cwd();
     for file in corpus_files(dir_name) {
+        let name = file
+            .strip_prefix(&corpus_root())
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !cfg!(target_os = "linux") && PLATFORM_SKIPPED.contains(&name.as_str()) {
+            continue;
+        }
         let raw =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let result = core_config::check_str(&raw);

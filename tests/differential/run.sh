@@ -28,6 +28,20 @@ fi
 STRICT="${STRICT:-0}"
 pass=0; fail=0; gap=0
 
+# Corpus entries that only pass on Linux: the dialer gates (routing_mark,
+# bind_address_no_port, network_strategy) are refused elsewhere, so both
+# binaries reject them off Linux and that counts as agreement.
+LINUX_ONLY=("tachyon/f1-exit-gate.json")
+
+is_linux_only() {
+  local file="$1" name
+  name="${file#"$CORPUS"/}"
+  for entry in "${LINUX_ONLY[@]}"; do
+    [[ "$name" == "$entry" ]] && return 0
+  done
+  return 1
+}
+
 check_pair() {
   local file="$1" expect="$2"  # expect: ok | reject
   local ref_out core_out ref_code core_code
@@ -37,7 +51,16 @@ check_pair() {
   local ref_ok=0; [[ $ref_code -eq 0 ]] && ref_ok=1
   local core_ok=0; [[ $core_code -eq 0 ]] && core_ok=1
 
-  if [[ "$expect" == "ok" ]]; then
+  if [[ "$expect" == "ok" ]] && is_linux_only "$file" && [[ "$(uname -s)" != "Linux" ]]; then
+    # platform-gated fixture: agreement means both reject off Linux
+    if [[ $ref_ok -eq $core_ok ]]; then
+      pass=$((pass+1)); echo "PASS  $file (both reject off Linux: platform-gated)"
+    else
+      fail=$((fail+1)); echo "FAIL  $file (platform-gated; ref=$ref_code core=$core_code)"
+      [[ $ref_ok -eq 0 ]] && { echo "  ref:  $ref_out"; }
+      [[ $core_ok -eq 0 ]] && { echo "  core: $core_out"; }
+    fi
+  elif [[ "$expect" == "ok" ]]; then
     if [[ $ref_ok -eq 1 && $core_ok -eq 1 ]]; then
       pass=$((pass+1)); echo "PASS  $file"
     else

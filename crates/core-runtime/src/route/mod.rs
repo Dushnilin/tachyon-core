@@ -29,6 +29,7 @@ use crate::outbound::direct::Direct;
 use crate::outbound::fptn::Fptn;
 use crate::outbound::hysteria2::Hysteria2;
 use crate::outbound::masque::Masque;
+use crate::outbound::openvpn::OpenVpn;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
@@ -118,6 +119,7 @@ pub enum Outbound {
     Snell(Snell),
     Tuic(Tuic),
     WireGuard(WireGuard),
+    OpenVpn(OpenVpn),
     Urltest(Urltest),
     Selector(Selector),
 }
@@ -151,6 +153,7 @@ impl Outbound {
             Outbound::Snell(snell) => snell.connect(target).await.map(Conn::Plain),
             Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
+            Outbound::OpenVpn(ovpn) => ovpn.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
@@ -170,6 +173,7 @@ impl Outbound {
             Outbound::Snell(snell) => snell.connect_udp(target).await,
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
+            Outbound::OpenVpn(ovpn) => ovpn.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "blocked by outbound",
@@ -386,12 +390,14 @@ impl Router {
         for (i, obj) in endpoints_list.iter().enumerate() {
             let at = format!("endpoints[{i}]");
             let ty = obj.get("type").and_then(Value::as_str).unwrap_or_default();
-            if ty != "wireguard" {
-                anyhow::bail!("{at}: unknown endpoint type: {ty}");
-            }
             let map = obj
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
+            let outbound = match ty {
+                "wireguard" => Outbound::WireGuard(WireGuard::build(map, &at)?),
+                "openvpn-client" => Outbound::OpenVpn(OpenVpn::build(map, &at)?),
+                _ => anyhow::bail!("{at}: unknown endpoint type: {ty}"),
+            };
             let tag = map
                 .get("tag")
                 .and_then(Value::as_str)
@@ -403,7 +409,7 @@ impl Router {
                 }
                 tags.insert(tag, outbounds.len());
             }
-            outbounds.push(Outbound::WireGuard(WireGuard::build(map, &at)?));
+            outbounds.push(outbound);
         }
         for outbound in &mut outbounds {
             match outbound {

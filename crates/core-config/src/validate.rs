@@ -5487,7 +5487,6 @@ fn check_out_multiplex(value: &Value, at: &str, outer: &str) -> Result<(), Strin
 
 fn check_http_header(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
     // badoption.HTTPHeader
-    let go_struct = go_struct;
     match value {
         Value::Null => Ok(()),
         Value::Object(map) => {

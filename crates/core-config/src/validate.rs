@@ -792,8 +792,8 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     ("mixed", "set_system_proxy", "bool"),
     ("http", "set_system_proxy", "bool"),
     ("tproxy", "network", "network_list"),
-    ("tproxy", "udp_mapping", "bool"),
-    ("tproxy", "udp_filtering", "bool"),
+    ("tproxy", "udp_mapping", "string"),
+    ("tproxy", "udp_filtering", "string"),
     ("tproxy", "udp_nat_max", "uint32"),
     ("redirect", "network", "network_list"),
     ("direct", "network", "network_list"),
@@ -1547,6 +1547,32 @@ fn check_int_field(value: &Value, at: &str, go_struct: &str, go_field: &str) -> 
         Value::Object(_) => Err(format!(
             "{at}: json: cannot unmarshal object into Go struct field {go_struct}.{go_field} of type int"
         )),
+    }
+}
+
+/// `[]netip.Prefix` / `[]netip.Addr` (tun address lists): the reference decoder
+/// reports the pointer, the slice and the failing element in one message.
+fn check_listable_netip(value: &Value, at: &str, element: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(_) => Ok(()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if !item.is_string() {
+                    return Err(format!(
+                        "{at}: (json: cannot unmarshal array into Go value of type **{element} | [{index}]: json: cannot unmarshal {} into Go value of type {element})",
+                        json_kind(item)
+                    ));
+                }
+            }
+            Ok(())
+        }
+        other => {
+            let kind = json_kind(other);
+            Err(format!(
+                "{at}: (json: cannot unmarshal {kind} into Go value of type **{element} | json: cannot unmarshal {kind} into Go value of type []{element})"
+            ))
+        }
     }
 }
 
@@ -2391,7 +2417,6 @@ fn check_legacy_inbound(obj: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// UDPTimeoutCompat: number (seconds) or duration string.
 /// The reference prune drops every Go zero value, so an explicit `false`
 /// never reaches the strict decoder and cannot fail a bool field.
 fn is_pruned_bool(value: &Value) -> bool {
@@ -2723,7 +2748,7 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                 check_uint_field(value, &format!("{at}.{field}"), go_struct, field, 32)?;
             }
         }
-        for field in ["interface_name", "netns", "dns_mode", "stack", "platform"] {
+        for field in ["interface_name", "netns", "dns_mode", "stack"] {
             if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
                 && !value.is_string()
             {
@@ -2731,6 +2756,98 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                     value,
                     &format!("{at}.{field}"),
                     go_struct,
+                    field,
+                    "string",
+                ));
+            }
+        }
+        if let Some(value) = obj.get("platform").filter(|value| !prunes_value(value))
+            && !value.is_object()
+        {
+            return Err(go_type_error(
+                value,
+                &format!("{at}.platform"),
+                go_struct,
+                "platform",
+                "option.TunPlatformOptions",
+            ));
+        }
+        for field in [
+            "address",
+            "route_address",
+            "route_exclude_address",
+            "inet4_address",
+            "inet6_address",
+            "inet4_route_address",
+            "inet6_route_address",
+            "inet4_route_exclude_address",
+            "inet6_route_exclude_address",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
+                check_listable_netip(value, &format!("{at}.{field}"), "netip.Prefix")?;
+            }
+        }
+        for field in ["dns_address", "loopback_address"] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
+                check_listable_netip(value, &format!("{at}.{field}"), "netip.Addr")?;
+            }
+        }
+        for field in [
+            "route_address_set",
+            "route_exclude_address_set",
+            "include_interface",
+            "exclude_interface",
+            "include_uid_range",
+            "exclude_uid_range",
+            "include_package",
+            "exclude_package",
+            "include_mac_address",
+            "exclude_mac_address",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
+                check_listable_string(value, &format!("{at}.{field}"))?;
+            }
+        }
+        for field in ["udp_mapping", "udp_filtering"] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+                && !value.is_string()
+            {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.{field}"),
+                    go_struct,
+                    field,
+                    "string",
+                ));
+            }
+        }
+        // the legacy `InboundOptions` embed is decoded before the legacy gate
+        for field in [
+            "sniff",
+            "sniff_override_destination",
+            "udp_disable_domain_unmapping",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+                && !is_pruned_bool(value)
+                && !matches!(value, Value::Bool(_))
+            {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.{field}"),
+                    "TunInboundOptions.InboundOptions",
+                    field,
+                    "bool",
+                ));
+            }
+        }
+        for field in ["domain_strategy", "sniff_timeout"] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+                && !value.is_string()
+            {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.{field}"),
+                    "TunInboundOptions.InboundOptions",
                     field,
                     "string",
                 ));
@@ -12543,8 +12660,22 @@ fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
             u32::MAX as u64,
         )?;
     }
-    if let Some(v) = obj.get("udp_timeout") {
-        check_duration_field(v, &format!("{at}.udp_timeout"), TS_EP, "udp_timeout")?;
+    if let Some(v) = obj.get("udp_timeout").filter(|v| !prunes_value(v)) {
+        match v {
+            Value::Number(_) => {}
+            other => {
+                return Err(go_type_error(
+                    other,
+                    &format!("{at}.udp_timeout"),
+                    TS_EP,
+                    "udp_timeout",
+                    "string",
+                ));
+            }
+        }
+        if let Value::String(text) = v {
+            go_parse_duration(text).map_err(|m| format!("{at}.udp_timeout: {m}"))?;
+        }
     }
     if let Some(v) = obj.get("advertise_routes")
         && !v.is_null()
@@ -13183,6 +13314,15 @@ fn endpoint_initialize(
     if ty == "wireguard" {
         // the wireguard initializer builds its own identical prefix.
         return wireguard_endpoint_initialize(i, &tag, obj);
+    }
+    // reference `common/dialer.New` builds the endpoint dialer during init
+    if let Some(mark) = obj.get("routing_mark").and_then(Value::as_u64)
+        && mark > 0
+        && !cfg!(target_os = "linux")
+    {
+        return Err(format!(
+            "initialize endpoint[{i}] {ty}[{tag}]: `routing_mark` is only supported on Linux"
+        ));
     }
     let result = match ty {
         "openvpn-client" => openvpn_client_initialize(i, &tag, obj),

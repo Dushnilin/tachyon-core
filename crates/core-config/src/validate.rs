@@ -685,6 +685,34 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         true,
     ),
     (
+        "http",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "tuic",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "hysteria",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "hysteria2",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
         "shadowsocks",
         "multiplex",
         "multiplex",
@@ -763,17 +791,16 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     // (inbound type, field, Go kind)
     ("mixed", "set_system_proxy", "bool"),
     ("http", "set_system_proxy", "bool"),
-    ("tproxy", "network", "listable_string"),
+    ("tproxy", "network", "network_list"),
     ("tproxy", "udp_mapping", "bool"),
     ("tproxy", "udp_filtering", "bool"),
     ("tproxy", "udp_nat_max", "uint32"),
-    ("redirect", "network", "listable_string"),
-    ("direct", "network", "listable_string"),
+    ("redirect", "network", "network_list"),
+    ("direct", "network", "network_list"),
     ("direct", "override_address", "string"),
     ("direct", "override_port", "uint16"),
-    ("trojan", "fallback", "object"),
-    ("trojan", "fallback_for_alpn", "listable_string"),
-    ("shadowsocks", "network", "listable_string"),
+    ("trojan", "fallback", "server_options"),
+    ("shadowsocks", "network", "network_list"),
     ("shadowsocks", "method", "string"),
     ("shadowsocks", "password", "string"),
     ("shadowsocks", "destinations", "destination_list"),
@@ -785,7 +812,12 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     ("shadowtls", "strict_mode", "bool"),
     ("shadowtls", "wildcard_sni", "int"),
     ("anytls", "padding_scheme", "listable_string"),
-    ("naive", "network", "listable_string"),
+    ("trojan", "fallback_for_alpn", "fallback_map"),
+    ("tuic", "zero_rtt_handshake", "bool"),
+    ("tuic", "idle_timeout", "quic_duration"),
+    ("tuic", "keep_alive_period", "quic_duration"),
+    ("tuic", "disable_path_mtu_discovery", "quic_bool"),
+    ("naive", "network", "network_list"),
     ("naive", "quic_congestion_control", "string"),
     ("hysteria", "up", "network_bytes"),
     ("hysteria", "down", "network_bytes"),
@@ -2540,63 +2572,6 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
         }
     }
 
-    if ty == "tun" {
-        let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
-            return Ok(());
-        };
-        let mut allowed: Vec<&str> = vec!["type", "tag"];
-        allowed.extend_from_slice(own);
-        allowed.extend(LEGACY_INBOUND_FIELDS);
-        reject_unknown_fields(obj, &allowed, &at)?;
-        let go_struct = "TunInboundOptions";
-        for field in [
-            "mtu",
-            "iproute2_table_index",
-            "iproute2_rule_index",
-            "auto_redirect_iproute2_fallback_rule_index",
-        ] {
-            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
-                check_uint_field(value, &format!("{at}.{field}"), go_struct, field, 32)?;
-            }
-        }
-        for field in [
-            "auto_route",
-            "strict_route",
-            "auto_redirect",
-            "exclude_mptcp",
-            "gso",
-            "endpoint_independent_nat",
-        ] {
-            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
-                && !is_pruned_bool(value)
-                && !matches!(value, Value::Bool(_))
-            {
-                return Err(go_type_error(
-                    value,
-                    &format!("{at}.{field}"),
-                    go_struct,
-                    field,
-                    "bool",
-                ));
-            }
-        }
-        return Ok(());
-    }
-    let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
-        return Ok(());
-    };
-    let mut allowed: Vec<&str> = vec!["type", "tag"];
-    allowed.extend(LISTEN_IN_FIELDS);
-    allowed.extend_from_slice(own);
-    allowed.extend(LEGACY_INBOUND_FIELDS);
-    reject_unknown_fields(obj, &allowed, &at)?;
-
-    // the type's own scalar fields
-    let go_struct = INBOUND_LISTEN_STRUCT
-        .iter()
-        .find(|(known, _)| *known == ty)
-        .map(|(_, name)| *name)
-        .unwrap_or("");
     for (inbound, field, kind) in INBOUND_FIELD_KINDS {
         if *inbound != ty {
             continue;
@@ -2619,8 +2594,69 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                 return Err(go_type_error(value, &field_at, go_struct, field, "string"));
             }
             "listable_string" => {
-                check_string_list(value, &field_at, go_struct, field)?;
+                // badoption.Listable[string] reports both shapes in one message
+                check_listable_string(value, &field_at)?;
                 continue;
+            }
+            "network_list" => {
+                // option.NetworkList: a string or a list of them, and any other
+                // shape fails as the element type
+                let shaped = match value {
+                    Value::String(_) => true,
+                    Value::Array(items) => {
+                        items.iter().all(|item| item.is_string() || item.is_null())
+                    }
+                    _ => false,
+                };
+                if !shaped {
+                    return Err(go_type_error(value, &field_at, go_struct, field, "string"));
+                }
+                continue;
+            }
+            "server_options" => {
+                if value.is_object() {
+                    continue;
+                }
+                return Err(go_type_error(
+                    value,
+                    &field_at,
+                    go_struct,
+                    field,
+                    "option.ServerOptions",
+                ));
+            }
+            "fallback_map" => {
+                if value.is_object() {
+                    continue;
+                }
+                return Err(go_type_error(
+                    value,
+                    &field_at,
+                    go_struct,
+                    field,
+                    "map[string]*option.ServerOptions",
+                ));
+            }
+            "quic_duration" => {
+                check_duration_field(
+                    value,
+                    &field_at,
+                    &format!("{go_struct}.QUICOptions.HTTP2Options"),
+                    field,
+                )?;
+                continue;
+            }
+            "quic_bool" => {
+                if is_pruned_bool(value) || matches!(value, Value::Bool(_)) {
+                    continue;
+                }
+                return Err(go_type_error(
+                    value,
+                    &field_at,
+                    &format!("{go_struct}.QUICOptions"),
+                    field,
+                    "bool",
+                ));
             }
             "object" => {
                 if value.is_object() {
@@ -2667,6 +2703,70 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
             _ => {}
         }
     }
+
+    if ty == "tun" {
+        let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
+            return Ok(());
+        };
+        let mut allowed: Vec<&str> = vec!["type", "tag"];
+        allowed.extend_from_slice(own);
+        allowed.extend(LEGACY_INBOUND_FIELDS);
+        reject_unknown_fields(obj, &allowed, &at)?;
+        let go_struct = "TunInboundOptions";
+        for field in [
+            "mtu",
+            "iproute2_table_index",
+            "iproute2_rule_index",
+            "auto_redirect_iproute2_fallback_rule_index",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
+                check_uint_field(value, &format!("{at}.{field}"), go_struct, field, 32)?;
+            }
+        }
+        for field in ["interface_name", "netns", "dns_mode", "stack", "platform"] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+                && !value.is_string()
+            {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.{field}"),
+                    go_struct,
+                    field,
+                    "string",
+                ));
+            }
+        }
+        for field in [
+            "auto_route",
+            "strict_route",
+            "auto_redirect",
+            "exclude_mptcp",
+            "gso",
+            "endpoint_independent_nat",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+                && !is_pruned_bool(value)
+                && !matches!(value, Value::Bool(_))
+            {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.{field}"),
+                    go_struct,
+                    field,
+                    "bool",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
+        return Ok(());
+    };
+    let mut allowed: Vec<&str> = vec!["type", "tag"];
+    allowed.extend(LISTEN_IN_FIELDS);
+    allowed.extend_from_slice(own);
+    allowed.extend(LEGACY_INBOUND_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
     Ok(())
 }
 
@@ -11043,6 +11143,79 @@ mod tests {
             ))
             .unwrap_err(),
             "inbounds[0].mtu: json: cannot unmarshal string into Go struct field TunInboundOptions.mtu of type uint32"
+        );
+    }
+
+    #[test]
+    fn inbound_containers_and_field_kinds() {
+        let json = |raw: &str| lx_json(raw);
+        // container fields fail on their own kind, with the embedding container
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"tls":1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].tls: json: cannot unmarshal number into Go struct field TUICInboundOptions.InboundTLSOptionsContainer.tls of type option.InboundTLSOptions"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":2080,"users":1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].users: json: cannot unmarshal number into Go struct field HTTPMixedInboundOptions.users of type []auth.User"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"vmess","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"multiplex":1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].multiplex: json: cannot unmarshal number into Go struct field VMessInboundOptions.multiplex of type option.InboundMultiplexOptions"
+        );
+        // NetworkList and badoption.Listable[string] report differently
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"shadowsocks","method":"aes-128-gcm","password":"p","network":1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].network: json: cannot unmarshal number into Go struct field ShadowsocksInboundOptions.network of type string"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"anytls","users":[{"password":"p"}],"tls":{"enabled":true,"insecure":true},"padding_scheme":[1]}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].padding_scheme: (json: cannot unmarshal array into Go value of type string | [0]: json: cannot unmarshal number into Go value of type string)"
+        );
+        // the QUIC options live under their container path
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"tls":{"enabled":true,"insecure":true},"idle_timeout":1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].idle_timeout: json: cannot unmarshal number into Go struct field TUICInboundOptions.QUICOptions.HTTP2Options.idle_timeout of type string"
+        );
+        // the dialer gates of common/dialer.New
+        assert_eq!(
+            validate(&json(
+                r#"{"outbounds":[{"type":"socks","server":"a.com","routing_mark":1}]}"#
+            ))
+            .unwrap_err(),
+            "initialize outbound[0] socks[0]: `routing_mark` is only supported on Linux"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"outbounds":[{"type":"socks","server":"a.com","network_strategy":"default","tcp_fast_open":true}]}"#
+            ))
+            .unwrap_err(),
+            "initialize outbound[0] socks[0]: `network_strategy` is conflict with `bind_interface`, `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`"
+        );
+        // the group member lists decode before the init pass
+        assert_eq!(
+            validate(&json(
+                r#"{"outbounds":[{"type":"selector","outbounds":1}]}"#
+            ))
+            .unwrap_err(),
+            "outbounds[0].outbounds: json: cannot unmarshal number into Go struct field SelectorOutboundOptions.outbounds of type []string"
         );
     }
 }

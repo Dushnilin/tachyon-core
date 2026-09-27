@@ -52,7 +52,7 @@ fn assert_accepts(dir_name: &str) {
     use_workspace_cwd();
     for file in corpus_files(dir_name) {
         let name = file
-            .strip_prefix(&corpus_root())
+            .strip_prefix(corpus_root())
             .unwrap_or(&file)
             .to_string_lossy()
             .replace('\\', "/");

@@ -22,6 +22,7 @@ digest = { version = "0.10.7", default-features = false }
 ecdsa = { version = "0.16.8", default-features = false, features = ["alloc"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["pkcs8"] }
 hmac = { version = "0.12.1", default-features = false }
+ml-kem.workspace = true
 p256 = { version = "0.13.2", default-features = false, features = ["pem", "ecdsa", "ecdh"] }
 p384 = { version = "0.13.0", default-features = false, features = ["pem", "ecdsa", "ecdh"] }
 paste = { version = "1.0.14", default-features = false }

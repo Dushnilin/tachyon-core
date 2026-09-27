@@ -162,7 +162,7 @@ macro_rules! impl_gcm_tls12 {
 
                     let nonce = cipher::Nonce::new(&self.1.into(), seq).0;
                     let aad = cipher::make_tls12_aad(seq, m.typ, m.version, m.payload.len());
-                    payload.extend_from_slice(&nonce.as_ref()[4..]); // explicit
+                    payload.extend_from_slice(&nonce[4..]); // explicit
                     payload.extend_from_chunks(&m.payload);
 
                     self.0

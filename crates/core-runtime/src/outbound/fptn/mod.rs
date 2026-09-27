@@ -13,6 +13,7 @@
 mod http;
 mod obfs;
 mod proto;
+mod reality;
 mod tls;
 mod ws;
 
@@ -55,18 +56,37 @@ pub enum Obfuscation {
     /// `kTlsObfuscator`: handshake inside TlsObfuscator2 frames; the server
     /// then skips the session-id / probing / reality checks.
     Tls,
+    /// `kSniRealityMode*`: decoy browser ClientHello first, then the real
+    /// handshake inside TlsObfuscator2 frames (mode 2). The deprecated mode 1
+    /// (`kSniRealityMode`) is rejected.
+    Reality(reality::RealityProfile),
 }
 
 impl Obfuscation {
+    /// Whether the real handshake travels inside TlsObfuscator2 frames.
+    pub(crate) fn is_obfuscated(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
     fn parse(value: Option<&Value>, at: &str) -> anyhow::Result<Self> {
         match value {
             None | Some(Value::Null) => Ok(Self::Tls),
             Some(Value::String(raw)) => match raw.as_str() {
-                "tls" | "tls_obfuscator" | "kTlsObfuscator" => Ok(Self::Tls),
-                "none" | "sni" | "kSni" => Ok(Self::None),
-                other => anyhow::bail!(
-                    "{at}: invalid obfuscation: {other:?} (expected \"tls\" or \"none\")"
+                "tls" | "tls_obfuscator" | "kTlsObfuscator" | "1" => Ok(Self::Tls),
+                "none" | "sni" | "kSni" | "0" => Ok(Self::None),
+                // Bare `reality` = the reference default browser profile.
+                "reality" => Ok(Self::Reality(reality::RealityProfile::Chrome149)),
+                "kSniRealityMode" | "2" => anyhow::bail!(
+                    "{at}: obfuscation: reality mode 1 (kSniRealityMode) is deprecated \
+                     in the reference client; use \"reality\" (mode 2)"
                 ),
+                other => match reality::RealityProfile::parse(other) {
+                    Some(profile) => Ok(Self::Reality(profile)),
+                    None => anyhow::bail!(
+                        "{at}: invalid obfuscation: {other:?} (expected \"tls\", \"none\", \
+                         \"reality\" or a reality profile such as \"reality_chrome149\")"
+                    ),
+                },
             },
             Some(_) => anyhow::bail!("{at}: obfuscation: must be a string"),
         }
@@ -165,6 +185,16 @@ impl Fptn {
             .map(|m| m as usize)
             .unwrap_or(DEFAULT_MTU);
         let obfuscation = Obfuscation::parse(obj.get("obfuscation"), at)?;
+        if matches!(obfuscation, Obfuscation::Reality(_)) && !reality::SNI_LEN.contains(&sni.len())
+        {
+            anyhow::bail!(
+                "{at}: reality obfuscation needs an sni of {}..={} bytes, got {:?} \
+                 (set \"sni\" explicitly for an IP server)",
+                reality::SNI_LEN.start(),
+                reality::SNI_LEN.end(),
+                sni
+            );
+        }
         let (allow_tcp, allow_udp) = parse_network_list(obj.get("network_list"));
 
         Ok(Self {
@@ -233,13 +263,7 @@ impl Fptn {
         server: SocketAddr,
         jwt: &str,
     ) -> io::Result<(ws::WsMsgStream, Ipv4Addr)> {
-        let tls = tls::connect(
-            server,
-            &self.cfg.sni,
-            &self.cfg.md5,
-            self.cfg.obfuscation == Obfuscation::Tls,
-        )
-        .await?;
+        let tls = tls::connect(server, &self.cfg.sni, &self.cfg.md5, self.cfg.obfuscation).await?;
         let stream: AnyStream = Box::new(tls);
         let host = server.to_string();
         let headers = [(String::from("Authorization"), format!("Bearer {jwt}"))];
@@ -563,11 +587,22 @@ mod live {
             .find(|o| o["type"] == "fptn")
             .expect("member")
             .clone();
+        // Optional live overrides: `FPTN_OBFUSCATION=reality FPTN_SNI=…`.
+        let mut member = member;
+        if let Ok(obf) = std::env::var("FPTN_OBFUSCATION") {
+            member["obfuscation"] = Value::String(obf);
+        }
+        if let Ok(sni) = std::env::var("FPTN_SNI") {
+            member["sni"] = Value::String(sni);
+        }
         let fptn = Fptn::build(member.as_object().expect("object"), "live").expect("build");
         let server = resolve_host(&fptn.cfg.server.0, fptn.cfg.server.1)
             .await
             .expect("resolve");
-        eprintln!("== server {server} sni={:?}", fptn.cfg.sni);
+        eprintln!(
+            "== server {server} sni={:?} obfuscation={:?}",
+            fptn.cfg.sni, fptn.cfg.obfuscation
+        );
 
         eprintln!("== stage 1: login");
         let jwt = http::login(
@@ -583,14 +618,9 @@ mod live {
         eprintln!("== login ok, token len {}", jwt.len());
 
         eprintln!("== stage 2: tls");
-        let tls = tls::connect(
-            server,
-            &fptn.cfg.sni,
-            &fptn.cfg.md5,
-            fptn.cfg.obfuscation == Obfuscation::Tls,
-        )
-        .await
-        .expect("tls");
+        let tls = tls::connect(server, &fptn.cfg.sni, &fptn.cfg.md5, fptn.cfg.obfuscation)
+            .await
+            .expect("tls");
         eprintln!("== tls ok");
 
         eprintln!("== stage 3: websocket handshake");

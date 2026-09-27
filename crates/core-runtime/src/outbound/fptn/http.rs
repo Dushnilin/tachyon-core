@@ -47,8 +47,7 @@ pub(crate) async fn login(
     let host = server.to_string();
     let mut last_503 = 0usize;
     for attempt in 1..=RETRIES {
-        let tls =
-            super::tls::connect(server, sni, md5, obfuscation == super::Obfuscation::Tls).await?;
+        let tls = super::tls::connect(server, sni, md5, obfuscation).await?;
         let mut stream: AnyStream = Box::new(tls);
         let (status, payload) = match timeout(
             LOGIN_TIMEOUT,
@@ -113,8 +112,7 @@ pub(crate) async fn get_dns(
             sleep(DNS_RETRY_DELAY).await;
         }
         let outcome = async {
-            let tls = super::tls::connect(server, sni, md5, obfuscation == super::Obfuscation::Tls)
-                .await?;
+            let tls = super::tls::connect(server, sni, md5, obfuscation).await?;
             let mut stream: AnyStream = Box::new(tls);
             let (status, payload) = timeout(DNS_TIMEOUT, get(&mut stream, &host, DNS_PATH))
                 .await

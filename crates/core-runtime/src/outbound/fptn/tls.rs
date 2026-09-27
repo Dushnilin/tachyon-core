@@ -71,6 +71,17 @@ pub(crate) fn fptn_session_id(now: u32) -> [u8; 32] {
     sid
 }
 
+/// Mode-2 decoy session id (`GenerateDecoyTlsSessionId2`): same key, but at
+/// offset **14** — the reality-mode marker in `IsDecoyHandshakeSessionID2`
+/// (offset 10 was the deprecated mode 1). The other 28 bytes are random, so
+/// the id can never validate as a regular FPTN session id.
+pub(crate) fn fptn_decoy_session_id(now: u32) -> [u8; 32] {
+    let mut sid = [0u8; 32];
+    crate::outbound::shadowsocks::crypto::random_bytes(&mut sid).expect("system random available");
+    sid[14..18].copy_from_slice(&fptn_key(now));
+    sid
+}
+
 /// Wall-clock seconds, the timestamp both the session id and the obfuscator
 /// framing are derived from (server side: `TimeProvider::NowTimestamp`).
 pub(crate) fn unix_now() -> u32 {
@@ -82,13 +93,28 @@ pub(crate) fn unix_now() -> u32 {
 
 /// Mirror of the server check (unit-testable without a socket).
 #[cfg(test)]
+fn is_session_id_keyed_at(sid: &[u8], offset: usize, now: u32) -> bool {
+    if sid.len() < offset + 4 {
+        return false;
+    }
+    let key: [u8; 4] = sid[offset..offset + 4].try_into().expect("4 bytes");
+    let base = now as i64 + HALF_WINDOW;
+    (0..=SESSION_WINDOW).any(|shift| fptn_key((base - shift as i64) as u32) == key)
+}
+
+/// Mirror of `IsFptnClientSessionID` (key at bytes 28..32).
+#[cfg(test)]
 pub(crate) fn is_fptn_session_id(sid: &[u8], now: u32) -> bool {
     if sid.len() < 4 {
         return false;
     }
-    let key: [u8; 4] = sid[sid.len() - 4..].try_into().expect("4 bytes");
-    let base = now as i64 + HALF_WINDOW;
-    (0..=SESSION_WINDOW).any(|shift| fptn_key((base - shift as i64) as u32) == key)
+    is_session_id_keyed_at(sid, sid.len() - 4, now)
+}
+
+/// Mirror of `IsDecoyHandshakeSessionID2` (mode-2 key at bytes 14..18).
+#[cfg(test)]
+pub(crate) fn is_decoy_session_id(sid: &[u8], now: u32) -> bool {
+    is_session_id_keyed_at(sid, 14, now)
 }
 
 /// Pooled per-handshake injection state.
@@ -239,9 +265,17 @@ fn server_name(sni: &str) -> io::Result<ServerName<'static>> {
 /// session id and the MD5 pin.
 fn client_config(md5: &str, state: &'static FptnRandom) -> io::Result<Arc<rustls::ClientConfig>> {
     let base = core_tls::quic::configured_provider();
+    // Reference `CreateNewSslCtx` group order: X25519MLKEM768 first (the
+    // draft-ietf-tls-ecdhe-mlkem hybrid), then the classical groups. The
+    // hybrid is first *and* X25519 is listed separately, so rustls emits a
+    // Chrome-sized hybrid key share (1216 B) plus a standalone X25519 entry
+    // and falls back without HelloRetryRequest when the server has no
+    // ML-KEM support.
+    let mut kx_groups = vec![&core_crypto::X25519MLKEM768 as &dyn rustls::crypto::SupportedKxGroup];
+    kx_groups.extend(base.kx_groups.iter().copied());
     let provider = rustls::crypto::CryptoProvider {
         cipher_suites: base.cipher_suites.clone(),
-        kx_groups: base.kx_groups.clone(),
+        kx_groups,
         signature_verification_algorithms: base.signature_verification_algorithms,
         secure_random: state,
         key_provider: base.key_provider,
@@ -265,25 +299,40 @@ pub(crate) type BoxStream = crate::inbound::AnyStream;
 /// Established FPTN TLS session.
 pub(crate) type FptnTls = TlsStream<BoxStream>;
 
-/// TCP connect + TLS handshake with the FPTN session id and MD5 pin. With
-/// `obfuscate` the handshake travels inside TlsObfuscator2 frames, which is
-/// the official `kTlsObfuscator` strategy (the server then skips the
-/// session-id / probing checks, and the flow survives TLS-fingerprint DPI).
+/// TCP connect + TLS handshake with the FPTN session id and MD5 pin.
+///
+/// - `Obfuscation::None` (`kSni`): plain TCP, plain TLS.
+/// - `Obfuscation::Tls` (`kTlsObfuscator`): the handshake travels inside
+///   TlsObfuscator2 frames; the server then skips the session-id / probing
+///   checks.
+/// - `Obfuscation::Reality(_)` (`kSniRealityMode*`): raw decoy handshake
+///   first ([`super::reality::fake_handshake`]), then the real handshake
+///   inside TlsObfuscator2 frames.
 pub(crate) async fn connect(
     server: SocketAddr,
     sni: &str,
     md5: &str,
-    obfuscate: bool,
+    obfuscation: super::Obfuscation,
 ) -> io::Result<FptnTls> {
+    use super::Obfuscation;
     let state = acquire(fptn_session_id(unix_now()));
     let _armed = ArmedGuard(state);
     let config = client_config(md5, state)?;
     let name = server_name(sni)?;
-    let stream = TcpStream::connect(server).await?;
+    let mut stream = TcpStream::connect(server).await?;
     let _ = stream.set_nodelay(true);
+    let is_reality = matches!(obfuscation, Obfuscation::Reality(_));
+    if let Obfuscation::Reality(profile) = obfuscation {
+        super::reality::fake_handshake(&mut stream, profile, sni).await?;
+    }
     let connector = TlsConnector::from(config);
-    let tls = if obfuscate {
+    let tls = if obfuscation.is_obfuscated() {
         let (obfs, plain) = ObfsStream::new(stream);
+        if is_reality {
+            // Reference websocket path: attach the obfuscator after the
+            // decoy flight, pause 150 ms, then run the real handshake.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
         let tls = connector
             .connect(name, Box::new(obfs) as BoxStream)
             .await
@@ -334,6 +383,21 @@ mod tests {
     }
 
     #[test]
+    fn decoy_session_id_shape() {
+        let now = 1_760_000_000;
+        let sid = fptn_decoy_session_id(now);
+        assert_eq!(sid.len(), 32);
+        assert_eq!(&sid[14..18], &fptn_key(now));
+        // Inside the server's ±120s window, outside it.
+        assert!(is_decoy_session_id(&sid, now));
+        assert!(is_decoy_session_id(&sid, now + 100));
+        assert!(!is_decoy_session_id(&sid, now + 400));
+        // The two id flavours must never cross-validate.
+        assert!(!is_decoy_session_id(&fptn_session_id(now), now));
+        assert!(!is_fptn_session_id(&sid, now));
+    }
+
+    #[test]
     fn md5_pin_matches_reference_format() {
         // Self-signed certificate bytes are not needed: digest stability is
         // what matters. A fixed input must produce the lowercase hex MD5.
@@ -365,6 +429,67 @@ mod tests {
             hello.session_id.as_slice(),
             &sid,
             "session id was not the injected FPTN id"
+        );
+        release(state);
+    }
+
+    /// Chrome-sized hybrid key share: `X25519MLKEM768` (1216 B) first plus a
+    /// standalone X25519 entry — the reference client's layout, and the
+    /// ClientHello padding this feature exists for. A regression here would
+    /// silently shrink the hello back to a ~238-byte tell.
+    #[test]
+    fn client_hello_carries_hybrid_key_share() {
+        let sid = fptn_session_id(1_760_000_000);
+        let state = acquire(sid);
+        let config = client_config("", state).expect("config");
+        let name = server_name("192.0.2.1").expect("server name");
+        let mut conn = rustls::ClientConnection::new(config, name).expect("connection");
+        let mut buf = Vec::new();
+        conn.write_tls(&mut buf).expect("write client hello");
+        let hello = core_tls::hello::parse_record(&buf).expect("parse client hello");
+        let key_share = hello
+            .template
+            .extensions
+            .iter()
+            .find_map(|e| match e {
+                core_tls::hello::Ext::KeyShare(body) => Some(body.as_slice()),
+                _ => None,
+            })
+            .expect("key_share extension");
+        // (group, key length) walk over the key_share list.
+        let list_len = u16::from_be_bytes([key_share[0], key_share[1]]) as usize;
+        let mut shares = Vec::new();
+        let mut off = 2;
+        while off + 4 <= 2 + list_len {
+            let group = u16::from_be_bytes([key_share[off], key_share[off + 1]]);
+            let len = u16::from_be_bytes([key_share[off + 2], key_share[off + 3]]) as usize;
+            shares.push((group, len));
+            off += 4 + len;
+        }
+        assert_eq!(
+            shares,
+            vec![(0x11ec, 1216), (0x001d, 32)],
+            "hybrid share first, standalone X25519 second"
+        );
+        let supported = hello
+            .template
+            .extensions
+            .iter()
+            .find_map(|e| match e {
+                core_tls::hello::Ext::Static(0x000a, body) => Some(body.clone()),
+                _ => None,
+            })
+            .expect("supported_groups extension");
+        assert!(supported.len() >= 4, "supported_groups body too short");
+        assert_eq!(
+            u16::from_be_bytes([supported[2], supported[3]]),
+            0x11ec,
+            "hybrid group must lead supported_groups"
+        );
+        assert!(
+            buf.len() > 1200,
+            "ClientHello is {} bytes; expected Chrome-sized (>1200)",
+            buf.len()
         );
         release(state);
     }

@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -105,6 +105,8 @@ pub struct Fptn {
     shared: AsyncMutex<Option<Arc<FptnShared>>>,
     /// Cached JWT; cleared and re-fetched when the WebSocket is rejected.
     jwt: AsyncMutex<Option<String>>,
+    /// One `GET /api/v1/dns` probe per instance (logged, non-fatal).
+    dns_probed: AtomicBool,
 }
 
 fn get_str<'a>(obj: &'a Map<String, Value>, key: &str) -> &'a str {
@@ -181,6 +183,7 @@ impl Fptn {
             }),
             shared: AsyncMutex::new(None),
             jwt: AsyncMutex::new(None),
+            dns_probed: AtomicBool::new(false),
         })
     }
 
@@ -303,6 +306,24 @@ impl Fptn {
             }
         });
         *guard = Some(Arc::clone(&shared));
+        // Reference `GetDns` is a plain GET with no auth; fetch the provider
+        // resolver once per instance and log it — it is what a DNS-through-
+        // tunnel config entry needs, and the lookup must not delay the dial.
+        if !self.dns_probed.swap(true, Ordering::Relaxed) {
+            let cfg = Arc::clone(&self.cfg);
+            tokio::spawn(async move {
+                match http::get_dns(server, &cfg.sni, &cfg.md5, cfg.obfuscation).await {
+                    Ok((dns, dns_ipv6)) => logging::info(format_args!(
+                        "fptn[{}]: provider dns {dns} / {dns_ipv6}",
+                        cfg.tag
+                    )),
+                    Err(e) => logging::debug(format_args!(
+                        "fptn[{}]: provider dns lookup failed: {e}",
+                        cfg.tag
+                    )),
+                }
+            });
+        }
         Ok(shared)
     }
 
@@ -588,5 +609,12 @@ mod live {
             .expect("eof");
         let (v4, v6) = proto::decode_ip_assignment(&msg).expect("assignment");
         eprintln!("== assigned {v4} / {v6}");
+
+        eprintln!("== stage 5: provider dns (GET /api/v1/dns)");
+        let (dns4, dns6) =
+            http::get_dns(server, &fptn.cfg.sni, &fptn.cfg.md5, fptn.cfg.obfuscation)
+                .await
+                .expect("get_dns");
+        eprintln!("== provider dns {dns4} / {dns6}");
     }
 }

@@ -1,0 +1,35 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  },
+  "lx": {
+    "wg": {
+      "idle_suspend": "5m",
+      "idle_suspend_reachable": "10m",
+      "idle_teardown": "1m",
+      "lazy_build": true,
+      "build_max": 8,
+      "build_overflow": "wait"
+    },
+    "masque": {
+      "idle_timeout": "30s"
+    }
+  }
+}

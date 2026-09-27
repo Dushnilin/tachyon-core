@@ -1,0 +1,10 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "lx": {
+    "wg": {
+      "idle_suspend_reachable": "5m"
+    }
+  }
+}

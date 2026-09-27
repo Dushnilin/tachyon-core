@@ -47,18 +47,25 @@ pub fn parse_slice(bytes: &[u8]) -> Result<Config, serde_json::Error> {
     serde_json::from_slice(bytes)
 }
 
-/// Full `sing-box check` equivalent: schema parse + semantic validation.
-/// FPTN token outbounds are validated as written, then expanded into
+/// Full `sing-box check` equivalent plus the reference's warning lines
+/// (deprecated `route.lx_idle_*` aliases and friends), which do not fail the
+/// check. FPTN token outbounds are validated as written, then expanded into
 /// per-server outbounds + urltest group and validated again.
-pub fn check_str(raw: &str) -> Result<(), String> {
+pub fn check_str_warnings(raw: &str) -> Result<Vec<String>, String> {
     parse_str(raw).map_err(|e| e.to_string())?;
     let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    // as written first (an fptn `token` field is not part of the schema)
     validate::validate(&value)?;
     match fptn::expand(&value) {
-        Ok(Some(expanded)) => validate::validate(&expanded),
-        Ok(None) => Ok(()),
+        Ok(Some(expanded)) => validate::validate_with_warnings(&expanded),
+        Ok(None) => Ok(validate::take_warnings()),
         Err(e) => Err(e),
     }
+}
+
+/// Full `sing-box check` equivalent: schema parse + semantic validation.
+pub fn check_str(raw: &str) -> Result<(), String> {
+    check_str_warnings(raw).map(|_| ())
 }
 
 #[cfg(test)]

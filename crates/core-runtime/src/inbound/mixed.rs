@@ -4,9 +4,13 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::inbound::{ClientConn, Target, pump_conn, require_u16, socks_success_reply};
+use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, UdpHub};
+use crate::inbound::{
+    ClientConn, Target, network_includes_udp, pump_conn, require_u16, socks_failure_reply,
+    socks_success_reply,
+};
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
@@ -16,6 +20,8 @@ pub struct Mixed {
     tag: String,
     users: Vec<(String, String)>,
     router: Arc<Router>,
+    /// Shared UDP ASSOCIATE relay hub (`network` allows UDP).
+    udp: Option<Arc<UdpHub>>,
 }
 
 impl Mixed {
@@ -50,11 +56,14 @@ impl Mixed {
         logging::info(format_args!(
             "inbound mixed[{tag}] listening at {ip}:{port}"
         ));
+        let udp = network_includes_udp(obj)
+            .then(|| UdpHub::new_socks(Arc::clone(&router), DEFAULT_UDP_TIMEOUT));
         Ok(Self {
             listener,
             tag: tag.to_string(),
             users,
             router,
+            udp,
         })
     }
 
@@ -69,8 +78,11 @@ impl Mixed {
                     let router = Arc::clone(&self.router);
                     let users = self.users.clone();
                     let tag = self.tag.clone();
+                    let udp = self.udp.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_conn(stream, peer, &tag, &users, &router).await {
+                        if let Err(err) =
+                            handle_conn(stream, peer, &tag, &users, &router, udp.as_ref()).await
+                        {
                             logging::debug(format_args!("mixed[{tag}] {peer}: {err}"));
                         }
                     });
@@ -90,11 +102,12 @@ async fn handle_conn(
     tag: &str,
     users: &[(String, String)],
     router: &Arc<Router>,
+    udp: Option<&Arc<UdpHub>>,
 ) -> io::Result<()> {
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).await?;
     if first[0] == 0x05 {
-        socks5(stream, peer, tag, users, router).await
+        socks5(stream, peer, tag, users, router, udp).await
     } else {
         http(stream, first[0], peer, tag, users, router).await
     }
@@ -106,6 +119,7 @@ async fn socks5(
     tag: &str,
     users: &[(String, String)],
     router: &Arc<Router>,
+    udp: Option<&Arc<UdpHub>>,
 ) -> io::Result<()> {
     let mut greeting = vec![0x05];
     let mut nmethods = [0u8; 1];
@@ -156,10 +170,22 @@ async fn socks5(
     if head[0] != 0x05 {
         return Err(io::Error::other("bad socks version in request"));
     }
+    if head[1] == 0x03 {
+        // UDP ASSOCIATE — the requested address is only a client hint; the
+        // relay replies from its own socket and reads the real source from
+        // each datagram (reference socks inbound `ListenPacket`).
+        consume_socks_addr(&mut stream, head[3]).await?;
+        let hub = match udp {
+            Some(hub) => Arc::clone(hub),
+            None => {
+                stream.write_all(&socks_failure_reply(0x07)).await?;
+                return Err(io::Error::other("udp not enabled in network field"));
+            }
+        };
+        return socks_udp_associate(stream, peer, tag, hub).await;
+    }
     if head[1] != 0x01 {
-        stream
-            .write_all(&crate::inbound::socks_failure_reply(0x07))
-            .await?;
+        stream.write_all(&socks_failure_reply(0x07)).await?;
         return Err(io::Error::other("only CONNECT is supported"));
     }
     let target = match head[3] {
@@ -232,6 +258,139 @@ async fn socks5(
             }
         }
     }
+}
+
+/// Consume a SOCKS5 address (ATYP + addr + port) from the control stream;
+/// the ASSOCIATE hint is informational only (reference socks inbound).
+async fn consume_socks_addr(stream: &mut TcpStream, atyp: u8) -> io::Result<()> {
+    match atyp {
+        0x01 => {
+            let mut raw = [0u8; 6];
+            stream.read_exact(&mut raw).await?;
+        }
+        0x04 => {
+            let mut raw = [0u8; 18];
+            stream.read_exact(&mut raw).await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut rest = vec![0u8; usize::from(len[0]) + 2];
+            stream.read_exact(&mut rest).await?;
+        }
+        _ => {
+            stream.write_all(&socks_failure_reply(0x08)).await?;
+            return Err(io::Error::other("unsupported address type"));
+        }
+    }
+    Ok(())
+}
+
+/// SOCKS5 UDP ASSOCIATE: answer with a relay socket, pump datagrams through
+/// the shared hub, and tear the association down when the control
+/// connection closes (RFC 1928 §7).
+async fn socks_udp_associate(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    tag: &str,
+    hub: Arc<UdpHub>,
+) -> io::Result<()> {
+    let local = stream.local_addr()?;
+    let relay = Arc::new(UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?);
+    let relay_addr = relay.local_addr()?;
+    let bnd_ip = if local.ip().is_unspecified() {
+        peer.ip()
+    } else {
+        local.ip()
+    };
+    let bnd = SocketAddr::new(bnd_ip, relay_addr.port());
+    stream.write_all(&socks_success_reply(bnd)).await?;
+    logging::info(format_args!("mixed[{tag}] UDP ASSOCIATE relay {bnd}"));
+
+    let relay_task = {
+        let relay = Arc::clone(&relay);
+        let hub = Arc::clone(&hub);
+        let tag = tag.to_string();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match relay.recv_from(&mut buf).await {
+                    Ok((n, source)) => match parse_socks_udp_datagram(&buf[..n]).await {
+                        Some((dest, offset)) => {
+                            if let Err(err) = hub
+                                .handle(&relay, source, dest, &buf[offset..n], &tag)
+                                .await
+                            {
+                                logging::debug(format_args!(
+                                    "mixed[{tag}] udp relay {source}: {err}"
+                                ));
+                            }
+                        }
+                        None => logging::debug(format_args!(
+                            "mixed[{tag}] udp relay: invalid datagram ({n}B)"
+                        )),
+                    },
+                    Err(err) => {
+                        logging::debug(format_args!("mixed[{tag}] udp relay recv: {err}"));
+                        return;
+                    }
+                }
+            }
+        })
+    };
+
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+    relay_task.abort();
+    Ok(())
+}
+
+/// `[RSV][RSV][FRAG][ATYP][ADDR][PORT][payload]` → (destination, payload
+/// offset). Domain targets resolve through the DNS service.
+async fn parse_socks_udp_datagram(data: &[u8]) -> Option<(SocketAddr, usize)> {
+    if data.len() < 4 || data[0] != 0 || data[1] != 0 || data[2] != 0 {
+        return None;
+    }
+    let (ip, offset) = match data[3] {
+        0x01 => {
+            if data.len() < 10 {
+                return None;
+            }
+            let octets: [u8; 4] = data[4..8].try_into().ok()?;
+            (IpAddr::V4(octets.into()), 8)
+        }
+        0x04 => {
+            if data.len() < 22 {
+                return None;
+            }
+            let octets: [u8; 16] = data[4..20].try_into().ok()?;
+            (IpAddr::V6(octets.into()), 20)
+        }
+        0x03 => {
+            let len = *data.get(4)? as usize;
+            let end = 5 + len + 2;
+            if data.len() < end {
+                return None;
+            }
+            let host = std::str::from_utf8(&data[5..5 + len]).ok()?;
+            let ip = match host.parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    let service = crate::dns::current()?;
+                    *service.resolve(host).await.ok()?.first()?
+                }
+            };
+            (ip, end)
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
+    Some((SocketAddr::new(ip, port), offset + 2))
 }
 
 /// Hop-by-hop headers removed before forwarding (RFC 9110 §7.6.1 +

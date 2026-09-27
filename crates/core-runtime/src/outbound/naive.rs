@@ -12,23 +12,17 @@ use std::io;
 use std::net::IpAddr;
 
 use serde_json::{Map, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
 use crate::logging;
 use crate::outbound::proxy::{base64_std, server_endpoint};
 use crate::outbound::quic::udp_loopback_pair;
 use crate::outbound::transport::h2io::{H2Io, H2Stream};
+use crate::outbound::uot::{UOT_DEFAULT_VERSION, magic_authority, request_header, spawn_bridge};
 use crate::tls_client::TlsOptions;
 
-/// sing `uot` v2 magic destination (version 0/2).
-const UOT_MAGIC: &str = "sp.v2.udp-over-tcp.arpa";
-/// sing `uot` v1 (legacy): no request header, bare datagrams.
-const UOT_LEGACY_MAGIC: &str = "sp.udp-over-tcp.arpa";
-const UOT_DEFAULT_VERSION: u8 = 2;
-
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const UDP_BUF: usize = 65_535;
 
 /// Config knobs that only tune the reference (cronet) client internals.
 const TUNING_FIELDS: &[&str] = &[
@@ -148,18 +142,12 @@ impl Naive {
                 "naive: UDP is not supported unless UDP over TCP is enabled",
             ));
         };
-        let magic = if version == 1 {
-            UOT_LEGACY_MAGIC
-        } else {
-            UOT_MAGIC
-        };
         let (local, peer) = udp_loopback_pair().await?;
-        let mut stream = self.tunnel(&format!("{magic}:0")).await?;
+        let mut stream = self.tunnel(&magic_authority(version)).await?;
         if version != 1 {
-            let header = uot_request(true, target)?;
+            let header = request_header(true, target)?;
             stream.write_all(&header).await?;
         }
-        // datagrams: loopback peer -> tunnel
         spawn_bridge(stream, peer);
         Ok(local)
     }
@@ -204,36 +192,6 @@ impl Naive {
     }
 }
 
-/// Copy datagrams between the loopback socket and the tunnel in both
-/// directions; the tunnel is the shared owner of the CONNECT stream.
-fn spawn_bridge(stream: AnyStream, peer: tokio::net::UdpSocket) {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let peer_send = std::sync::Arc::new(peer);
-    let peer_recv = std::sync::Arc::clone(&peer_send);
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; UDP_BUF];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if peer_send.send(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; UDP_BUF];
-        while let Ok(n) = peer_recv.recv(&mut buf).await {
-            if writer.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
-        }
-    });
-}
-
 /// CONNECT authority for a target (`host:port`, IPv6 bracketed).
 fn authority_of(target: &Target) -> io::Result<String> {
     Ok(match target {
@@ -243,35 +201,6 @@ fn authority_of(target: &Target) -> io::Result<String> {
             IpAddr::V6(v6) => format!("[{v6}]:{}", addr.port()),
         },
     })
-}
-
-/// `uot.WriteRequest`: `[is_connect][addr type][addr][port]`.
-fn uot_request(is_connect: bool, target: &Target) -> io::Result<Vec<u8>> {
-    let mut out = vec![u8::from(is_connect)];
-    match target {
-        Target::Domain(host, port) => {
-            if host.len() > 255 {
-                return Err(io::Error::other("naive: udp target domain too long"));
-            }
-            out.push(0x02);
-            out.push(host.len() as u8);
-            out.extend_from_slice(host.as_bytes());
-            out.extend_from_slice(&port.to_be_bytes());
-        }
-        Target::Ip(addr) => match addr.ip() {
-            IpAddr::V4(v4) => {
-                out.push(0x00);
-                out.extend_from_slice(&v4.octets());
-                out.extend_from_slice(&addr.port().to_be_bytes());
-            }
-            IpAddr::V6(v6) => {
-                out.push(0x01);
-                out.extend_from_slice(&v6.octets());
-                out.extend_from_slice(&addr.port().to_be_bytes());
-            }
-        },
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -385,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_and_uot_headers() {
+    fn authority_of_targets() {
         assert_eq!(
             authority_of(&Target::Domain("example.com".into(), 80)).expect("authority"),
             "example.com:80"
@@ -398,20 +327,5 @@ mod tests {
             authority_of(&Target::Ip("[::1]:443".parse().expect("addr"))).expect("authority"),
             "[::1]:443"
         );
-
-        let v4 = uot_request(true, &Target::Ip("10.0.0.1:53".parse().expect("addr"))).expect("v4");
-        assert_eq!(v4, vec![0x01, 0x00, 10, 0, 0, 1, 0, 53]);
-        let v6 = uot_request(false, &Target::Ip("[::1]:5353".parse().expect("addr"))).expect("v6");
-        let mut expected = vec![0x00, 0x01];
-        expected.extend_from_slice(&[0u8; 15]);
-        expected.push(1);
-        expected.extend_from_slice(&5353u16.to_be_bytes());
-        assert_eq!(v6, expected);
-        let domain =
-            uot_request(true, &Target::Domain("dns.example.com".into(), 53)).expect("fqdn");
-        assert_eq!(&domain[..2], &[0x01, 0x02]);
-        assert_eq!(domain[2] as usize, "dns.example.com".len());
-        assert_eq!(&domain[3..3 + 15], b"dns.example.com");
-        assert_eq!(&domain[domain.len() - 2..], &53u16.to_be_bytes());
     }
 }

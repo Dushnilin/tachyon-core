@@ -24,6 +24,7 @@ pub use rule::{
 use crate::dns::{self, QueryMeta};
 use crate::inbound::Conn;
 use crate::logging;
+use crate::outbound::anytls::AnyTls;
 use crate::outbound::block::Block;
 use crate::outbound::direct::Direct;
 use crate::outbound::fptn::Fptn;
@@ -122,6 +123,7 @@ pub enum Outbound {
     WireGuard(WireGuard),
     OpenVpn(OpenVpn),
     Naive(Naive),
+    AnyTls(AnyTls),
     Urltest(Urltest),
     Selector(Selector),
 }
@@ -157,6 +159,7 @@ impl Outbound {
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
             Outbound::OpenVpn(ovpn) => ovpn.connect(target).await.map(Conn::Plain),
             Outbound::Naive(naive) => naive.connect(target).await.map(Conn::Plain),
+            Outbound::AnyTls(anytls) => anytls.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
@@ -178,6 +181,7 @@ impl Outbound {
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
             Outbound::OpenVpn(ovpn) => ovpn.connect_udp(target).await,
             Outbound::Naive(naive) => naive.connect_udp(target).await,
+            Outbound::AnyTls(anytls) => anytls.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "blocked by outbound",
@@ -211,6 +215,7 @@ impl Outbound {
             "snell" => Ok(Outbound::Snell(Snell::build(obj, at)?)),
             "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
             "naive" => Ok(Outbound::Naive(Naive::build(obj, at)?)),
+            "anytls" => Ok(Outbound::AnyTls(AnyTls::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(

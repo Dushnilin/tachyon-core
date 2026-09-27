@@ -1683,14 +1683,14 @@ mod tests {
 
     #[test]
     fn log_entry_shape() {
-        // serde_json orders object keys alphabetically here
+        // serde_json keeps the insertion order (preserve_order feature)
         assert_eq!(
             log_entry("", logging::Level::Info, "hello"),
-            r#"{"payload":"hello","type":"info"}"#
+            r#"{"type":"info","payload":"hello"}"#
         );
         assert_eq!(
             log_entry("warning", logging::Level::Warn, "careful"),
-            r#"{"payload":"careful","type":"warning"}"#
+            r#"{"type":"warning","payload":"careful"}"#
         );
     }
 

@@ -1,0 +1,51 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "remote",
+        "server": "1.1.1.1"
+      },
+      {
+        "type": "local",
+        "tag": "system",
+        "prefer_go": true,
+        "neighbor_domain": [
+          ".local"
+        ]
+      },
+      {
+        "type": "mdns",
+        "tag": "zeroconf",
+        "interface": [
+          "eth0"
+        ]
+      },
+      {
+        "type": "group",
+        "tag": "any",
+        "servers": [
+          "remote",
+          "system"
+        ],
+        "mode": "fastest",
+        "error_ttl": "10s",
+        "win_ttl": "5s"
+      }
+    ],
+    "final": "any"
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct",
+    "default_domain_resolver": "remote"
+  }
+}

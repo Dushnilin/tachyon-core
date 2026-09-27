@@ -667,6 +667,7 @@ pub(crate) async fn run(
             match keepalive_tick(interval, activity, &mut ping_sent, Instant::now()) {
                 Keepalive::Wait => {}
                 Keepalive::Ping => {
+                    logging::debug(format_args!("masque[{}]: ws keepalive ping", stack.cfg.tag));
                     leg.keepalive().await?;
                     ping_sent = leg.last_activity();
                 }

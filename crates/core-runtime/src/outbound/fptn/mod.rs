@@ -261,6 +261,16 @@ impl Fptn {
         Ok((ws, addr))
     }
 
+    /// True while the shared stack task is live. `shared()` silently
+    /// rebuilds a dead tunnel on the next dial, so this is the only way to
+    /// observe one (used by tests/diagnostics to catch keep-alive deaths).
+    pub fn tunnel_alive(&self) -> bool {
+        match self.shared.try_lock() {
+            Ok(guard) => guard.as_ref().is_some_and(|s| !s.cmd_tx.is_closed()),
+            Err(_) => true, // a dial holds the lock — the tunnel is (re)building
+        }
+    }
+
     /// Return the live stack task, building a tunnel lazily (reference
     /// `ensureSession`). A dead task is replaced on the next dial.
     async fn shared(&self) -> io::Result<Arc<FptnShared>> {

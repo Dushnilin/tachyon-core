@@ -486,6 +486,239 @@ const LISTEN_IN_FIELDS: &[&str] = &[
     "proxy_protocol_accept_no_header",
 ];
 
+/// Go struct that embeds `option.ListenOptions` for every inbound type, as the
+/// strict decoder names it in `cannot unmarshal ... into Go struct field ...`.
+const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
+    ("mixed", "HTTPMixedInboundOptions"),
+    ("http", "HTTPMixedInboundOptions"),
+    ("socks", "SocksInboundOptions"),
+    ("tproxy", "TProxyInboundOptions"),
+    ("redirect", "RedirectInboundOptions"),
+    ("direct", "DirectInboundOptions"),
+    ("trojan", "TrojanInboundOptions"),
+    ("shadowsocks", "ShadowsocksInboundOptions"),
+    ("shadowtls", "ShadowTLSInboundOptions"),
+    ("vmess", "VMessInboundOptions"),
+    ("vless", "VLESSInboundOptions"),
+    ("anytls", "AnyTLSInboundOptions"),
+    ("naive", "NaiveInboundOptions"),
+    ("hysteria", "HysteriaInboundOptions"),
+    ("hysteria2", "Hysteria2InboundOptions"),
+    ("tuic", "TUICInboundOptions"),
+    ("snell", "SnellInboundOptions"),
+];
+
+/// Fields each simple inbound type declares beyond `ListenOptions` and the
+/// shared containers (users, tls, multiplex, transport, domain_resolver).
+const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "mixed",
+        &["users", "domain_resolver", "set_system_proxy", "tls"],
+    ),
+    ("http", &[]),
+    ("socks", &["users", "domain_resolver"]),
+    (
+        "tproxy",
+        &["network", "udp_mapping", "udp_filtering", "udp_nat_max"],
+    ),
+    ("redirect", &[]),
+    ("direct", &["network", "override_address", "override_port"]),
+    (
+        "trojan",
+        &[
+            "users",
+            "fallback",
+            "fallback_for_alpn",
+            "multiplex",
+            "transport",
+            "tls",
+        ],
+    ),
+    (
+        "shadowsocks",
+        &[
+            "network",
+            "method",
+            "password",
+            "users",
+            "destinations",
+            "multiplex",
+            "managed",
+        ],
+    ),
+    (
+        "shadowtls",
+        &[
+            "version",
+            "password",
+            "users",
+            "handshake",
+            "handshake_for_server_name",
+            "strict_mode",
+            "wildcard_sni",
+        ],
+    ),
+    ("vmess", &["users", "multiplex", "transport", "tls"]),
+    ("vless", &["users", "multiplex", "transport", "tls"]),
+    ("anytls", &["users", "padding_scheme", "tls"]),
+    (
+        "naive",
+        &["users", "network", "quic_congestion_control", "tls"],
+    ),
+    (
+        "hysteria",
+        &[
+            "up",
+            "up_mbps",
+            "down",
+            "down_mbps",
+            "obfs",
+            "users",
+            "recv_window_conn",
+            "recv_window_client",
+            "max_conn_client",
+            "disable_mtu_discovery",
+            "tls",
+        ],
+    ),
+    (
+        "tun",
+        &[
+            "interface_name",
+            "netns",
+            "mtu",
+            "address",
+            "dns_mode",
+            "dns_address",
+            "auto_route",
+            "iproute2_table_index",
+            "iproute2_rule_index",
+            "auto_redirect",
+            "auto_redirect_input_mark",
+            "auto_redirect_output_mark",
+            "auto_redirect_reset_mark",
+            "auto_redirect_nfqueue",
+            "auto_redirect_iproute2_fallback_rule_index",
+            "exclude_mptcp",
+            "loopback_address",
+            "strict_route",
+            "route_address",
+            "route_address_set",
+            "route_exclude_address",
+            "route_exclude_address_set",
+            "include_interface",
+            "exclude_interface",
+            "include_uid",
+            "include_uid_range",
+            "exclude_uid",
+            "exclude_uid_range",
+            "include_android_user",
+            "include_package",
+            "exclude_package",
+            "include_mac_address",
+            "exclude_mac_address",
+            "udp_timeout",
+            "udp_mapping",
+            "udp_filtering",
+            "udp_nat_max",
+            "stack",
+            "platform",
+            "gso",
+            "inet4_address",
+            "inet6_address",
+            "inet4_route_address",
+            "inet6_route_address",
+            "inet4_route_exclude_address",
+            "inet6_route_exclude_address",
+            "endpoint_independent_nat",
+        ],
+    ),
+];
+
+/// Go kinds of the simple inbound fields (`option` structs above). The check is
+/// the strict decoder: wrong JSON kind -> `cannot unmarshal ... of type ...`.
+const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
+    // (inbound type, field, Go kind)
+    ("mixed", "set_system_proxy", "bool"),
+    ("tproxy", "network", "listable_string"),
+    ("tproxy", "udp_mapping", "bool"),
+    ("tproxy", "udp_filtering", "bool"),
+    ("tproxy", "udp_nat_max", "uint32"),
+    ("redirect", "network", "listable_string"),
+    ("direct", "network", "listable_string"),
+    ("direct", "override_address", "string"),
+    ("direct", "override_port", "uint16"),
+    ("trojan", "fallback", "object"),
+    ("trojan", "fallback_for_alpn", "listable_string"),
+    ("shadowsocks", "network", "listable_string"),
+    ("shadowsocks", "method", "string"),
+    ("shadowsocks", "password", "string"),
+    ("shadowsocks", "destinations", "listable_string"),
+    ("shadowsocks", "managed", "bool"),
+    ("shadowtls", "version", "int"),
+    ("shadowtls", "password", "string"),
+    ("shadowtls", "handshake", "object"),
+    ("shadowtls", "handshake_for_server_name", "object"),
+    ("shadowtls", "strict_mode", "bool"),
+    ("shadowtls", "wildcard_sni", "int"),
+    ("anytls", "padding_scheme", "listable_string"),
+    ("naive", "network", "listable_string"),
+    ("naive", "quic_congestion_control", "string"),
+    ("hysteria", "up", "network_bytes"),
+    ("hysteria", "down", "network_bytes"),
+    ("hysteria", "up_mbps", "int"),
+    ("hysteria", "down_mbps", "int"),
+    ("hysteria", "obfs", "string"),
+    ("hysteria", "recv_window_conn", "uint64"),
+    ("hysteria", "recv_window_client", "uint64"),
+    ("hysteria", "max_conn_client", "int"),
+    ("hysteria", "disable_mtu_discovery", "bool"),
+];
+
+/// `byteformats.NetworkBytesCompat` (sing/common/byteformats): a byte count, or
+/// a digit prefix plus one of the case-sensitive network units.
+const NETWORK_UNITS: &[&str] = &[
+    "Bps", "Kbps", "KBps", "Mbps", "MBps", "Gbps", "GBps", "Tbps", "TBps", "Pbps", "PBps", "Ebps",
+    "EBps",
+];
+
+fn check_network_bytes(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    field: &str,
+) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        // any integer is a byte count, signed included
+        Value::Number(_) => Ok(()),
+        Value::String(text) => {
+            let Some(unit_index) = text
+                .char_indices()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map(|(index, _)| index)
+            else {
+                return Ok(());
+            };
+            if unit_index == 0 {
+                return Err(format!("{at}: invalid format: {text}"));
+            }
+            let digits = &text[..unit_index];
+            if digits.parse::<u64>().is_err() {
+                return Err(format!(
+                    "{at}: parse {digits}: strconv.ParseUint: parsing \"{digits}\": invalid syntax"
+                ));
+            }
+            let raw_unit = &text[unit_index..];
+            if !NETWORK_UNITS.contains(&raw_unit.trim()) {
+                return Err(format!("{at}: unsupported unit: {raw_unit}"));
+            }
+            Ok(())
+        }
+        other => Err(go_type_error(other, at, go_struct, field, "string")),
+    }
+}
+
 /// reference `option.QUICOptions` flattened (idle_timeout, keep_alive_period,
 /// HTTP2 window fields, initial_packet_size, disable_path_mtu_discovery).
 const QUIC_OUT_FIELDS: &[&str] = &[
@@ -947,6 +1180,14 @@ fn go_parse_duration(raw: &str) -> Result<(), String> {
         return Err(format!("time: invalid duration \"{raw}\""));
     }
     Ok(())
+}
+
+/// `json: cannot unmarshal {kind} into Go struct field {struct}.{field} of type {go}`
+fn go_type_error(value: &Value, at: &str, go_struct: &str, field: &str, go: &str) -> String {
+    format!(
+        "{at}: json: cannot unmarshal {} into Go struct field {go_struct}.{field} of type {go}",
+        json_kind(value)
+    )
 }
 
 /// `badoption.Duration` in nanoseconds; a bare `0` (no unit) is 0, which
@@ -1964,6 +2205,278 @@ fn check_legacy_inbound(obj: &Map<String, Value>) -> Result<(), String> {
 }
 
 /// UDPTimeoutCompat: number (seconds) or duration string.
+/// The reference prune drops every Go zero value, so an explicit `false`
+/// never reaches the strict decoder and cannot fail a bool field.
+fn is_pruned_bool(value: &Value) -> bool {
+    is_zero_json(value) || matches!(value, Value::Bool(false))
+}
+
+/// reference `option.ListenOptions` (option/inbound.go) for one inbound type:
+/// the field kinds, the listen address parse and the FwMark shape. The
+/// messages name the struct that embeds `ListenOptions`, like the decoder.
+fn validate_listen_options(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let Some((_, go_struct)) = INBOUND_LISTEN_STRUCT.iter().find(|(known, _)| *known == ty) else {
+        return Ok(());
+    };
+    let at = format!("inbounds[{i}]");
+    let field_at = |value: &Value, field: &str, go: &str| {
+        format!(
+            "{at}.{field}: json: cannot unmarshal {} into Go struct field {go_struct}.ListenOptions.{field} of type {go}",
+            json_kind(value)
+        )
+    };
+    if let Some(listen) = obj.get("listen").filter(|value| !prunes_value(value)) {
+        let Some(addr) = listen.as_str() else {
+            return Err(field_at(listen, "listen", "string"));
+        };
+        if IpAddr::from_str(addr).is_err() {
+            return Err(format!(
+                "{at}.listen: ParseAddr(\"{addr}\"): unable to parse IP"
+            ));
+        }
+    }
+    if let Some(port) = obj.get("listen_port").filter(|value| !prunes_value(value)) {
+        match port.as_u64() {
+            Some(number) if number <= u64::from(u16::MAX) => {}
+            Some(number) => {
+                return Err(format!(
+                    "{at}.listen_port: json: cannot unmarshal number {number} into Go struct field {go_struct}.ListenOptions.listen_port of type uint16"
+                ));
+            }
+            None => return Err(field_at(port, "listen_port", "uint16")),
+        }
+    }
+    for field in ["bind_interface", "netns", "detour"] {
+        if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+            && !value.is_string()
+        {
+            return Err(field_at(value, field, "string"));
+        }
+    }
+    for field in [
+        "reuse_addr",
+        "disable_tcp_keep_alive",
+        "tcp_fast_open",
+        "tcp_multi_path",
+        "proxy_protocol",
+        "proxy_protocol_accept_no_header",
+    ] {
+        if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+            && !is_pruned_bool(value)
+            && !matches!(value, Value::Bool(_))
+        {
+            return Err(field_at(value, field, "bool"));
+        }
+    }
+    for field in ["tcp_keep_alive", "tcp_keep_alive_interval"] {
+        if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
+            check_duration_field(
+                value,
+                &format!("{at}.{field}"),
+                &format!("{go_struct}.ListenOptions"),
+                field,
+            )?;
+        }
+    }
+    if let Some(value) = obj.get("udp_fragment").filter(|value| !prunes_value(value))
+        && !is_pruned_bool(value)
+        && !matches!(value, Value::Bool(_))
+    {
+        return Err(field_at(value, "udp_fragment", "bool"));
+    }
+    if let Some(value) = obj.get("udp_timeout").filter(|value| !prunes_value(value)) {
+        check_udp_timeout(value, &format!("{at}.udp_timeout"))?;
+    }
+    if (ty == "mixed" || ty == "socks")
+        && let Some(value) = obj
+            .get("domain_resolver")
+            .filter(|value| !prunes_value(value))
+    {
+        if !value.is_object() {
+            return Err(format!(
+                "{at}.domain_resolver: json: cannot unmarshal {} into Go struct field {go_struct}.domain_resolver of type option._DomainResolveOptions",
+                json_kind(value)
+            ));
+        }
+        domain_resolver_server(value, &format!("{at}.domain_resolver"))?;
+    }
+    // reference `option.FwMark`: a string mark, or a uint32 number
+    if let Some(value) = obj.get("routing_mark").filter(|value| !prunes_value(value)) {
+        match value {
+            Value::String(text) => {
+                if parse_go_uint(text.as_str(), 32).is_none() {
+                    return Err(format!(
+                        "{at}.routing_mark: strconv.ParseUint: parsing \"{text}\": invalid syntax"
+                    ));
+                }
+            }
+            Value::Number(number) => {
+                if number
+                    .as_u64()
+                    .is_none_or(|mark| mark > u64::from(u32::MAX))
+                {
+                    return Err(format!(
+                        "{at}.routing_mark: invalid number or string mark: json: cannot unmarshal number into Go value of type string"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{at}.routing_mark: invalid number or string mark: json: cannot unmarshal {} into Go value of type string",
+                    json_kind(other)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `strconv.ParseUint(text, 0, bits)`: base prefixes, no sign, no underscores.
+fn parse_go_uint(text: &str, bits: u32) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    let (digits, base) = match text.as_bytes()[0] {
+        b'0' if text.len() > 1 => match text.as_bytes().get(1) {
+            Some(b'x') | Some(b'X') => (&text[2..], 16),
+            Some(b'o') | Some(b'O') => (&text[2..], 8),
+            Some(b'b') | Some(b'B') => (&text[2..], 2),
+            _ => (&text[1..], 8),
+        },
+        _ => (text, 10),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let value = u64::from_str_radix(digits, base).ok()?;
+    (bits == 32 && value <= u64::from(u32::MAX)).then_some(value)
+}
+
+/// Unknown-field rejection for the inbound types without a dedicated decode
+/// pass, using the field sets the reference option structs declare.
+fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("inbounds[{i}]");
+    if ty == "tun" {
+        let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
+            return Ok(());
+        };
+        let mut allowed: Vec<&str> = vec!["type", "tag"];
+        allowed.extend_from_slice(own);
+        allowed.extend(LEGACY_INBOUND_FIELDS);
+        reject_unknown_fields(obj, &allowed, &at)?;
+        let go_struct = "TunInboundOptions";
+        for field in [
+            "mtu",
+            "iproute2_table_index",
+            "iproute2_rule_index",
+            "auto_redirect_iproute2_fallback_rule_index",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) {
+                check_uint_field(value, &format!("{at}.{field}"), go_struct, field, 32)?;
+            }
+        }
+        for field in [
+            "auto_route",
+            "strict_route",
+            "auto_redirect",
+            "exclude_mptcp",
+            "gso",
+            "endpoint_independent_nat",
+        ] {
+            if let Some(value) = obj.get(field).filter(|value| !prunes_value(value))
+                && !is_pruned_bool(value)
+                && !matches!(value, Value::Bool(_))
+            {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.{field}"),
+                    go_struct,
+                    field,
+                    "bool",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
+        return Ok(());
+    };
+    let mut allowed: Vec<&str> = vec!["type", "tag"];
+    allowed.extend(LISTEN_IN_FIELDS);
+    allowed.extend_from_slice(own);
+    allowed.extend(LEGACY_INBOUND_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+
+    // the type's own scalar fields
+    let go_struct = INBOUND_LISTEN_STRUCT
+        .iter()
+        .find(|(known, _)| *known == ty)
+        .map(|(_, name)| *name)
+        .unwrap_or("");
+    for (inbound, field, kind) in INBOUND_FIELD_KINDS {
+        if *inbound != ty {
+            continue;
+        }
+        let Some(value) = obj.get(*field).filter(|value| !prunes_value(value)) else {
+            continue;
+        };
+        let field_at = format!("{at}.{field}");
+        match *kind {
+            "bool" => {
+                if is_pruned_bool(value) || matches!(value, Value::Bool(_)) {
+                    continue;
+                }
+                return Err(go_type_error(value, &field_at, go_struct, field, "bool"));
+            }
+            "string" => {
+                if value.is_string() {
+                    continue;
+                }
+                return Err(go_type_error(value, &field_at, go_struct, field, "string"));
+            }
+            "listable_string" => match value {
+                Value::String(_) => continue,
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        if !item.is_string() {
+                            return Err(format!(
+                                "{field_at}[{index}]: json: cannot unmarshal {} into Go value of type string",
+                                json_kind(item)
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                other => {
+                    return Err(format!(
+                        "{field_at}: json: cannot unmarshal {} into Go value of type string",
+                        json_kind(other)
+                    ));
+                }
+            },
+            "object" => {
+                if value.is_object() {
+                    continue;
+                }
+                return Err(go_type_error(
+                    value,
+                    &field_at,
+                    go_struct,
+                    field,
+                    "map[string]interface {}",
+                ));
+            }
+            "int" => check_int_field(value, &field_at, go_struct, field)?,
+            "uint16" => check_uint_field(value, &field_at, go_struct, field, 16)?,
+            "uint32" => check_uint_field(value, &field_at, go_struct, field, 32)?,
+            "uint64" => check_uint_field(value, &field_at, go_struct, field, 64)?,
+            "network_bytes" => check_network_bytes(value, &field_at, go_struct, field)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn check_udp_timeout(value: &Value, at: &str) -> Result<(), String> {
     match value {
         Value::Null => Err(format!("{at}: time: invalid duration \"\"")),
@@ -2598,19 +3111,6 @@ pub fn validate(root: &Value) -> Result<(), String> {
             let tag = tag_field(obj, &format!("inbounds[{i}]"))?;
             if !tag.is_empty() && !inbound_tags.insert(tag.to_string()) {
                 return Err(format!("duplicate inbound tag: {tag}"));
-            }
-            if let Some(listen) = obj.get("listen").filter(|v| !v.is_null()) {
-                let addr = listen
-                    .as_str()
-                    .ok_or_else(|| format!("inbounds[{i}].listen: must be a string"))?;
-                if IpAddr::from_str(addr).is_err() {
-                    return Err(format!(
-                        "inbounds[{i}].listen: ParseAddr(\"{addr}\"): unable to parse IP"
-                    ));
-                }
-            }
-            if let Some(port) = obj.get("listen_port").filter(|p| !p.is_null()) {
-                check_u16(port).map_err(|m| format!("inbounds[{i}].listen_port: {m}"))?;
             }
             validate_inbound(i, ty, &index_tag(tag, i), obj)?;
         }
@@ -3272,6 +3772,8 @@ fn validate_snell_in_init(at: &str, obj: &Map<String, Value>) -> Result<(), Stri
 
 fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("initialize inbound[{i}] {ty}[{tag}]");
+    validate_listen_options(i, ty, obj)?;
+    validate_inbound_fields(i, ty, obj)?;
 
     match ty {
         "cloudflared" => {
@@ -10118,6 +10620,96 @@ mod tests {
             ))
             .unwrap_err(),
             r#"inbounds[0].users[0].nope: json: unknown field "nope""#
+        );
+    }
+
+    #[test]
+    fn inbound_listen_options_and_fields() {
+        let json = |raw: &str| lx_json(raw);
+        // unknown fields on the inbounds that had no decode pass
+        assert_eq!(
+            validate(&json(r#"{"inbounds":[{"type":"mixed","bogus":1}]}"#)).unwrap_err(),
+            r#"inbounds[0].bogus: json: unknown field "bogus""#
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"mixed","connect_timeout":"1s"}]}"#
+            ))
+            .unwrap_err(),
+            r#"inbounds[0].connect_timeout: json: unknown field "connect_timeout""#
+        );
+        assert_eq!(
+            validate(&json(r#"{"inbounds":[{"type":"tun","listen":"::"}]}"#)).unwrap_err(),
+            r#"inbounds[0].listen: json: unknown field "listen""#
+        );
+        // ListenOptions field kinds name the struct that embeds it
+        assert_eq!(
+            validate(&json(r#"{"inbounds":[{"type":"socks","listen":1}]}"#)).unwrap_err(),
+            "inbounds[0].listen: json: cannot unmarshal number into Go struct field SocksInboundOptions.ListenOptions.listen of type string"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"mixed","listen_port":70000}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].listen_port: json: cannot unmarshal number 70000 into Go struct field HTTPMixedInboundOptions.ListenOptions.listen_port of type uint16"
+        );
+        assert_eq!(
+            validate(&json(r#"{"inbounds":[{"type":"mixed","reuse_addr":1}]}"#)).unwrap_err(),
+            "inbounds[0].reuse_addr: json: cannot unmarshal number into Go struct field HTTPMixedInboundOptions.ListenOptions.reuse_addr of type bool"
+        );
+        // the reference prune drops Go zero values, so `false` is not an error
+        assert!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tproxy","listen":"::","listen_port":1,"tcp_fast_open":false}]}"#
+            ))
+            .is_ok()
+        );
+        // FwMark: uint32 or a parseable string
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"mixed","routing_mark":-1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].routing_mark: invalid number or string mark: json: cannot unmarshal number into Go value of type string"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"mixed","routing_mark":"zz"}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].routing_mark: strconv.ParseUint: parsing \"zz\": invalid syntax"
+        );
+        for mark in ["0", "1", "0x10", "010"] {
+            assert!(
+                validate(&json(&format!(
+                    r#"{{"inbounds":[{{"type":"mixed","routing_mark":"{mark}"}}]}}"#
+                )))
+                .is_ok(),
+                "{mark}"
+            );
+        }
+        // per-type scalar fields
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"direct","override_address":1}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].override_address: json: cannot unmarshal number into Go struct field DirectInboundOptions.override_address of type string"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tproxy","listen":"::","listen_port":1,"udp_nat_max":"x"}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].udp_nat_max: json: cannot unmarshal string into Go struct field TProxyInboundOptions.udp_nat_max of type uint32"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tun","interface_name":"tun0","address":["172.19.0.1/30"],"mtu":"x"}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].mtu: json: cannot unmarshal string into Go struct field TunInboundOptions.mtu of type uint32"
         );
     }
 }

@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "m",
+      "listen": "127.0.0.1",
+      "listen_port": 2080,
+      "listen_field_typo": true
+    }
+  ]
+}

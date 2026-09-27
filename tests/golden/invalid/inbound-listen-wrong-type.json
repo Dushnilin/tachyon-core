@@ -1,0 +1,12 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "m",
+      "listen": 1234
+    }
+  ]
+}

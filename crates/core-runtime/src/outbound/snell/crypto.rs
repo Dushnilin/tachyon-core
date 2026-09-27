@@ -65,6 +65,32 @@ pub(crate) fn open_in_place(
         .map_err(|_| io::Error::other("snell: open record"))
 }
 
+/// Seal `data` in place with AAD, appending the 16 byte tag (v6 shaped
+/// records bind the record prefix / padding regions as associated data).
+pub(crate) fn seal_in_place_aad(
+    cipher: &Aes128Gcm,
+    nonce: &[u8; NONCE_LEN],
+    data: &mut Vec<u8>,
+    aad: &[u8],
+) -> io::Result<()> {
+    cipher
+        .encrypt_in_place(Nonce::from_slice(nonce), aad, data)
+        .map_err(|_| io::Error::other("snell: seal record"))
+}
+
+/// Open `data` (ciphertext + tag) in place with AAD, truncating to the
+/// plaintext.
+pub(crate) fn open_in_place_aad(
+    cipher: &Aes128Gcm,
+    nonce: &[u8; NONCE_LEN],
+    data: &mut Vec<u8>,
+    aad: &[u8],
+) -> io::Result<()> {
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce), aad, data)
+        .map_err(|_| io::Error::other("snell: open record"))
+}
+
 pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     getrandom::fill(buf).map_err(|e| io::Error::other(format!("snell: rng: {e}")))
 }

@@ -1,8 +1,10 @@
-//! snell outbound interop: our box (v4 client) dials the reference sing-box
-//! snell inbound. lx supports inbound versions 5/6, and the v5 server shares
-//! the v4 request/record/reply framing (same `snell.RequestVersion`, header
-//! layout and `ParseReply`), so this pins wire compatibility. Skipped unless
-//! SING_BOX_REF is set (docker gate and CI set it).
+//! snell outbound interop: our box (v4 and v6 clients) dials the reference
+//! sing-box snell inbound. lx supports inbound versions 5/6 — the v5 server
+//! shares the v4 request/record/reply framing (same `snell.RequestVersion`,
+//! header layout and `ParseReply`), v6 speaks the three framing modes
+//! (`default`/`unshaped`/`unsafe-raw`) over the same request protocol, so
+//! this pins wire compatibility. Skipped unless SING_BOX_REF is set (docker
+//! gate and CI set it).
 
 use std::net::SocketAddr;
 use std::process::{Child, Command};
@@ -219,7 +221,9 @@ async fn socks_udp_roundtrip(proxy: SocketAddr, echo: SocketAddr, payload: &[u8]
 async fn assert_snell(
     ref_bin: &str,
     label: &str,
+    version: u8,
     obfs_mode: &str,
+    mode: &str,
     reuse: bool,
     rounds: usize,
     with_udp: bool,
@@ -227,14 +231,25 @@ async fn assert_snell(
     let ref_port = free_port();
     let echo = spawn_echo().await;
     let udp_echo = spawn_udp_echo().await;
+    // Version-scoped inbound options (reference `SnellInboundOptions`):
+    // v5 takes obfs, v6 takes the framing mode. Fields of the other version
+    // are omitted entirely.
+    let ref_inbound = if version == 6 {
+        json!({
+            "type": "snell", "listen": "127.0.0.1", "listen_port": ref_port,
+            "version": 6, "psk": PSK, "mode": mode
+        })
+    } else {
+        json!({
+            "type": "snell", "listen": "127.0.0.1", "listen_port": ref_port,
+            "version": 5, "psk": PSK, "obfs_mode": obfs_mode
+        })
+    };
     let _server = start_ref(
         ref_bin,
         &json!({
             "log": {"level": "error"},
-            "inbounds": [{
-                "type": "snell", "listen": "127.0.0.1", "listen_port": ref_port,
-                "version": 5, "psk": PSK, "obfs_mode": obfs_mode
-            }],
+            "inbounds": [ref_inbound],
             "outbounds": [{"type": "direct", "tag": "direct"}]
         }),
     );
@@ -243,6 +258,8 @@ async fn assert_snell(
         "{label}: reference snell server did not start"
     );
 
+    // Our outbound carries both option families: the runtime keeps only the
+    // fields of `version` (mirroring `UnmarshallExcluded`).
     let instance = core_runtime::start(&json!({
         "log": {"level": "error"},
         "inbounds": [
@@ -250,8 +267,9 @@ async fn assert_snell(
         ],
         "outbounds": [{
             "type": "snell", "tag": "up", "server": "127.0.0.1", "server_port": ref_port,
-            "version": 4, "psk": PSK,
+            "version": version, "psk": PSK,
             "obfs_mode": obfs_mode, "obfs_host": "www.bing.com",
+            "mode": mode,
             "reuse": reuse, "network": ["tcp", "udp"]
         }],
         "route": {"final": "up"}
@@ -293,7 +311,9 @@ async fn interop_snell_plain() {
     assert_snell(
         &ref_bin.to_string_lossy(),
         "snell-none",
+        4,
         "none",
+        "",
         false,
         1,
         true,
@@ -312,7 +332,9 @@ async fn interop_snell_obfs_http_reuse() {
     assert_snell(
         &ref_bin.to_string_lossy(),
         "snell-http",
+        4,
         "http",
+        "",
         true,
         2,
         false,
@@ -328,9 +350,67 @@ async fn interop_snell_obfs_tls_reuse() {
     assert_snell(
         &ref_bin.to_string_lossy(),
         "snell-tls",
+        4,
         "tls",
+        "",
         true,
         2,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn interop_snell_v6_default() {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    // Profile-shaped records with salt blocks and record prefixes; two dials
+    // (reuse off) exercise fresh profiles, UDP rides the same framer.
+    assert_snell(
+        &ref_bin.to_string_lossy(),
+        "snell-v6-default",
+        6,
+        "none",
+        "default",
+        false,
+        2,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn interop_snell_v6_unshaped_reuse() {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    assert_snell(
+        &ref_bin.to_string_lossy(),
+        "snell-v6-unshaped",
+        6,
+        "none",
+        "unshaped",
+        true,
+        2,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn interop_snell_v6_unsafe_raw() {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    assert_snell(
+        &ref_bin.to_string_lossy(),
+        "snell-v6-raw",
+        6,
+        "none",
+        "unsafe-raw",
+        false,
+        1,
         false,
     )
     .await;

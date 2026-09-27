@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::record::{RecordReader, RecordWriter};
+use super::{ReaderLayer, WriterLayer};
 
 pub(crate) const POOL_SIZE: usize = 10;
 pub(crate) const POOL_MAX_AGE: Duration = Duration::from_secs(180);
@@ -19,7 +19,7 @@ const STATE_ACTIVE: u32 = 1;
 const STATE_CLOSED: u32 = 2;
 
 /// The record-stream halves parked inside a session while it is idle.
-type Halves<W, R> = (Option<RecordWriter<W>>, Option<RecordReader<R>>);
+type Halves<W, R> = (Option<WriterLayer<W>>, Option<ReaderLayer<R>>);
 
 /// Shared half of a snell TCP session: one record stream per direction.
 ///
@@ -35,7 +35,7 @@ pub(crate) struct Session<W, R> {
 impl<W, R> Session<W, R> {
     /// New sessions start `Active` (reference sets `StateActive` right after
     /// dialing); pooling happens later via `release`.
-    pub(crate) fn new(writer: RecordWriter<W>, reader: RecordReader<R>) -> Self {
+    pub(crate) fn new(writer: WriterLayer<W>, reader: ReaderLayer<R>) -> Self {
         Self {
             state: AtomicU32::new(STATE_ACTIVE),
             halves: Mutex::new((Some(writer), Some(reader))),
@@ -57,7 +57,7 @@ impl<W, R> Session<W, R> {
     }
 
     /// Move the record stream out for use by the owning stream.
-    pub(crate) fn take_halves(&self) -> Option<(RecordWriter<W>, RecordReader<R>)> {
+    pub(crate) fn take_halves(&self) -> Option<(WriterLayer<W>, ReaderLayer<R>)> {
         let mut halves = self.halves.lock().expect("snell: session poisoned");
         match (halves.0.take(), halves.1.take()) {
             (Some(writer), Some(reader)) => Some((writer, reader)),
@@ -70,7 +70,7 @@ impl<W, R> Session<W, R> {
     }
 
     /// Return the record stream after use (release or close path).
-    pub(crate) fn put_halves(&self, writer: RecordWriter<W>, reader: RecordReader<R>) {
+    pub(crate) fn put_halves(&self, writer: WriterLayer<W>, reader: ReaderLayer<R>) {
         let mut halves = self.halves.lock().expect("snell: session poisoned");
         halves.0 = Some(writer);
         halves.1 = Some(reader);
@@ -224,8 +224,8 @@ mod tests {
 
     fn session() -> Session<tokio::io::Sink, tokio::io::Empty> {
         Session::new(
-            RecordWriter::new(tokio::io::sink(), b"test-psk-12345678"),
-            RecordReader::new(tokio::io::empty(), b"test-psk-12345678"),
+            WriterLayer::V4(RecordWriter::new(tokio::io::sink(), b"test-psk-12345678")),
+            ReaderLayer::V4(RecordReader::new(tokio::io::empty(), b"test-psk-12345678")),
         )
     }
 

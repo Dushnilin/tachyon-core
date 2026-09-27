@@ -1,12 +1,16 @@
-//! snell outbound: v4 record tunnel over argon2-derived AES-128-GCM with
+//! snell outbound: record tunnel over argon2-derived AES-128-GCM with
 //! optional HTTP/TLS obfs and connection reuse (reference sing-snell
-//! `snellv4` client: eager request record, reply on connect, zero-chunk EOF).
+//! `snellv4` client: eager request record, reply on connect, zero-chunk EOF)
+//! plus the v6 framing modes (`unsafe-raw`, `unshaped`, profile-shaped
+//! `default`) sharing the same request/reply protocol.
 
 mod crypto;
 mod obfs;
 mod pool;
+mod profile;
 mod record;
 mod request;
+mod v6;
 
 use std::collections::VecDeque;
 use std::io;
@@ -26,21 +30,85 @@ use crate::outbound::quic::udp_loopback_pair;
 use self::crypto::MAX_PAYLOAD_LEN;
 use self::obfs::{ObfsMode, ObfsStream, parse_obfs_mode};
 use self::pool::{Pool, Session};
-use self::record::{RecordReader, RecordWriter, now_unix};
+use self::profile::Profile;
+use self::record::{RecordReader, RecordWriter, now_unix, poll_flush};
 use self::request::{
     ADDRESS_TYPE_IPV4, ADDRESS_TYPE_IPV6, CMD_CONNECT_V2, CMD_UDP, UDP_FORWARD, parse_reply,
     read_udp_response_address, write_request, write_udp_request_address,
 };
+use self::v6::{MAX_PAYLOAD_V6, Mode, V6Reader, V6Writer, parse_mode};
 
 type BoxedObfs = ObfsStream<AnyStream>;
 type ObfsWrite = tokio::io::WriteHalf<BoxedObfs>;
 type ObfsRead = tokio::io::ReadHalf<BoxedObfs>;
-type SnellWriter = RecordWriter<ObfsWrite>;
-type SnellReader = RecordReader<ObfsRead>;
+type SnellWriter = WriterLayer<ObfsWrite>;
+type SnellReader = ReaderLayer<ObfsRead>;
 type SharedSession = Arc<Session<ObfsWrite, ObfsRead>>;
 type SnellPool = Pool<ObfsWrite, ObfsRead>;
 
-/// snell v4 outbound (reference `snellv4.Client` + `option.SnellOutboundOptions`).
+/// Version-dispatching record writer: v4 `RecordWriter` or v6 `V6Writer`
+/// (the pool and stream plumbing stay mode-agnostic).
+pub(crate) enum WriterLayer<W> {
+    V4(RecordWriter<W>),
+    V6(V6Writer<W>),
+}
+
+impl<W> WriterLayer<W> {
+    fn emit(&mut self, now_unix: i64, data: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+        match self {
+            Self::V4(writer) => writer.emit(now_unix, data),
+            Self::V6(writer) => writer.emit(now_unix, data),
+        }
+    }
+
+    fn emit_packet(&mut self, now_unix: i64, data: &[u8]) -> io::Result<Vec<u8>> {
+        match self {
+            Self::V4(writer) => writer.emit_packet(now_unix, data),
+            Self::V6(writer) => writer.emit_packet(now_unix, data),
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> WriterLayer<W> {
+    async fn write_all(&mut self, records: Vec<Vec<u8>>) -> io::Result<()> {
+        match self {
+            Self::V4(writer) => writer.write_all(records).await,
+            Self::V6(writer) => writer.write_all(records).await,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut W {
+        match self {
+            Self::V4(writer) => &mut writer.inner,
+            Self::V6(writer) => writer.inner_mut(),
+        }
+    }
+}
+
+/// Version-dispatching record reader (see `WriterLayer`).
+pub(crate) enum ReaderLayer<R> {
+    V4(RecordReader<R>),
+    V6(V6Reader<R>),
+}
+
+impl<R: AsyncRead + Unpin> ReaderLayer<R> {
+    fn poll_read_record(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
+        match self {
+            Self::V4(reader) => reader.poll_read_record(cx),
+            Self::V6(reader) => reader.poll_read_record(cx),
+        }
+    }
+
+    async fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match self {
+            Self::V4(reader) => reader.read_record().await,
+            Self::V6(reader) => reader.read_record().await,
+        }
+    }
+}
+
+/// snell outbound (reference `snellv4.Client`/`snellv6.Client` +
+/// `option.SnellOutboundOptions`).
 pub struct Snell {
     server: String,
     port: u16,
@@ -50,6 +118,9 @@ pub struct Snell {
     want_udp: bool,
     obfs_mode: ObfsMode,
     obfs_host: String,
+    version: u8,
+    mode: Mode,
+    profile: Option<Arc<Profile>>,
     pool: Option<Arc<SnellPool>>,
 }
 
@@ -66,8 +137,7 @@ impl Snell {
         };
         match version {
             0 => anyhow::bail!("{at}: snell: missing version"),
-            4 => {}
-            6 => anyhow::bail!("{at}: snell: version 6 not implemented yet"),
+            4 | 6 => {}
             v => anyhow::bail!("{at}: snell: unsupported version: {v}"),
         }
 
@@ -80,14 +150,34 @@ impl Snell {
             anyhow::bail!("{at}: snell: user key too long");
         }
 
-        let raw_mode = obj.get("obfs_mode").and_then(Value::as_str).unwrap_or("");
-        let obfs_mode = parse_obfs_mode(raw_mode)
-            .ok_or_else(|| anyhow::anyhow!("{at}: snell: unknown obfs mode: {raw_mode}"))?;
-        let obfs_host = obj
-            .get("obfs_host")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // Version-scoped options (reference `option.SnellOutboundOptions`
+        // `UnmarshallExcluded`): v4 reads obfs fields and ignores `mode`,
+        // v6 reads `mode` and ignores the obfs fields entirely.
+        let (obfs_mode, obfs_host, mode, profile) = if version == 6 {
+            let raw_mode = obj.get("mode").and_then(Value::as_str).unwrap_or("");
+            let mode = parse_mode(raw_mode)
+                .ok_or_else(|| anyhow::anyhow!("{at}: snell: unknown v6 mode: {raw_mode}"))?;
+            // The shaping profile only exists for the default mode
+            // (reference `snellv6.NewClient`).
+            let profile = if mode == Mode::Default {
+                let profile =
+                    Profile::new(psk.as_bytes()).map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
+                Some(Arc::new(profile))
+            } else {
+                None
+            };
+            (ObfsMode::None, String::new(), mode, profile)
+        } else {
+            let raw_mode = obj.get("obfs_mode").and_then(Value::as_str).unwrap_or("");
+            let obfs_mode = parse_obfs_mode(raw_mode)
+                .ok_or_else(|| anyhow::anyhow!("{at}: snell: unknown obfs mode: {raw_mode}"))?;
+            let obfs_host = obj
+                .get("obfs_host")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            (obfs_mode, obfs_host, Mode::Default, None)
+        };
         let reuse = obj.get("reuse").and_then(Value::as_bool).unwrap_or(false);
         let (want_tcp, want_udp) = network_flags(obj);
 
@@ -100,6 +190,9 @@ impl Snell {
             want_udp,
             obfs_mode,
             obfs_host,
+            version: version as u8,
+            mode,
+            profile,
             pool: reuse.then(SnellPool::new),
         })
     }
@@ -108,10 +201,27 @@ impl Snell {
         let tcp = crate::dns::connect_tcp(&self.server, self.port).await?;
         let obfs = BoxedObfs::new(Box::new(tcp), self.obfs_mode, &self.obfs_host, "/");
         let (reader, writer) = tokio::io::split(obfs);
-        Ok((
-            RecordWriter::new(writer, &self.psk),
-            RecordReader::new(reader, &self.psk),
-        ))
+        Ok(if self.version == 6 {
+            (
+                WriterLayer::V6(V6Writer::new(
+                    writer,
+                    self.mode,
+                    &self.psk,
+                    self.profile.clone(),
+                )),
+                ReaderLayer::V6(V6Reader::new(
+                    reader,
+                    self.mode,
+                    &self.psk,
+                    self.profile.clone(),
+                )),
+            )
+        } else {
+            (
+                WriterLayer::V4(RecordWriter::new(writer, &self.psk)),
+                ReaderLayer::V4(RecordReader::new(reader, &self.psk)),
+            )
+        })
     }
 
     async fn dial_session(&self) -> io::Result<SharedSession> {
@@ -174,6 +284,13 @@ impl Snell {
         let (local, peer) = udp_loopback_pair().await?;
         let peer = Arc::new(peer);
         let forward_target = target.clone();
+        // Forward frame cap: reference `WritePacket` — v4 `MaxPayloadLen`
+        // (0x3fff), v6 `maxPayload` (0xffff).
+        let max_packet = if self.version == 6 {
+            MAX_PAYLOAD_V6
+        } else {
+            MAX_PAYLOAD_LEN
+        };
 
         let send_sock = Arc::clone(&peer);
         tokio::spawn(async move {
@@ -182,7 +299,7 @@ impl Snell {
             loop {
                 match tokio::time::timeout(DEFAULT_UDP_TIMEOUT, send_sock.recv(&mut buf)).await {
                     Ok(Ok(n)) => {
-                        let packet = match forward_packet(&forward_target, &buf[..n]) {
+                        let packet = match forward_packet(&forward_target, &buf[..n], max_packet) {
                             Ok(packet) => packet,
                             Err(e) => {
                                 logging::debug(format_args!("snell udp send: {e}"));
@@ -276,13 +393,14 @@ async fn read_reply(
     Ok(parse_reply(&reply)?.unwrap_or_default())
 }
 
-/// `[0x01][source address][payload]` forward frame (reference `WritePacket`).
-fn forward_packet(target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+/// `[0x01][source address][payload]` forward frame (reference `WritePacket`),
+/// rejected past `max_packet` (version-dependent payload cap).
+fn forward_packet(target: &Target, payload: &[u8], max_packet: usize) -> io::Result<Vec<u8>> {
     let mut packet = Vec::with_capacity(1 + 32 + payload.len());
     packet.push(UDP_FORWARD);
     write_udp_request_address(&mut packet, target)?;
     packet.extend_from_slice(payload);
-    if packet.len() > MAX_PAYLOAD_LEN {
+    if packet.len() > max_packet {
         return Err(io::Error::other("snell: payload length exceeds maximum"));
     }
     Ok(packet)
@@ -361,7 +479,7 @@ impl SnellStream {
             Some(writer) => writer,
             None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
         };
-        let result = RecordWriter::<_>::poll_write_all(cx, &mut writer.inner, &mut self.pending);
+        let result = poll_flush(cx, writer.inner_mut(), &mut self.pending);
         if let Poll::Ready(Err(e)) = &result {
             self.fatal = Some(io::Error::new(e.kind(), e.to_string()));
         }
@@ -562,5 +680,94 @@ impl Drop for SnellStream {
                 self.session.close();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn build(extra: &[(&str, Value)]) -> anyhow::Result<Snell> {
+        let mut pairs: Vec<(&str, Value)> = vec![
+            ("server", Value::String("127.0.0.1".into())),
+            (
+                "server_port",
+                Value::Number(serde_json::Number::from(9990u32)),
+            ),
+            ("psk", Value::String("psk-for-build-tests".into())),
+        ];
+        pairs.extend_from_slice(extra);
+        Snell::build(&opts(&pairs), "snell[out]")
+    }
+
+    /// v6 rejects unknown modes at build time (reference `snellv6.ParseMode`).
+    #[test]
+    fn build_rejects_unknown_v6_mode() {
+        let err = build(&[
+            ("version", Value::Number(6.into())),
+            ("mode", Value::String("bogus".into())),
+        ])
+        .err()
+        .expect("bad mode must fail");
+        assert!(
+            err.to_string()
+                .contains("snell[out]: snell: unknown v6 mode: bogus"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Version-scoped options: v6 reads `mode`, ignores `obfs_mode`.
+    #[test]
+    fn build_v6_default_builds_profile_and_ignores_obfs() {
+        let snell = build(&[
+            ("version", Value::Number(6.into())),
+            ("mode", Value::String("default".into())),
+            ("obfs_mode", Value::String("http".into())),
+            ("obfs_host", Value::String("www.example.com".into())),
+        ])
+        .expect("v6 default");
+        assert_eq!(snell.version, 6);
+        assert_eq!(snell.mode, Mode::Default);
+        assert!(snell.profile.is_some(), "default mode builds a profile");
+        assert_eq!(snell.obfs_mode, ObfsMode::None, "v6 never obfuscates");
+        assert!(snell.obfs_host.is_empty());
+    }
+
+    /// The shaping profile only exists for the default mode (reference
+    /// `snellv6.NewClient`).
+    #[test]
+    fn build_v6_unshaped_skips_profile() {
+        let snell = build(&[
+            ("version", Value::Number(6.into())),
+            ("mode", Value::String("unshaped".into())),
+        ])
+        .expect("v6 unshaped");
+        assert_eq!(snell.mode, Mode::Unshaped);
+        assert!(snell.profile.is_none());
+    }
+
+    /// v4 ignores the `mode` field entirely (reference
+    /// `option.SnellOutboundOptions` v4 branch) and still parses obfs.
+    #[test]
+    fn build_v4_ignores_mode_field() {
+        let snell = build(&[
+            ("version", Value::Number(4.into())),
+            ("mode", Value::String("bogus".into())),
+            ("obfs_mode", Value::String("tls".into())),
+            ("obfs_host", Value::String("www.bing.com".into())),
+        ])
+        .expect("v4 build");
+        assert_eq!(snell.version, 4);
+        assert_eq!(snell.mode, Mode::Default);
+        assert!(snell.profile.is_none());
+        assert_eq!(snell.obfs_mode, ObfsMode::Tls);
+        assert_eq!(snell.obfs_host, "www.bing.com");
     }
 }

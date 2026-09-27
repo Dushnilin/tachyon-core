@@ -37,6 +37,15 @@ const CMD_QUEUE: usize = 256;
 const REPLY_QUEUE: usize = 64;
 const EGRESS_BUF_MAX: usize = 1 << 20;
 
+/// One tunnel write carries at most this many IP packets — the reference
+/// FPTN client's `kMaxBatchSize` in `wsclient.cpp::RunSender`.
+const LEG_BATCH_MAX: usize = 32;
+
+/// Reference keep-alive window (`websocket::stream_base::timeout` with
+/// `keep_alive_pings = true`): ping after this much silence, dead after a
+/// full window without any traffic following the ping.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+
 /// Stack tunables shared by every tunnel flavor (masque CONNECT-IP, fptn).
 pub(crate) struct StackCfg {
     pub tag: String,
@@ -62,11 +71,57 @@ impl Leg {
         }
     }
 
-    async fn write_packet(&mut self, pkt: &mut [u8]) -> io::Result<Option<Vec<u8>>> {
+    /// Write a whole batch in one tunnel message where the protocol has one
+    /// (fptn), packet-by-packet otherwise. Takes the batch by value: H3/H2
+    /// need mutable access per packet, the caller refills its queue after.
+    async fn write_packets(&mut self, pkts: Vec<Vec<u8>>) -> io::Result<Vec<Vec<u8>>> {
         match self {
-            Leg::H3(conn) => conn.write_packet(pkt).await,
-            Leg::H2(conn) => conn.write_packet(pkt).await,
-            Leg::Fptn(conn) => conn.write_packet(pkt).await,
+            Leg::H3(conn) => {
+                let mut icmp = Vec::new();
+                for mut pkt in pkts {
+                    if let Some(reply) = conn.write_packet(&mut pkt).await? {
+                        icmp.push(reply);
+                    }
+                }
+                Ok(icmp)
+            }
+            Leg::H2(conn) => {
+                let mut icmp = Vec::new();
+                for mut pkt in pkts {
+                    if let Some(reply) = conn.write_packet(&mut pkt).await? {
+                        icmp.push(reply);
+                    }
+                }
+                Ok(icmp)
+            }
+            Leg::Fptn(conn) => {
+                conn.write_batch(&pkts).await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Keep-alive ping interval; only the fptn websocket leg has one
+    /// (H3/H2 HTTP/2-3 streams are not pingable this way).
+    fn keepalive_interval(&self) -> Option<Duration> {
+        match self {
+            Leg::Fptn(_) => Some(KEEPALIVE_IDLE),
+            Leg::H3(_) | Leg::H2(_) => None,
+        }
+    }
+
+    /// Last frame timestamp in either direction, when the leg tracks one.
+    fn last_activity(&self) -> Option<Instant> {
+        match self {
+            Leg::Fptn(conn) => Some(conn.last_activity()),
+            Leg::H3(_) | Leg::H2(_) => None,
+        }
+    }
+
+    async fn keepalive(&mut self) -> io::Result<()> {
+        match self {
+            Leg::Fptn(conn) => conn.keepalive().await,
+            Leg::H3(_) | Leg::H2(_) => Ok(()),
         }
     }
 
@@ -364,21 +419,32 @@ impl Stack {
         self.device.rx.push_back(pkt);
     }
 
-    /// Write all queued packets into the tunnel; an ICMP too-big reply from
-    /// the leg goes back into the stack.
+    /// Write all queued packets into the tunnel in batches of at most
+    /// [`LEG_BATCH_MAX`] — one tunnel message per batch (fptn serializes the
+    /// batch into a single frame, mirroring the reference `RunSender`); an
+    /// ICMP too-big reply from the leg goes back into the stack.
     async fn flush_leg(&mut self, leg: &mut Leg) -> io::Result<()> {
-        while let Some(mut pkt) = self
-            .device
-            .tx
-            .pop_front()
-            .or_else(|| self.out_q.pop_front())
-        {
-            match leg.write_packet(&mut pkt).await? {
-                None => {}
-                Some(icmp) => self.device.rx.push_back(icmp),
+        loop {
+            let mut batch = Vec::with_capacity(LEG_BATCH_MAX);
+            while batch.len() < LEG_BATCH_MAX {
+                match self
+                    .device
+                    .tx
+                    .pop_front()
+                    .or_else(|| self.out_q.pop_front())
+                {
+                    Some(pkt) if !pkt.is_empty() => batch.push(pkt),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for reply in leg.write_packets(batch).await? {
+                self.device.rx.push_back(reply);
             }
         }
-        Ok(())
     }
 
     fn maintain_tcp(&mut self) {
@@ -517,6 +583,39 @@ impl Stack {
     }
 }
 
+/// Decision of one keep-alive check (see [`keepalive_tick`]).
+enum Keepalive {
+    Wait,
+    Ping,
+    Timeout,
+}
+
+/// Beast `websocket::stream_base::timeout{idle_timeout=15s,
+/// keep_alive_pings=true}` decision for one tick.
+///
+/// `activity` is the leg's last frame in either direction; `ping_sent` is
+/// the instant of the previous keep-alive ping (`None` when none is
+/// outstanding). Traffic after the ping (`activity > ping_sent`) proves the
+/// peer is alive and retires the ping; a full idle window with no traffic
+/// since the ping means the peer is gone.
+fn keepalive_tick(
+    interval: Duration,
+    activity: Instant,
+    ping_sent: &mut Option<Instant>,
+    now: Instant,
+) -> Keepalive {
+    if now.duration_since(activity) >= interval {
+        if ping_sent.is_some_and(|sent| activity <= sent) {
+            return Keepalive::Timeout;
+        }
+        return Keepalive::Ping;
+    }
+    if ping_sent.is_some_and(|sent| activity > sent) {
+        *ping_sent = None;
+    }
+    Keepalive::Wait
+}
+
 /// One stack task: smoltcp over the CONNECT-IP leg, commands from the
 /// outbound, tunnels packets in both directions. Exits when the caller side
 /// drops (`rx` closed), the leg dies, or the idle window elapses — the next
@@ -553,6 +652,8 @@ pub(crate) async fn run(
         out_q: VecDeque::new(),
         last_activity: Instant::now(),
     };
+    let ka_interval = leg.keepalive_interval();
+    let mut ping_sent: Option<Instant> = None;
 
     loop {
         while let Ok(cmd) = rx.try_recv() {
@@ -562,6 +663,21 @@ pub(crate) async fn run(
         stack.poll_stack();
         stack.flush_leg(&mut leg).await?;
         stack.maintain_tcp();
+        if let (Some(interval), Some(activity)) = (ka_interval, leg.last_activity()) {
+            match keepalive_tick(interval, activity, &mut ping_sent, Instant::now()) {
+                Keepalive::Wait => {}
+                Keepalive::Ping => {
+                    leg.keepalive().await?;
+                    ping_sent = leg.last_activity();
+                }
+                Keepalive::Timeout => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{}: websocket keepalive timeout", stack.cfg.tag),
+                    ));
+                }
+            }
+        }
         if stack.idle_expired() {
             logging::debug(format_args!(
                 "masque[{}]: idle-suspend tunnel",
@@ -698,5 +814,51 @@ mod tests {
         let host: IpCidr = "172.16.0.2/32".parse().expect("cidr");
         assert!(cidr_contains_v4(host, Ipv4Addr::new(172, 16, 0, 2)));
         assert!(!cidr_contains_v4(host, Ipv4Addr::new(172, 16, 0, 3)));
+    }
+
+    /// Reference keep-alive: ping once per idle window, die after a window
+    /// with no traffic following the ping; any frame clears the outstanding
+    /// ping.
+    #[test]
+    fn keepalive_state_machine() {
+        let interval = KEEPALIVE_IDLE;
+        let t0 = Instant::now();
+
+        // Fresh connection, no traffic yet: ping is due.
+        let mut ping = None;
+        assert!(matches!(
+            keepalive_tick(interval, t0, &mut ping, t0 + interval),
+            Keepalive::Ping
+        ));
+        ping = Some(t0 + interval);
+
+        // The ping refreshed activity, but no pong arrived: silent wait
+        // until the next window, then timeout.
+        let activity = t0 + interval;
+        assert!(matches!(
+            keepalive_tick(interval, activity, &mut ping, activity + interval / 2),
+            Keepalive::Wait
+        ));
+        assert!(matches!(
+            keepalive_tick(interval, activity, &mut ping, activity + interval),
+            Keepalive::Timeout
+        ));
+
+        // Pong (or any traffic) after the ping retires it.
+        let mut ping = Some(t0);
+        let activity = t0 + Duration::from_secs(1);
+        assert!(matches!(
+            keepalive_tick(interval, activity, &mut ping, activity),
+            Keepalive::Wait
+        ));
+        assert!(ping.is_none(), "traffic after a ping clears the ping");
+
+        // With a retired ping, the next idle window pings again, never dies.
+        let activity = t0;
+        let mut ping = None;
+        assert!(matches!(
+            keepalive_tick(interval, activity, &mut ping, t0 + interval),
+            Keepalive::Ping
+        ));
     }
 }

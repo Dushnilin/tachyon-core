@@ -99,12 +99,8 @@ impl ReplayWindow {
         if packet_id > self.highest_id {
             let shift = packet_id - self.highest_id;
             if shift >= self.window_size {
-                for word in &mut self.bitmap {
-                    *word = 0;
-                }
-                for slot in &mut self.arrival_times {
-                    *slot = None;
-                }
+                self.bitmap.fill(0);
+                self.arrival_times.fill(None);
             } else {
                 shift_bitmap(&mut self.bitmap, shift);
                 shift_times(&mut self.arrival_times, shift);
@@ -137,12 +133,8 @@ impl ReplayWindow {
         self.highest_timestamp = timestamp;
         self.highest_id = packet_id;
         self.minimum_id = 0;
-        for word in &mut self.bitmap {
-            *word = 0;
-        }
-        for slot in &mut self.arrival_times {
-            *slot = None;
-        }
+        self.bitmap.fill(0);
+        self.arrival_times.fill(None);
         if self.window_size > 0 {
             self.bitmap[0] = 1;
             self.arrival_times[0] = Some(Instant::now());

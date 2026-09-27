@@ -346,7 +346,11 @@ where
             biased;
             _ = signal.wait() => return Err(closed_by_api()),
             read = client.read(&mut down_buf), if !down_done => match read {
-                Ok(0) => down_done = true,
+                // half-close: like copy_bidirectional, tell the peer we are done
+                Ok(0) => {
+                    down_done = true;
+                    upstream.shutdown().await?;
+                }
                 Ok(n) => {
                     upstream.write_all(&down_buf[..n]).await?;
                     tracker.add_upload(n as u64);
@@ -354,7 +358,10 @@ where
                 Err(e) => return Err(e),
             },
             read = upstream.read(&mut up_buf), if !up_done => match read {
-                Ok(0) => up_done = true,
+                Ok(0) => {
+                    up_done = true;
+                    client.shutdown().await?;
+                }
                 Ok(n) => {
                     client.write_all(&up_buf[..n]).await?;
                     tracker.add_download(n as u64);

@@ -299,6 +299,28 @@ impl Selector {
         router.connect_index(*member, target).await
     }
 
+    /// Switch to `member` by tag (clash `PUT /proxies/{name}`).
+    pub fn select(&self, member: &str) -> bool {
+        if let Some(pos) = self.raw_members.iter().position(|m| m == member) {
+            self.current.store(pos, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Member tags and the current selection (clash group view).
+    pub fn all(&self) -> &[String] {
+        &self.raw_members
+    }
+
+    pub fn now(&self) -> &str {
+        self.raw_members
+            .get(self.current.load(Ordering::Relaxed))
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
     pub async fn connect_udp(
         &self,
         router: &Router,

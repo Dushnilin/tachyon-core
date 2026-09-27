@@ -6,6 +6,7 @@
 //! server pings with pongs in line with the RFC.
 
 use std::io;
+use std::time::Instant;
 
 use sha1::Digest as _;
 use sha1::Sha1;
@@ -29,6 +30,9 @@ pub(crate) struct WsMsgStream {
     inner: AnyStream,
     rbuf: Vec<u8>,
     pos: usize,
+    /// Instant of the last frame in either direction (data or control) —
+    /// the reference client's `keep_alive_pings` clock.
+    last_activity: Instant,
 }
 
 impl WsMsgStream {
@@ -77,7 +81,19 @@ impl WsMsgStream {
             inner,
             rbuf: Vec::new(),
             pos: 0,
+            last_activity: Instant::now(),
         })
+    }
+
+    /// Last frame timestamp in either direction (beast treats reads and
+    /// writes alike for its keep-alive timer).
+    pub(crate) fn last_activity(&self) -> Instant {
+        self.last_activity
+    }
+
+    /// Send a keep-alive ping (reference client: `keep_alive_pings = true`).
+    pub(crate) async fn send_ping(&mut self) -> io::Result<()> {
+        self.send_control(OP_PING, &[]).await
     }
 
     /// Send one binary message (client frames are masked per RFC 6455).
@@ -99,7 +115,9 @@ impl WsMsgStream {
         frame.extend_from_slice(&mask);
         frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
         self.inner.write_all(&frame).await?;
-        self.inner.flush().await
+        self.inner.flush().await?;
+        self.last_activity = Instant::now();
+        Ok(())
     }
 
     /// Read the next complete data message; `Ok(None)` on a clean close.
@@ -201,7 +219,9 @@ impl WsMsgStream {
         frame.extend_from_slice(&mask);
         frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
         self.inner.write_all(&frame).await?;
-        self.inner.flush().await
+        self.inner.flush().await?;
+        self.last_activity = Instant::now();
+        Ok(())
     }
 
     /// Ensure `n` bytes are readable from `pos`. `allow_eof` (only valid at
@@ -221,6 +241,8 @@ impl WsMsgStream {
                 ));
             }
             self.rbuf.extend_from_slice(&chunk[..read]);
+            // Any inbound bytes (pong, ping, partial frame) count as life.
+            self.last_activity = Instant::now();
         }
         Ok(true)
     }
@@ -253,7 +275,7 @@ async fn read_head(stream: &mut AnyStream) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Server-to-client binary frame (unmasked per RFC 6455).
     fn server_frame(payload: &[u8]) -> Vec<u8> {
@@ -284,6 +306,7 @@ mod tests {
             inner: Box::new(a),
             rbuf: Vec::new(),
             pos: 0,
+            last_activity: Instant::now(),
         };
         let m1 = stream.read_message().await.expect("msg 1");
         assert_eq!(m1.as_deref(), Some(&b"first"[..]));
@@ -304,8 +327,33 @@ mod tests {
             inner: Box::new(a),
             rbuf: Vec::new(),
             pos: 0,
+            last_activity: Instant::now(),
         };
         assert_eq!(stream.read_message().await.expect("msg 1"), Some(big1));
         assert_eq!(stream.read_message().await.expect("msg 2"), Some(big2));
+    }
+
+    /// Keep-alive pings are masked client control frames; sending one must
+    /// refresh the activity clock the stack's timeout branch consults.
+    #[tokio::test]
+    async fn sends_masked_ping_and_tracks_activity() {
+        let (a, mut b) = tokio::io::duplex(64 * 1024);
+        let mut stream = WsMsgStream {
+            inner: Box::new(a),
+            rbuf: Vec::new(),
+            pos: 0,
+            last_activity: Instant::now() - std::time::Duration::from_secs(300),
+        };
+        stream.send_ping().await.expect("ping");
+        assert!(stream.last_activity().elapsed() < std::time::Duration::from_secs(1));
+
+        let mut head = [0u8; 2];
+        b.read_exact(&mut head).await.expect("frame head");
+        assert_eq!(head[0], 0x80 | OP_PING);
+        assert_eq!(head[1] & 0x80, 0x80, "client frames must be masked");
+        assert_eq!(head[1] & 0x7f, 0, "keep-alive ping carries no payload");
+        let mut mask = [0u8; 4];
+        b.read_exact(&mut mask).await.expect("mask key");
+        assert_ne!(mask, [0u8; 4]);
     }
 }

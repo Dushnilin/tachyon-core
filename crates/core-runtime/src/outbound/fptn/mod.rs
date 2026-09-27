@@ -450,8 +450,8 @@ impl Fptn {
     }
 }
 
-/// Stack leg: one IP packet per binary WebSocket message (a batch of one),
-/// decoded/encoded by [`proto`].
+/// Stack leg: IP packets carried in binary WebSocket messages, batched per
+/// the reference client's `kMaxBatchSize = 32` and encoded by [`proto`].
 pub struct FptnConn {
     ws: ws::WsMsgStream,
     pending: VecDeque<Vec<u8>>,
@@ -485,14 +485,22 @@ impl FptnConn {
         }
     }
 
-    pub(crate) async fn write_packet(&mut self, pkt: &mut [u8]) -> io::Result<Option<Vec<u8>>> {
-        if pkt.is_empty() {
-            return Ok(None);
-        }
-        let payload = pkt.to_vec();
-        let msg = proto::encode_batch(&[payload])?;
-        self.ws.send_binary(&msg).await?;
-        Ok(None)
+    /// Serialize a whole batch into one binary WebSocket message (the
+    /// reference client's `RunSender` writes at most `kMaxBatchSize = 32`
+    /// packets per frame).
+    pub(crate) async fn write_batch(&mut self, packets: &[Vec<u8>]) -> io::Result<()> {
+        let msg = proto::encode_batch(packets)?;
+        self.ws.send_binary(&msg).await
+    }
+
+    /// Last frame timestamp in either direction (keep-alive clock).
+    pub(crate) fn last_activity(&self) -> std::time::Instant {
+        self.ws.last_activity()
+    }
+
+    /// Send a WebSocket keep-alive ping (`keep_alive_pings = true`).
+    pub(crate) async fn keepalive(&mut self) -> io::Result<()> {
+        self.ws.send_ping().await
     }
 
     /// The WebSocket (and its TLS session) closes when this leg drops.

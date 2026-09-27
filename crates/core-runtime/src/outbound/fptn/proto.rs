@@ -309,6 +309,15 @@ mod tests {
         assert_eq!(got, packets);
     }
 
+    /// A full reference batch window (`kMaxBatchSize = 32`) round-trips in
+    /// one message — the shape `flush_leg` now produces.
+    #[test]
+    fn batch_roundtrip_full_window() {
+        let packets: Vec<Vec<u8>> = (0..32).map(|i| vec![0x45; 20 + i]).collect();
+        let wire = encode_batch(&packets).unwrap();
+        assert_eq!(decode_batch(&wire).unwrap(), packets);
+    }
+
     #[test]
     fn batch_rejects_error_message() {
         // Message{protocol_version=1, msg_type=MSG_ERROR, error{error_msg}}.

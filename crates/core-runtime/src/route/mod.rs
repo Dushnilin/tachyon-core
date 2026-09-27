@@ -459,6 +459,45 @@ impl Router {
         self.tags.get(tag).copied()
     }
 
+    /// (index, tag, outbound) for every built outbound — clash API views.
+    pub fn outbound_table(&self) -> impl Iterator<Item = (usize, &str, &Outbound)> {
+        self.outbounds.iter().enumerate().map(|(i, outbound)| {
+            let tag = self
+                .tags
+                .iter()
+                .find(|(_, idx)| **idx == i)
+                .map(|(t, _)| t.as_str())
+                .unwrap_or("");
+            (i, tag, outbound)
+        })
+    }
+
+    /// Tag of the outbound `route.final` points at (empty when untagged).
+    pub fn default_tag(&self) -> &str {
+        self.outbound_table()
+            .find(|(i, ..)| *i == self.default)
+            .map(|(_, tag, _)| tag)
+            .unwrap_or("")
+    }
+
+    /// Switch a `selector` group to one of its members (clash `PUT /proxies`).
+    pub fn select_member(&self, group_tag: &str, member: &str) -> Result<bool, SelectError> {
+        let index = self.index_of(group_tag).ok_or(SelectError::NotFound)?;
+        let Some(outbound) = self.outbounds.get(index) else {
+            return Err(SelectError::NotFound);
+        };
+        match outbound {
+            Outbound::Selector(selector) => {
+                if selector.select(member) {
+                    Ok(true)
+                } else {
+                    Err(SelectError::NotMember)
+                }
+            }
+            _ => Err(SelectError::NotSelector),
+        }
+    }
+
     pub fn connect<'a>(
         &'a self,
         target: &'a Target,
@@ -570,6 +609,14 @@ impl Router {
         self.index_of(tag)
             .ok_or_else(|| io::Error::other(format!("outbound not found: {tag}")))
     }
+}
+
+/// `PUT /proxies/{name}` failure classes (reference clash API messages).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelectError {
+    NotFound,
+    NotSelector,
+    NotMember,
 }
 
 /// FakeIP reverse mapping + ip_version before the rule walk.

@@ -124,6 +124,19 @@ impl Urltest {
         router.connect_udp_index(*member, target).await
     }
 
+    /// Member tags and the current selection (clash group view).
+    pub fn all(&self) -> &[String] {
+        &self.shared.members
+    }
+
+    pub fn now(&self) -> &str {
+        self.shared
+            .members
+            .get(self.shared.current.load(Ordering::Relaxed))
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
     /// Spawn the background probe loop (called once the router is shared).
     pub(crate) fn spawn(&self, router: Arc<Router>) -> tokio::task::JoinHandle<()> {
         let shared = Arc::clone(&self.shared);

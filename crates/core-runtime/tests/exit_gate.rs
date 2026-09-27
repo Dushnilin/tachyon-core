@@ -36,6 +36,15 @@ fn adapt_for_test(root: &mut Value) {
         ib["listen"] = Value::String("127.0.0.1".into());
         ib["listen_port"] = Value::from(0u16);
     }
+    // The fixture listens on the router's LAN address (192.168.1.1:9090);
+    // rewrite to an ephemeral loopback port on the test host.
+    if let Some(controller) = root
+        .get_mut("experimental")
+        .and_then(|exp| exp.get_mut("clash_api"))
+        .and_then(|ca| ca.get_mut("external_controller"))
+    {
+        *controller = Value::String("127.0.0.1:0".into());
+    }
 }
 
 fn inbound_addr(instance: &core_runtime::BoxInstance, tag: &str) -> SocketAddr {
@@ -70,6 +79,10 @@ async fn f1_exit_gate_starts_and_answers_fakeip_dns() {
     for tag in &expected {
         let _ = inbound_addr(&instance, tag);
     }
+    assert!(
+        instance.clash_api_addr().is_some(),
+        "fixture has experimental.clash_api; controller must bind"
+    );
 
     // UDP DNS through the direct inbound → hijack-dns → FakeIP pool
     // (domain_suffix google.com routes to fakeip-server; no upstream needed).

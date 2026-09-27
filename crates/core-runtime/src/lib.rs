@@ -1,3 +1,4 @@
+pub mod clash_api;
 pub mod dns;
 pub mod inbound;
 pub mod logging;
@@ -20,6 +21,7 @@ pub struct BoxInstance {
     tasks: Vec<JoinHandle<()>>,
     inbounds: Vec<(String, SocketAddr)>,
     dns: Option<Arc<dns::DnsService>>,
+    clash_api: Option<SocketAddr>,
 }
 
 impl BoxInstance {
@@ -31,6 +33,11 @@ impl BoxInstance {
     /// The configured dns service (`None` without a `dns` section).
     pub fn dns(&self) -> Option<Arc<dns::DnsService>> {
         self.dns.clone()
+    }
+
+    /// Bound clash-api external controller (`None` when not configured).
+    pub fn clash_api_addr(&self) -> Option<SocketAddr> {
+        self.clash_api
     }
 
     /// Abort all listeners and connection tasks.
@@ -70,6 +77,13 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
 
     let mut tasks = Vec::new();
     tasks.extend(router.take_probe_tasks());
+    let mut clash_api = None;
+    if let Some(clash) = clash_api::ClashApi::build(root).context("experimental.clash_api")? {
+        let (addr, handle) = clash.bind_and_spawn(Arc::clone(&router)).await?;
+        logging::info(format_args!("clash-api: restful api listening at {addr}"));
+        tasks.push(handle);
+        clash_api = Some(addr);
+    }
     if let Some(ntp) = ntp::NtpService::build(root)? {
         tasks.push(ntp.spawn());
     }
@@ -130,6 +144,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         tasks,
         inbounds,
         dns: dns_service,
+        clash_api,
     })
 }
 

@@ -2664,15 +2664,97 @@ fn validate_ntp(ntp: &Value) -> Result<(), String> {
 }
 
 fn validate_experimental(experimental: &Value) -> Result<(), String> {
-    let obj = experimental
-        .as_object()
-        .ok_or_else(|| "experimental: must be a JSON object".to_string())?;
+    if experimental.is_null() {
+        return Ok(());
+    }
+    let obj = experimental.as_object().ok_or_else(|| {
+        format!(
+            "experimental: json: cannot unmarshal {} into Go struct field \
+             _Options.experimental of type option.ExperimentalOptions",
+            json_kind(experimental)
+        )
+    })?;
     for key in obj.keys() {
         if !KNOWN_EXPERIMENTAL_FIELDS.contains(&key.as_str()) {
-            return Err(format!(
-                "experimental: {key}: json: unknown field \"{key}\""
-            ));
+            return Err(format!("experimental.{key}: json: unknown field \"{key}\""));
         }
+    }
+    if let Some(clash) = obj.get("clash_api")
+        && !clash.is_null()
+    {
+        validate_clash_api(clash)?;
+    }
+    Ok(())
+}
+
+/// `option.ClashAPIOptions` decode: field allowlist + type checks in input
+/// order, then the reference's post-decode deprecation guard (raised by
+/// `create clash-server` during `check` as well as `run`).
+fn validate_clash_api(clash: &Value) -> Result<(), String> {
+    const STRING_FIELDS: &[&str] = &[
+        "external_controller",
+        "external_ui",
+        "external_ui_download_url",
+        "external_ui_download_detour",
+        "secret",
+        "default_mode",
+        "cache_file",
+        "cache_id",
+    ];
+    const BOOL_FIELDS: &[&str] = &[
+        "access_control_allow_private_network",
+        "store_mode",
+        "store_selected",
+        "store_fakeip",
+    ];
+    const DEPRECATED_TRUTHY: &[&str] = &["store_mode", "store_selected", "store_fakeip"];
+    const DEPRECATED_NONEMPTY: &[&str] = &["cache_file", "cache_id"];
+
+    let obj = clash.as_object().ok_or_else(|| {
+        format!(
+            "experimental.clash_api: json: cannot unmarshal {} into Go struct field \
+             ExperimentalOptions.experimental.clash_api of type option.ClashAPIOptions",
+            json_kind(clash)
+        )
+    })?;
+    for (key, value) in obj {
+        let at = format!("experimental.clash_api.{key}");
+        if STRING_FIELDS.contains(&key.as_str()) {
+            if !matches!(value, Value::String(_) | Value::Null) {
+                return Err(format!(
+                    "{at}: json: cannot unmarshal {} into Go struct field \
+                     ClashAPIOptions.experimental.clash_api.{key} of type string",
+                    json_kind(value)
+                ));
+            }
+        } else if BOOL_FIELDS.contains(&key.as_str()) {
+            if !matches!(value, Value::Bool(_) | Value::Null) {
+                return Err(format!(
+                    "{at}: json: cannot unmarshal {} into Go struct field \
+                     ClashAPIOptions.experimental.clash_api.{key} of type bool",
+                    json_kind(value)
+                ));
+            }
+        } else if key == "access_control_allow_origin" {
+            check_listable_string(value, &at)?;
+        } else {
+            return Err(format!("{at}: json: unknown field \"{key}\""));
+        }
+    }
+    let deprecated = DEPRECATED_TRUTHY
+        .iter()
+        .any(|k| obj.get(*k) == Some(&Value::Bool(true)))
+        || DEPRECATED_NONEMPTY.iter().any(|k| {
+            obj.get(*k)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        });
+    if deprecated {
+        return Err(
+            "create clash-server: cache_file and related fields in Clash API is deprecated \
+             in sing-box 1.8.0, use experimental.cache_file instead."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -6910,6 +6992,79 @@ mod tests {
     fn rejects_unknown_top_level_field() {
         let err = validate(&json!({"clash_api": {}})).unwrap_err();
         assert!(err.contains("unknown field \"clash_api\""));
+    }
+
+    #[test]
+    fn clash_api_check_parity() {
+        let run = |cfg: Value| validate(&cfg).unwrap_err();
+
+        let err = run(json!({"experimental": {"clash_api": {"foo": 1}}}));
+        assert_eq!(
+            err,
+            "experimental.clash_api.foo: json: unknown field \"foo\""
+        );
+
+        let err = run(json!({"experimental": {"clash_api": {"external_controller": 1}}}));
+        assert_eq!(
+            err,
+            "experimental.clash_api.external_controller: json: cannot unmarshal number into \
+             Go struct field ClashAPIOptions.experimental.clash_api.external_controller \
+             of type string"
+        );
+        let err = run(json!({"experimental": {"clash_api": {"store_mode": 1}}}));
+        assert!(
+            err.contains(
+                "Go struct field ClashAPIOptions.experimental.clash_api.store_mode of type bool"
+            ),
+            "{err}"
+        );
+
+        let err = run(json!({"experimental": {"clash_api": {"access_control_allow_origin": 1}}}));
+        assert_eq!(
+            err,
+            "experimental.clash_api.access_control_allow_origin: (json: cannot unmarshal number \
+             into Go value of type string | json: cannot unmarshal number into Go value of type []string)"
+        );
+        let err = run(json!({"experimental": {"clash_api": {"access_control_allow_origin": [1]}}}));
+        assert!(
+            err.contains("[0]: json: cannot unmarshal number into Go value of type string"),
+            "{err}"
+        );
+
+        let err = run(json!({"experimental": {"clash_api": 1}}));
+        assert_eq!(
+            err,
+            "experimental.clash_api: json: cannot unmarshal number into Go struct field \
+             ExperimentalOptions.experimental.clash_api of type option.ClashAPIOptions"
+        );
+        let err = run(json!({"experimental": 1}));
+        assert_eq!(
+            err,
+            "experimental: json: cannot unmarshal number into Go struct field \
+             _Options.experimental of type option.ExperimentalOptions"
+        );
+        let err = run(json!({"experimental": {"zz": 1}}));
+        assert_eq!(err, "experimental.zz: json: unknown field \"zz\"");
+
+        assert!(validate(&json!({"experimental": null})).is_ok());
+        assert!(validate(&json!({"experimental": {"clash_api": null}})).is_ok());
+        let ok = json!({"experimental": {"clash_api": {
+            "external_controller": "127.0.0.1:9090", "secret": "s",
+            "access_control_allow_origin": ["*"],
+            "store_mode": false, "cache_file": "", "cache_id": "",
+            "default_mode": "rule", "external_ui": "/nonexistent"
+        }}});
+        assert!(validate(&ok).is_ok(), "{ok}");
+
+        let deprecated = "create clash-server: cache_file and related fields in Clash API is \
+                           deprecated in sing-box 1.8.0, use experimental.cache_file instead.";
+        let err = run(json!({"experimental": {"clash_api": {"store_selected": true}}}));
+        assert_eq!(err, deprecated);
+        let err = run(json!({"experimental": {"clash_api": {"cache_file": "c.db"}}}));
+        assert_eq!(err, deprecated);
+        // decode errors precede the deprecation guard
+        let err = run(json!({"experimental": {"clash_api": {"store_mode": 1}}}));
+        assert!(!err.starts_with("create clash-server"), "{err}");
     }
 
     #[test]

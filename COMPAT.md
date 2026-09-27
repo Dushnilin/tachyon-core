@@ -46,7 +46,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `outbounds` | planned | see protocol table |
 | `route` | partial | matchers + actions live; dial defaults `auto_detect_interface`/`default_interface`/`default_mark`/`default_domain_resolver` live (Linux SO_MARK/SO_BINDTODEVICE; non-Linux mark/interface inert); reject flood counter; `default_domain_strategy` rejected like leadaxe; per-outbound `domain_resolver` dial field not yet; rule_set/SRS F3 |
 | `services` | planned | |
-| `experimental` | planned | cache_file, clash_api |
+| `experimental` | partial | clash_api slice live (check parity + REST, see below); cache_file not wired |
 | `http_clients` | planned | 1.14+ gate |
 
 ## Outbound protocols
@@ -84,4 +84,4 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | Feature | Status | Notes |
 |---|---|---|
 | `cache_file` (bbolt, store_fakeip/store_dns) | planned | must read/write upstream `cache.db` |
-| `clash_api` | planned | external_controller :9090, Yacd UI, secret |
+| `clash_api` | runtime (REST slice) | external_controller + secret (Bearer header, ws `?token=`), CORS middleware order/probe-verified error bodies, `GET /` `/version` `/proxies` `/proxies/{name}` (trailing slash), selector `PUT` (204 / `Must be a Selector` / `Selector update error: not found`), delay (i16 timeout, `http://` quirk, 400/503/504), keep-alive; deprecated fields (`store_*`, `cache_file`/`cache_id`) rejected at check like lx.3; gaps: `/logs` `/traffic` `/connections` `/rules`, providers, `external_ui`, history |

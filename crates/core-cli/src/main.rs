@@ -44,12 +44,22 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let path = config_path_from(args).ok_or("check: missing -c/--config <path>")?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("check: read {}: {e}", path.display()))?;
+    // like the reference, `check` reports errors only — the ResolveLX
+    // deprecation warnings surface at run time
     core_config::check_str(&raw).map_err(|e| format!("check: {}: {e}", path.display()))?;
     Ok(())
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let path = config_path_from(args).ok_or("run: missing -c/--config <path>")?;
+    if let Ok(raw) = std::fs::read_to_string(&path)
+        && let Ok(warnings) = core_config::check_str_warnings(&raw)
+    {
+        // the reference logs ResolveLX deprecations when the box starts
+        for warning in warnings {
+            eprintln!("WARN[0000] {warning}");
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

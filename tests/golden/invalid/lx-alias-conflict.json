@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "lx": {
+    "wg": {
+      "idle_suspend": "30s"
+    }
+  },
+  "route": {
+    "lx_idle_suspend": "1m"
+  }
+}

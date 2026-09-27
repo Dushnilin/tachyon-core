@@ -14,6 +14,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 const KNOWN_TOP_LEVEL: &[&str] = &[
+    "lx",
     "log",
     "dns",
     "ntp",
@@ -141,6 +142,9 @@ const KNOWN_ROUTE_FIELDS: &[&str] = &[
     "rules",
     "final",
     "rule_set",
+    "lx_idle_suspend",
+    "lx_idle_suspend_reachable",
+    "lx_idle_teardown",
     "geoip",
     "geosite",
     "find_process",
@@ -852,6 +856,12 @@ fn go_parse_duration(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `badoption.Duration` in nanoseconds; a bare `0` (no unit) is 0, which
+/// `go_duration_ns` reports as unparsed because it has no unit suffix.
+fn go_duration_ns_or_zero(raw: &str) -> i64 {
+    go_duration_ns(raw).unwrap_or(0) as i64
+}
+
 /// Parsed duration in nanoseconds for legacy-vs-tls conflict comparisons
 /// (`badoption.Duration` equality). `None` when the text is not a valid
 /// duration — callers treat that as zero, decode has already rejected it.
@@ -1079,6 +1089,22 @@ fn check_uint_field(
         }
         other => Err(format!(
             "{at}: json: cannot unmarshal {} into Go struct field {go_struct}.{go_field} of type uint{bits}",
+            json_kind(other)
+        )),
+    }
+}
+
+/// Bool field at decode: null OK; every other kind reports the Go message.
+fn check_bool_field(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    go_field: &str,
+) -> Result<(), String> {
+    match value {
+        Value::Null | Value::Bool(_) => Ok(()),
+        other => Err(format!(
+            "{at}: json: cannot unmarshal {} into Go struct field {go_struct}.{go_field} of type bool",
             json_kind(other)
         )),
     }
@@ -2409,6 +2435,15 @@ pub fn validate(root: &Value) -> Result<(), String> {
             return Err(format!("{key}: json: unknown field \"{key}\""));
         }
     }
+
+    // ResolveLX: decode the block, fold the deprecated route.lx_idle_*
+    // aliases into it, then validate the merged result once.
+    let mut lx = validate_lx(root.get("lx"))?.unwrap_or_default();
+    if let Some(route) = root.get("route") {
+        let warnings = resolve_lx_aliases(&mut lx, route)?;
+        record_warnings(warnings);
+    }
+    resolve_lx_values(&lx)?;
 
     if let Some(log) = root.get("log") {
         validate_log(log)?;
@@ -8644,6 +8679,179 @@ mod tests {
         assert!(validate(&masque(json!({"server_port": null}))).is_ok());
         assert!(validate(&masque(json!({"server_port": []}))).is_ok());
     }
+
+    /// Parse a config literal for the lx parity tests.
+    fn lx_json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("probe json")
+    }
+
+    #[test]
+    fn lx_block_decode_and_resolution() {
+        // empty / null blocks are accepted
+        assert!(validate(&lx_json(r#"{"lx":{}}"#)).is_ok());
+        assert!(validate(&lx_json(r#"{"lx":null}"#)).is_ok());
+        assert!(validate(&lx_json(r#"{"lx":{"wg":null,"masque":null}}"#)).is_ok());
+        // full block with every knob
+        assert!(
+            validate(&lx_json(
+                r#"{"lx":{"wg":{"idle_suspend":"30s","idle_suspend_reachable":"5m",
+                    "idle_teardown":"0","lazy_build":true,"build_max":4,
+                    "build_overflow":"build"}}}"#
+            ))
+            .is_ok()
+        );
+        assert!(validate(&lx_json(r#"{"lx":{"masque":{"idle_timeout":"30s"}}}"#)).is_ok());
+        assert!(validate(&lx_json(r#"{"lx":{"wg":{"build_overflow":"wait"}}}"#)).is_ok());
+    }
+
+    #[test]
+    fn lx_decode_errors() {
+        let cases = [
+            (
+                r#"{"lx":{"nope":{}}}"#,
+                r#"lx.nope: json: unknown field "nope""#,
+            ),
+            (
+                r#"{"lx":{"wg":{"nope":1}}}"#,
+                r#"lx.wg.nope: json: unknown field "nope""#,
+            ),
+            (
+                r#"{"lx":{"masque":{"nope":1}}}"#,
+                r#"lx.masque.nope: json: unknown field "nope""#,
+            ),
+            (
+                r#"{"lx":5}"#,
+                "lx: json: cannot unmarshal number into Go struct field _Options.lx of type option.LXOptions",
+            ),
+            (
+                r#"{"lx":{"wg":5}}"#,
+                "lx.wg: json: cannot unmarshal number into Go struct field LXOptions.lx.wg of type option.LXWGOptions",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend":5}}}"#,
+                "lx.wg.idle_suspend: json: cannot unmarshal number into Go struct field LXWGOptions.lx.wg.idle_suspend of type string",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend":"5x"}}}"#,
+                r#"lx.wg.idle_suspend: time: unknown unit "x" in duration "5x""#,
+            ),
+            (
+                r#"{"lx":{"wg":{"lazy_build":"yes"}}}"#,
+                "lx.wg.lazy_build: json: cannot unmarshal string into Go struct field LXWGOptions.lx.wg.lazy_build of type bool",
+            ),
+            (
+                r#"{"lx":{"wg":{"build_max":"4"}}}"#,
+                "lx.wg.build_max: json: cannot unmarshal string into Go struct field LXWGOptions.lx.wg.build_max of type int",
+            ),
+            (
+                r#"{"lx":{"wg":{"build_max":1.5}}}"#,
+                "lx.wg.build_max: json: cannot unmarshal number 1.5 into Go struct field LXWGOptions.lx.wg.build_max of type int",
+            ),
+        ];
+        for (config, message) in cases {
+            assert_eq!(validate(&lx_json(config)).unwrap_err(), message, "{config}");
+        }
+    }
+
+    #[test]
+    fn lx_resolution_chain() {
+        let cases = [
+            (
+                r#"{"lx":{"wg":{"idle_suspend":"-1s"}}}"#,
+                "lx.wg.idle_suspend must be >= 0",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend":"1s","idle_suspend_reachable":"-1s"}}}"#,
+                "lx.wg.idle_suspend_reachable must be >= 0",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend":"1s","idle_teardown":"-1s"}}}"#,
+                "lx.wg.idle_teardown must be >= 0",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend_reachable":"5m"}}}"#,
+                "lx.wg.idle_suspend_reachable requires lx.wg.idle_suspend",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_teardown":"0"}}}"#,
+                "lx.wg.idle_teardown requires lx.wg.idle_suspend",
+            ),
+            (
+                r#"{"lx":{"wg":{"lazy_build":true}}}"#,
+                "lx.wg.lazy_build requires lx.wg.idle_suspend",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend":"5m","idle_suspend_reachable":"1m"}}}"#,
+                "lx.wg.idle_suspend_reachable must be >= lx.wg.idle_suspend",
+            ),
+            (
+                r#"{"lx":{"wg":{"idle_suspend":"1s","build_max":-1}}}"#,
+                "lx.wg.build_max must be >= 0",
+            ),
+            (
+                r#"{"lx":{"wg":{"build_overflow":"nope"}}}"#,
+                "lx.wg.build_overflow must be \"wait\" or \"build\"",
+            ),
+            (
+                r#"{"lx":{"masque":{"idle_timeout":"-1s"}}}"#,
+                "lx.masque.idle_timeout must be >= 0",
+            ),
+        ];
+        for (config, message) in cases {
+            assert_eq!(validate(&lx_json(config)).unwrap_err(), message, "{config}");
+        }
+    }
+
+    #[test]
+    fn lx_legacy_route_aliases() {
+        // folds silently, exit 0
+        assert!(validate(&lx_json(r#"{"route":{"lx_idle_suspend":"30s"}}"#)).is_ok());
+        assert!(
+            validate(&lx_json(
+                r#"{"route":{"lx_idle_suspend":"30s","lx_idle_teardown":"1m"}}"#
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate(&lx_json(
+                r#"{"lx":{"wg":{"idle_suspend":"30s"}},"route":{"lx_idle_suspend":"30s"}}"#
+            ))
+            .is_ok()
+        );
+        // the folded value feeds the same validation chain
+        assert_eq!(
+            validate(&lx_json(r#"{"route":{"lx_idle_suspend_reachable":"5m"}}"#)).unwrap_err(),
+            "lx.wg.idle_suspend_reachable requires lx.wg.idle_suspend"
+        );
+        assert_eq!(
+            validate(&lx_json(r#"{"route":{"lx_idle_teardown":"0"}}"#)).unwrap_err(),
+            "lx.wg.idle_teardown requires lx.wg.idle_suspend"
+        );
+        // conflicting values are rejected before the chain runs
+        assert_eq!(
+            validate(&lx_json(
+                r#"{"lx":{"wg":{"idle_suspend":"30s"}},"route":{"lx_idle_suspend":"1m"}}"#
+            ))
+            .unwrap_err(),
+            "route.lx_idle_suspend conflicts with lx.wg.idle_suspend"
+        );
+        assert_eq!(
+            validate(&lx_json(
+                r#"{"lx":{"wg":{"idle_teardown":"0"}},"route":{"lx_idle_teardown":"1m"}}"#
+            ))
+            .unwrap_err(),
+            "route.lx_idle_teardown conflicts with lx.wg.idle_teardown"
+        );
+        // decode errors keep the route prefix and the Go field path
+        assert_eq!(
+            validate(&lx_json(r#"{"route":{"lx_idle_suspend":"5x"}}"#)).unwrap_err(),
+            r#"route.lx_idle_suspend: time: unknown unit "x" in duration "5x""#
+        );
+        assert_eq!(
+            validate(&lx_json(r#"{"route":{"lx_idle_suspend":30}}"#)).unwrap_err(),
+            "route.lx_idle_suspend: json: cannot unmarshal number into Go struct field RouteOptions.route.lx_idle_suspend of type string"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14026,4 +14234,274 @@ mod endpoint_probe_parity_tests {
             r#"endpoints[0].ssh_server.nope: json: unknown field "nope""#
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// lx: the fork's root block (option/lx.go) — decode + `ResolveLX`
+// ---------------------------------------------------------------------------
+
+/// Warnings collected during the last `validate()` call (deprecation notices
+/// the reference logs but does not treat as errors).
+static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_warnings(warnings: Vec<String>) {
+    if warnings.is_empty() {
+        return;
+    }
+    if let Ok(mut slot) = WARNINGS.lock() {
+        slot.extend(warnings);
+    }
+}
+
+/// Drain the warnings collected by the last `validate()` call.
+pub fn take_warnings() -> Vec<String> {
+    WARNINGS
+        .lock()
+        .map(|mut slot| std::mem::take(&mut *slot))
+        .unwrap_or_default()
+}
+
+/// `check` equivalent that also reports reference warnings.
+pub fn validate_with_warnings(root: &Value) -> Result<Vec<String>, String> {
+    validate(root)?;
+    Ok(take_warnings())
+}
+
+/// Decoded `lx.wg` durations in nanoseconds (`None` = absent).
+#[derive(Clone, Default)]
+struct LxBlock {
+    idle_suspend: Option<i64>,
+    idle_suspend_reachable: Option<i64>,
+    idle_teardown: Option<i64>,
+    lazy_build: bool,
+    build_max: i64,
+    build_overflow: String,
+    masque_idle_timeout: Option<i64>,
+}
+
+/// Duration field of the lx block: Go duration strings only (badoption.Duration).
+fn lx_duration(value: Option<&Value>, at: &str, field: &str) -> Result<Option<i64>, String> {
+    let go_field = format!("lx.wg.{field}");
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    check_duration_field(value, at, "LXWGOptions", &go_field)?;
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    go_parse_duration(text)?;
+    Ok(Some(go_duration_ns_or_zero(text)))
+}
+
+fn lx_masque_duration(value: Option<&Value>, at: &str, field: &str) -> Result<Option<i64>, String> {
+    let go_field = format!("lx.masque.{field}");
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    check_duration_field(value, at, "LXMASQUEOptions", &go_field)?;
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    go_parse_duration(text)?;
+    Ok(Some(go_duration_ns_or_zero(text)))
+}
+
+/// `check` accepts a null block; anything else must be an object.
+/// `go_path` is the full Go field path (`_Options.lx`, `LXOptions.lx.wg`).
+fn lx_object<'a>(
+    value: Option<&'a Value>,
+    at: &str,
+    go_path: &str,
+) -> Result<Option<&'a Map<String, Value>>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map)),
+        Some(other) => Err(format!(
+            "{at}: json: cannot unmarshal {} into Go struct field {go_path} of type {}",
+            json_kind(other),
+            go_type(go_path)
+        )),
+    }
+}
+
+/// `option.LXOptions` / `option.LXWGOptions` / `option.LXMASQUEOptions`.
+fn go_type(go_path: &str) -> &'static str {
+    if go_path.ends_with("lx.masque") {
+        "option.LXMASQUEOptions"
+    } else if go_path.ends_with("lx.wg") {
+        "option.LXWGOptions"
+    } else {
+        "option.LXOptions"
+    }
+}
+
+/// `lx` decode + the `resolveLXValues` chain, in reference order.
+fn validate_lx(value: Option<&Value>) -> Result<Option<LxBlock>, String> {
+    let Some(lx) = lx_object(value, "lx", "_Options.lx")? else {
+        return Ok(None);
+    };
+    let mut block = LxBlock::default();
+    for (key, entry) in lx {
+        match key.as_str() {
+            "wg" => {
+                let Some(wg) = lx_object(Some(entry), "lx.wg", "LXOptions.lx.wg")? else {
+                    continue;
+                };
+                for (field, item) in wg {
+                    match field.as_str() {
+                        "idle_suspend" => {
+                            block.idle_suspend =
+                                lx_duration(Some(item), "lx.wg.idle_suspend", field)?
+                        }
+                        "idle_suspend_reachable" => {
+                            block.idle_suspend_reachable =
+                                lx_duration(Some(item), "lx.wg.idle_suspend_reachable", field)?
+                        }
+                        "idle_teardown" => {
+                            block.idle_teardown =
+                                lx_duration(Some(item), "lx.wg.idle_teardown", field)?
+                        }
+                        "lazy_build" => {
+                            check_bool_field(
+                                item,
+                                &format!("lx.wg.{field}"),
+                                "LXWGOptions",
+                                &format!("lx.wg.{field}"),
+                            )?;
+                            block.lazy_build = item.as_bool().unwrap_or(false);
+                        }
+                        "build_max" => {
+                            check_int_field(
+                                item,
+                                &format!("lx.wg.{field}"),
+                                "LXWGOptions",
+                                &format!("lx.wg.{field}"),
+                            )?;
+                            block.build_max = item.as_i64().unwrap_or(0);
+                        }
+                        "build_overflow" => {
+                            check_string_field(
+                                item,
+                                &format!("lx.wg.{field}"),
+                                "LXWGOptions",
+                                &format!("lx.wg.{field}"),
+                            )?;
+                            block.build_overflow = item.as_str().unwrap_or("").to_string();
+                        }
+                        other => {
+                            return Err(format!("lx.wg.{other}: json: unknown field \"{other}\""));
+                        }
+                    }
+                }
+            }
+            "masque" => {
+                let Some(masque) = lx_object(Some(entry), "lx.masque", "LXOptions.lx.masque")?
+                else {
+                    continue;
+                };
+                for (field, item) in masque {
+                    match field.as_str() {
+                        "idle_timeout" => {
+                            block.masque_idle_timeout =
+                                lx_masque_duration(Some(item), "lx.masque.idle_timeout", field)?
+                        }
+                        other => {
+                            return Err(format!(
+                                "lx.masque.{other}: json: unknown field \"{other}\""
+                            ));
+                        }
+                    }
+                }
+            }
+            other => return Err(format!("lx.{other}: json: unknown field \"{other}\"")),
+        }
+    }
+    Ok(Some(block))
+}
+
+/// `resolveLXValues`: the post-decode validation chain (no `decode config at`).
+fn resolve_lx_values(block: &LxBlock) -> Result<(), String> {
+    let suspend = block.idle_suspend.unwrap_or(0);
+    let reachable = block.idle_suspend_reachable.unwrap_or(0);
+    if suspend < 0 {
+        return Err("lx.wg.idle_suspend must be >= 0".to_string());
+    }
+    if reachable < 0 {
+        return Err("lx.wg.idle_suspend_reachable must be >= 0".to_string());
+    }
+    if block.idle_teardown.is_some_and(|value| value < 0) {
+        return Err("lx.wg.idle_teardown must be >= 0".to_string());
+    }
+    if suspend == 0 {
+        if reachable > 0 {
+            return Err("lx.wg.idle_suspend_reachable requires lx.wg.idle_suspend".to_string());
+        }
+        if block.idle_teardown.is_some() {
+            return Err("lx.wg.idle_teardown requires lx.wg.idle_suspend".to_string());
+        }
+        if block.lazy_build {
+            return Err("lx.wg.lazy_build requires lx.wg.idle_suspend".to_string());
+        }
+    }
+    if reachable > 0 && reachable < suspend {
+        return Err("lx.wg.idle_suspend_reachable must be >= lx.wg.idle_suspend".to_string());
+    }
+    if block.build_max < 0 {
+        return Err("lx.wg.build_max must be >= 0".to_string());
+    }
+    match block.build_overflow.as_str() {
+        "" | "wait" | "build" => {}
+        _ => return Err("lx.wg.build_overflow must be \"wait\" or \"build\"".to_string()),
+    }
+    if block.masque_idle_timeout.is_some_and(|value| value < 0) {
+        return Err("lx.masque.idle_timeout must be >= 0".to_string());
+    }
+    Ok(())
+}
+
+/// Deprecated `route.lx_idle_*` aliases: same value folds silently, a
+/// different value conflicts, and the folded block is validated again.
+/// Returns one deprecation warning per alias that folded.
+fn resolve_lx_aliases(lx: &mut LxBlock, route: &Value) -> Result<Vec<String>, String> {
+    let Some(route) = route.as_object() else {
+        return Ok(Vec::new());
+    };
+    let folded = lx;
+    let mut warnings = Vec::new();
+    for (legacy, field) in [
+        ("lx_idle_suspend", "idle_suspend"),
+        ("lx_idle_suspend_reachable", "idle_suspend_reachable"),
+        ("lx_idle_teardown", "idle_teardown"),
+    ] {
+        let Some(value) = route.get(legacy) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let at = format!("route.{legacy}");
+        check_duration_field(value, &at, "RouteOptions", &format!("route.{legacy}"))?;
+        let Some(text) = value.as_str() else { continue };
+        go_parse_duration(text)?;
+        let nanos = go_duration_ns_or_zero(text);
+        let current = match field {
+            "idle_suspend" => folded.idle_suspend,
+            "idle_suspend_reachable" => folded.idle_suspend_reachable,
+            _ => folded.idle_teardown,
+        };
+        if let Some(current) = current
+            && current != nanos
+        {
+            return Err(format!("route.{legacy} conflicts with lx.wg.{field}"));
+        }
+        match field {
+            "idle_suspend" => folded.idle_suspend = Some(nanos),
+            "idle_suspend_reachable" => folded.idle_suspend_reachable = Some(nanos),
+            _ => folded.idle_teardown = Some(nanos),
+        }
+        warnings.push(format!("route.{legacy} is deprecated, use lx.wg.{field}"));
+    }
+    Ok(warnings)
 }

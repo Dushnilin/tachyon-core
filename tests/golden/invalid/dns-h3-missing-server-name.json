@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "h3",
+        "tag": "h3"
+      }
+    ]
+  }
+}

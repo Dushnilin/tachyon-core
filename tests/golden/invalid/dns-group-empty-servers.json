@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "group",
+        "tag": "g",
+        "servers": []
+      }
+    ]
+  }
+}

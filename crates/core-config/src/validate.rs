@@ -263,8 +263,71 @@ const KNOWN_OUTBOUND_TYPES: &[&str] = &[
 const TRANSPORT_TYPES: &[&str] = &["ws", "quic", "grpc", "httpupgrade", "http", "xhttp"];
 
 const DNS_SERVER_TYPES: &[&str] = &[
-    "tcp", "udp", "tls", "https", "quic", "h3", "hosts", "fakeip", "dhcp",
+    "tcp",
+    "udp",
+    "tls",
+    "https",
+    "quic",
+    "h3",
+    "hosts",
+    "fakeip",
+    "dhcp",
+    // lx/upstream additions
+    "local",
+    "mdns",
+    "resolved",
+    "tailscale",
+    "openvpn",
+    "openconnect",
+    "group",
 ];
+
+/// `RawLocalDNSServerOptions` = DialerOptions; every DNS transport embeds it.
+const DNS_DIALER_FIELDS: &[&str] = DIALER_OUT_FIELDS;
+
+/// Per-type allowlists (option/dns.go + the endpoint option structs).
+fn dns_server_fields(ty: &str) -> Vec<&'static str> {
+    let dialer = DNS_DIALER_FIELDS;
+    let mut fields: Vec<&'static str> = vec!["type", "tag"];
+    fields.extend_from_slice(dialer);
+    match ty {
+        "udp" | "tcp" => fields.extend_from_slice(&["server", "server_port"]),
+        "tls" | "quic" => {
+            fields.extend_from_slice(&["server", "server_port", "tls"]);
+        }
+        "https" => {
+            fields.extend_from_slice(&["server", "server_port", "tls", "path", "method", "headers"])
+        }
+        "h3" => fields.extend_from_slice(&["server", "server_port", "tls", "path"]),
+        "hosts" => fields.extend_from_slice(&["path", "predefined"]),
+        "fakeip" => fields.extend_from_slice(&["inet4_range", "inet6_range"]),
+        "local" => fields.extend_from_slice(&["prefer_go", "neighbor_domain"]),
+        "dhcp" => fields.extend_from_slice(&["prefer_go", "neighbor_domain", "interface"]),
+        "mdns" => fields.extend_from_slice(&["prefer_go", "neighbor_domain", "interface"]),
+        "resolved" => fields.extend_from_slice(&["service", "accept_default_resolvers"]),
+        "tailscale" | "openvpn" | "openconnect" => {
+            fields.extend_from_slice(&[
+                "endpoint",
+                "accept_default_resolvers",
+                "accept_search_domain",
+            ]);
+        }
+        "group" => fields.extend_from_slice(&["servers", "mode", "error_ttl", "win_ttl"]),
+        _ => {}
+    }
+    fields
+}
+
+/// Types whose init requires an endpoint tag (protocol/{tailscale,openvpn,
+/// openconnect}/dns_transport.go).
+fn dns_endpoint_tag_error(ty: &str, tag: &str) -> Option<String> {
+    let message = match ty {
+        "tailscale" => "missing tailscale endpoint tag",
+        "openvpn" | "openconnect" => "missing endpoint tag",
+        _ => return None,
+    };
+    Some(format!("initialize DNS server[0] {ty}[{tag}]: {message}"))
+}
 
 const SS_METHODS: &[&str] = &[
     "2022-blake3-aes-128-gcm",
@@ -2920,6 +2983,7 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
     let servers = servers
         .as_array()
         .ok_or_else(|| "dns.servers: must be an array".to_string())?;
+    let mut seen: Vec<(String, &'static str, usize)> = Vec::new();
     for (i, server) in servers.iter().enumerate() {
         let server = server.as_object().ok_or_else(|| {
             format!(
@@ -2935,24 +2999,51 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
         if !DNS_SERVER_TYPES.contains(&ty) {
             return Err(format!("dns.servers[{i}]: unknown transport type: {ty}"));
         }
-        if let Some(tag) = server.get("tag").and_then(Value::as_str) {
-            tags.insert(tag.to_string());
+        let server_tag = server.get("tag").and_then(Value::as_str).unwrap_or("");
+        if !server_tag.is_empty() {
+            tags.insert(server_tag.to_string());
+            let static_ty = DNS_SERVER_TYPES
+                .iter()
+                .find(|known| **known == ty)
+                .copied()
+                .unwrap_or("");
+            seen.push((server_tag.to_string(), static_ty, i));
         }
-        if (ty == "fakeip" || ty == "dhcp") && server.contains_key("server") {
-            return Err(format!(
-                "dns.servers[{i}]: server: json: unknown field \"server\""
-            ));
+        // per-type field allowlist (reference decodes the concrete options
+        // with DisallowUnknownFields)
+        let allowed = dns_server_fields(ty);
+        for key in server.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "dns.servers[{i}].{key}: json: unknown field \"{key}\""
+                ));
+            }
         }
+        validate_dns_server_fields(ty, server, server_tag, &seen)?;
         if ty == "fakeip" {
             let has_ranges =
                 server.contains_key("inet4_range") || server.contains_key("inet6_range");
+            let tag = server.get("tag").and_then(Value::as_str).unwrap_or("");
             if !has_ranges {
-                let tag = server.get("tag").and_then(Value::as_str).unwrap_or("");
                 return Err(format!(
                     "initialize DNS server[{i}] fakeip[{tag}]: at least one of inet4_range or inet6_range must be set"
                 ));
             }
         }
+    }
+    // the default transport (`dns.final`, else the first server) cannot be fakeip
+    let final_tag = obj.get("final").and_then(Value::as_str).unwrap_or("");
+    let default = if final_tag.is_empty() {
+        seen.first()
+    } else {
+        seen.iter().find(|(known, _, _)| known == final_tag)
+    };
+    if let Some((tag, ty, index)) = default
+        && *ty == "fakeip"
+    {
+        return Err(format!(
+            "initialize DNS server[{index}] fakeip[{tag}]: default server cannot be fakeip"
+        ));
     }
     Ok(())
 }
@@ -8852,6 +8943,143 @@ mod tests {
             "route.lx_idle_suspend: json: cannot unmarshal number into Go struct field RouteOptions.route.lx_idle_suspend of type string"
         );
     }
+
+    #[test]
+    fn dns_server_types_and_fields() {
+        let json = |raw: &str| lx_json(raw);
+        // new transports decode
+        for config in [
+            r#"{"dns":{"servers":[{"type":"local","tag":"l","prefer_go":true}]}}"#,
+            r#"{"dns":{"servers":[{"type":"local","tag":"l","neighbor_domain":[".local"]}]}}"#,
+            r#"{"dns":{"servers":[{"type":"mdns","tag":"m","interface":["eth0"]}]}}"#,
+            r#"{"dns":{"servers":[{"type":"dhcp","tag":"d","interface":"eth0"}]}}"#,
+            r#"{"dns":{"servers":[{"type":"udp","tag":"a","server":"1.1.1.1"},
+                {"type":"group","tag":"g","servers":["a"],"mode":"fastest"}]}}"#,
+            r#"{"dns":{"servers":[{"type":"https","tag":"h","server":"1.1.1.1","path":"/dns-query"}]}}"#,
+        ] {
+            assert!(validate(&json(config)).is_ok(), "{config}");
+        }
+        // unknown fields are rejected with the reference's path
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"udp","server":"1.1.1.1","bogus":1}]}}"#
+            ))
+            .unwrap_err(),
+            r#"dns.servers[0].bogus: json: unknown field "bogus""#
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"local","tag":"l","path":"/x"}]}}"#
+            ))
+            .unwrap_err(),
+            r#"dns.servers[0].path: json: unknown field "path""#
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"local","tag":"l","prefer_go":"yes"}]}}"#
+            ))
+            .unwrap_err(),
+            "dns.servers[0].prefer_go: json: cannot unmarshal string into Go struct field LocalDNSServerOptions.prefer_go of type bool"
+        );
+        // init-chain messages
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"local","tag":"l","neighbor_domain":["home.arpa"]}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] local[l]: neighbor_domain entry must start with '.': home.arpa"
+        );
+        assert_eq!(
+            validate(&json(r#"{"dns":{"servers":[{"type":"h3","tag":"h"}]}}"#)).unwrap_err(),
+            "initialize DNS server[0] h3[h]: missing server_name or insecure=true"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"tailscale","tag":"t"}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] tailscale[t]: missing tailscale endpoint tag"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"openvpn","tag":"o"}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] openvpn[o]: missing endpoint tag"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"openconnect","tag":"c"}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] openconnect[c]: missing endpoint tag"
+        );
+        // h3 accepts a bare server address as the effective name
+        assert!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"h3","tag":"h","server":"1.1.1.1"}]}}"#
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn dns_group_and_default_rules() {
+        let json = |raw: &str| lx_json(raw);
+        // group messages carry the initialize prefix and the group[tag] body
+        assert_eq!(
+            validate(&json(r#"{"dns":{"servers":[{"type":"group","tag":"g"}]}}"#)).unwrap_err(),
+            "initialize DNS server[0] group[g]: group[g]: servers is required and must not be empty"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"udp","tag":"a","server":"1.1.1.1"},
+                    {"type":"group","tag":"g","servers":["a","a"]}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] group[g]: group[g]: duplicate server: a"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"udp","tag":"a","server":"1.1.1.1"},
+                    {"type":"group","tag":"g","servers":["g"]}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] group[g]: group[g]: group cannot contain itself"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"udp","tag":"a","server":"1.1.1.1"},
+                    {"type":"group","tag":"g","servers":["a"],"mode":"nope"}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] group[g]: group[g]: unknown mode: nope (expected stable, fastest or parallel)"
+        );
+        // the default server may not be fakeip
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"fakeip","tag":"f","inet4_range":"198.18.0.0/15"}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] fakeip[f]: default server cannot be fakeip"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"fakeip","tag":"f","inet4_range":"198.18.0.0/15"},
+                    {"type":"udp","tag":"a","server":"1.1.1.1"}],"final":"f"}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[0] fakeip[f]: default server cannot be fakeip"
+        );
+        // ...but fine as a non-default member
+        assert!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"udp","tag":"a","server":"1.1.1.1"},
+                    {"type":"fakeip","tag":"f","inet4_range":"198.18.0.0/15"}]}}"#
+            ))
+            .is_ok()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14504,4 +14732,209 @@ fn resolve_lx_aliases(lx: &mut LxBlock, route: &Value) -> Result<Vec<String>, St
         warnings.push(format!("route.{legacy} is deprecated, use lx.wg.{field}"));
     }
     Ok(warnings)
+}
+
+/// Type-specific field checks and init-chain messages for DNS servers
+/// (option/dns.go plus each transport's `NewXxx` chain).
+///
+/// `seen` carries the `(tag, type)` pairs collected so far, so groups can
+/// resolve their members.
+fn validate_dns_server_fields(
+    ty: &str,
+    server: &Map<String, Value>,
+    tag: &str,
+    seen: &[(String, &'static str, usize)],
+) -> Result<(), String> {
+    let at = "dns.servers[0]";
+    let listable_strings = |value: &Value, at: &str| -> Result<Vec<String>, String> {
+        match value {
+            Value::Null => Ok(Vec::new()),
+            Value::String(text) => Ok(vec![text.clone()]),
+            Value::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    match item {
+                        Value::String(text) => out.push(text.clone()),
+                        other => {
+                            return Err(format!(
+                                "{at}[{index}]: json: cannot unmarshal {} into Go value of type string",
+                                json_kind(other)
+                            ));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            other => Err(format!(
+                "{at}: json: cannot unmarshal {} into Go value of type string",
+                json_kind(other)
+            )),
+        }
+    };
+    match ty {
+        "local" | "dhcp" | "mdns" => {
+            if let Some(value) = server.get("prefer_go") {
+                check_bool_field(
+                    value,
+                    &format!("{at}.prefer_go"),
+                    "LocalDNSServerOptions",
+                    "prefer_go",
+                )?;
+            }
+            if let Some(value) = server.get("neighbor_domain") {
+                for entry in listable_strings(value, &format!("{at}.neighbor_domain"))? {
+                    if !entry.starts_with('.') {
+                        return Err(format!(
+                            "initialize DNS server[0] {ty}[{tag}]: neighbor_domain entry must start with '.': {entry}"
+                        ));
+                    }
+                }
+            }
+            if let Some(field) = server.get("interface") {
+                // badoption.Listable[string] (mdns) and a plain string (dhcp)
+                if field.as_str().is_none() && !matches!(field, Value::Array(_) | Value::Null) {
+                    return Err(format!(
+                        "{at}.interface: (json: cannot unmarshal {} into Go value of type string | json: cannot unmarshal {} into Go value of type []string)",
+                        json_kind(field),
+                        json_kind(field)
+                    ));
+                }
+                if matches!(field, Value::Array(_)) {
+                    listable_strings(field, &format!("{at}.interface"))?;
+                }
+            }
+        }
+        "h3" => {
+            // reference `RemoteHTTPSDNSServerOptions` for h3: a server name or
+            // insecure TLS is required
+            let tls = server.get("tls").and_then(Value::as_object);
+            let insecure = tls
+                .and_then(|tls| tls.get("insecure"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let server_name = tls
+                .and_then(|tls| tls.get("server_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| server.get("server").and_then(Value::as_str).unwrap_or(""));
+            if server_name.is_empty() && !insecure {
+                return Err(format!(
+                    "initialize DNS server[0] h3[{tag}]: missing server_name or insecure=true"
+                ));
+            }
+        }
+        "resolved" => {
+            if let Some(value) = server.get("service") {
+                check_string_field(
+                    value,
+                    &format!("{at}.service"),
+                    "ResolvedDNSServerOptions",
+                    "service",
+                )?;
+            }
+            if let Some(value) = server.get("accept_default_resolvers") {
+                check_bool_field(
+                    value,
+                    &format!("{at}.accept_default_resolvers"),
+                    "ResolvedDNSServerOptions",
+                    "accept_default_resolvers",
+                )?;
+            }
+            if !cfg!(target_os = "linux") {
+                return Err(format!(
+                    "initialize DNS server[0] resolved[{tag}]: resolved DNS server is only supported on Linux"
+                ));
+            }
+        }
+        "tailscale" | "openvpn" | "openconnect" => {
+            let endpoint = server.get("endpoint").and_then(Value::as_str).unwrap_or("");
+            if endpoint.is_empty() {
+                if let Some(message) = dns_endpoint_tag_error(ty, tag) {
+                    return Err(message);
+                }
+            } else if !seen.iter().any(|(known, _, _)| known == endpoint) {
+                // endpoints live in their own section; only the tag shape is
+                // checked here (the reference reports "endpoint not found" at
+                // start, after the DNS server exists)
+            }
+            for field in ["accept_default_resolvers", "accept_search_domain"] {
+                if let Some(value) = server.get(field) {
+                    check_bool_field(
+                        value,
+                        &format!("{at}.{field}"),
+                        "TailscaleDNSServerOptions",
+                        field,
+                    )?;
+                }
+            }
+        }
+        "group" => {
+            // the group transport prefixes its own `group[tag]: ...` message
+            let group = |message: String| {
+                format!("initialize DNS server[0] group[{tag}]: group[{tag}]: {message}")
+            };
+            let servers = match server.get("servers") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(value) => listable_strings(value, &format!("{at}.servers"))?,
+            };
+            if servers.is_empty() {
+                return Err(group(
+                    "servers is required and must not be empty".to_string(),
+                ));
+            }
+            let mut unique: Vec<&str> = Vec::new();
+            for entry in &servers {
+                if entry == tag {
+                    return Err(group("group cannot contain itself".to_string()));
+                }
+                if unique.contains(&entry.as_str()) {
+                    return Err(group(format!("duplicate server: {entry}")));
+                }
+                unique.push(entry);
+            }
+            if let Some(value) = server.get("mode") {
+                check_string_field(
+                    value,
+                    &format!("{at}.mode"),
+                    "GroupDNSServerOptions",
+                    "mode",
+                )?;
+                let mode = value.as_str().unwrap_or("");
+                if !matches!(mode, "" | "stable" | "fastest" | "parallel") {
+                    return Err(group(format!(
+                        "unknown mode: {mode} (expected stable, fastest or parallel)"
+                    )));
+                }
+            }
+            for field in ["error_ttl", "win_ttl"] {
+                if let Some(value) = server.get(field) {
+                    check_duration_field(
+                        value,
+                        &format!("{at}.{field}"),
+                        "GroupDNSServerOptions",
+                        field,
+                    )?;
+                }
+            }
+        }
+        "https" => {
+            if let Some(value) = server.get("method") {
+                check_string_field(
+                    value,
+                    &format!("{at}.method"),
+                    "RemoteHTTPSDNSServerOptions",
+                    "method",
+                )?;
+            }
+            if let Some(value) = server.get("headers") {
+                check_http_header(value, &format!("{at}.headers"), "badoption", "headers")?;
+            }
+        }
+        "hosts" => {
+            if let Some(value) = server.get("path") {
+                let _ = listable_strings(value, &format!("{at}.path"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

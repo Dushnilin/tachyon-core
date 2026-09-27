@@ -638,6 +638,125 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Inbound container fields: the Go field path the decoder reports and the type
+/// it fails with. `users` is a list, the rest are objects.
+const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
+    // (inbound type, field, Go field path, Go type, wants an object)
+    (
+        "mixed",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "trojan",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "vmess",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "vless",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "anytls",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "naive",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "shadowsocks",
+        "multiplex",
+        "multiplex",
+        "option.InboundMultiplexOptions",
+        true,
+    ),
+    (
+        "vmess",
+        "multiplex",
+        "multiplex",
+        "option.InboundMultiplexOptions",
+        true,
+    ),
+    (
+        "vless",
+        "multiplex",
+        "multiplex",
+        "option.InboundMultiplexOptions",
+        true,
+    ),
+    (
+        "trojan",
+        "multiplex",
+        "multiplex",
+        "option.InboundMultiplexOptions",
+        true,
+    ),
+    (
+        "vmess",
+        "transport",
+        "transport",
+        "option._V2RayTransportOptions",
+        true,
+    ),
+    (
+        "vless",
+        "transport",
+        "transport",
+        "option._V2RayTransportOptions",
+        true,
+    ),
+    (
+        "trojan",
+        "transport",
+        "transport",
+        "option._V2RayTransportOptions",
+        true,
+    ),
+    ("mixed", "users", "users", "[]auth.User", false),
+    ("http", "users", "users", "[]auth.User", false),
+    ("socks", "users", "users", "[]auth.User", false),
+    ("naive", "users", "users", "[]auth.User", false),
+    (
+        "shadowsocks",
+        "users",
+        "users",
+        "[]option.ShadowsocksUser",
+        false,
+    ),
+    ("vmess", "users", "users", "[]option.VMessUser", false),
+    ("vless", "users", "users", "[]option.VLESSUser", false),
+    ("trojan", "users", "users", "[]option.TrojanUser", false),
+    ("anytls", "users", "users", "[]option.AnyTLSUser", false),
+    (
+        "hysteria2",
+        "users",
+        "users",
+        "[]option.Hysteria2User",
+        false,
+    ),
+];
+
 /// Go kinds of the simple inbound fields (`option` structs above). The check is
 /// the strict decoder: wrong JSON kind -> `cannot unmarshal ... of type ...`.
 const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
@@ -1572,17 +1691,17 @@ fn reject_unknown_fields_deep(value: &Value, path: &str, allowed: &[&str]) -> Re
     Ok(())
 }
 
-fn validate_obfs(value: &Value, at: &str) -> Result<(), String> {
+fn validate_obfs(value: &Value, at: &str, go_struct: &str) -> Result<(), String> {
     match value {
         Value::Null | Value::Array(_) => Ok(()),
         Value::String(_) => Err(format!(
-            "{at}: json: cannot unmarshal string into Go struct field Hysteria2OutboundOptions.obfs of type option._Hysteria2Obfs"
+            "{at}: json: cannot unmarshal string into Go struct field {go_struct}.obfs of type option._Hysteria2Obfs"
         )),
         Value::Number(_) => Err(format!(
-            "{at}: json: cannot unmarshal number into Go struct field Hysteria2OutboundOptions.obfs of type option._Hysteria2Obfs"
+            "{at}: json: cannot unmarshal number into Go struct field {go_struct}.obfs of type option._Hysteria2Obfs"
         )),
         Value::Bool(_) => Err(format!(
-            "{at}: json: cannot unmarshal bool into Go struct field Hysteria2OutboundOptions.obfs of type option._Hysteria2Obfs"
+            "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.obfs of type option._Hysteria2Obfs"
         )),
         Value::Object(map) => {
             let ty = map.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1669,9 +1788,12 @@ fn validate_users_hy2(value: &Value, at: &str) -> Result<(), String> {
     if value.is_null() {
         return Ok(());
     }
-    let users = value
-        .as_array()
-        .ok_or_else(|| format!("{at}: json: cannot unmarshal value into Go struct field Hysteria2InboundOptions.users of type []option.Hysteria2User"))?;
+    let users = value.as_array().ok_or_else(|| {
+        format!(
+            "{at}: json: cannot unmarshal {} into Go struct field Hysteria2InboundOptions.users of type []option.Hysteria2User",
+            json_kind(value)
+        )
+    })?;
     for (idx, user) in users.iter().enumerate() {
         let u = user.as_object().ok_or_else(|| {
             format!("{at}[{idx}]: json: cannot unmarshal value into Go value of type option.Hysteria2User")
@@ -1730,7 +1852,12 @@ fn validate_realm(value: &Value, at: &str, inbound: bool) -> Result<(), String> 
         return Ok(());
     }
     let map = value.as_object().ok_or_else(|| {
-        format!("{at}: json: cannot unmarshal value into Go field of type option.Hysteria2Realm")
+        format!(
+            "{at}: json: cannot unmarshal {} into Go struct field Hysteria2{}Options.realm of type option.Hysteria2{}Realm",
+            json_kind(value),
+            if inbound { "Inbound" } else { "Outbound" },
+            if inbound { "Inbound" } else { "" }
+        )
     })?;
     if map.is_empty() {
         return Ok(());
@@ -2384,6 +2511,35 @@ fn parse_go_uint(text: &str, bits: u32) -> Option<u64> {
 /// pass, using the field sets the reference option structs declare.
 fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("inbounds[{i}]");
+    // the container fields
+    let go_struct = INBOUND_LISTEN_STRUCT
+        .iter()
+        .find(|(known, _)| *known == ty)
+        .map(|(_, name)| *name)
+        .unwrap_or("");
+    for (inbound, field, path, go, wants_object) in INBOUND_CONTAINERS {
+        if *inbound != ty {
+            continue;
+        }
+        let Some(value) = obj.get(*field).filter(|value| !prunes_value(value)) else {
+            continue;
+        };
+        let shaped = if *wants_object {
+            value.is_object()
+        } else {
+            value.is_array()
+        };
+        if !shaped {
+            return Err(go_type_error(
+                value,
+                &format!("{at}.{field}"),
+                go_struct,
+                path,
+                go,
+            ));
+        }
+    }
+
     if ty == "tun" {
         let Some((_, own)) = INBOUND_OWN_FIELDS.iter().find(|(known, _)| *known == ty) else {
             return Ok(());
@@ -2656,7 +2812,7 @@ fn validate_hy2_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
         validate_utls_reality(tls, &format!("initialize outbound[{i}]"))?;
     }
     if let Some(obfs) = obj.get("obfs") {
-        validate_obfs(obfs, &format!("{at}.obfs"))?;
+        validate_obfs(obfs, &format!("{at}.obfs"), "Hysteria2OutboundOptions")?;
     }
     if let Some(realm) = obj.get("realm") {
         validate_realm(realm, &format!("{at}.realm"), false)?;
@@ -3010,8 +3166,36 @@ fn validate_hy2_in_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Stri
             )?;
         }
     }
+    for field in ["ignore_client_bandwidth", "brutal_debug"] {
+        if let Some(v) = obj.get(field).filter(|v| !prunes_value(v))
+            && !is_pruned_bool(v)
+            && !matches!(v, Value::Bool(_))
+        {
+            return Err(go_type_error(
+                v,
+                &format!("{at}.{field}"),
+                "Hysteria2InboundOptions",
+                field,
+                "bool",
+            ));
+        }
+    }
+    if let Some(v) = obj
+        .get("disable_path_mtu_discovery")
+        .filter(|v| !prunes_value(v))
+        && !is_pruned_bool(v)
+        && !matches!(v, Value::Bool(_))
+    {
+        return Err(go_type_error(
+            v,
+            &format!("{at}.disable_path_mtu_discovery"),
+            "Hysteria2InboundOptions.QUICOptions",
+            "disable_path_mtu_discovery",
+            "bool",
+        ));
+    }
     if let Some(obfs) = obj.get("obfs") {
-        validate_obfs(obfs, &format!("{at}.obfs"))?;
+        validate_obfs(obfs, &format!("{at}.obfs"), "Hysteria2InboundOptions")?;
     }
     if let Some(users) = obj.get("users") {
         validate_users_hy2(users, &format!("{at}.users"))?;
@@ -5302,6 +5486,8 @@ fn check_out_multiplex(value: &Value, at: &str, outer: &str) -> Result<(), Strin
 }
 
 fn check_http_header(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    // badoption.HTTPHeader
+    let go_struct = go_struct;
     match value {
         Value::Null => Ok(()),
         Value::Object(map) => {
@@ -5315,7 +5501,7 @@ fn check_http_header(value: &Value, at: &str, go_struct: &str, field: &str) -> R
             other,
             go_struct,
             field,
-            "option.HTTPHeader",
+            "badoption.HTTPHeader",
         )),
     }
 }
@@ -5446,7 +5632,7 @@ fn validate_plain_out_decode(
     if ty == "http"
         && let Some(v) = obj.get("headers")
     {
-        check_http_header(v, &format!("{at}.headers"), go_base, "badoption.HTTPHeader")?;
+        check_http_header(v, &format!("{at}.headers"), go_base, "headers")?;
     }
     if matches!(ty, "socks" | "shadowsocks" | "naive")
         && let Some(v) = obj.get("udp_over_tcp")
@@ -5466,9 +5652,9 @@ fn validate_plain_out_decode(
             return Err(go_field_err(
                 &format!("{at}.tls"),
                 tls,
-                go_base,
+                &format!("{go_base}.OutboundTLSOptionsContainer"),
                 "tls",
-                "OutboundTLSOptions",
+                "option.OutboundTLSOptions",
             ));
         }
         validate_tls_container(tls, &format!("{at}.tls"), false)?;

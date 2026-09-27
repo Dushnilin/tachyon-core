@@ -11311,14 +11311,17 @@ mod tests {
             .unwrap_err(),
             "inbounds[0].idle_timeout: json: cannot unmarshal number into Go struct field TUICInboundOptions.QUICOptions.HTTP2Options.idle_timeout of type string"
         );
-        // the dialer gates of common/dialer.New
-        assert_eq!(
-            validate(&json(
-                r#"{"outbounds":[{"type":"socks","server":"a.com","routing_mark":1}]}"#
-            ))
-            .unwrap_err(),
-            "initialize outbound[0] socks[0]: `routing_mark` is only supported on Linux"
-        );
+        // the dialer gates of common/dialer.New (the mark is Linux-only)
+        let routing_mark =
+            json(r#"{"outbounds":[{"type":"socks","server":"a.com","routing_mark":1}]}"#);
+        if cfg!(target_os = "linux") {
+            assert!(validate(&routing_mark).is_ok());
+        } else {
+            assert_eq!(
+                validate(&routing_mark).unwrap_err(),
+                "initialize outbound[0] socks[0]: `routing_mark` is only supported on Linux"
+            );
+        }
         assert_eq!(
             validate(&json(
                 r#"{"outbounds":[{"type":"socks","server":"a.com","network_strategy":"default","tcp_fast_open":true}]}"#

@@ -224,14 +224,6 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         let mut pending: VecDeque<(Vec<u8>, usize)> = records.into_iter().map(|r| (r, 0)).collect();
         std::future::poll_fn(|cx| poll_flush(cx, &mut self.inner, &mut pending)).await
     }
-
-    pub(crate) fn poll_write_all(
-        cx: &mut Context<'_>,
-        inner: &mut W,
-        pending: &mut VecDeque<(Vec<u8>, usize)>,
-    ) -> Poll<io::Result<()>> {
-        poll_flush(cx, inner, pending)
-    }
 }
 
 /// Drain `pending` records into `inner`, tracking partial writes.
@@ -285,12 +277,12 @@ pub(crate) struct RecordReader<R> {
 
 /// Result of reading exactly `buf.len()` bytes: done, or clean EOF with no
 /// bytes read at a record boundary.
-enum Fill {
+pub(crate) enum Fill {
     Done,
     Eof,
 }
 
-fn poll_fill<R: AsyncRead + Unpin>(
+pub(crate) fn poll_fill<R: AsyncRead + Unpin>(
     cx: &mut Context<'_>,
     inner: &mut R,
     buf: &mut [u8],

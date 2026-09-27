@@ -1,4 +1,5 @@
 pub mod clash_api;
+pub mod clash_state;
 pub mod dns;
 pub mod inbound;
 pub mod logging;

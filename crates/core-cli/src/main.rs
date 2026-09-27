@@ -59,12 +59,108 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("run: {e:#}"))
 }
 
+/// `api <method> <path> [body]` against our own Clash REST controller
+/// (`--url`, `--secret`; defaults `BOX_API_URL` / `BOX_API_SECRET`). The
+/// reference ships a gRPC client for its daemon service, which belongs to the
+/// F7 daemon track; this is the router-friendly HTTP equivalent.
+fn cmd_api(args: &[String]) -> Result<(), String> {
+    let mut url = std::env::var("BOX_API_URL").unwrap_or_default();
+    let mut secret = std::env::var("BOX_API_SECRET").unwrap_or_default();
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => {
+                url = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--secret" => {
+                secret = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            other if other.starts_with("--url=") => {
+                url = other["--url=".len()..].to_string();
+                i += 1;
+            }
+            other if other.starts_with("--secret=") => {
+                secret = other["--secret=".len()..].to_string();
+                i += 1;
+            }
+            other => {
+                rest.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let (method, path) = match rest.len() {
+        0 => return Err("api: usage: api [--url URL] [--secret S] <method> <path> [body]".into()),
+        1 => ("GET".to_string(), rest[0].clone()),
+        _ => (rest[0].clone(), rest[1].clone()),
+    };
+    let body = rest.get(2).cloned().unwrap_or_default();
+    if url.is_empty() {
+        return Err("api: missing --url (or BOX_API_URL)".into());
+    }
+    let response = http_request(&url, &method, &path, &body, &secret)
+        .map_err(|e| format!("api: {method} {path}: {e}"))?;
+    print!("{response}");
+    Ok(())
+}
+
+/// Minimal blocking HTTP/1.1 request; returns the response body.
+fn http_request(
+    url: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    secret: &str,
+) -> std::io::Result<String> {
+    use std::io::{Read, Write};
+    if url.starts_with("https://") {
+        return Err(std::io::Error::other(
+            "https is not supported by the api client",
+        ));
+    }
+    let rest = url.strip_prefix("http://").unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let mut stream = std::net::TcpStream::connect(authority)?;
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    if !secret.is_empty() {
+        request.push_str(&format!("Authorization: Bearer {secret}\r\n"));
+    }
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes())?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .map(|(h, b)| (h.to_string(), b.to_string()))
+        .unwrap_or((text, String::new()));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("?");
+    if status.starts_with('2') {
+        return Ok(body);
+    }
+    Err(std::io::Error::other(format!("status {status}: {body}")))
+}
+
 fn usage() -> String {
     "usage: tachyon-core <command> [options]\n\
      \n\
      commands:\n\
        check  -c <path>   validate configuration\n\
        run    -c <path>   start the proxy\n\
+       api    <method> <path> [body]  call the Clash REST controller\n\
        version            print version\n\
        help               show this help\n"
         .to_string()
@@ -82,6 +178,7 @@ fn main() -> ExitCode {
         }
         "check" => cmd_check(&args),
         "run" => cmd_run(&args),
+        "api" => cmd_api(&args),
         "help" | "-h" | "--help" => {
             print!("{}", usage());
             Ok(())

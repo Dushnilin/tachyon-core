@@ -74,6 +74,8 @@ pub struct ConnContext {
     pub sniffer_names: Vec<String>,
     pub ip_version: Option<u8>,
     pub route_original_destination: Option<Target>,
+    /// Clash connection view: the rule that produced the decision.
+    pub matched_rule: Option<(String, String)>,
 }
 
 use std::net::IpAddr;
@@ -102,6 +104,7 @@ impl ConnContext {
             sniffer_names: Vec::new(),
             ip_version: None,
             route_original_destination: None,
+            matched_rule: None,
         }
     }
 }
@@ -406,6 +409,14 @@ impl Router {
             let outbound = match ty {
                 "wireguard" => Outbound::WireGuard(WireGuard::build(map, &at)?),
                 "openvpn-client" => Outbound::OpenVpn(OpenVpn::build(map, &at)?),
+                // Validated exactly like the reference, but the dataplane is
+                // not implemented: fail at start instead of silently skipping.
+                "openconnect" => anyhow::bail!(
+                    "{at}: openconnect client is not implemented yet (config check parity only)"
+                ),
+                "tailscale" => anyhow::bail!(
+                    "{at}: tailscale client is not implemented yet (config check parity only)"
+                ),
                 _ => anyhow::bail!("{at}: unknown endpoint type: {ty}"),
             };
             let tag = map
@@ -494,6 +505,12 @@ impl Router {
     }
 
     /// Tag of the outbound `route.final` points at (empty when untagged).
+    /// \ view: per rule, the Clash condition items and the
+    /// outbound they select.
+    pub fn clash_rules(&self) -> Vec<(String, String, String)> {
+        self.rules.iter().map(|rule| rule.clash_view()).collect()
+    }
+
     pub fn default_tag(&self) -> &str {
         self.outbound_table()
             .find(|(i, ..)| *i == self.default)
@@ -583,6 +600,7 @@ impl Router {
                 continue;
             }
             let action = rule.action();
+            ctx.matched_rule = Some(rule.clash_primary());
             logging::debug(format_args!(
                 "route: match[{i}] {} => {}",
                 ctx.destination,

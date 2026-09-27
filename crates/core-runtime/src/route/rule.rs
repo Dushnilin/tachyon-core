@@ -99,6 +99,28 @@ impl Action {
         }
     }
 
+    /// Reference `RuleAction.String()` for `GET /rules`.
+    pub fn clash_view(&self) -> String {
+        match self {
+            Action::Route { outbound, .. } => format!("route({outbound})"),
+            Action::Bypass { outbound, .. } if outbound.is_empty() => "bypass()".to_string(),
+            Action::Bypass { outbound, .. } => format!("bypass({outbound})"),
+            Action::RouteOptions(_) => "route-options()".to_string(),
+            Action::Direct => "direct".to_string(),
+            Action::Reject { method, .. } => match method {
+                RejectMethod::Default => "reject".to_string(),
+                RejectMethod::Drop => "reject(drop)".to_string(),
+                RejectMethod::Reply => "reject(reply)".to_string(),
+            },
+            Action::HijackDns => "hijack-dns".to_string(),
+            Action::Sniff { .. } => "sniff()".to_string(),
+            Action::Resolve(action) => match &action.server {
+                Some(server) => format!("route({server})"),
+                None => "route()".to_string(),
+            },
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Action::Route { .. } => "route",
@@ -193,6 +215,60 @@ enum DomainItem {
 struct IpCidrItem {
     prefixes: Vec<IpPrefix>,
     is_private: bool,
+}
+
+/// Reference item descriptions: one value inline, up to three in brackets,
+/// longer lists truncated with `...`.
+fn field_list(name: &str, values: &[String]) -> String {
+    match values.len() {
+        0 => String::new(),
+        1 => format!("{name}={}", values[0]),
+        len if len <= 3 => format!("{name}=[{}]", values.join(" ")),
+        _ => format!("{name}=[{}...]", values[..3].join(" ")),
+    }
+}
+
+/// Merge per-value `name=value` pairs of one category back into the reference
+/// bracket form (`domain=[a b]`, or `domain_suffix=[...]` when mixed).
+fn collapse_fields(parts: &[String]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for part in parts {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        match &mut current {
+            Some((active, values)) if active == name => values.push(value.to_string()),
+            _ => {
+                if let Some((name, values)) = current.take() {
+                    out.push(field_list(&name, &values));
+                }
+                current = Some((name.to_string(), vec![value.to_string()]));
+            }
+        }
+    }
+    if let Some((name, values)) = current {
+        out.push(field_list(&name, &values));
+    }
+    out.join(" ")
+}
+
+/// `port=` / `source_port=`, with ranges in the `100-200` form.
+fn port_description(name: &str, item: &PortItem) -> String {
+    let mut values: Vec<String> = Vec::new();
+    match item {
+        PortItem::Ports(ports) => values.extend(ports.iter().map(u16::to_string)),
+        PortItem::Ranges(ranges) => values.extend(ranges.iter().map(|(a, b)| format!("{a}-{b}"))),
+    }
+    field_list(name, &values)
+}
+
+fn wrap_invert(invert: bool, payload: &str) -> String {
+    if invert {
+        format!("!({payload})")
+    } else {
+        payload.to_string()
+    }
 }
 
 impl Rule {
@@ -450,6 +526,59 @@ impl Rule {
         }
     }
 
+    /// Reference `GET /rules` entry: `(type, payload, proxy)` where payload
+    /// is the item description string (`abstractDefaultRule.String`).
+    pub fn clash_view(&self) -> (String, String, String) {
+        let (kind, payload) = match self {
+            Rule::Default(r) => ("default", r.item_description()),
+            Rule::Logical(r) => {
+                let mode = if r.mode == LogicalMode::And {
+                    "and"
+                } else {
+                    "or"
+                };
+                let inner = r
+                    .rules
+                    .iter()
+                    .map(|sub| sub.clash_view().1)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let payload = format!("{mode}({inner})");
+                ("logical", wrap_invert(r.invert, &payload))
+            }
+        };
+        (kind.to_string(), payload, self.action().clash_view())
+    }
+
+    /// Label used for a connection in `/connections`: the leading condition of
+    /// the payload, with the sing-box field name.
+    pub fn clash_primary(&self) -> (String, String) {
+        let (kind, payload, _) = self.clash_view();
+        let field = payload
+            .split(['=', '['])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let value = payload
+            .split_once('=')
+            .map(|(_, rest)| {
+                rest.trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(' ')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if field.is_empty() {
+            (kind, String::new())
+        } else {
+            (field, value)
+        }
+    }
+
     pub fn matches(&self, ctx: &ConnContext) -> bool {
         match self {
             Rule::Default(r) => r.matches(ctx),
@@ -459,6 +588,75 @@ impl Rule {
 }
 
 impl DefaultRule {
+    /// `abstractDefaultRule.String`: item descriptions joined by spaces,
+    /// wrapped in `!(...)` for inverted rules.
+    fn item_description(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for item in &self.plain {
+            match item {
+                PlainItem::Inbound(list) => parts.push(field_list("inbound", list)),
+                PlainItem::IpVersion { is_v6 } => {
+                    parts.push(format!("ip_version={}", if *is_v6 { 6 } else { 4 }));
+                }
+                PlainItem::Network(list) => parts.push(field_list("network", list)),
+                PlainItem::AuthUser(list) => parts.push(field_list("auth_user", list)),
+                PlainItem::Protocol(list) => parts.push(field_list("protocol", list)),
+                PlainItem::Client(list) => parts.push(field_list("client", list)),
+                // process_*, clash_mode, … never match and carry no description
+                PlainItem::Unsupported => {}
+            }
+        }
+        for item in &self.source_address {
+            match item {
+                AddressItem::Cidr(list) => {
+                    let values: Vec<String> = list.iter().map(IpPrefix::to_cidr).collect();
+                    parts.push(field_list("source_ip_cidr", &values));
+                }
+                AddressItem::IsPrivate => parts.push("source_ip_cidr=lan".to_string()),
+            }
+        }
+        for item in &self.source_port {
+            parts.push(port_description("source_port", item));
+        }
+        let domains: Vec<String> = self
+            .dest_address
+            .iter()
+            .filter_map(|item| match item {
+                DomainItem::Exact(list) => Some(("domain", list.clone())),
+                DomainItem::Suffix(list) => Some(("domain_suffix", list.clone())),
+                DomainItem::Keyword(list) => Some(("domain_keyword", list.clone())),
+                DomainItem::Regex(_) => None,
+            })
+            .flat_map(|(name, list)| {
+                list.into_iter()
+                    .map(|value| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if !domains.is_empty() {
+            parts.push(collapse_fields(&domains));
+        }
+        for item in &self.dest_address {
+            if let DomainItem::Regex(list) = item {
+                let values: Vec<String> = list.iter().map(|re| re.as_str().to_string()).collect();
+                parts.push(field_list("domain_regex", &values));
+            }
+        }
+        for item in &self.dest_ip_cidr {
+            let values: Vec<String> = item.prefixes.iter().map(IpPrefix::to_cidr).collect();
+            if !values.is_empty() {
+                parts.push(field_list("ip_cidr", &values));
+            }
+            if item.is_private {
+                parts.push("ip_cidr=lan".to_string());
+            }
+        }
+        for item in &self.dest_port {
+            parts.push(port_description("port", item));
+        }
+        wrap_invert(self.invert, &parts.join(" "))
+    }
+
     fn matches(&self, ctx: &ConnContext) -> bool {
         if self.rule_set_never_match {
             return false;
@@ -1077,6 +1275,7 @@ mod tests {
             sniffer_names: Vec::new(),
             ip_version: None,
             route_original_destination: None,
+            matched_rule: None,
         }
     }
 

@@ -64,6 +64,11 @@ impl IpPrefix {
         Ok(Self { addr, bits })
     }
 
+    /// `addr/prefix` rendering (Clash rule payloads, log lines).
+    pub fn to_cidr(&self) -> String {
+        format!("{}/{}", self.addr, self.bits)
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {

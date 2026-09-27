@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
+use crate::clash_state;
 use crate::logging;
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
@@ -194,9 +195,59 @@ fn reply_code_for_error(err: &io::Error) -> u8 {
     }
 }
 
-/// Relay the client stream into an established upstream connection,
-/// replaying any sniff-read `prefix` upstream first.
-pub async fn pump_conn<S>(mut client: S, conn: Conn, prefix: &[u8]) -> io::Result<()>
+/// Clash connection-view metadata for a routed connection: inbound, source,
+/// destination, matched rule and the outbound chain.
+pub fn clash_meta(
+    ctx: &ConnContext,
+    router: &Router,
+    outbound_index: usize,
+) -> clash_state::ConnMeta {
+    let host = match &ctx.destination {
+        Target::Ip(addr) => addr.ip().to_string(),
+        Target::Domain(host, _) => host.clone(),
+    };
+    let mut chains = Vec::new();
+    let mut index = Some(outbound_index);
+    // expand selector groups into their selected member (one level, like the
+    // reference chain display for group proxies)
+    for _ in 0..8 {
+        let Some(current) = index else { break };
+        let Some((_, tag, outbound)) = router.outbound_table().find(|(i, _, _)| *i == current)
+        else {
+            break;
+        };
+        chains.push(tag.to_string());
+        index = match outbound {
+            crate::route::Outbound::Selector(selector) => router.index_of(selector.now()),
+            _ => None,
+        };
+    }
+    let (rule, rule_payload) = ctx
+        .matched_rule
+        .clone()
+        .unwrap_or_else(|| ("".to_string(), String::new()));
+    clash_state::ConnMeta {
+        network: ctx.network,
+        inbound: ctx.inbound.clone().unwrap_or_default(),
+        source: ctx.source.to_string(),
+        host,
+        destination: ctx.destination.to_string(),
+        chains,
+        rule,
+        rule_payload,
+    }
+}
+
+/// Relay the client stream into an established upstream connection, replaying
+/// any sniff-read `prefix` upstream first. With a `tracker` the connection is
+/// registered in the Clash connection view: byte counters feed `/connections`
+/// and `/traffic`, and `DELETE /connections/{id}` can drop it.
+pub async fn pump_conn_tracked<S>(
+    mut client: S,
+    conn: Conn,
+    prefix: &[u8],
+    tracker: Option<&clash_state::ConnHandle>,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -204,8 +255,18 @@ where
         Conn::Plain(mut upstream) => {
             if !prefix.is_empty() {
                 upstream.write_all(prefix).await?;
+                if let Some(tracker) = tracker {
+                    tracker.add_upload(prefix.len() as u64);
+                }
             }
-            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            match tracker {
+                Some(tracker) => {
+                    relay_tracked(&mut client, &mut upstream, tracker).await?;
+                }
+                None => {
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                }
+            }
             Ok(())
         }
         Conn::Shadowsocks(mut reader, mut writer) => {
@@ -222,13 +283,21 @@ where
                         return Ok(());
                     }
                     writer.write_chunk(&up_buf[..n]).await?;
+                    if let Some(tracker) = tracker {
+                        tracker.add_upload(n as u64);
+                    }
                 }
             };
             let down = async {
                 loop {
                     match reader.read(&mut down_buf).await {
                         Ok(0) => return Ok(()),
-                        Ok(n) => client_write.write_all(&down_buf[..n]).await?,
+                        Ok(n) => {
+                            client_write.write_all(&down_buf[..n]).await?;
+                            if let Some(tracker) = tracker {
+                                tracker.add_download(n as u64);
+                            }
+                        }
                         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                             return Ok(());
                         }
@@ -236,9 +305,65 @@ where
                     }
                 }
             };
-            tokio::try_join!(up, down).map(|_| ())
+            match tracker {
+                Some(tracker) => {
+                    let signal = tracker.close_signal();
+                    let relay = async { tokio::try_join!(up, down).map(|_| ()) };
+                    tokio::pin!(relay);
+                    tokio::select! {
+                        result = &mut relay => result,
+                        _ = signal.wait() => Err(closed_by_api()),
+                    }
+                }
+                None => tokio::try_join!(up, down).map(|_| ()),
+            }
         }
     }
+}
+
+/// Controller asked to drop the connection (`DELETE /connections/{id}`).
+fn closed_by_api() -> io::Error {
+    io::Error::other("connection closed by clash api")
+}
+
+/// Counted bidirectional relay that aborts when the API closes the entry.
+async fn relay_tracked<S, U>(
+    client: &mut S,
+    upstream: &mut U,
+    tracker: &clash_state::ConnHandle,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let signal = tracker.close_signal();
+    let mut up_buf = vec![0u8; 32 * 1024];
+    let mut down_buf = vec![0u8; 32 * 1024];
+    let mut up_done = false;
+    let mut down_done = false;
+    while !(up_done && down_done) {
+        tokio::select! {
+            biased;
+            _ = signal.wait() => return Err(closed_by_api()),
+            read = client.read(&mut down_buf), if !down_done => match read {
+                Ok(0) => down_done = true,
+                Ok(n) => {
+                    upstream.write_all(&down_buf[..n]).await?;
+                    tracker.add_upload(n as u64);
+                }
+                Err(e) => return Err(e),
+            },
+            read = upstream.read(&mut up_buf), if !up_done => match read {
+                Ok(0) => up_done = true,
+                Ok(n) => {
+                    client.write_all(&up_buf[..n]).await?;
+                    tracker.add_download(n as u64);
+                }
+                Err(e) => return Err(e),
+            },
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,7 +465,8 @@ pub(crate) async fn drive_transparent(
             let dest = ctx.destination.clone();
             let conn = router.connect_index(idx, &dest).await?;
             logging::info(format_args!("inbound {tag} {peer} CONNECT {dest}"));
-            pump_conn(client, conn, &ctx.sniff_prefix).await
+            let tracker = clash_state::ConnHandle::open(clash_meta(&ctx, router, idx));
+            pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
         }
     }
 }

@@ -1,10 +1,13 @@
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
@@ -15,19 +18,33 @@ pub enum Level {
     Error = 4,
 }
 
+/// `Level::Disabled` marker: `set_disabled` stores 255.
+const LEVEL_DISABLED: u8 = u8::MAX;
+
 impl Level {
-    fn parse(raw: &str) -> Option<Level> {
+    pub fn parse(raw: &str) -> Option<Level> {
         match raw {
             "trace" => Some(Level::Trace),
             "debug" => Some(Level::Debug),
             "info" => Some(Level::Info),
-            "warn" => Some(Level::Warn),
+            "warn" | "warning" => Some(Level::Warn),
             "error" | "fatal" => Some(Level::Error),
             _ => None,
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// clash `/logs` level names are lower case.
+    pub fn level_name(self) -> &'static str {
+        match self {
+            Level::Trace => "trace",
+            Level::Debug => "debug",
+            Level::Info => "info",
+            Level::Warn => "warning",
+            Level::Error => "error",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Level::Trace => "TRACE",
             Level::Debug => "DEBUG",
@@ -51,6 +68,93 @@ static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static START: OnceLock<Instant> = OnceLock::new();
 static SINK: OnceLock<Sink> = OnceLock::new();
 static TIMESTAMP: AtomicU8 = AtomicU8::new(0);
+
+/// Recent lines kept in memory for `GET /logs` (reference `log_buffer`).
+const RING_CAPACITY: usize = 1024;
+static RING: OnceLock<Mutex<VecDeque<(Level, String)>>> = OnceLock::new();
+/// `(level, message)` feed for one `/logs` subscriber.
+type Subscriber = mpsc::UnboundedSender<(Level, String)>;
+static SUBSCRIBERS: OnceLock<Mutex<HashMap<u64, Subscriber>>> = OnceLock::new();
+static NEXT_SUBSCRIBER: AtomicU64 = AtomicU64::new(1);
+
+fn ring() -> &'static Mutex<VecDeque<(Level, String)>> {
+    RING.get_or_init(|| Mutex::new(VecDeque::with_capacity(RING_CAPACITY)))
+}
+
+fn subscribers() -> &'static Mutex<HashMap<u64, Subscriber>> {
+    SUBSCRIBERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Buffered lines at or above `level` (oldest first).
+pub fn recent(level: Level) -> Vec<String> {
+    let Ok(guard) = ring().lock() else {
+        return Vec::new();
+    };
+    guard
+        .iter()
+        .filter(|(lvl, _)| *lvl >= level)
+        .map(|(_, msg)| msg.clone())
+        .collect()
+}
+
+/// Register a live `/logs` subscriber; drop the id to unsubscribe.
+pub fn subscribe() -> (u64, mpsc::UnboundedReceiver<(Level, String)>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let id = NEXT_SUBSCRIBER.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut guard) = subscribers().lock() {
+        guard.insert(id, tx);
+    }
+    (id, rx)
+}
+
+pub fn unsubscribe(id: u64) {
+    if let Ok(mut guard) = subscribers().lock() {
+        guard.remove(&id);
+    }
+}
+
+/// Current level, `None` while `log.disabled` is in effect.
+pub fn level() -> Option<Level> {
+    match LEVEL.load(Ordering::Relaxed) {
+        LEVEL_DISABLED => None,
+        raw => Level::parse(raw_to_name(raw)),
+    }
+}
+
+fn raw_to_name(raw: u8) -> &'static str {
+    match raw {
+        0 => "trace",
+        1 => "debug",
+        3 => "warn",
+        4 => "error",
+        _ => "info",
+    }
+}
+
+/// `PATCH /configs {"log-level": "debug"}`; re-enables a disabled logger.
+pub fn set_level(raw: &str) -> bool {
+    let Some(level) = Level::parse(raw) else {
+        return false;
+    };
+    LEVEL.store(level as u8, Ordering::Relaxed);
+    true
+}
+
+pub fn set_enabled(enabled: bool) {
+    if enabled {
+        let raw = LEVEL.load(Ordering::Relaxed);
+        if raw == LEVEL_DISABLED {
+            LEVEL.store(Level::Info as u8, Ordering::Relaxed);
+        }
+    } else {
+        LEVEL.store(LEVEL_DISABLED, Ordering::Relaxed);
+    }
+}
+
+/// True when `level` passes the current filter (used by `/logs?level=`).
+pub fn passes(level: Level) -> bool {
+    enabled(level)
+}
 
 /// Configure level / sink / timestamp from the `log` section.
 ///
@@ -86,7 +190,7 @@ pub fn init(output: Option<&str>, level: Option<&str>, timestamp: bool) -> bool 
 
 /// Silence every level (`log.disabled: true`); LEVEL=255 fails all compares.
 pub fn set_disabled() {
-    LEVEL.store(u8::MAX, Ordering::Relaxed);
+    set_enabled(false);
 }
 
 fn enabled(level: Level) -> bool {
@@ -96,6 +200,16 @@ fn enabled(level: Level) -> bool {
 fn emit(level: Level, msg: fmt::Arguments) {
     if !enabled(level) {
         return;
+    }
+    let text = msg.to_string();
+    if let Ok(mut guard) = ring().lock() {
+        if guard.len() >= RING_CAPACITY {
+            guard.pop_front();
+        }
+        guard.push_back((level, text.clone()));
+    }
+    if let Ok(mut guard) = subscribers().lock() {
+        guard.retain(|_, tx| tx.send((level, text.clone())).is_ok());
     }
     let start = START.get_or_init(Instant::now);
     let stamp = if TIMESTAMP.load(Ordering::Relaxed) == 1 {
@@ -107,7 +221,7 @@ fn emit(level: Level, msg: fmt::Arguments) {
         "{stamp}{}[{:04}] {}",
         level.as_str(),
         start.elapsed().as_secs(),
-        msg
+        text
     );
     match SINK.get() {
         Some(Sink::Stderr) => eprintln!("{line}"),

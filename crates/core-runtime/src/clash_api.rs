@@ -7,8 +7,14 @@
 //! (`experimental/clashapi` in the sing-box reference, probed against
 //! `sing-box 1.14.2-lx.3`).
 //!
-//! Known gaps (roadmap): `/logs`, `/traffic`, `/connections`, `/rules`,
-//! providers, `external_ui` file serving, delay history persistence.
+//! Also serves the reference data views: `GET /logs` and `GET /traffic`
+//! (chunked streams), `GET|DELETE /connections` (with
+//! `DELETE /connections/{id}`), `GET /rules` and `GET|PATCH /configs`, plus
+//! `external_ui` static files when configured.
+//!
+//! Known gaps (roadmap): proxy/rule providers (404 — no provider runtime),
+//! `external_ui` auto-download, and cache.db persistence of the delay
+//! history, fakeip and DNS cache.
 //!
 //! Known deviations (deliberate): HTTP keep-alive loop without `Date`
 //! headers; version string reports `tachyon-core`.
@@ -23,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+use crate::clash_state;
 use crate::inbound::Target;
 use crate::route::{Outbound, Router, SelectError};
 use crate::{logging, tls_client};
@@ -35,6 +42,8 @@ const DEPRECATED_MSG: &str = "create clash-server: cache_file and related fields
 
 const GET_ONLY: &[&str] = &["GET"];
 const GET_PUT: &[&str] = &["GET", "PUT"];
+const GET_DELETE: &[&str] = &["GET", "DELETE"];
+const GET_PUT_PATCH: &[&str] = &["GET", "PUT", "PATCH"];
 const PREFLIGHT_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 
 pub struct ClashApi {
@@ -42,6 +51,11 @@ pub struct ClashApi {
     secret: Option<String>,
     allow_origins: Vec<String>,
     allow_private_network: bool,
+    /// `experimental.clash_api.external_ui` directory served for unknown GETs.
+    external_ui: Option<String>,
+    /// `external_ui-download-url`: the reference fetches a dashboard bundle;
+    /// we only report it as unimplemented.
+    external_ui_download: Option<String>,
 }
 
 impl ClashApi {
@@ -101,11 +115,33 @@ impl ClashApi {
             .get("access_control_allow_private_network")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let external_ui = obj
+            .get("external_ui")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        if let Some(dir) = external_ui.as_deref()
+            && !std::path::Path::new(dir).is_dir()
+        {
+            anyhow::bail!("external_ui: {dir} is not a directory");
+        }
+        let external_ui_download = obj
+            .get("external_ui_download_url")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        if external_ui_download.is_some() {
+            logging::warn(format_args!(
+                "external_ui_download_url: fetching a dashboard bundle is not implemented yet (ignored)"
+            ));
+        }
         Ok(Some(Self {
             bind,
             secret,
             allow_origins,
             allow_private_network,
+            external_ui,
+            external_ui_download,
         }))
     }
 
@@ -233,7 +269,7 @@ async fn handle_request(
         return Ok(true);
     }
 
-    let (route, methods) = classify(&path);
+    let (route, methods) = classify_with_ui(&path, api.external_ui.is_some());
 
     // Unknown paths answer 404 outside the authenticated group (chi layout).
     if matches!(route, Route::Unknown) {
@@ -254,7 +290,19 @@ async fn handle_request(
     // Direct routes (`/`, `/version`): method mismatch never reaches the
     // group middleware, so 405 comes before auth. Mounted `/proxies`
     // authenticates first (probed against the reference).
-    let mounted = matches!(route, Route::Proxies | Route::Proxy(_) | Route::Delay(_));
+    let mounted = matches!(
+        route,
+        Route::Proxies
+            | Route::Proxy(_)
+            | Route::Delay(_)
+            | Route::Logs
+            | Route::Traffic
+            | Route::Connections
+            | Route::Connection(_)
+            | Route::Rules
+            | Route::Configs
+            | Route::Providers
+    );
     if !mounted && !methods.contains(&method) {
         method_not_allowed(stream, methods, method == "OPTIONS", &cors).await?;
         return Ok(true);
@@ -312,6 +360,40 @@ async fn handle_request(
             )
             .await;
         }
+        Route::Logs => {
+            return stream_logs(stream, &query, &cors).await;
+        }
+        Route::Traffic => {
+            return stream_traffic(stream, &cors).await;
+        }
+        Route::Connections => {
+            return handle_connections(stream, method, &cors).await;
+        }
+        Route::Connection(id) => {
+            return handle_connection(stream, method, id, &cors).await;
+        }
+        Route::Rules => {
+            let body = rules_view(router);
+            respond_json(stream, 200, "OK", &body, &cors).await?;
+        }
+        Route::Configs => {
+            return handle_configs(stream, method, &headers, api, &cors).await;
+        }
+        Route::Providers => {
+            // No provider runtime yet: the reference lists proxy/rule
+            // providers, we report the feature instead of an empty list.
+            respond_json(
+                stream,
+                404,
+                "Not Found",
+                &json!({"message": "providers are not implemented yet"}),
+                &cors,
+            )
+            .await?;
+        }
+        Route::Static(asset) => {
+            return serve_static(stream, api, &asset, &cors).await;
+        }
         Route::Unknown => unreachable!("unknown route handled above"),
     }
     Ok(true)
@@ -323,30 +405,426 @@ enum Route {
     Proxies,
     Proxy(String),
     Delay(String),
+    Logs,
+    Traffic,
+    Connections,
+    Connection(u64),
+    Rules,
+    Configs,
+    Providers,
+    /// unknown path with `external_ui` configured: try a static file
+    Static(String),
     Unknown,
 }
 
 /// URL → route class + allowed methods (reference chi router layout).
-fn classify(path: &str) -> (Route, &'static [&'static str]) {
+/// Unknown paths become static-asset lookups only when `external_ui` is set.
+fn classify_with_ui(path: &str, external_ui: bool) -> (Route, &'static [&'static str]) {
     match path {
         "/" => (Route::Root, GET_ONLY),
         "/version" => (Route::Version, GET_ONLY),
         "/proxies" | "/proxies/" => (Route::Proxies, GET_ONLY),
-        p => match p.strip_prefix("/proxies/") {
+        "/logs" => (Route::Logs, GET_ONLY),
+        "/traffic" => (Route::Traffic, GET_ONLY),
+        "/connections" => (Route::Connections, GET_DELETE),
+        "/rules" => (Route::Rules, GET_ONLY),
+        "/configs" => (Route::Configs, GET_PUT_PATCH),
+        "/providers/proxies" | "/providers/rules" => (Route::Providers, GET_ONLY),
+        p => match p.strip_prefix("/connections/") {
             Some(rest) => {
                 let rest = rest.strip_suffix('/').unwrap_or(rest);
-                match rest.rsplit_once('/') {
-                    Some((base, "delay")) if !base.is_empty() && !base.contains('/') => {
-                        (Route::Delay(base.to_string()), GET_ONLY)
-                    }
-                    Some(_) => (Route::Unknown, GET_ONLY),
-                    None if !rest.is_empty() => (Route::Proxy(rest.to_string()), GET_PUT),
-                    None => (Route::Unknown, GET_ONLY),
+                match rest.parse::<u64>() {
+                    Ok(id) => (Route::Connection(id), GET_DELETE),
+                    Err(_) => (Route::Unknown, GET_DELETE),
                 }
             }
-            None => (Route::Unknown, GET_ONLY),
+            None => match p.strip_prefix("/providers/") {
+                Some(_) => (Route::Providers, GET_ONLY),
+                None => classify_proxies(path, external_ui),
+            },
         },
     }
+}
+
+fn classify_proxies(path: &str, external_ui: bool) -> (Route, &'static [&'static str]) {
+    match path.strip_prefix("/proxies/") {
+        Some(rest) => {
+            let rest = rest.strip_suffix('/').unwrap_or(rest);
+            match rest.rsplit_once('/') {
+                Some((base, "delay")) if !base.is_empty() && !base.contains('/') => {
+                    (Route::Delay(base.to_string()), GET_ONLY)
+                }
+                Some(_) => (Route::Unknown, GET_ONLY),
+                None if !rest.is_empty() => (Route::Proxy(rest.to_string()), GET_PUT),
+                None => (Route::Unknown, GET_ONLY),
+            }
+        }
+        None if external_ui && !path.contains("..") => (Route::Static(path.to_string()), GET_ONLY),
+        None => (Route::Unknown, GET_ONLY),
+    }
+}
+
+/// `GET /logs`: replay the ring buffer, then stream live lines. The response
+/// is chunked, like the reference's flusher-based handler.
+async fn stream_logs(
+    stream: &mut TcpStream,
+    query: &[(String, String)],
+    cors: &[String],
+) -> std::io::Result<bool> {
+    let level_raw = query
+        .iter()
+        .find(|(k, _)| k == "level")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let level = if level_raw.is_empty() {
+        logging::Level::Trace
+    } else {
+        match logging::Level::parse(level_raw) {
+            Some(level) => level,
+            None => {
+                respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
+                return Ok(true);
+            }
+        }
+    };
+    let (id, mut live) = logging::subscribe();
+    let mut headers = cors.to_vec();
+    headers.push("Content-Type: application/json".to_string());
+    send_chunked_head(stream, &headers).await?;
+    for line in logging::recent(level) {
+        write_chunk(stream, &log_entry(level_raw, level, &line)).await?;
+    }
+    while let Some((entry_level, line)) = live.recv().await {
+        if entry_level >= level {
+            write_chunk(stream, &log_entry(level_raw, level, &line)).await?;
+        }
+    }
+    logging::unsubscribe(id);
+    Ok(false)
+}
+
+fn log_entry(requested: &str, level: logging::Level, message: &str) -> String {
+    let name = if requested.is_empty() {
+        level.level_name()
+    } else {
+        requested
+    };
+    json!({"type": name, "payload": message}).to_string()
+}
+
+/// `GET /traffic`: one JSON object per second with the running totals.
+async fn stream_traffic(stream: &mut TcpStream, cors: &[String]) -> std::io::Result<bool> {
+    let mut headers = cors.to_vec();
+    headers.push("Content-Type: application/json".to_string());
+    send_chunked_head(stream, &headers).await?;
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let (_, up, down) = clash_state::snapshot();
+        write_chunk(stream, &json!({"up": up, "down": down}).to_string()).await?;
+    }
+}
+
+/// `GET /connections` / `DELETE /connections`.
+async fn handle_connections(
+    stream: &mut TcpStream,
+    method: &str,
+    cors: &[String],
+) -> std::io::Result<bool> {
+    match method {
+        "GET" => {
+            let (views, up, down) = clash_state::snapshot();
+            let connections: Vec<Value> = views.iter().map(connection_json).collect();
+            let body = json!({
+                "downloadTotal": down,
+                "uploadTotal": up,
+                "connections": connections,
+                "memory": 0,
+            });
+            respond_json(stream, 200, "OK", &body, cors).await?;
+        }
+        _ => {
+            let closed = clash_state::close_all();
+            logging::info(format_args!("clash-api: closed {closed} connections"));
+            respond_no_content(stream, cors).await?;
+        }
+    }
+    Ok(true)
+}
+
+/// `GET|DELETE /connections/{id}`.
+async fn handle_connection(
+    stream: &mut TcpStream,
+    method: &str,
+    id: u64,
+    cors: &[String],
+) -> std::io::Result<bool> {
+    match method {
+        "GET" => {
+            let (views, _, _) = clash_state::snapshot();
+            match views.iter().find(|view| view.id == id.to_string()) {
+                Some(view) => {
+                    let body = connection_json(view);
+                    respond_json(stream, 200, "OK", &body, cors).await?;
+                }
+                None => {
+                    respond_json(stream, 404, "Not Found", &not_found(), cors).await?;
+                }
+            }
+        }
+        _ => {
+            if clash_state::close(id) {
+                respond_no_content(stream, cors).await?;
+            } else {
+                respond_json(stream, 404, "Not Found", &not_found(), cors).await?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn connection_json(view: &clash_state::ConnView) -> Value {
+    let (source_ip, source_port) = split_host_port(&view.meta.source);
+    let (dest_ip, dest_port) = split_host_port(&view.meta.destination);
+    json!({
+        "id": view.id,
+        "metadata": {
+            "network": view.meta.network,
+            "type": "Clash",
+            "sourceIP": source_ip,
+            "sourcePort": source_port,
+            "host": view.meta.host,
+            "destinationIP": dest_ip,
+            "destinationPort": dest_port,
+            "chains": view.meta.chains,
+        },
+        "upload": view.upload,
+        "download": view.download,
+        "start": rfc3339_utc(view.start.elapsed()),
+        "rule": view.meta.rule,
+        "rulePayload": view.meta.rule_payload,
+    })
+}
+
+fn split_host_port(value: &str) -> (String, String) {
+    match value.rsplit_once(':') {
+        Some((host, port)) => (host.trim_matches(['[', ']']).to_string(), port.to_string()),
+        None => (value.to_string(), String::new()),
+    }
+}
+
+/// Clash `start` field: RFC3339 UTC, derived from the elapsed age.
+fn rfc3339_utc(elapsed: Duration) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (year, month, day, hour, minute, second) = civil_from_epoch(now - elapsed.as_secs());
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Howard Hinnant's civil_from_days plus the time of day.
+fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (
+        y,
+        m as u32,
+        d as u32,
+        (rem / 3_600) as u32,
+        ((rem % 3_600) / 60) as u32,
+        (rem % 60) as u32,
+    )
+}
+
+/// `GET /rules`: reference shape — `{type, payload, proxy}` per rule, where
+/// payload is the sing-box item description (`rule.String()`).
+fn rules_view(router: &Router) -> Value {
+    let rules: Vec<Value> = router
+        .clash_rules()
+        .into_iter()
+        .map(|(kind, payload, proxy)| json!({"type": kind, "payload": payload, "proxy": proxy}))
+        .collect();
+    json!({ "rules": rules })
+}
+
+/// `GET /configs` and `PATCH /configs {"log-level": "debug"}`.
+async fn handle_configs(
+    stream: &mut TcpStream,
+    method: &str,
+    headers: &[(String, String)],
+    api: &ClashApi,
+    cors: &[String],
+) -> std::io::Result<bool> {
+    match method {
+        "GET" => {
+            let body = json!({
+                "port": 0,
+                "socks-port": 0,
+                "redir-port": 0,
+                "tproxy-port": 0,
+                "mixed-port": 0,
+                "mode": "rule",
+                "log-level": logging::level().map(logging::Level::level_name),
+                "ipv6": false,
+                "allow-lan": false,
+                "external-controller": api.bind,
+                "external-ui": api.external_ui,
+                "external-ui-download-url": api.external_ui_download,
+            });
+            respond_json(stream, 200, "OK", &body, cors).await?;
+        }
+        "PATCH" => {
+            let len: usize = header_get(headers, "content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if len > MAX_BODY {
+                respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
+                return Ok(false);
+            }
+            let mut body = vec![0u8; len];
+            if len > 0 && stream.read_exact(&mut body).await.is_err() {
+                return Ok(false);
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+                respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
+                return Ok(true);
+            };
+            let requested = value
+                .get("log-level")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match requested {
+                Some(level) if !logging::set_level(&level) => {
+                    respond_json(
+                        stream,
+                        400,
+                        "Bad Request",
+                        &json!({"message": "invalid log level"}),
+                        cors,
+                    )
+                    .await?;
+                }
+                Some(level) => {
+                    logging::info(format_args!("clash-api: log level set to {level}"));
+                    respond_no_content(stream, cors).await?;
+                }
+                None => {
+                    respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
+                }
+            }
+        }
+        _ => {
+            // PUT would reload the whole configuration; unsupported.
+            respond_json(
+                stream,
+                501,
+                "Not Implemented",
+                &json!({"message": "config reload is not implemented yet"}),
+                cors,
+            )
+            .await?;
+        }
+    }
+    Ok(true)
+}
+
+/// `external_ui` static files; unknown paths fall back to `index.html`.
+async fn serve_static(
+    stream: &mut TcpStream,
+    api: &ClashApi,
+    asset: &str,
+    cors: &[String],
+) -> std::io::Result<bool> {
+    let Some(dir) = api.external_ui.as_deref() else {
+        respond_text(
+            stream,
+            404,
+            "Not Found",
+            "404 page not found\n",
+            cors,
+            "text/plain; charset=utf-8",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let relative = asset.trim_start_matches('/');
+    let relative = if relative.is_empty() {
+        "index.html"
+    } else {
+        relative
+    };
+    let mut path = std::path::PathBuf::from(dir);
+    for part in relative.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            continue;
+        }
+        path.push(part);
+    }
+    let body = match std::fs::read(&path) {
+        Ok(body) => body,
+        Err(_) => match std::fs::read(std::path::PathBuf::from(dir).join("index.html")) {
+            Ok(body) => body,
+            Err(_) => {
+                respond_text(
+                    stream,
+                    404,
+                    "Not Found",
+                    "404 page not found\n",
+                    cors,
+                    "text/plain; charset=utf-8",
+                )
+                .await?;
+                return Ok(true);
+            }
+        },
+    };
+    let mime = mime_for(&path);
+    let mut headers = cors.to_vec();
+    headers.push(format!("Content-Type: {mime}"));
+    send(stream, 200, "OK", None, &headers, &body, false).await?;
+    Ok(true)
+}
+
+fn mime_for(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Chunked response head (Go's flusher-based handlers).
+async fn send_chunked_head(stream: &mut TcpStream, headers: &[String]) -> std::io::Result<()> {
+    let mut head = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n");
+    for header in headers {
+        head.push_str(header);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await
+}
+
+async fn write_chunk(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
+    stream
+        .write_all(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes())
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -959,6 +1437,8 @@ mod tests {
             secret: secret.map(str::to_string),
             allow_origins: vec!["*".into()],
             allow_private_network: false,
+            external_ui: None,
+            external_ui_download: None,
         }
     }
 
@@ -1062,21 +1542,54 @@ mod tests {
 
     #[test]
     fn route_classification() {
-        assert!(matches!(classify("/").0, Route::Root));
-        assert!(matches!(classify("/version").0, Route::Version));
-        assert!(matches!(classify("/proxies").0, Route::Proxies));
-        assert!(matches!(classify("/proxies/").0, Route::Proxies));
-        assert!(matches!(classify("/proxies/sel").0, Route::Proxy(_)));
-        assert!(matches!(classify("/proxies/sel/").0, Route::Proxy(_)));
-        assert!(matches!(classify("/proxies/sel/delay").0, Route::Delay(_)));
-        assert!(matches!(classify("/proxies/sel/delay/").0, Route::Delay(_)));
-        assert!(matches!(classify("/proxies/a/b").0, Route::Unknown));
-        assert!(matches!(classify("/proxies//sel").0, Route::Unknown));
-        assert!(matches!(classify("/proxies/").0, Route::Proxies));
-        assert!(matches!(classify("/nope").0, Route::Unknown));
-        assert!(matches!(classify("/version/").0, Route::Unknown));
-        assert_eq!(classify("/proxies/sel").1, GET_PUT);
-        assert_eq!(classify("/version").1, GET_ONLY);
+        assert!(matches!(classify_with_ui("/", false).0, Route::Root));
+        assert!(matches!(
+            classify_with_ui("/version", false).0,
+            Route::Version
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies", false).0,
+            Route::Proxies
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/", false).0,
+            Route::Proxies
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/sel", false).0,
+            Route::Proxy(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/sel/", false).0,
+            Route::Proxy(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/sel/delay", false).0,
+            Route::Delay(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/sel/delay/", false).0,
+            Route::Delay(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/a/b", false).0,
+            Route::Unknown
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies//sel", false).0,
+            Route::Unknown
+        ));
+        assert!(matches!(
+            classify_with_ui("/proxies/", false).0,
+            Route::Proxies
+        ));
+        assert!(matches!(classify_with_ui("/nope", false).0, Route::Unknown));
+        assert!(matches!(
+            classify_with_ui("/version/", false).0,
+            Route::Unknown
+        ));
+        assert_eq!(classify_with_ui("/proxies/sel", false).1, GET_PUT);
+        assert_eq!(classify_with_ui("/version", false).1, GET_ONLY);
     }
 
     #[test]
@@ -1091,5 +1604,109 @@ mod tests {
     fn normalize_bind_wildcard() {
         assert_eq!(normalize_bind(":9090"), "0.0.0.0:9090");
         assert_eq!(normalize_bind("127.0.0.1:9090"), "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn data_view_routes_classify() {
+        assert!(matches!(classify_with_ui("/logs", false).0, Route::Logs));
+        assert!(matches!(
+            classify_with_ui("/traffic", false).0,
+            Route::Traffic
+        ));
+        assert!(matches!(
+            classify_with_ui("/connections", false).0,
+            Route::Connections
+        ));
+        assert!(matches!(
+            classify_with_ui("/connections/42", false).0,
+            Route::Connection(42)
+        ));
+        assert!(matches!(
+            classify_with_ui("/connections/abc", false).0,
+            Route::Unknown
+        ));
+        assert!(matches!(classify_with_ui("/rules", false).0, Route::Rules));
+        assert!(matches!(
+            classify_with_ui("/configs", false).0,
+            Route::Configs
+        ));
+        assert!(matches!(
+            classify_with_ui("/providers/proxies", false).0,
+            Route::Providers
+        ));
+        assert!(matches!(
+            classify_with_ui("/providers/rule/abc", false).0,
+            Route::Providers
+        ));
+        assert_eq!(classify_with_ui("/connections", false).1, GET_DELETE);
+        assert_eq!(classify_with_ui("/configs", false).1, GET_PUT_PATCH);
+        // external_ui turns unknown paths into static lookups
+        assert!(matches!(
+            classify_with_ui("/ui/app.js", true).0,
+            Route::Static(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/ui/app.js", false).0,
+            Route::Unknown
+        ));
+        // traversal attempts never become file lookups
+        assert!(matches!(
+            classify_with_ui("/../etc/passwd", true).0,
+            Route::Unknown
+        ));
+    }
+
+    #[test]
+    fn rfc3339_and_ports() {
+        assert_eq!(rfc3339_utc(Duration::from_secs(0)).len(), 20);
+        assert!(rfc3339_utc(Duration::from_secs(0)).ends_with('Z'));
+        // 2024-01-02T03:04:05Z
+        let (y, m, d, hh, mm, ss) = civil_from_epoch(1_704_164_645);
+        assert_eq!(
+            (y, m, d, hh, mm, ss),
+            (2024, 1, 2, 3, 4, 5),
+            "civil_from_epoch"
+        );
+        assert_eq!(
+            split_host_port("192.168.1.10:5000"),
+            ("192.168.1.10".to_string(), "5000".to_string())
+        );
+        assert_eq!(
+            split_host_port("[::1]:443"),
+            ("::1".to_string(), "443".to_string())
+        );
+        assert_eq!(
+            split_host_port("example.com"),
+            ("example.com".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn log_entry_shape() {
+        // serde_json orders object keys alphabetically here
+        assert_eq!(
+            log_entry("", logging::Level::Info, "hello"),
+            r#"{"payload":"hello","type":"info"}"#
+        );
+        assert_eq!(
+            log_entry("warning", logging::Level::Warn, "careful"),
+            r#"{"payload":"careful","type":"warning"}"#
+        );
+    }
+
+    #[test]
+    fn mime_guesses() {
+        assert_eq!(
+            mime_for(std::path::Path::new("a/index.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            mime_for(std::path::Path::new("a/app.js")),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            mime_for(std::path::Path::new("a/x.bin")),
+            "application/octet-stream"
+        );
     }
 }

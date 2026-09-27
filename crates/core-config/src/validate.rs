@@ -515,7 +515,10 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
         "mixed",
         &["users", "domain_resolver", "set_system_proxy", "tls"],
     ),
-    ("http", &[]),
+    (
+        "http",
+        &["users", "domain_resolver", "set_system_proxy", "tls"],
+    ),
     ("socks", &["users", "domain_resolver"]),
     (
         "tproxy",
@@ -640,6 +643,7 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
 const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     // (inbound type, field, Go kind)
     ("mixed", "set_system_proxy", "bool"),
+    ("http", "set_system_proxy", "bool"),
     ("tproxy", "network", "listable_string"),
     ("tproxy", "udp_mapping", "bool"),
     ("tproxy", "udp_filtering", "bool"),
@@ -653,7 +657,7 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     ("shadowsocks", "network", "listable_string"),
     ("shadowsocks", "method", "string"),
     ("shadowsocks", "password", "string"),
-    ("shadowsocks", "destinations", "listable_string"),
+    ("shadowsocks", "destinations", "destination_list"),
     ("shadowsocks", "managed", "bool"),
     ("shadowtls", "version", "int"),
     ("shadowtls", "password", "string"),
@@ -1391,6 +1395,30 @@ fn check_int_field(value: &Value, at: &str, go_struct: &str, go_field: &str) -> 
         )),
         Value::Object(_) => Err(format!(
             "{at}: json: cannot unmarshal object into Go struct field {go_struct}.{go_field} of type int"
+        )),
+    }
+}
+
+/// `[]string` field: a bare string or an array of strings, with the reference
+/// element paths.
+fn check_string_list(value: &Value, at: &str, go_struct: &str, field: &str) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(_) => Ok(()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if !item.is_string() {
+                    return Err(format!(
+                        "{at}[{index}]: json: cannot unmarshal {} into Go struct field {go_struct}.{field} of type string",
+                        json_kind(item)
+                    ));
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "{at}: json: cannot unmarshal {} into Go struct field {go_struct}.{field} of type []string",
+            json_kind(other)
         )),
     }
 }
@@ -2287,7 +2315,7 @@ fn validate_listen_options(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
     if let Some(value) = obj.get("udp_timeout").filter(|value| !prunes_value(value)) {
         check_udp_timeout(value, &format!("{at}.udp_timeout"))?;
     }
-    if (ty == "mixed" || ty == "socks")
+    if (ty == "mixed" || ty == "http" || ty == "socks")
         && let Some(value) = obj
             .get("domain_resolver")
             .filter(|value| !prunes_value(value))
@@ -2434,26 +2462,10 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                 }
                 return Err(go_type_error(value, &field_at, go_struct, field, "string"));
             }
-            "listable_string" => match value {
-                Value::String(_) => continue,
-                Value::Array(items) => {
-                    for (index, item) in items.iter().enumerate() {
-                        if !item.is_string() {
-                            return Err(format!(
-                                "{field_at}[{index}]: json: cannot unmarshal {} into Go value of type string",
-                                json_kind(item)
-                            ));
-                        }
-                    }
-                    continue;
-                }
-                other => {
-                    return Err(format!(
-                        "{field_at}: json: cannot unmarshal {} into Go value of type string",
-                        json_kind(other)
-                    ));
-                }
-            },
+            "listable_string" => {
+                check_string_list(value, &field_at, go_struct, field)?;
+                continue;
+            }
             "object" => {
                 if value.is_object() {
                     continue;
@@ -2466,6 +2478,31 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                     "map[string]interface {}",
                 ));
             }
+            "destination_list" => match value {
+                Value::Null => {}
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        if !item.is_object() {
+                            return Err(go_type_error(
+                                item,
+                                &format!("{field_at}[{index}]"),
+                                go_struct,
+                                &format!("{field}[{index}]"),
+                                "option.ShadowsocksDestination",
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    return Err(go_type_error(
+                        other,
+                        &field_at,
+                        go_struct,
+                        field,
+                        "[]option.ShadowsocksDestination",
+                    ));
+                }
+            },
             "int" => check_int_field(value, &field_at, go_struct, field)?,
             "uint16" => check_uint_field(value, &field_at, go_struct, field, 16)?,
             "uint32" => check_uint_field(value, &field_at, go_struct, field, 32)?,
@@ -4417,7 +4454,7 @@ fn validate_vless_encryption(obj: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_anytls_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+fn validate_anytls_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     // reference stage-2 prune runs deep: empty containers behave as absent.
     let pruned =
@@ -4427,6 +4464,7 @@ fn validate_anytls_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), 
     };
     let obj = pruned;
     const ABS: &str = "AnyTLSOutboundOptions.DialerOptions.AbstractDialerOptions";
+    check_dialer_platform_gates(obj, &format!("initialize outbound[{i}] anytls[{tag}]"))?;
 
     // Field checks run before the unknown-field pass (fixed order matches the
     // observed reference probes better than the BTreeMap alphabetical walk).
@@ -4856,7 +4894,7 @@ fn go_read_file(path: &str) -> Result<String, String> {
 /// reference `option.SnellOutboundOptions.UnmarshalJSON`: base pass (types),
 /// version switch, then version-specific fields plus unknown fields via
 /// `badjson.UnmarshallExcluded`. Input is already stage-2 pruned by `validate`.
-fn validate_snell_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+fn validate_snell_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     const ABSO: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions";
     const SRV: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions.ServerOptions";
@@ -4881,6 +4919,7 @@ fn validate_snell_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), S
     }
     check_dialer_fields(
         &at,
+        &format!("initialize outbound[{i}] snell[{tag}]"),
         obj,
         "_SnellOutboundOptions.AbstractSnellOutboundOptions",
     )?;
@@ -4980,7 +5019,46 @@ fn valid_netip_addr(s: &str) -> bool {
 
 /// Dialer field value checks for the plain outbounds; `prefix` is the Go
 /// struct that embeds `DialerOptions` (e.g. `SOCKSOutboundOptions`).
-fn check_dialer_fields(at: &str, obj: &Map<String, Value>, prefix: &str) -> Result<(), String> {
+/// reference `common/dialer.New`: the platform gates and the option conflict
+/// it reports while the dialer is built.
+fn check_dialer_platform_gates(obj: &Map<String, Value>, init_at: &str) -> Result<(), String> {
+    if let Some(mark) = obj.get("routing_mark").and_then(Value::as_u64)
+        && mark > 0
+        && !cfg!(target_os = "linux")
+    {
+        return Err(format!(
+            "{init_at}: `routing_mark` is only supported on Linux"
+        ));
+    }
+    if obj.get("bind_address_no_port").and_then(Value::as_bool) == Some(true)
+        && !cfg!(target_os = "linux")
+    {
+        return Err(format!(
+            "{init_at}: `bind_address_no_port` is only supported on Linux"
+        ));
+    }
+    let network_strategy = obj
+        .get("network_strategy")
+        .is_some_and(|value| !prunes_value(value));
+    let default_bind = ["bind_interface", "inet4_bind_address", "inet6_bind_address"]
+        .iter()
+        .any(|field| obj.get(*field).is_some_and(|value| !prunes_value(value)))
+        || obj.get("tcp_fast_open").and_then(Value::as_bool) == Some(true);
+    if network_strategy && default_bind {
+        return Err(format!(
+            "{init_at}: `network_strategy` is conflict with `bind_interface`, `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`"
+        ));
+    }
+    Ok(())
+}
+
+fn check_dialer_fields(
+    at: &str,
+    init_at: &str,
+    obj: &Map<String, Value>,
+    prefix: &str,
+) -> Result<(), String> {
+    check_dialer_platform_gates(obj, init_at)?;
     let dial = format!("{prefix}.DialerOptions");
     let abs = format!("{dial}.AbstractDialerOptions");
     if let Some(v) = obj.get("detour") {
@@ -5095,19 +5173,34 @@ fn check_dialer_fields(at: &str, obj: &Map<String, Value>, prefix: &str) -> Resu
 }
 
 /// `option.UDPOverTCPOptions`: bool or strict {enabled, version} object.
-fn check_udp_over_tcp(value: &Value, at: &str) -> Result<(), String> {
+fn check_udp_over_tcp(value: &Value, at: &str, outer: &str) -> Result<(), String> {
     match value {
         Value::Null | Value::Bool(_) => Ok(()),
         Value::Object(map) => {
             reject_unknown_fields(map, &["enabled", "version"], at)?;
             if let Some(v) = map.get("enabled") {
-                ep_bool(v, &format!("{at}.enabled"), "UDPOverTCPOptions", "enabled")?;
+                ep_bool(v, &format!("{at}.enabled"), "_UDPOverTCPOptions", "enabled")?;
             }
             if let Some(v) = map.get("version")
-                && check_u16(v).is_err()
+                && !matches!(v, Value::Number(_))
             {
-                return Err(format!(
-                    "{at}.version: json: cannot unmarshal value into Go struct field UDPOverTCPOptions.version of type uint8"
+                return Err(go_type_error(
+                    v,
+                    &format!("{at}.version"),
+                    "_UDPOverTCPOptions",
+                    "version",
+                    "uint8",
+                ));
+            }
+            if let Some(v) = map.get("version")
+                && v.as_u64().is_none_or(|number| number > u64::from(u8::MAX))
+            {
+                return Err(go_type_error(
+                    v,
+                    &format!("{at}.version"),
+                    "_UDPOverTCPOptions",
+                    "version",
+                    "uint8",
                 ));
             }
             Ok(())
@@ -5115,15 +5208,15 @@ fn check_udp_over_tcp(value: &Value, at: &str) -> Result<(), String> {
         other => Err(go_field_err(
             at,
             other,
-            "UDPOverTCPOptions",
+            outer,
             "udp_over_tcp",
-            "value",
+            "option._UDPOverTCPOptions",
         )),
     }
 }
 
 /// `option.OutboundMultiplexOptions` (+ nested brutal).
-fn check_out_multiplex(value: &Value, at: &str) -> Result<(), String> {
+fn check_out_multiplex(value: &Value, at: &str, outer: &str) -> Result<(), String> {
     match value {
         Value::Null => Ok(()),
         Value::Object(map) => {
@@ -5140,9 +5233,15 @@ fn check_out_multiplex(value: &Value, at: &str) -> Result<(), String> {
                 ],
                 at,
             )?;
+            // the decoder reports the json path inside the container
             for f in ["enabled", "padding"] {
                 if let Some(v) = map.get(f) {
-                    ep_bool(v, &format!("{at}.{f}"), "OutboundMultiplexOptions", f)?;
+                    ep_bool(
+                        v,
+                        &format!("{at}.{f}"),
+                        "OutboundMultiplexOptions",
+                        &format!("multiplex.{f}"),
+                    )?;
                 }
             }
             if let Some(v) = map.get("protocol") {
@@ -5150,12 +5249,17 @@ fn check_out_multiplex(value: &Value, at: &str) -> Result<(), String> {
                     v,
                     &format!("{at}.protocol"),
                     "OutboundMultiplexOptions",
-                    "protocol",
+                    "multiplex.protocol",
                 )?;
             }
             for f in ["max_connections", "min_streams", "max_streams"] {
                 if let Some(v) = map.get(f) {
-                    check_int_field(v, &format!("{at}.{f}"), "OutboundMultiplexOptions", f)?;
+                    check_int_field(
+                        v,
+                        &format!("{at}.{f}"),
+                        "OutboundMultiplexOptions",
+                        &format!("multiplex.{f}"),
+                    )?;
                 }
             }
             if let Some(brutal) = map.get("brutal")
@@ -5190,9 +5294,9 @@ fn check_out_multiplex(value: &Value, at: &str) -> Result<(), String> {
         other => Err(go_field_err(
             at,
             other,
-            "OutboundMultiplexOptions",
+            outer,
             "multiplex",
-            "value",
+            "option.OutboundMultiplexOptions",
         )),
     }
 }
@@ -5218,7 +5322,12 @@ fn check_http_header(value: &Value, at: &str, go_struct: &str, field: &str) -> R
 
 /// Decode for the plain outbounds without a bespoke validator: allowed-field
 /// rejection + per-type value checks + shared dialer/tls containers.
-fn validate_plain_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Result<(), String> {
+fn validate_plain_out_decode(
+    i: usize,
+    ty: &str,
+    tag: &str,
+    obj: &Map<String, Value>,
+) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     let (protocol, go_base, has_tls, has_quic): (&[&str], &str, bool, bool) = match ty {
         "socks" => (SOCKS_OUT_FIELDS, "SOCKSOutboundOptions", false, false),
@@ -5337,17 +5446,17 @@ fn validate_plain_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Re
     if ty == "http"
         && let Some(v) = obj.get("headers")
     {
-        check_http_header(v, &format!("{at}.headers"), go_base, "headers")?;
+        check_http_header(v, &format!("{at}.headers"), go_base, "badoption.HTTPHeader")?;
     }
     if matches!(ty, "socks" | "shadowsocks" | "naive")
         && let Some(v) = obj.get("udp_over_tcp")
     {
-        check_udp_over_tcp(v, &format!("{at}.udp_over_tcp"))?;
+        check_udp_over_tcp(v, &format!("{at}.udp_over_tcp"), go_base)?;
     }
     if matches!(ty, "shadowsocks" | "vmess" | "vless" | "trojan")
         && let Some(v) = obj.get("multiplex")
     {
-        check_out_multiplex(v, &format!("{at}.multiplex"))?;
+        check_out_multiplex(v, &format!("{at}.multiplex"), go_base)?;
     }
     if has_tls
         && let Some(tls) = obj.get("tls")
@@ -5364,11 +5473,16 @@ fn validate_plain_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Re
         }
         validate_tls_container(tls, &format!("{at}.tls"), false)?;
     }
-    check_dialer_fields(&at, obj, go_base)?;
+    check_dialer_fields(
+        &at,
+        &format!("initialize outbound[{i}] {ty}[{tag}]"),
+        obj,
+        go_base,
+    )?;
     Ok(())
 }
 
-fn validate_direct_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+fn validate_direct_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     let mut allowed: Vec<&str> = DIALER_OUT_FIELDS.to_vec();
     allowed.extend(DIRECT_OUT_FIELDS);
@@ -5394,7 +5508,12 @@ fn validate_direct_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), 
     if let Some(v) = obj.get("override_port") {
         check_u16(v).map_err(|m| format!("{at}.override_port: {m}"))?;
     }
-    check_dialer_fields(&at, obj, "_DirectOutboundOptions")?;
+    check_dialer_fields(
+        &at,
+        &format!("initialize outbound[{i}] direct[{tag}]"),
+        obj,
+        "_DirectOutboundOptions",
+    )?;
     //nolint:staticcheck
     let override_address = obj
         .get("override_address")
@@ -5412,7 +5531,7 @@ fn validate_direct_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), 
     Ok(())
 }
 
-fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+fn validate_tor_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     let mut allowed: Vec<&str> = DIALER_OUT_FIELDS.to_vec();
     allowed.extend(TOR_OUT_FIELDS);
@@ -5424,7 +5543,12 @@ fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
         }
     }
     if let Some(v) = obj.get("extra_args") {
-        check_listable_string(v, &format!("{at}.extra_args"))?;
+        check_string_list(
+            v,
+            &format!("{at}.extra_args"),
+            "TorOutboundOptions",
+            "extra_args",
+        )?;
     }
     if let Some(v) = obj.get("torrc")
         && !v.is_null()
@@ -5450,7 +5574,12 @@ fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
             }
         }
     }
-    check_dialer_fields(&at, obj, "TorOutboundOptions")?;
+    check_dialer_fields(
+        &at,
+        &format!("initialize outbound[{i}] tor[{tag}]"),
+        obj,
+        "TorOutboundOptions",
+    )?;
     Ok(())
 }
 
@@ -5606,6 +5735,14 @@ fn validate_group_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Re
         _ => CHAIN_OUT_FIELDS,
     };
     reject_unknown_fields(obj, allowed, &at)?;
+    if let Some(v) = obj.get("outbounds") {
+        let go_struct = match ty {
+            "selector" => "SelectorOutboundOptions",
+            "urltest" => "URLTestOutboundOptions",
+            _ => "ChainOutboundOptions",
+        };
+        check_string_list(v, &format!("{at}.outbounds"), go_struct, "outbounds")?;
+    }
     match ty {
         "selector" => {
             if let Some(v) = obj.get("default") {
@@ -5762,17 +5899,17 @@ fn validate_outbound(
         "hysteria2" => validate_hy2_out_decode(i, obj)?,
         "tuic" => validate_tuic_out_decode(i, obj)?,
         "masque" => validate_masque_out_decode(i, obj)?,
-        "anytls" => validate_anytls_out_decode(i, obj)?,
-        "snell" => validate_snell_out_decode(i, obj)?,
+        "anytls" => validate_anytls_out_decode(i, tag, obj)?,
+        "snell" => validate_snell_out_decode(i, tag, obj)?,
         "fptn" => validate_fptn_out_decode(i, obj)?,
         "socks" | "http" | "shadowsocks" | "shadowtls" | "vmess" | "vless" | "trojan"
         | "hysteria" | "naive" | "ssh" => {
-            validate_plain_out_decode(i, ty, obj)?;
+            validate_plain_out_decode(i, ty, tag, obj)?;
             if ty == "vless" {
                 validate_vless_encryption(obj)?;
             }
         }
-        "direct" => validate_direct_out_decode(i, obj)?,
+        "direct" => validate_direct_out_decode(i, tag, obj)?,
         "bridge" => {
             reject_unknown_fields(obj, BRIDGE_OUT_FIELDS, &format!("outbounds[{i}]"))?;
             for field in ["iproute2_table_index", "iproute2_rule_index"] {
@@ -5789,7 +5926,7 @@ fn validate_outbound(
         "block" => {
             reject_unknown_fields(obj, &["type", "tag"], &format!("outbounds[{i}]"))?;
         }
-        "tor" => validate_tor_out_decode(i, obj)?,
+        "tor" => validate_tor_out_decode(i, tag, obj)?,
         "selector" | "urltest" | "chain" => validate_group_out_decode(i, ty, obj)?,
         _ => {}
     }
@@ -5822,9 +5959,20 @@ fn validate_outbound(
     }
 
     if let Some(transport) = obj.get("transport") {
-        let transport = transport
-            .as_object()
-            .ok_or_else(|| format!("outbounds[{i}].transport: must be a JSON object"))?;
+        let go_struct = SERVER_OUT_BASES
+            .iter()
+            .find(|(known, _)| *known == ty)
+            .map(|(_, name)| *name)
+            .unwrap_or("V2RayOutboundOptions");
+        let transport = transport.as_object().ok_or_else(|| {
+            go_type_error(
+                transport,
+                &format!("outbounds[{i}].transport"),
+                go_struct,
+                "transport",
+                "option._V2RayTransportOptions",
+            )
+        })?;
         let transport_ty = type_field(transport, &format!("outbounds[{i}].transport"))?;
         if !TRANSPORT_TYPES.contains(&transport_ty) {
             return Err(format!(

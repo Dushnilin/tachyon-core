@@ -1,0 +1,18 @@
+{
+  "log": {
+    "level": "error"
+  },
+  "inbounds": [
+    {
+      "type": "cloudflared",
+      "tag": "tunnel",
+      "token": "eyJhIjoiMGIwMTk1a2QiLCJiIjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImMiOiJhYmMifQ"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}

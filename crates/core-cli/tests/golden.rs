@@ -12,6 +12,14 @@ fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden")
 }
 
+/// `check` resolves relative paths (certificate/key files) against the working
+/// directory, exactly like the reference CLI, so the corpus is checked from the
+/// workspace root.
+fn use_workspace_cwd() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::env::set_current_dir(&root).expect("set workspace cwd");
+}
+
 fn json_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(entries) => entries
@@ -37,6 +45,7 @@ fn corpus_files(dir_name: &str) -> Vec<PathBuf> {
 }
 
 fn assert_accepts(dir_name: &str) {
+    use_workspace_cwd();
     for file in corpus_files(dir_name) {
         let raw =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
@@ -48,6 +57,7 @@ fn assert_accepts(dir_name: &str) {
 }
 
 fn assert_rejects(dir_name: &str) {
+    use_workspace_cwd();
     for file in corpus_files(dir_name) {
         let raw =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));

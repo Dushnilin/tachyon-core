@@ -231,6 +231,7 @@ const KNOWN_INBOUND_TYPES: &[&str] = &[
     "naive",
     "hysteria",
     "snell",
+    "cloudflared",
 ];
 
 const KNOWN_OUTBOUND_TYPES: &[&str] = &[
@@ -258,6 +259,35 @@ const KNOWN_OUTBOUND_TYPES: &[&str] = &[
     "wireguard",
     "fptn",
     "dns",
+    "bridge",
+];
+
+/// `option.BridgeOutboundOptions` (protocol/bridge): no dialer/listen embedding,
+/// four optional fields, no init validation.
+const BRIDGE_OUT_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "interface",
+    "bridge_name",
+    "iproute2_table_index",
+    "iproute2_rule_index",
+];
+
+/// `option.CloudflaredInboundOptions` (include/cloudflared): no listen options,
+/// two embedded `DialerOptions`.
+const CLOUDFLARED_IN_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "token",
+    "ha_connections",
+    "protocol",
+    "post_quantum",
+    "edge_ip_version",
+    "datagram_version",
+    "grace_period",
+    "region",
+    "control_dialer",
+    "tunnel_dialer",
 ];
 
 const TRANSPORT_TYPES: &[&str] = &["ws", "quic", "grpc", "httpupgrade", "http", "xhttp"];
@@ -320,13 +350,13 @@ fn dns_server_fields(ty: &str) -> Vec<&'static str> {
 
 /// Types whose init requires an endpoint tag (protocol/{tailscale,openvpn,
 /// openconnect}/dns_transport.go).
-fn dns_endpoint_tag_error(ty: &str, tag: &str) -> Option<String> {
+fn dns_endpoint_tag_error(ty: &str, i: usize, tag: &str) -> Option<String> {
     let message = match ty {
         "tailscale" => "missing tailscale endpoint tag",
         "openvpn" | "openconnect" => "missing endpoint tag",
         _ => return None,
     };
-    Some(format!("initialize DNS server[0] {ty}[{tag}]: {message}"))
+    Some(format!("initialize DNS server[{i}] {ty}[{tag}]: {message}"))
 }
 
 const SS_METHODS: &[&str] = &[
@@ -1382,23 +1412,42 @@ fn validate_users_hy2(value: &Value, at: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_users_tuic(value: &Value, at: &str, init_at: &str) -> Result<(), String> {
+fn validate_users_tuic(value: &Value, at: &str) -> Result<(), String> {
     if value.is_null() {
         return Ok(());
     }
-    let users = value
-        .as_array()
-        .ok_or_else(|| format!("{at}: json: cannot unmarshal value into Go struct field TUICInboundOptions.users of type []option.TUICUser"))?;
+    let users = value.as_array().ok_or_else(|| {
+        format!(
+            "{at}: json: cannot unmarshal {} into Go struct field TUICInboundOptions.users of type []option.TUICUser",
+            json_kind(value)
+        )
+    })?;
     for (idx, user) in users.iter().enumerate() {
         let u = user.as_object().ok_or_else(|| {
             format!(
                 "{at}[{idx}]: json: cannot unmarshal value into Go value of type option.TUICUser"
             )
         })?;
-        reject_unknown_fields(u, &["name", "uuid", "password"], &format!("{at}[{idx}"))?;
-        if let Some(uuid) = u.get("uuid").and_then(Value::as_str)
-            && !valid_uuid(uuid)
-        {
+        reject_unknown_fields(u, &["name", "uuid", "password"], &format!("{at}[{idx}]"))?;
+    }
+    Ok(())
+}
+
+/// reference `protocol/tuic.NewInbound`: the uuid list is walked after the
+/// server TLS config is built, so this is an init-chain check.
+fn check_users_tuic_uuid(value: &Value, init_at: &str) -> Result<(), String> {
+    let Some(users) = value.as_array() else {
+        return Ok(());
+    };
+    for (idx, user) in users.iter().enumerate() {
+        let Some(uuid) = user
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|uuid| !uuid.is_empty())
+        else {
+            return Err(format!("{init_at}: missing uuid for user {idx}"));
+        };
+        if !valid_uuid(uuid) {
             return Err(format!(
                 "{init_at}: invalid uuid for user {idx}: uuid: incorrect UUID length"
             ));
@@ -2477,8 +2526,9 @@ fn validate_tuic_in_decode(
             "tcp_keep_alive",
         )?;
     }
+    let _ = init_at;
     if let Some(users) = obj.get("users") {
-        validate_users_tuic(users, &format!("{at}.users"), init_at)?;
+        validate_users_tuic(users, &format!("{at}.users"))?;
     }
     if let Some(tls) = obj.get("tls") {
         validate_tls_container(tls, &format!("{at}.tls"), true)?;
@@ -2562,7 +2612,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
             if let Some(port) = obj.get("listen_port").filter(|p| !p.is_null()) {
                 check_u16(port).map_err(|m| format!("inbounds[{i}].listen_port: {m}"))?;
             }
-            validate_inbound(i, ty, tag, obj)?;
+            validate_inbound(i, ty, &index_tag(tag, i), obj)?;
         }
     }
 
@@ -2593,7 +2643,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
             {
                 check_u16(port).map_err(|m| format!("outbounds[{i}].server_port: {m}"))?;
             }
-            validate_outbound(i, ty, tag, obj, &dns_tags)?;
+            validate_outbound(i, ty, &index_tag(tag, i), obj, &dns_tags)?;
         }
     }
 
@@ -2649,7 +2699,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
                 return Err(format!("duplicate outbound/endpoint tag: {tag}"));
             }
             endpoint_decode(i, obj, ty)?;
-            initialized.push((i, tag.to_string(), ty.to_string()));
+            initialized.push((i, index_tag(tag, i), ty.to_string()));
         }
         for (i, tag, ty) in initialized {
             let raw = &entries[i];
@@ -2999,16 +3049,14 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
         if !DNS_SERVER_TYPES.contains(&ty) {
             return Err(format!("dns.servers[{i}]: unknown transport type: {ty}"));
         }
-        let server_tag = server.get("tag").and_then(Value::as_str).unwrap_or("");
-        if !server_tag.is_empty() {
-            tags.insert(server_tag.to_string());
-            let static_ty = DNS_SERVER_TYPES
-                .iter()
-                .find(|known| **known == ty)
-                .copied()
-                .unwrap_or("");
-            seen.push((server_tag.to_string(), static_ty, i));
-        }
+        let server_tag = index_tag(server.get("tag").and_then(Value::as_str).unwrap_or(""), i);
+        tags.insert(server_tag.clone());
+        let static_ty = DNS_SERVER_TYPES
+            .iter()
+            .find(|known| **known == ty)
+            .copied()
+            .unwrap_or("");
+        seen.push((server_tag.clone(), static_ty, i));
         // per-type field allowlist (reference decodes the concrete options
         // with DisallowUnknownFields)
         let allowed = dns_server_fields(ty);
@@ -3019,11 +3067,16 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
                 ));
             }
         }
-        validate_dns_server_fields(ty, server, server_tag, &seen)?;
+        validate_dns_server_fields(ty, server, i, &server_tag, &seen)?;
         if ty == "fakeip" {
             let has_ranges =
                 server.contains_key("inet4_range") || server.contains_key("inet6_range");
             let tag = server.get("tag").and_then(Value::as_str).unwrap_or("");
+            let tag = if tag.is_empty() {
+                i.to_string()
+            } else {
+                tag.to_string()
+            };
             if !has_ranges {
                 return Err(format!(
                     "initialize DNS server[{i}] fakeip[{tag}]: at least one of inet4_range or inet6_range must be set"
@@ -3221,6 +3274,61 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
     let at = format!("initialize inbound[{i}] {ty}[{tag}]");
 
     match ty {
+        "cloudflared" => {
+            reject_unknown_fields(obj, CLOUDFLARED_IN_FIELDS, &format!("inbounds[{i}]"))?;
+            for field in ["ha_connections", "edge_ip_version"] {
+                if let Some(value) = obj.get(field).filter(|v| !prunes_value(v)) {
+                    check_int_field(
+                        value,
+                        &format!("inbounds[{i}].{field}"),
+                        "CloudflaredInboundOptions",
+                        field,
+                    )?;
+                }
+            }
+            for field in ["token", "protocol", "datagram_version", "region"] {
+                if let Some(value) = obj.get(field).filter(|v| !prunes_value(v)) {
+                    ep_str(
+                        value,
+                        &format!("inbounds[{i}].{field}"),
+                        "CloudflaredInboundOptions",
+                        field,
+                    )?;
+                }
+            }
+            if let Some(value) = obj.get("post_quantum").filter(|v| !prunes_value(v)) {
+                check_bool_field(
+                    value,
+                    &format!("inbounds[{i}].post_quantum"),
+                    "CloudflaredInboundOptions",
+                    "post_quantum",
+                )?;
+            }
+            if let Some(value) = obj.get("grace_period").filter(|v| !prunes_value(v)) {
+                check_duration_field(
+                    value,
+                    &format!("inbounds[{i}].grace_period"),
+                    "CloudflaredInboundOptions",
+                    "grace_period",
+                )?;
+            }
+            for field in ["control_dialer", "tunnel_dialer"] {
+                if let Some(dialer) = obj.get(field).filter(|v| !prunes_value(v)) {
+                    let dialer = dialer.as_object().ok_or_else(|| {
+                        format!("inbounds[{i}].{field}: json: cannot unmarshal value into Go struct field CloudflaredInboundOptions.{field} of type option.DialerOptions")
+                    })?;
+                    reject_unknown_fields(
+                        dialer,
+                        DIALER_OUT_FIELDS,
+                        &format!("inbounds[{i}].{field}"),
+                    )?;
+                }
+            }
+            // the reference build has no `with_cloudflared` tag
+            return Err(format!(
+                "{at}: Cloudflared is not included in this build, rebuild with -tags with_cloudflared"
+            ));
+        }
         "hysteria2" => validate_hy2_in_decode(i, obj)?,
         "tuic" => validate_tuic_in_decode(i, &at, obj)?,
         "snell" => {
@@ -3263,7 +3371,12 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
 
     if ty == "hysteria2" || ty == "tuic" {
         if tls_enabled(obj.get("tls")) {
-            validate_server_tls(obj.get("tls").unwrap(), &at)?;
+            validate_server_tls(obj.get("tls").unwrap(), &at, &format!("inbounds[{i}].tls"))?;
+        }
+        if ty == "tuic"
+            && let Some(users) = obj.get("users")
+        {
+            check_users_tuic_uuid(users, &at)?;
         }
         if ty == "hysteria2" {
             if let Some(obfs) = obj.get("obfs")
@@ -3367,7 +3480,7 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
     }
 
     if tls_enabled(obj.get("tls")) && SERVER_TLS_INBOUNDS.contains(&ty) {
-        validate_server_tls(obj.get("tls").unwrap(), &at)?;
+        validate_server_tls(obj.get("tls").unwrap(), &at, &format!("inbounds[{i}].tls"))?;
     }
 
     Ok(())
@@ -5158,6 +5271,19 @@ fn validate_outbound(
             }
         }
         "direct" => validate_direct_out_decode(i, obj)?,
+        "bridge" => {
+            reject_unknown_fields(obj, BRIDGE_OUT_FIELDS, &format!("outbounds[{i}]"))?;
+            for field in ["iproute2_table_index", "iproute2_rule_index"] {
+                if let Some(value) = obj.get(field).filter(|v| !prunes_value(v)) {
+                    check_int_field(
+                        value,
+                        &format!("outbounds[{i}].{field}"),
+                        "BridgeOutboundOptions",
+                        field,
+                    )?;
+                }
+            }
+        }
         "block" => {
             reject_unknown_fields(obj, &["type", "tag"], &format!("outbounds[{i}]"))?;
         }
@@ -5863,14 +5989,650 @@ fn validate_utls_reality(tls: &Value, at: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_server_tls(tls: &Value, at: &str) -> Result<(), String> {
+/// Go `syscall.Errno.Error()` on Windows comes from a hardcoded English table,
+/// not from the (localized) system message text Rust would print.
+#[cfg(windows)]
+fn go_os_error_text(code: i32) -> Option<&'static str> {
+    Some(match code {
+        1 => "Incorrect function.",
+        2 => "The system cannot find the file specified.",
+        3 => "The system cannot find the path specified.",
+        5 => "Access is denied.",
+        21 => "The device is not ready.",
+        32 => "The process cannot access the file because it is being used by another process.",
+        53 => "The network path was not found.",
+        67 => "The network name cannot be found.",
+        80 => "Cannot create a file when that file already exists.",
+        123 => "The filename, directory name, or volume label syntax is incorrect.",
+        145 => "The directory is not empty.",
+        206 => "The filename or extension is too long.",
+        267 => "The directory name is invalid.",
+        995 => {
+            "The I/O operation was aborted because either the application has called the Abort function or the I/O operation has been canceled."
+        }
+        _ => return None,
+    })
+}
+
+#[cfg(not(windows))]
+fn go_os_error_text(_code: i32) -> Option<&'static str> {
+    None
+}
+
+/// Go `*fs.PathError`: `<op> <path>: <error>`. Go reports the bare syscall
+/// message, so the Rust " (os error N)" suffix goes away and the unix
+/// `strerror` text (already lowercased by Go) is lowercased here as well.
+fn go_path_error(op: &str, path: &str, err: &std::io::Error) -> String {
+    let text = match err.raw_os_error().and_then(go_os_error_text) {
+        Some(known) => known.to_string(),
+        None => {
+            let raw = err.to_string();
+            let raw = match raw.rfind(" (os error ") {
+                Some(index) => raw[..index].to_string(),
+                None => raw,
+            };
+            if cfg!(windows) {
+                raw
+            } else {
+                let mut chars = raw.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let lowered: String = first.to_lowercase().collect();
+                        lowered + chars.as_str()
+                    }
+                    None => raw,
+                }
+            }
+        }
+    };
+    format!("{op} {path}: {text}")
+}
+
+/// reference `filemanager.ReadFile` at check time: the server certificate and
+/// key are read while the TLS server config is built, so a missing file fails
+/// `check` exactly like the reference does. Go reports `open` for a failed
+/// open and `read` for a failed read (a directory opens fine, reading does not).
+fn read_tls_file(path: &str, at: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| {
+        if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+            // Go opens the directory and only fails while reading it
+            let text = if cfg!(windows) {
+                "Incorrect function."
+            } else {
+                "is a directory"
+            };
+            return format!("{at}: read certificate: read {path}: {text}");
+        }
+        format!(
+            "{at}: read certificate: {}",
+            go_path_error("open", path, &err)
+        )
+    })?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(|err| {
+        format!(
+            "{at}: read certificate: {}",
+            go_path_error("read", path, &err)
+        )
+    })?;
+    Ok(data)
+}
+
+/// Go `pem.Decode` blocks that base64-decode; blocks with broken base64 are
+/// skipped entirely, matching the decoder.
+fn pem_blocks(data: &[u8]) -> Vec<(String, Vec<u8>)> {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    const END: &str = "-----END ";
+    let mut blocks = Vec::new();
+    let mut offset = 0usize;
+    while let Some(found) = data[offset..]
+        .windows(BEGIN.len())
+        .position(|window| window == BEGIN)
+    {
+        let head = offset + found + BEGIN.len();
+        let Some(label_end) = data[head..].windows(5).position(|w| w == b"-----") else {
+            break;
+        };
+        let label = match std::str::from_utf8(&data[head..head + label_end]) {
+            Ok(text) => text.to_string(),
+            Err(_) => break,
+        };
+        let body = head + label_end + 5;
+        let tail = format!("{END}{label}-----");
+        let Some(found_end) = data[body..]
+            .windows(tail.len())
+            .position(|window| window == tail.as_bytes())
+        else {
+            break;
+        };
+        let encoded: String = data[body..body + found_end]
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(|byte| *byte as char)
+            .collect();
+        if let Some(der) = decode_base64_std(&encoded) {
+            blocks.push((label, der));
+        }
+        offset = body + found_end + tail.len();
+    }
+    blocks
+}
+
+/// Minimal DER shape check: one SEQUENCE with at least one element.
+fn der_is_sequence(der: &[u8]) -> bool {
+    !der.is_empty() && der[0] == 0x30
+}
+
+/// Go `x509.ParseCertificate` on something that is not a certificate reports
+/// "x509: malformed certificate"; the inner signature algorithm and signature
+/// are checked here, which covers truncated and non-DER input.
+fn der_is_certificate(der: &[u8]) -> bool {
+    let Some(children) = der_children(der) else {
+        return false;
+    };
+    children.len() == 3
+        && children[0].0 == 0x30
+        && children[1].0 == 0x30
+        && children[2].0 == 0x03
+        && der_children(children[0].2).is_some()
+}
+
+/// `SEQUENCE { INTEGER version, ... }` covers PKCS#1, PKCS#8 and SEC1 keys.
+fn der_is_private_key(der: &[u8]) -> bool {
+    let Some(children) = der_children(der) else {
+        return false;
+    };
+    children.len() >= 2 && children[0].0 == 0x02
+}
+
+/// SEQUENCE children as `(tag, content, whole element)`.
+type DerChildren<'a> = Vec<(u8, &'a [u8], &'a [u8])>;
+
+fn der_children(der: &[u8]) -> Option<DerChildren<'_>> {
+    if !der_is_sequence(der) {
+        return None;
+    }
+    let mut cursor = 1usize;
+    // length octets
+    let first = *der.get(cursor)?;
+    if first & 0x80 == 0 {
+        cursor += 1;
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return None;
+        }
+        cursor += 1 + count;
+    }
+    let mut children = Vec::new();
+    while cursor < der.len() {
+        let element_start = cursor;
+        let tag = der[cursor];
+        cursor += 1;
+        let first = *der.get(cursor)?;
+        let (length, header) = if first & 0x80 == 0 {
+            (first as usize, 1usize)
+        } else {
+            let count = (first & 0x7f) as usize;
+            if count == 0 || count > 4 {
+                return None;
+            }
+            let mut value = 0usize;
+            for byte in der.get(cursor + 1..cursor + 1 + count)? {
+                value = (value << 8) | *byte as usize;
+            }
+            (value, 1 + count)
+        };
+        let start = cursor + header;
+        let end = start.checked_add(length)?;
+        let content = der.get(start..end)?;
+        children.push((tag, content, &der[element_start..end]));
+        cursor = end;
+    }
+    Some(children)
+}
+
+/// reference `crypto/tls.X509KeyPair`, restricted to the PEM shapes and the
+/// shallow DER checks that cover truncated, swapped and garbage inputs. The
+/// public/private key comparison is not part of `check` parity yet.
+/// reference `option.CertificateProviderOptions` plus the inline providers
+/// registered by this build (`acme`, `tailscale`).
+fn validate_certificate_provider(value: &Value, at: &str) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    // a bare string is a shared provider tag reference
+    let Some(provider) = value.as_object() else {
+        return match value.as_str() {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "{at}: json: cannot unmarshal {} into Go value of type option.CertificateProviderOptions",
+                json_kind(value)
+            )),
+        };
+    };
+    if provider.is_empty() {
+        return Ok(());
+    }
+    let ty = match provider.get("type") {
+        None | Some(Value::Null) => {
+            return Err(format!("{at}: missing certificate provider type"));
+        }
+        Some(Value::String(text)) => text.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "{at}.type: json: cannot unmarshal {} into Go struct field _CertificateProviderInline.type of type string",
+                json_kind(other)
+            ));
+        }
+    };
+    match ty {
+        "acme" => {
+            const ACME_FIELDS: &[&str] = &[
+                "type",
+                "domain",
+                "data_directory",
+                "default_server_name",
+                "email",
+                "provider",
+                "account_key",
+                "disable_http_challenge",
+                "disable_tls_alpn_challenge",
+                "alternative_http_port",
+                "alternative_tls_port",
+                "external_account",
+                "dns01_challenge",
+                "http_challenge",
+                "challenges",
+            ];
+            reject_unknown_fields(provider, ACME_FIELDS, at)?;
+            for field in ["domain", "default_server_name"] {
+                if let Some(list) = provider.get(field).filter(|v| !prunes_value(v)) {
+                    // badoption.Listable[string]
+                    match list {
+                        Value::String(_) => {}
+                        Value::Array(items) => {
+                            for (index, item) in items.iter().enumerate() {
+                                if !item.is_string() {
+                                    return Err(format!(
+                                        "{at}.{field}[{index}]: json: cannot unmarshal {} into Go value of type string",
+                                        json_kind(item)
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "{at}.{field}: json: cannot unmarshal {} into Go value of type string",
+                                json_kind(other)
+                            ));
+                        }
+                    }
+                }
+            }
+            for field in ["data_directory", "email", "provider", "account_key"] {
+                if let Some(text) = provider.get(field).filter(|v| !prunes_value(v)) {
+                    ep_str(
+                        text,
+                        &format!("{at}.{field}"),
+                        "ACMECertificateProviderOptions",
+                        field,
+                    )?;
+                }
+            }
+            for field in ["disable_http_challenge", "disable_tls_alpn_challenge"] {
+                if let Some(flag) = provider.get(field).filter(|v| !prunes_value(v)) {
+                    check_bool_field(
+                        flag,
+                        &format!("{at}.{field}"),
+                        "ACMECertificateProviderOptions",
+                        field,
+                    )?;
+                }
+            }
+            for field in ["alternative_http_port", "alternative_tls_port"] {
+                if let Some(port) = provider.get(field).filter(|v| !prunes_value(v)) {
+                    if let Some(number) = port.as_u64() {
+                        if number > u64::from(u16::MAX) {
+                            return Err(format!(
+                                "{at}.{field}: json: cannot unmarshal number {number} into Go struct field ACMECertificateProviderOptions.{field} of type uint16"
+                            ));
+                        }
+                    } else {
+                        return Err(format!(
+                            "{at}.{field}: json: cannot unmarshal {} into Go struct field ACMECertificateProviderOptions.{field} of type uint16",
+                            json_kind(port)
+                        ));
+                    }
+                }
+            }
+            if let Some(account) = provider
+                .get("external_account")
+                .filter(|v| !prunes_value(v))
+            {
+                let account = account.as_object().ok_or_else(|| {
+                    format!("{at}.external_account: json: cannot unmarshal {} into Go value of type option.ACMEExternalAccountOptions", json_kind(account))
+                })?;
+                reject_unknown_fields(
+                    account,
+                    ACME_EXTERNAL_ACCOUNT_FIELDS,
+                    &format!("{at}.external_account"),
+                )?;
+            }
+            for field in ["dns01_challenge", "http_challenge"] {
+                if let Some(challenge) = provider.get(field).filter(|v| !prunes_value(v)) {
+                    let challenge = challenge.as_object().ok_or_else(|| {
+                        format!("{at}.{field}: json: cannot unmarshal {} into Go value of type option.ACMEProviderOptions", json_kind(challenge))
+                    })?;
+                    reject_unknown_fields(
+                        challenge,
+                        ACME_PROVIDER_FIELDS,
+                        &format!("{at}.{field}"),
+                    )?;
+                    validate_acme_dns01(challenge, &format!("{at}.{field}.dns01"))?;
+                }
+            }
+            if let Some(challenges) = provider.get("challenges").filter(|v| !prunes_value(v)) {
+                let entries = challenges.as_array().ok_or_else(|| {
+                    format!("{at}.challenges: json: cannot unmarshal {} into Go value of type []option.ACMEChallengeOptions", json_kind(challenges))
+                })?;
+                for (index, entry) in entries.iter().enumerate() {
+                    let entry = entry.as_object().ok_or_else(|| {
+                        format!("{at}.challenges[{index}]: json: cannot unmarshal {} into Go value of type option.ACMEChallengeOptions", json_kind(entry))
+                    })?;
+                    reject_unknown_fields(
+                        entry,
+                        ACME_PROVIDER_FIELDS,
+                        &format!("{at}.challenges[{index}]"),
+                    )?;
+                    validate_acme_dns01(entry, &format!("{at}.challenges[{index}].dns01"))?;
+                }
+            }
+        }
+        "tailscale" => {
+            const TAILSCALE_FIELDS: &[&str] = &["type", "endpoint"];
+            reject_unknown_fields(provider, TAILSCALE_FIELDS, at)?;
+            if let Some(endpoint) = provider.get("endpoint").filter(|v| !prunes_value(v)) {
+                ep_str(
+                    endpoint,
+                    &format!("{at}.endpoint"),
+                    "TailscaleCertificateProviderOptions",
+                    "endpoint",
+                )?;
+            }
+        }
+        other => {
+            return Err(format!("{at}: unknown certificate provider type: {other}"));
+        }
+    }
+    Ok(())
+}
+
+/// `option.ACMEProviderDNS01ChallengeOptions`: the shape is picked by the
+/// `provider` name, so the fields are validated against that choice.
+fn validate_acme_dns01(challenge: &Map<String, Value>, at: &str) -> Result<(), String> {
+    let Some(entry) = challenge.get("dns01").filter(|v| !prunes_value(v)) else {
+        return Ok(());
+    };
+    let entry = entry.as_object().ok_or_else(|| {
+        format!(
+            "{at}: json: cannot unmarshal {} into Go value of type string",
+            json_kind(entry)
+        )
+    })?;
+    let provider = entry
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let allowed = match ACME_DNS01_PROVIDERS
+        .iter()
+        .find(|(name, _)| *name == provider)
+    {
+        Some((_, fields)) => fields,
+        None => return Ok(()),
+    };
+    let mut all: Vec<&str> = allowed.to_vec();
+    all.extend(ACME_DNS01_FIELDS);
+    reject_unknown_fields(entry, &all, at)?;
+    Ok(())
+}
+
+/// reference `common/tls.newCertificateProvider`: the inline providers of this
+/// build fail fast, and the tailscale one needs a live endpoint tag.
+fn acme_provider_init_error(ty: &str, tls: &Map<String, Value>) -> Option<String> {
+    let prefix = "create inline certificate provider";
+    match ty {
+        "acme" => Some(format!(
+            "{prefix}: ACME is not included in this build, rebuild with -tags with_acme"
+        )),
+        "tailscale" => {
+            let endpoint = tls
+                .get("certificate_provider")
+                .and_then(Value::as_object)
+                .and_then(|provider| provider.get("endpoint"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if endpoint.is_empty() {
+                return Some(format!("{prefix}: missing tailscale endpoint tag"));
+            }
+            Some(format!("{prefix}: endpoint not found: {endpoint}"))
+        }
+        _ => None,
+    }
+}
+
+fn tls_key_pair_error(certificate: &[u8], key: &[u8]) -> Option<String> {
+    let cert_blocks = pem_blocks(certificate);
+    if cert_blocks.is_empty() {
+        return Some("tls: failed to find any PEM data in certificate input".to_string());
+    }
+    let cert_block = cert_blocks.iter().find(|(label, _)| label == "CERTIFICATE");
+    let Some((_, der)) = cert_block else {
+        if cert_blocks
+            .iter()
+            .any(|(label, _)| label.ends_with("PRIVATE KEY"))
+        {
+            return Some("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched".to_string());
+        }
+        let skipped: Vec<&str> = cert_blocks
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect();
+        return Some(format!(
+            "tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping PEM blocks of the following types: [{}]",
+            skipped.join(" ")
+        ));
+    };
+    if !der_is_certificate(der) {
+        return Some("x509: malformed certificate".to_string());
+    }
+    let key_blocks = pem_blocks(key);
+    if key_blocks.is_empty() {
+        return Some("tls: failed to find any PEM data in key input".to_string());
+    }
+    let key_block = key_blocks
+        .iter()
+        .find(|(label, _)| label.ends_with("PRIVATE KEY"));
+    let Some((_, der)) = key_block else {
+        // the hint only fires when the very first block is a certificate
+        if key_blocks
+            .first()
+            .is_some_and(|(label, _)| label == "CERTIFICATE")
+        {
+            return Some(
+                "tls: found a certificate rather than a key in the PEM for the private key"
+                    .to_string(),
+            );
+        }
+        let skipped: Vec<&str> = key_blocks.iter().map(|(label, _)| label.as_str()).collect();
+        return Some(format!(
+            "tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input after skipping PEM blocks of the following types: [{}]",
+            skipped.join(" ")
+        ));
+    };
+    if !der_is_private_key(der) {
+        return Some("tls: failed to parse private key".to_string());
+    }
+    None
+}
+
+/// reference `option.ACMEExternalAccountOptions`.
+const ACME_EXTERNAL_ACCOUNT_FIELDS: &[&str] = &["key_id", "hmac"];
+
+/// reference `option.ACMEProviderDNS01ChallengeOptions`: the provider name
+/// selects one of the registered challenge options.
+const ACME_DNS01_PROVIDERS: &[(&str, &[&str])] = &[
+    (
+        "cloudflare",
+        &["token", "account_id", "zone_id", "service_token"],
+    ),
+    ("alidns", &["access_key_id", "access_key_secret"]),
+    ("duckdns", &["token"]),
+    ("google cloud dns", &["service_account_json", "project_id"]),
+    (
+        "azure",
+        &[
+            "environment",
+            "client_id",
+            "client_secret",
+            "subscription_id",
+            "resource_group",
+            "user_agent",
+        ],
+    ),
+    (
+        "rfc2136",
+        &[
+            "address",
+            "name",
+            "key",
+            "key_algorithm",
+            "key_name",
+            "key_secret",
+        ],
+    ),
+    ("acme dns", &["name_server", "provider"]),
+    ("http", &["endpoint", "ip_address"]),
+    ("local", &["path"]),
+];
+
+/// reference `option.ACMEProviderOptions` (the inline ACME challenge set).
+const ACME_PROVIDER_FIELDS: &[&str] = &["http", "dns01", "ip"];
+
+/// reference `option.ACMEProviderDNS01ChallengeOptions` common fields.
+const ACME_DNS01_FIELDS: &[&str] = &["provider", "disable_glob"];
+
+/// reference `common/tls.NewSTDServer`: a `certificate_provider` or an inline
+/// `acme` block with a domain supplies the certificate, and `insecure` generates
+/// a throwaway key pair instead. Every other server needs a non-empty
+/// certificate and key (the reference compares values, not key presence).
+fn validate_server_tls(tls: &Value, at: &str, field_at: &str) -> Result<(), String> {
     let tls = tls
         .as_object()
         .ok_or_else(|| format!("{at}: tls: must be a JSON object"))?;
-    if !tls.contains_key("certificate") && !tls.contains_key("certificate_path") {
+    if let Some(value) = tls.get("certificate_provider").filter(|v| !prunes_value(v)) {
+        validate_certificate_provider(value, &format!("{field_at}.certificate_provider"))?;
+    }
+    let provider = tls
+        .get("certificate_provider")
+        .is_some_and(|value| !prunes_value(value));
+    let acme = tls.get("acme").is_some_and(|value| !prunes_value(value));
+    if provider && acme {
+        return Err(format!(
+            "{at}: certificate_provider and acme are mutually exclusive"
+        ));
+    }
+    if provider {
+        // the inline provider is built first, and only then does `insecure`
+        // have nothing left to attach to
+        if let Some(ty) = tls
+            .get("certificate_provider")
+            .and_then(Value::as_object)
+            .and_then(|provider| provider.get("type"))
+            .and_then(Value::as_str)
+            && let Some(message) = acme_provider_init_error(ty, tls)
+        {
+            return Err(format!("{at}: {message}"));
+        }
+        if tls.get("insecure").and_then(Value::as_bool) == Some(true) {
+            return Err(format!("{at}: tls: insecure unused"));
+        }
+        return Ok(());
+    }
+    let insecure = tls
+        .get("insecure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let acme_domain = tls
+        .get("acme")
+        .and_then(Value::as_object)
+        .is_some_and(|acme| {
+            acme.get("domain")
+                .and_then(Value::as_str)
+                .is_some_and(|domain| !domain.is_empty())
+        });
+    if insecure && (provider || acme_domain) {
+        return Err(format!("{at}: tls: insecure unused"));
+    }
+    if provider || acme_domain {
+        return Ok(());
+    }
+    let inline = |key: &str| -> Vec<u8> {
+        tls.get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<&str>>()
+                    .join("\n")
+                    .into_bytes()
+            })
+            .unwrap_or_default()
+    };
+    let certificate_path = tls
+        .get("certificate_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let key_path = tls
+        .get("key_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // the reference reads both files before looking at what it got
+    let certificate = if !certificate_path.is_empty() {
+        Some(read_tls_file(&certificate_path, at)?)
+    } else {
+        let inline_data = inline("certificate");
+        (!inline_data.is_empty()).then_some(inline_data)
+    };
+    let key = if !key_path.is_empty() {
+        Some(read_tls_file(&key_path, at).map_err(|message| {
+            // Go names the operation after the field it fills
+            message.replacen("read certificate:", "read key:", 1)
+        })?)
+    } else {
+        let inline_data = inline("key");
+        (!inline_data.is_empty()).then_some(inline_data)
+    };
+    if let (Some(certificate), Some(key)) = (&certificate, &key)
+        && let Some(message) = tls_key_pair_error(certificate, key)
+    {
+        return Err(format!("{at}: parse x509 key pair: {message}"));
+    }
+    let has_certificate = certificate.is_some();
+    let has_key = key.is_some();
+    if !has_certificate && !has_key && insecure {
+        // the reference generates a throwaway key pair from the ClientHello
+        return Ok(());
+    }
+    if !has_certificate {
         return Err(format!("{at}: missing certificate"));
     }
-    if !tls.contains_key("key") && !tls.contains_key("key_path") {
+    if !has_key {
         return Err(format!("{at}: missing key"));
     }
     Ok(())
@@ -7067,6 +7829,16 @@ fn type_field<'a>(obj: &'a Map<String, Value>, at: &str) -> Result<&'a str, Stri
     }
 }
 
+/// reference `box.go`: an empty tag falls back to the entry index, so every
+/// `initialize ...` message names the index instead of an empty bracket.
+fn index_tag(tag: &str, i: usize) -> String {
+    if tag.is_empty() {
+        i.to_string()
+    } else {
+        tag.to_string()
+    }
+}
+
 fn tag_field<'a>(obj: &'a Map<String, Value>, at: &str) -> Result<&'a str, String> {
     match obj.get("tag") {
         None | Some(Value::Null) => Ok(""),
@@ -7195,6 +7967,7 @@ fn decode_base64_url_raw(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn accepts_empty_config() {
@@ -9037,7 +9810,7 @@ mod tests {
                     {"type":"group","tag":"g","servers":["a","a"]}]}}"#
             ))
             .unwrap_err(),
-            "initialize DNS server[0] group[g]: group[g]: duplicate server: a"
+            "initialize DNS server[1] group[g]: group[g]: duplicate server: a"
         );
         assert_eq!(
             validate(&json(
@@ -9045,7 +9818,7 @@ mod tests {
                     {"type":"group","tag":"g","servers":["g"]}]}}"#
             ))
             .unwrap_err(),
-            "initialize DNS server[0] group[g]: group[g]: group cannot contain itself"
+            "initialize DNS server[1] group[g]: group[g]: group cannot contain itself"
         );
         assert_eq!(
             validate(&json(
@@ -9053,7 +9826,7 @@ mod tests {
                     {"type":"group","tag":"g","servers":["a"],"mode":"nope"}]}}"#
             ))
             .unwrap_err(),
-            "initialize DNS server[0] group[g]: group[g]: unknown mode: nope (expected stable, fastest or parallel)"
+            "initialize DNS server[1] group[g]: group[g]: unknown mode: nope (expected stable, fastest or parallel)"
         );
         // the default server may not be fakeip
         assert_eq!(
@@ -9078,6 +9851,273 @@ mod tests {
                     {"type":"fakeip","tag":"f","inet4_range":"198.18.0.0/15"}]}}"#
             ))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_tag_falls_back_to_index() {
+        let json = |raw: &str| lx_json(raw);
+        // reference box.go: an untagged entry is named by its index
+        assert_eq!(
+            validate(&json(r#"{"inbounds":[{"type":"shadowtls"}]}"#)).unwrap_err(),
+            "initialize inbound[0] shadowtls[0]: missing default handshake information"
+        );
+        assert_eq!(
+            validate(&json(r#"{"outbounds":[{"type":"anytls"}]}"#)).unwrap_err(),
+            "initialize outbound[0] anytls[0]: TLS required"
+        );
+        assert_eq!(
+            validate(&json(r#"{"dns":{"servers":[{"type":"h3"}]}}"#)).unwrap_err(),
+            "initialize DNS server[0] h3[0]: missing server_name or insecure=true"
+        );
+        assert_eq!(
+            validate(&json(r#"{"dns":{"servers":[{"type":"tailscale"}]}}"#)).unwrap_err(),
+            "initialize DNS server[0] tailscale[0]: missing tailscale endpoint tag"
+        );
+        // the message carries the real position, not a hardcoded 0
+        assert_eq!(
+            validate(&json(
+                r#"{"dns":{"servers":[{"type":"udp","tag":"a","server":"1.1.1.1"},
+                    {"type":"group","tag":"g","servers":[]}]}}"#
+            ))
+            .unwrap_err(),
+            "initialize DNS server[1] group[g]: group[g]: servers is required and must not be empty"
+        );
+    }
+
+    #[test]
+    fn bridge_outbound_and_cloudflared_inbound() {
+        let json = |raw: &str| lx_json(raw);
+        // bridge has no dialer/listen options and no init validation
+        for config in [
+            r#"{"outbounds":[{"type":"bridge"}]}"#,
+            r#"{"outbounds":[{"type":"bridge","tag":"b","bridge_name":"br0","interface":"eth0"}]}"#,
+            r#"{"outbounds":[{"type":"bridge","iproute2_table_index":100,"iproute2_rule_index":200}]}"#,
+        ] {
+            assert!(validate(&json(config)).is_ok(), "{config}");
+        }
+        assert_eq!(
+            validate(&json(
+                r#"{"outbounds":[{"type":"bridge","server":"example.com"}]}"#
+            ))
+            .unwrap_err(),
+            r#"outbounds[0].server: json: unknown field "server""#
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"outbounds":[{"type":"bridge","iproute2_table_index":"x"}]}"#
+            ))
+            .unwrap_err(),
+            "outbounds[0].iproute2_table_index: json: cannot unmarshal string into Go struct field BridgeOutboundOptions.iproute2_table_index of type int"
+        );
+        // cloudflared decodes, then fails like a build without with_cloudflared
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"cloudflared","token":"t"}]}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] cloudflared[0]: Cloudflared is not included in this build, rebuild with -tags with_cloudflared"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"cloudflared","tunnel_dialer":{"nope":1}}]}"#
+            ))
+            .unwrap_err(),
+            r#"inbounds[0].tunnel_dialer.nope: json: unknown field "nope""#
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"cloudflared","grace_period":30}]}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].grace_period: json: cannot unmarshal number into Go struct field CloudflaredInboundOptions.grace_period of type string"
+        );
+    }
+
+    /// the corpus certificate, so the `check`-time file reads resolve
+    fn cert_fixture(name: &str) -> String {
+        format!(
+            "{}/../../tests/golden/certs/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+        .replace('\\', "/")
+    }
+
+    #[test]
+    fn server_tls_certificate_sources() {
+        let json = |raw: &str| lx_json(raw);
+        let inbound = |tls: &str| {
+            json(&format!(
+                r#"{{"inbounds":[{{"type":"hysteria2","tls":{tls}}}]}}"#
+            ))
+        };
+        let certificate = cert_fixture("localhost.crt");
+        let key = cert_fixture("localhost.key");
+        // the reference compares values, so empty paths do not count
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_path":"","key_path":""}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: missing certificate"
+        );
+        assert_eq!(
+            validate(&inbound(&format!(
+                r#"{{"enabled":true,"certificate_path":"{certificate}"}}"#
+            )))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: missing key"
+        );
+        assert!(
+            validate(&inbound(&format!(
+                r#"{{"enabled":true,"certificate_path":"{certificate}","key_path":"{key}"}}"#
+            )))
+            .is_ok()
+        );
+        // the files are read while the server config is built
+        let absent = validate(&inbound(&format!(
+            r#"{{"enabled":true,"certificate_path":"{}/absent.crt"}}"#,
+            cert_fixture("")
+        )))
+        .unwrap_err();
+        assert!(
+            absent.starts_with("initialize inbound[0] hysteria2[0]: read certificate: open "),
+            "{absent}"
+        );
+        // inline PEM still has to hold real blocks
+        let certificate_pem = fs::read_to_string(cert_fixture("localhost.crt")).unwrap();
+        let key_pem = fs::read_to_string(cert_fixture("localhost.key")).unwrap();
+        let inline_pair = serde_json::json!({
+            "enabled": true,
+            "certificate": [certificate_pem],
+            "key": [key_pem]
+        })
+        .to_string();
+        assert!(validate(&inbound(&inline_pair)).is_ok());
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate":["hello"],"key":["hello"]}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: parse x509 key pair: tls: failed to find any PEM data in certificate input"
+        );
+        let swapped = serde_json::json!({
+            "enabled": true,
+            "certificate": [key_pem],
+            "key": [certificate_pem]
+        })
+        .to_string();
+        assert_eq!(
+            validate(&inbound(&swapped)).unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: parse x509 key pair: tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched"
+        );
+        // insecure generates a throwaway key pair
+        assert!(validate(&inbound(r#"{"enabled":true,"insecure":true}"#)).is_ok());
+        // a certificate provider supplies the certificate
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":{"type":"acme"}}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: create inline certificate provider: ACME is not included in this build, rebuild with -tags with_acme"
+        );
+        // an empty provider object is pruned away like any other empty value
+        assert_eq!(
+            validate(&inbound(r#"{"enabled":true,"certificate_provider":{}}"#)).unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: missing certificate"
+        );
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":{"domain":"example.com"}}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].tls.certificate_provider: missing certificate provider type"
+        );
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":{"type":"cloudflare_origin_ca"}}"#
+            ))
+            .unwrap_err(),
+            "inbounds[0].tls.certificate_provider: unknown certificate provider type: cloudflare_origin_ca"
+        );
+        // a shared provider reference is only resolved at start
+        assert!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":"shared"}"#
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":{"type":"acme"},"insecure":true}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: create inline certificate provider: ACME is not included in this build, rebuild with -tags with_acme"
+        );
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":{"type":"acme"},"acme":{"domain":"example.com"}}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: certificate_provider and acme are mutually exclusive"
+        );
+        assert_eq!(
+            validate(&inbound(
+                r#"{"enabled":true,"certificate_provider":{"type":"tailscale","endpoint":"ts"}}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] hysteria2[0]: create inline certificate provider: endpoint not found: ts"
+        );
+    }
+
+    #[test]
+    fn tuic_inbound_uuid_is_an_init_check() {
+        let json = |raw: &str| lx_json(raw);
+        // the server TLS config is built before the user list is walked
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"x"}],"tls":{"enabled":true}}]}"#
+            ))
+            .unwrap_err(),
+            "initialize inbound[0] tuic[0]: missing certificate"
+        );
+        let tls = format!(
+            r#""tls":{{"enabled":true,"certificate_path":"{}","key_path":"{}"}}"#,
+            cert_fixture("localhost.crt"),
+            cert_fixture("localhost.key")
+        );
+        assert!(
+            validate(&json(&format!(
+                r#"{{"inbounds":[{{"type":"tuic","users":[{{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],{tls}}}]}}"#
+            )))
+            .is_ok(),
+            "a valid certificate pair and uuid must pass"
+        );
+        assert_eq!(
+            validate(&json(&format!(
+                r#"{{"inbounds":[{{"type":"tuic","users":[{{"uuid":"x"}}],{tls}}}]}}"#
+            )))
+            .unwrap_err(),
+            "initialize inbound[0] tuic[0]: invalid uuid for user 0: uuid: incorrect UUID length"
+        );
+        assert_eq!(
+            validate(&json(&format!(
+                r#"{{"inbounds":[{{"type":"tuic","users":[{{"name":"n"}}],{tls}}}]}}"#
+            )))
+            .unwrap_err(),
+            "initialize inbound[0] tuic[0]: missing uuid for user 0"
+        );
+        // the user list is still a decode-time shape check
+        assert_eq!(
+            validate(&json(r#"{"inbounds":[{"type":"tuic","users":5}]}"#)).unwrap_err(),
+            "inbounds[0].users: json: cannot unmarshal number into Go struct field TUICInboundOptions.users of type []option.TUICUser"
+        );
+        assert_eq!(
+            validate(&json(
+                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"x","nope":1}]}]}"#
+            ))
+            .unwrap_err(),
+            r#"inbounds[0].users[0].nope: json: unknown field "nope""#
         );
     }
 }
@@ -14742,10 +15782,13 @@ fn resolve_lx_aliases(lx: &mut LxBlock, route: &Value) -> Result<Vec<String>, St
 fn validate_dns_server_fields(
     ty: &str,
     server: &Map<String, Value>,
+    i: usize,
     tag: &str,
     seen: &[(String, &'static str, usize)],
 ) -> Result<(), String> {
-    let at = "dns.servers[0]";
+    let at = format!("dns.servers[{i}]");
+    let init = format!("initialize DNS server[{i}]");
+    let at = at.as_str();
     let listable_strings = |value: &Value, at: &str| -> Result<Vec<String>, String> {
         match value {
             Value::Null => Ok(Vec::new()),
@@ -14785,7 +15828,7 @@ fn validate_dns_server_fields(
                 for entry in listable_strings(value, &format!("{at}.neighbor_domain"))? {
                     if !entry.starts_with('.') {
                         return Err(format!(
-                            "initialize DNS server[0] {ty}[{tag}]: neighbor_domain entry must start with '.': {entry}"
+                            "{init} {ty}[{tag}]: neighbor_domain entry must start with '.': {entry}"
                         ));
                     }
                 }
@@ -14818,7 +15861,7 @@ fn validate_dns_server_fields(
                 .unwrap_or_else(|| server.get("server").and_then(Value::as_str).unwrap_or(""));
             if server_name.is_empty() && !insecure {
                 return Err(format!(
-                    "initialize DNS server[0] h3[{tag}]: missing server_name or insecure=true"
+                    "{init} h3[{tag}]: missing server_name or insecure=true"
                 ));
             }
         }
@@ -14841,14 +15884,14 @@ fn validate_dns_server_fields(
             }
             if !cfg!(target_os = "linux") {
                 return Err(format!(
-                    "initialize DNS server[0] resolved[{tag}]: resolved DNS server is only supported on Linux"
+                    "{init} resolved[{tag}]: resolved DNS server is only supported on Linux"
                 ));
             }
         }
         "tailscale" | "openvpn" | "openconnect" => {
             let endpoint = server.get("endpoint").and_then(Value::as_str).unwrap_or("");
             if endpoint.is_empty() {
-                if let Some(message) = dns_endpoint_tag_error(ty, tag) {
+                if let Some(message) = dns_endpoint_tag_error(ty, i, tag) {
                     return Err(message);
                 }
             } else if !seen.iter().any(|(known, _, _)| known == endpoint) {
@@ -14870,7 +15913,7 @@ fn validate_dns_server_fields(
         "group" => {
             // the group transport prefixes its own `group[tag]: ...` message
             let group = |message: String| {
-                format!("initialize DNS server[0] group[{tag}]: group[{tag}]: {message}")
+                format!("initialize DNS server[{i}] group[{tag}]: group[{tag}]: {message}")
             };
             let servers = match server.get("servers") {
                 None | Some(Value::Null) => Vec::new(),

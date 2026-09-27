@@ -1,0 +1,17 @@
+{
+  "log": {
+    "level": "error"
+  },
+  "outbounds": [
+    {
+      "type": "bridge",
+      "tag": "br0",
+      "bridge_name": "tachyon0",
+      "iproute2_table_index": 2022
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "h",
+      "listen": "127.0.0.1",
+      "listen_port": 8443,
+      "up_mbps": 10,
+      "down_mbps": 10,
+      "users": [
+        {
+          "name": "a",
+          "password": "p"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate": [
+          "-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAK5\n-----END PRIVATE KEY-----\n"
+        ],
+        "key": [
+          "-----BEGIN CERTIFICATE-----\nMIIBogIBAAJBAK5\n-----END CERTIFICATE-----\n"
+        ]
+      }
+    }
+  ]
+}

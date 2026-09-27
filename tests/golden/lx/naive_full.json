@@ -1,0 +1,36 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-out",
+      "server": "example.com",
+      "server_port": 443,
+      "username": "user",
+      "password": "pass",
+      "insecure_concurrency": 4,
+      "extra_headers": {
+        "X-Padding": ["one", "two"]
+      },
+      "stream_receive_window": "4mb",
+      "udp_over_tcp": {
+        "enabled": true,
+        "version": 2
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      }
+    }
+  ]
+}

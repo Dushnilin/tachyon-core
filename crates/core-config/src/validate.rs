@@ -4699,17 +4699,72 @@ fn validate_tor_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
     Ok(())
 }
 
+/// Official `CensorshipStrategy::kSniRealityMode*` reality profiles as
+/// (`reality_<name>`, official enum name) pairs; the strategy numbers
+/// (20..=24, 60..=62, 80..=83, 100, 101) are accepted numerically.
+const FPTN_REALITY_PROFILES: &[(&str, &str)] = &[
+    ("reality_chrome145", "kSniRealityModeChrome145"),
+    ("reality_chrome146", "kSniRealityModeChrome146"),
+    ("reality_chrome147", "kSniRealityModeChrome147"),
+    ("reality_chrome148", "kSniRealityModeChrome148"),
+    ("reality_chrome149", "kSniRealityModeChrome149"),
+    ("reality_firefox149", "kSniRealityModeFirefox149"),
+    ("reality_firefox150", "kSniRealityModeFirefox150"),
+    ("reality_firefox151", "kSniRealityModeFirefox151"),
+    ("reality_yandex24", "kSniRealityModeYandex24"),
+    ("reality_yandex25", "kSniRealityModeYandex25"),
+    ("reality_yandex26_3", "kSniRealityModeYandex26_3"),
+    ("reality_yandex26_4", "kSniRealityModeYandex26_4"),
+    ("reality_safari26_4", "kSniRealityModeSafari26_4"),
+    ("reality_safari26_5", "kSniRealityModeSafari26_5"),
+];
+
 /// Censorship strategy knob shared by both fptn forms (token and server).
 fn check_fptn_obfuscation(obj: &Map<String, Value>, at: &str) -> Result<(), String> {
-    if let Some(v) = obj.get("obfuscation").filter(|v| !v.is_null()) {
-        match v.as_str() {
-            Some("tls" | "tls_obfuscator" | "kTlsObfuscator" | "none" | "sni" | "kSni") => {}
-            Some(_) => {
+    let Some(v) = obj.get("obfuscation").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let raw = match v.as_str() {
+        Some(s) => s,
+        None => return Err(format!("{at}.obfuscation: must be a string")),
+    };
+    let reality = match raw {
+        "tls" | "tls_obfuscator" | "kTlsObfuscator" | "1" | "none" | "sni" | "kSni" | "0" => false,
+        "reality" => true,
+        "kSniRealityMode" | "2" => {
+            return Err(format!(
+                "{at}.obfuscation: reality mode 1 (kSniRealityMode) is deprecated in \
+                 the reference client; use \"reality\" (mode 2)"
+            ));
+        }
+        other => {
+            if FPTN_REALITY_PROFILES
+                .iter()
+                .any(|(alias, official)| *alias == other || *official == other)
+            {
+                true
+            } else if let Ok(n) = other.parse::<u16>() {
+                matches!(n, 20..=24 | 60..=62 | 80..=83 | 100 | 101)
+            } else {
                 return Err(format!(
-                    "{at}.obfuscation: invalid value (expected \"tls\" or \"none\")"
+                    "{at}.obfuscation: invalid value (expected \"tls\", \"none\", \
+                     \"reality\" or a reality profile such as \"reality_chrome149\")"
                 ));
             }
-            None => return Err(format!("{at}.obfuscation: must be a string")),
+        }
+    };
+    if reality && let Some(sv) = obj.get("sni").filter(|sv| !sv.is_null()) {
+        // The decoy ClientHello needs a capture-length SNI (4..=64, the
+        // template tables' entry range); an absent sni still resolves to a
+        // hostname server name at runtime and is checked there.
+        let sni = sv
+            .as_str()
+            .ok_or_else(|| format!("{at}.sni: must be a string"))?;
+        if !(4..=64).contains(&sni.len()) {
+            return Err(format!(
+                "{at}: reality obfuscation needs sni of 4..=64 bytes, got {}",
+                sni.len()
+            ));
         }
     }
     Ok(())
@@ -8102,6 +8157,34 @@ mod tests {
             err.contains("outbounds[0].obfuscation: must be a string"),
             "{err}"
         );
+        // Reality profiles: alias, official enum name, strategy number.
+        for obf in [
+            "reality",
+            "reality_chrome149",
+            "kSniRealityModeFirefox151",
+            "reality_safari26_5",
+            "24",
+            "101",
+        ] {
+            assert!(
+                validate(&json!({"outbounds": [{
+                    "type": "fptn", "tag": "x", "token": "fptn:zz",
+                    "sni": "www.cloudflare.com", "obfuscation": obf
+                }]}))
+                .is_ok(),
+                "{obf}"
+            );
+        }
+        // Deprecated reality mode 1 is rejected with a pointer to mode 2.
+        for obf in ["kSniRealityMode", "2"] {
+            let err = token_form(json!({"obfuscation": obf}));
+            assert!(err.contains("reality mode 1"), "{err}");
+        }
+        // Reality needs a capture-length SNI when one is set explicitly.
+        let err = server_form(json!({"obfuscation": "reality", "sni": "ab"}));
+        assert!(err.contains("4..=64"), "{err}");
+        let err = token_form(json!({"obfuscation": "reality_chrome145", "sni": ""}));
+        assert!(err.contains("4..=64"), "{err}");
         let err = server_form(json!({"sni": 5}));
         assert!(err.contains("outbounds[0].sni: must be a string"), "{err}");
         let err = server_form(json!({"mtu": "big"}));

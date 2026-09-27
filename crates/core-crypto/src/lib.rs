@@ -40,6 +40,8 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::sync::Arc;
 
+pub use kx::X25519MLKEM768;
+
 use rustls::crypto::{
     CipherSuiteCommon, CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom,
 };

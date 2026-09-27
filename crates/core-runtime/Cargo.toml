@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 core-config = { path = "../core-config" }
+core-crypto = { path = "../core-crypto" }
 core-tls = { path = "../core-tls" }
 serde_json.workspace = true
 anyhow.workspace = true

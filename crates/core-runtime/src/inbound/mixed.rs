@@ -6,10 +6,11 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+use crate::clash_state;
 use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, UdpHub};
 use crate::inbound::{
-    ClientConn, Target, network_includes_udp, pump_conn, require_u16, socks_failure_reply,
-    socks_success_reply,
+    ClientConn, Target, clash_meta, network_includes_udp, pump_conn_tracked, require_u16,
+    socks_failure_reply, socks_success_reply,
 };
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
@@ -249,7 +250,8 @@ async fn socks5(
             match router.connect_index(idx, &dest).await {
                 Ok(conn) => {
                     logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
-                    pump_conn(client, conn, &ctx.sniff_prefix).await
+                    let tracker = clash_state::ConnHandle::open(clash_meta(&ctx, router, idx));
+                    pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
                 }
                 Err(err) => {
                     let _ = client.fail(&err).await;
@@ -486,7 +488,8 @@ async fn http_connect(
             let dest = ctx.destination.clone();
             let conn = router.connect_index(idx, &dest).await?;
             logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
-            pump_conn(client, conn, &ctx.sniff_prefix).await
+            let tracker = clash_state::ConnHandle::open(clash_meta(&ctx, router, idx));
+            pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
         }
     }
 }

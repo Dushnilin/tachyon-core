@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-out",
+      "server": "example.com",
+      "server_port": 443
+    }
+  ]
+}

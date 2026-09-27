@@ -3,6 +3,7 @@ pub mod direct;
 pub mod fptn;
 pub mod hysteria2;
 pub mod masque;
+pub mod naive;
 pub mod openvpn;
 pub mod proxy;
 pub mod quic;

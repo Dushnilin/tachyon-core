@@ -29,6 +29,7 @@ use crate::outbound::direct::Direct;
 use crate::outbound::fptn::Fptn;
 use crate::outbound::hysteria2::Hysteria2;
 use crate::outbound::masque::Masque;
+use crate::outbound::naive::Naive;
 use crate::outbound::openvpn::OpenVpn;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
@@ -120,6 +121,7 @@ pub enum Outbound {
     Tuic(Tuic),
     WireGuard(WireGuard),
     OpenVpn(OpenVpn),
+    Naive(Naive),
     Urltest(Urltest),
     Selector(Selector),
 }
@@ -154,6 +156,7 @@ impl Outbound {
             Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
             Outbound::OpenVpn(ovpn) => ovpn.connect(target).await.map(Conn::Plain),
+            Outbound::Naive(naive) => naive.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
         }
@@ -174,6 +177,7 @@ impl Outbound {
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
             Outbound::OpenVpn(ovpn) => ovpn.connect_udp(target).await,
+            Outbound::Naive(naive) => naive.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "blocked by outbound",
@@ -206,6 +210,7 @@ impl Outbound {
             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
             "snell" => Ok(Outbound::Snell(Snell::build(obj, at)?)),
             "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
+            "naive" => Ok(Outbound::Naive(Naive::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             other => Err(anyhow::anyhow!(

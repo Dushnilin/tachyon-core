@@ -7,6 +7,7 @@ pub mod proxy;
 pub mod quic;
 pub mod secure;
 pub mod shadowsocks;
+pub mod snell;
 pub mod transport;
 pub mod tuic;
 pub mod urltest;

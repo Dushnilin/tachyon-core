@@ -4,7 +4,7 @@
 //! socket with an idle-timeout reverse reader (reference `udpnat.Service`).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -58,10 +58,22 @@ pub(crate) struct UdpHub {
     router: Arc<Router>,
     flows: Mutex<HashMap<FlowKey, Arc<Flow>>>,
     timeout: Duration,
+    /// Wrap responses in a SOCKS5 UDP relay header (mixed inbound);
+    /// direct/tproxy inbounds reply with the raw payload.
+    socks: bool,
 }
 
 impl UdpHub {
     pub fn new(router: Arc<Router>, timeout: Duration) -> Arc<Self> {
+        Self::with_wrap(router, timeout, false)
+    }
+
+    /// Hub for a SOCKS5 UDP ASSOCIATE relay (response header re-added).
+    pub fn new_socks(router: Arc<Router>, timeout: Duration) -> Arc<Self> {
+        Self::with_wrap(router, timeout, true)
+    }
+
+    fn with_wrap(router: Arc<Router>, timeout: Duration, socks: bool) -> Arc<Self> {
         let hub = Arc::new(Self {
             router,
             flows: Mutex::new(HashMap::new()),
@@ -70,6 +82,7 @@ impl UdpHub {
             } else {
                 timeout
             },
+            socks,
         });
         let sweeper = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -154,6 +167,7 @@ impl UdpHub {
                     self.timeout,
                     Arc::clone(self),
                     (source, dest),
+                    self.socks,
                 );
                 Flow {
                     kind: FlowKind::Outbound { sock },
@@ -184,6 +198,11 @@ impl UdpHub {
             "udp hijack-dns {tag} {source} -> {dest}: {}B reply",
             resp.len()
         ));
+        let resp = if self.socks {
+            socks_udp_datagram(dest, &resp)
+        } else {
+            resp
+        };
         listen.send_to(&resp, source).await?;
         Ok(())
     }
@@ -191,6 +210,25 @@ impl UdpHub {
     async fn remove_flow(&self, key: FlowKey) {
         self.flows.lock().await.remove(&key);
     }
+}
+
+/// SOCKS5 UDP datagram header `[RSV][RSV][FRAG][ATYP][ADDR][PORT]` + payload.
+fn socks_udp_datagram(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + payload.len());
+    out.extend_from_slice(&[0, 0, 0]);
+    match dest.ip() {
+        IpAddr::V4(ip) => {
+            out.push(0x01);
+            out.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            out.push(0x04);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(&dest.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,6 +240,7 @@ fn spawn_reverse(
     idle: Duration,
     hub: Arc<UdpHub>,
     key: FlowKey,
+    socks: bool,
 ) {
     let tag = tag.to_string();
     tokio::spawn(async move {
@@ -209,7 +248,13 @@ fn spawn_reverse(
         loop {
             match tokio::time::timeout(idle, outbound.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    if let Err(err) = listen.send_to(&buf[..n], source).await {
+                    let dest = key.1;
+                    let packet = if socks {
+                        socks_udp_datagram(dest, &buf[..n])
+                    } else {
+                        buf[..n].to_vec()
+                    };
+                    if let Err(err) = listen.send_to(&packet, source).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
                         hub.remove_flow(key).await;
                         return;

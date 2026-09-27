@@ -32,6 +32,7 @@ use crate::outbound::masque::Masque;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
+use crate::outbound::snell::Snell;
 use crate::outbound::tuic::Tuic;
 use crate::outbound::urltest::Urltest;
 use crate::outbound::vmess::Vmess;
@@ -114,6 +115,7 @@ pub enum Outbound {
     Hysteria2(Hysteria2),
     Fptn(Fptn),
     Masque(Masque),
+    Snell(Snell),
     Tuic(Tuic),
     WireGuard(WireGuard),
     Urltest(Urltest),
@@ -146,6 +148,7 @@ impl Outbound {
             Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
             Outbound::Fptn(fptn) => fptn.connect(target).await.map(Conn::Plain),
             Outbound::Masque(masque) => masque.connect(target).await.map(Conn::Plain),
+            Outbound::Snell(snell) => snell.connect(target).await.map(Conn::Plain),
             Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
@@ -164,6 +167,7 @@ impl Outbound {
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
             Outbound::Fptn(fptn) => fptn.connect_udp(target).await,
             Outbound::Masque(masque) => masque.connect_udp(target).await,
+            Outbound::Snell(snell) => snell.connect_udp(target).await,
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
@@ -196,6 +200,7 @@ impl Outbound {
             "hysteria2" => Ok(Outbound::Hysteria2(Hysteria2::build(obj, at)?)),
             "fptn" => Ok(Outbound::Fptn(Fptn::build(obj, at)?)),
             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
+            "snell" => Ok(Outbound::Snell(Snell::build(obj, at)?)),
             "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),

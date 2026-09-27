@@ -547,6 +547,7 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
         Outbound::Hysteria2(_) => "Hysteria2",
         Outbound::Fptn(_) => "FPTN",
         Outbound::Masque(_) => "MASQUE",
+        Outbound::Snell(_) => "Snell",
         Outbound::Tuic(_) => "TUIC",
         Outbound::WireGuard(_) => "WireGuard",
         Outbound::Urltest(_) => "URLTest",

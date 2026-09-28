@@ -488,7 +488,33 @@ async fn instance_getter_and_connect_tcp_via_service() {
 
 #[test]
 fn router_main_dns_section_builds() {
-    let root: Value = serde_json::from_str(ROUTER_MAIN).expect("parse router-main");
+    let mut root: Value = serde_json::from_str(ROUTER_MAIN).expect("parse router-main");
+    // the captured config points at rule-set files of the reference host; the
+    // dns build now loads them, so give every local set a real one
+    let compiled = core_config::srs::compile(
+        &serde_json::json!({"rules": [{"domain_suffix": ["example.invalid"]}]}),
+        2,
+    )
+    .expect("compile rule-set");
+    let dir = std::env::temp_dir().join("tachyon-dns-rule-set-test");
+    std::fs::create_dir_all(&dir).expect("create rule-set dir");
+    let path = dir.join("ruleset.srs");
+    std::fs::write(&path, &compiled).expect("write rule-set");
+    let path = path.to_string_lossy().replace('\\', "/");
+    if let Some(entries) = root
+        .get_mut("route")
+        .and_then(|route| route.get_mut("rule_set"))
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries.iter_mut() {
+            if entry.get("type").and_then(Value::as_str) == Some("local")
+                && let Some(object) = entry.as_object_mut()
+            {
+                object.insert("path".into(), Value::String(path.clone()));
+                object.insert("format".into(), Value::String("binary".into()));
+            }
+        }
+    }
     let svc = DnsService::build(&root)
         .expect("router-main dns section must build")
         .expect("dns present");

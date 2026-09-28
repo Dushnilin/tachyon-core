@@ -2,6 +2,7 @@
 //! hijack-dns / sniff / resolve), connection context, and outbound dispatch.
 
 pub mod rule;
+pub mod rule_set;
 pub mod sniff;
 
 use std::borrow::Cow;
@@ -229,10 +230,110 @@ impl Outbound {
 }
 
 /// `route` section fields accepted by check but not yet honored at runtime.
+/// `route.rule_set`: the inline, local and remote variants. Inline and local
+/// sets load here; a remote set needs the downloader and is reported instead of
+/// being silently ignored.
+pub(crate) fn build_rule_sets(
+    route: &serde_json::Map<String, Value>,
+) -> anyhow::Result<rule_set::RuleSetRegistry> {
+    let mut registry = rule_set::RuleSetRegistry::new();
+    let Some(list) = route.get("rule_set").filter(|value| !value.is_null()) else {
+        return Ok(registry);
+    };
+    let entries = list
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("route.rule_set: must be an array"))?;
+    for (i, entry) in entries.iter().enumerate() {
+        let at = format!("route.rule_set[{i}]");
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
+        let ty = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("inline");
+        let tags = rule_set_tags(entry, &at)?;
+        let rules = match ty {
+            "inline" => entry
+                .get("rules")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "local" => {
+                let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
+                let data = std::fs::read(resolve_rule_set_path(path, &tags))
+                    .map_err(|err| anyhow::anyhow!("{at}: read {path}: {err}"))?;
+                parse_rule_set_payload(&data, entry, &at)?
+            }
+            "remote" => {
+                anyhow::bail!("{at}: remote rule-set download is not implemented yet");
+            }
+            other => anyhow::bail!("{at}: unknown rule-set type: {other}"),
+        };
+        logging::info(format_args!("loaded rule-set {}", tags.join(",")));
+        registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
+    }
+    Ok(registry)
+}
+
+/// `option.RuleSet.tag`: a listable of non-empty strings.
+fn rule_set_tags(entry: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Vec<String>> {
+    let mut tags = Vec::new();
+    match entry.get("tag") {
+        Some(Value::String(text)) => tags.push(text.clone()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    tags.push(text.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    if tags.is_empty() || tags.iter().any(|tag| tag.is_empty()) {
+        anyhow::bail!("{at}: missing tag");
+    }
+    Ok(tags)
+}
+
+/// A multi-tag set interpolates `{tag}` per tag; the first tag loads by default.
+fn resolve_rule_set_path(path: &str, tags: &[String]) -> String {
+    if !path.contains("{tag}") {
+        return path.to_string();
+    }
+    path.replace("{tag}", &tags[0])
+}
+
+/// The payload of a local rule set: the binary container or the source JSON.
+fn parse_rule_set_payload(
+    data: &[u8],
+    entry: &serde_json::Map<String, Value>,
+    at: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let format = entry.get("format").and_then(Value::as_str).unwrap_or("");
+    let binary = format == "binary"
+        || (format.is_empty() && data.starts_with(b"SRS"))
+        || (format.is_empty()
+            && entry
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with(".srs")));
+    if binary {
+        return core_config::srs::read(data).map_err(|err| anyhow::anyhow!("{at}: {err}"));
+    }
+    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("{at}: not utf-8"))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|err| anyhow::anyhow!("{at}: parse source: {err}"))?;
+    Ok(value
+        .get("rules")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
 const ROUTE_UNIMPL_FIELDS: &[&str] = &[
     "geoip",
     "geosite",
-    "rule_set",
     "find_process",
     "find_neighbor",
     "dhcp_lease_files",
@@ -449,9 +550,15 @@ impl Router {
                     logging::warn(format_args!("route.{key} is not implemented yet (ignored)"));
                 }
             }
+            let registry = build_rule_sets(map)?;
             if let Some(list) = map.get("rules").and_then(Value::as_array) {
                 for (i, obj) in list.iter().enumerate() {
-                    rules.push(Rule::build(obj, &format!("route.rules[{i}]"), true)?);
+                    rules.push(Rule::build_with_rule_sets(
+                        obj,
+                        &format!("route.rules[{i}]"),
+                        true,
+                        &registry,
+                    )?);
                 }
             }
         }

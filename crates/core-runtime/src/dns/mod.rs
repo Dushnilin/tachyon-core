@@ -104,6 +104,13 @@ impl DnsService {
         }
 
         let mut rules = Vec::new();
+        // dns rules consult the same rule sets as the route rules
+        let empty_route = serde_json::Map::new();
+        let route = root
+            .get("route")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty_route);
+        let rule_sets = crate::route::build_rule_sets(route)?;
         for (i, obj) in map
             .get("rules")
             .and_then(Value::as_array)
@@ -115,7 +122,7 @@ impl DnsService {
             if obj.get("type").and_then(Value::as_str) == Some("logical") {
                 anyhow::bail!("{at}: logical dns rules are not implemented yet");
             }
-            rules.push(Rule::build(obj, &at)?);
+            rules.push(Rule::build_with_rule_sets(obj, &at, &rule_sets)?);
         }
 
         let final_tag = match map.get("final").and_then(Value::as_str) {

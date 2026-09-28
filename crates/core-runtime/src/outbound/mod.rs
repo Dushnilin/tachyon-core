@@ -15,6 +15,7 @@ pub mod transport;
 pub mod tuic;
 pub(crate) mod uot;
 pub mod urltest;
+pub mod vision;
 pub mod vless_enc;
 pub mod vmess;
 pub mod wireguard;

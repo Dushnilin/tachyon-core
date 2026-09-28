@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::inbound::{AnyStream, Target};
+use crate::outbound::packet::{CMD_TCP, PacketEncoding, ResponseHeaderStream, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::transport::Transport;
@@ -48,6 +49,8 @@ pub struct Vmess {
     alter_key: Option<[u8; 16]>,
     transport: Transport,
     tls: Option<TlsOptions>,
+    /// how datagrams are framed on the stream, see `packet`
+    packet_encoding: PacketEncoding,
 }
 
 impl Vmess {
@@ -73,12 +76,8 @@ impl Vmess {
         {
             anyhow::bail!("{at}: vmess multiplex not implemented yet");
         }
-        match obj.get("packet_encoding").and_then(Value::as_str) {
-            None | Some("") => {}
-            Some(other) => {
-                anyhow::bail!("{at}: vmess packet_encoding {other:?} (UDP) not implemented yet")
-            }
-        }
+        let packet_encoding =
+            PacketEncoding::parse(obj.get("packet_encoding").and_then(Value::as_str), at)?;
 
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
         let security = match obj
@@ -115,17 +114,19 @@ impl Vmess {
             alter_key,
             transport: Transport::parse(obj, at)?,
             tls,
+            packet_encoding,
         })
     }
 
-    pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let mut request_key = [0u8; 16];
-        let mut request_iv = [0u8; 16];
-        let mut response_header = [0u8; 1];
-        random_bytes(&mut request_key)?;
-        random_bytes(&mut request_iv)?;
-        random_bytes(&mut response_header)?;
-
+    /// The sealed request head for `command` (1 tcp, 2 udp, 3 mux).
+    fn request(
+        &self,
+        command: u8,
+        target: &Target,
+        request_key: &[u8; 16],
+        request_iv: &[u8; 16],
+        response_header: u8,
+    ) -> io::Result<Vec<u8>> {
         let mut option = 0u8;
         if self.security == SEC_AES128_GCM || self.security == SEC_CHACHA20_POLY1305 {
             option |= OPT_CHUNK_STREAM | OPT_CHUNK_MASKING;
@@ -140,14 +141,15 @@ impl Vmess {
         }
 
         let header = wire::build_request_header(
-            &request_iv,
-            &request_key,
-            response_header[0],
+            request_iv,
+            request_key,
+            response_header,
             option,
             self.security,
+            command,
             target,
         )?;
-        let first = if let Some(alter_key) = &self.alter_key {
+        if let Some(alter_key) = &self.alter_key {
             // Legacy header: HMAC-MD5(alterKey, ts) || CFB(cmdKey, md5(ts x4)).
             let timestamp = unix_now()?;
             let mut request = Vec::with_capacity(16 + header.len());
@@ -157,10 +159,56 @@ impl Vmess {
                 .map_err(|_| io::Error::other("cfb init"))?;
             cfb.encrypt(&mut encrypted);
             request.extend_from_slice(&encrypted);
-            request
+            Ok(request)
         } else {
-            seal_request_header(&self.cmd_key, &header)?
-        };
+            seal_request_header(&self.cmd_key, &header)
+        }
+    }
+
+    /// A datagram relay. vmess packets ride the raw stream after the request
+    /// head, not the body cipher, so only the response header is consumed.
+    pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
+        let mut request_key = [0u8; 16];
+        let mut request_iv = [0u8; 16];
+        let mut response_header = [0u8; 1];
+        random_bytes(&mut request_key)?;
+        random_bytes(&mut request_iv)?;
+        random_bytes(&mut response_header)?;
+        let mode = self.packet_encoding;
+        let first = self.request(
+            mode.command(),
+            &mode.request_target(target),
+            &request_key,
+            &request_iv,
+            response_header[0],
+        )?;
+        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let (mut stream, consumed) = self
+            .transport
+            .connect(tcp, self.tls.as_ref(), &self.server, self.port, &first)
+            .await?;
+        stream.write_all(&first[consumed..]).await?;
+        let stream: AnyStream = Box::new(ResponseHeaderStream::new(stream));
+        spawn_packet_bridge(stream, peer, mode, target.clone());
+        Ok(local)
+    }
+
+    pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        let mut request_key = [0u8; 16];
+        let mut request_iv = [0u8; 16];
+        let mut response_header = [0u8; 1];
+        random_bytes(&mut request_key)?;
+        random_bytes(&mut request_iv)?;
+        random_bytes(&mut response_header)?;
+
+        let first = self.request(
+            CMD_TCP,
+            target,
+            &request_key,
+            &request_iv,
+            response_header[0],
+        )?;
         let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         // a ws transport with early data carries the request in the upgrade head
         let (mut stream, consumed) = self

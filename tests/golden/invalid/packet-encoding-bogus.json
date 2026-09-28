@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"vmess","tag":"v","server":"1.2.3.4","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","packet_encoding":"bogus"}]}

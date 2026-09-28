@@ -178,6 +178,8 @@ impl Outbound {
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
             Outbound::Fptn(fptn) => fptn.connect_udp(target).await,
             Outbound::Masque(masque) => masque.connect_udp(target).await,
+            Outbound::Vless(vless) => vless.connect_udp(target).await,
+            Outbound::Vmess(vmess) => vmess.connect_udp(target).await,
             Outbound::Snell(snell) => snell.connect_udp(target).await,
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,

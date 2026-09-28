@@ -4,6 +4,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
+use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
@@ -85,6 +86,8 @@ pub struct Vless {
     tls: Option<TlsOptions>,
     /// `flow: xtls-rprx-vision` — the payload is framed, see `vision`.
     vision: bool,
+    /// how datagrams are framed on the stream, see `packet`
+    packet_encoding: PacketEncoding,
 }
 
 impl Vless {
@@ -103,6 +106,8 @@ impl Vless {
         };
         let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
+        let packet_encoding =
+            PacketEncoding::parse(obj.get("packet_encoding").and_then(Value::as_str), at)?;
         Ok(Self {
             server,
             port,
@@ -110,15 +115,32 @@ impl Vless {
             transport,
             tls,
             vision,
+            packet_encoding,
         })
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        self.dial(CMD_TCP, target).await
+    }
+
+    /// A datagram relay: the request head names the destination (or the
+    /// packetaddr magic name) and the framing takes over from there.
+    pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
+        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
+        let mode = self.packet_encoding;
+        let stream = self
+            .dial(mode.command(), &mode.request_target(target))
+            .await?;
+        spawn_packet_bridge(stream, peer, mode, target.clone());
+        Ok(local)
+    }
+
+    async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
         let mut header = Vec::with_capacity(24 + 8);
         header.push(0x00);
         header.extend_from_slice(&self.uuid);
         header.push(0x00);
-        header.push(0x01);
+        header.push(command);
         header.extend_from_slice(&encode_vless_target(target)?);
         let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
         // a ws transport with early data carries the request in the upgrade head

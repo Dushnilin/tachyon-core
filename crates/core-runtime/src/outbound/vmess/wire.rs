@@ -109,6 +109,8 @@ pub(crate) fn build_request_header(
     response_header: u8,
     option: u8,
     security: u8,
+    // vmess request command: 1 tcp, 2 udp, 3 mux (xudp)
+    command: u8,
     target: &Target,
 ) -> io::Result<Vec<u8>> {
     let mut rand = [0u8; 1];
@@ -123,7 +125,7 @@ pub(crate) fn build_request_header(
     header.push(option);
     header.push(((pad_len as u8) << 4) | security);
     header.push(0);
-    header.push(1);
+    header.push(command);
     header.extend_from_slice(&target.port().to_be_bytes());
     match target {
         Target::Ip(addr) => match addr.ip() {

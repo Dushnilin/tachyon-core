@@ -6,6 +6,7 @@ pub mod hysteria2;
 pub mod masque;
 pub mod naive;
 pub mod openvpn;
+pub mod packet;
 pub mod proxy;
 pub mod quic;
 pub mod secure;

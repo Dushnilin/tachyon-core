@@ -109,12 +109,23 @@ impl RuleSetRegistry {
     }
 
     /// `RemoteRuleSet.StartContext` for every remote set, then the updaters.
-    pub async fn start_remote(&self, router: &Arc<crate::route::Router>) -> anyhow::Result<()> {
+    pub async fn start_remote(
+        &self,
+        router: &Arc<crate::route::Router>,
+        cache: Option<crate::cache_file::SharedCacheFile>,
+    ) -> anyhow::Result<()> {
         let Some(remotes) = &self.remotes else {
             return Ok(());
         };
-        remotes.lock().await.start_all(router).await?;
-        remotes.lock().await.spawn_updaters(Arc::clone(router));
+        remotes
+            .lock()
+            .await
+            .start_all(router, cache.as_ref())
+            .await?;
+        remotes
+            .lock()
+            .await
+            .spawn_updaters(Arc::clone(router), cache);
         Ok(())
     }
 

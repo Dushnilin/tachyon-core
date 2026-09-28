@@ -64,6 +64,18 @@ const KNOWN_NTP_FIELDS: &[&str] = &[
 
 const KNOWN_EXPERIMENTAL_FIELDS: &[&str] = &["cache_file", "clash_api"];
 
+/// `option.CacheFileOptions`: bbolt store behind `experimental.cache_file`.
+const CACHE_FILE_FIELDS: &[&str] = &[
+    "enabled",
+    "path",
+    "cache_id",
+    "store_fakeip",
+    "store_rdrc",
+    "rdrc_timeout",
+    "store_dns",
+];
+const CACHE_FILE_BOOL_FIELDS: &[&str] = &["enabled", "store_fakeip", "store_rdrc", "store_dns"];
+
 /// reference `option.WireGuardEndpointOptions`: wireguard.go root fields +
 /// `option.AmneziaWGOptions` (wireguard_awg.go, embedded without a wrapper
 /// key) + the `type`/`tag` wrapper fields. Shared dial fields live in
@@ -4191,10 +4203,54 @@ fn validate_experimental(experimental: &Value) -> Result<(), String> {
             return Err(format!("experimental.{key}: json: unknown field \"{key}\""));
         }
     }
+    if let Some(cache) = obj.get("cache_file")
+        && !cache.is_null()
+    {
+        validate_cache_file(cache)?;
+    }
     if let Some(clash) = obj.get("clash_api")
         && !clash.is_null()
     {
         validate_clash_api(clash)?;
+    }
+    Ok(())
+}
+
+/// `option.CacheFileOptions` decode: field set, types and the duration gate.
+fn validate_cache_file(cache: &Value) -> Result<(), String> {
+    let obj = cache.as_object().ok_or_else(|| {
+        format!(
+            "experimental.cache_file: json: cannot unmarshal {} into Go struct field \
+             option.CacheFileOptions",
+            json_kind(cache)
+        )
+    })?;
+    for (key, value) in obj {
+        let at = format!("experimental.cache_file.{key}");
+        if !CACHE_FILE_FIELDS.contains(&key.as_str()) {
+            return Err(format!("{at}: json: unknown field \"{key}\""));
+        }
+        if CACHE_FILE_BOOL_FIELDS.contains(&key.as_str()) {
+            if !matches!(value, Value::Bool(_)) {
+                return Err(format!(
+                    "{at}: json: cannot unmarshal {} into Go value of type bool",
+                    json_kind(value)
+                ));
+            }
+            continue;
+        }
+        match value {
+            Value::String(_) | Value::Null => {}
+            other => {
+                return Err(format!(
+                    "{at}: json: cannot unmarshal {} into Go value of type string",
+                    json_kind(other)
+                ));
+            }
+        }
+        if key == "rdrc_timeout" {
+            go_parse_duration(value.as_str().unwrap_or_default())?;
+        }
     }
     Ok(())
 }

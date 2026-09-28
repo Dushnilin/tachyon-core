@@ -1,0 +1,7 @@
+{
+  "experimental": {
+    "cache_file": {
+      "enabled": "yes"
+    }
+  }
+}

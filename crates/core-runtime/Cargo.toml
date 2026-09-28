@@ -11,6 +11,7 @@ rust-version.workspace = true
 argon2.workspace = true
 core-config = { path = "../core-config" }
 core-crypto = { path = "../core-crypto" }
+core-experimental = { path = "../core-experimental" }
 core-tls = { path = "../core-tls" }
 serde_json.workspace = true
 anyhow.workspace = true

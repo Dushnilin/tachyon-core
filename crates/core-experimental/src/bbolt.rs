@@ -145,6 +145,9 @@ fn branch_elems(page: &[u8]) -> io::Result<Vec<Elem>> {
     Ok(out)
 }
 
+/// A bucket's key/value pairs, in key order.
+pub type BucketEntries = Vec<(String, Vec<u8>)>;
+
 pub struct Db {
     data: Vec<u8>,
     page_size: usize,
@@ -200,9 +203,82 @@ impl Db {
                 .ok_or_else(|| err("bucket not found"))?;
             page = self.bucket_root_bytes(&entry)?;
         }
-        match find_in_bytes(&page, key)? {
+        // the bucket root may be a branch page when the bucket is wide
+        match self.find_in_page(&page, key)? {
             Some(e) if e.flags & BUCKET_LEAF_FLAG == 0 => Ok(Some(e.value)),
             _ => Ok(None),
+        }
+    }
+
+    /// Depth-first lookup of a key in a node, descending branch pages.
+    fn find_in_page(&self, page: &[u8], key: &[u8]) -> io::Result<Option<Elem>> {
+        match page_kind(page)? {
+            PageKind::Leaf => find_in_bytes(page, key),
+            PageKind::Branch => {
+                for e in branch_elems(page)? {
+                    let child = self.load_page(e.child)?;
+                    if let Some(found) = self.find_in_page(&child, key)? {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Every top-level bucket name, in key order.
+    pub fn bucket_names(&self) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        self.collect_buckets(self.meta.root, &mut out)?;
+        Ok(out)
+    }
+
+    /// Every key/value of a bucket (depth first, in key order).
+    pub fn bucket_page(&self, path: &[&str]) -> io::Result<Option<BucketEntries>> {
+        let mut page = self.load_page(self.meta.root)?;
+        for segment in path {
+            let entry = self
+                .find_bucket_in(&page, segment.as_bytes())?
+                .ok_or_else(|| err("bucket not found"))?;
+            page = self.bucket_root_bytes(&entry)?;
+        }
+        let mut out = Vec::new();
+        self.collect_pairs(&page, &mut out)?;
+        Ok(Some(out))
+    }
+
+    fn collect_buckets(&self, pgid: u64, out: &mut Vec<String>) -> io::Result<()> {
+        let page = self.load_page(pgid)?;
+        for elem in self.all_elems(&page)? {
+            if elem.flags & BUCKET_LEAF_FLAG != 0 {
+                out.push(String::from_utf8_lossy(&elem.key).to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_pairs(&self, page: &[u8], out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
+        for elem in self.all_elems(page)? {
+            if elem.flags & BUCKET_LEAF_FLAG != 0 {
+                continue;
+            }
+            out.push((String::from_utf8_lossy(&elem.key).to_string(), elem.value));
+        }
+        Ok(())
+    }
+
+    /// All elements of a node, descending branch pages (keys stay sorted).
+    fn all_elems(&self, page: &[u8]) -> io::Result<Vec<Elem>> {
+        match page_kind(page)? {
+            PageKind::Leaf => leaf_elems(page),
+            PageKind::Branch => {
+                let mut out = Vec::new();
+                for elem in branch_elems(page)? {
+                    let child = self.load_page(elem.child)?;
+                    out.extend(self.all_elems(&child)?);
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -217,19 +293,27 @@ impl Db {
         Ok(true)
     }
 
+    /// A page plus its overflow continuation pages, so a leaf whose value
+    /// spans several physical pages parses in one buffer.
     fn load_page(&self, pgid: u64) -> io::Result<Vec<u8>> {
         let start = pgid
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| err("pgid overflow"))? as usize;
-        let page = self
+        let first = self
             .data
             .get(start..start + self.page_size)
             .ok_or_else(|| err("page oob"))?;
-        if (Reader { buf: page }).u64(0)? != pgid {
+        if (Reader { buf: first }).u64(0)? != pgid {
             return Err(err("page id mismatch"));
         }
-        page_kind(page)?;
-        Ok(page.to_vec())
+        let overflow = (Reader { buf: first }).u32(12)? as usize;
+        let total = (overflow + 1) * self.page_size;
+        let full = self
+            .data
+            .get(start..start + total)
+            .ok_or_else(|| err("overflow page oob"))?;
+        page_kind(full)?;
+        Ok(full.to_vec())
     }
 
     fn bucket_root_bytes(&self, entry: &Elem) -> io::Result<Vec<u8>> {
@@ -330,109 +414,222 @@ fn sorted_tree(node: &NodeSpec) -> NodeSpec {
     NodeSpec { entries }
 }
 
-fn node_bytes(node: &NodeSpec) -> usize {
-    PAGE_HEADER
-        + LEAF_ELEM * node.entries.len()
-        + node
-            .entries
-            .iter()
-            .map(|e| match e {
-                EntrySpec::Kv(k, v) => k.len() + v.len(),
-                EntrySpec::Bucket { name, node, .. } => {
-                    name.len() + BUCKET_HEADER + node_bytes(node)
+/// One leaf element of a B+tree node.
+#[derive(Clone)]
+struct Inode {
+    key: Vec<u8>,
+    flags: u32,
+    value: Vec<u8>,
+}
+
+/// A bbolt writer: builds the tree bottom-up, spilling large nodes across
+/// overflow pages and splitting wide nodes behind branch pages, so the file is
+/// byte-compatible with go.etcd.io/bbolt readers.
+struct Writer {
+    page_size: usize,
+    next_pgid: u64,
+    file: Vec<u8>,
+}
+
+impl Writer {
+    fn new(page_size: usize) -> Self {
+        Self {
+            page_size,
+            next_pgid: 2,
+            file: vec![0u8; 2 * page_size],
+        }
+    }
+
+    fn alloc(&mut self, npages: usize) -> u64 {
+        let pgid = self.next_pgid;
+        self.next_pgid += npages as u64;
+        let end = (pgid as usize + npages) * self.page_size;
+        if self.file.len() < end {
+            self.file.resize(end, 0);
+        }
+        pgid
+    }
+
+    /// Materialize a node and everything under it; returns (root pgid, first
+    /// key) so a parent branch can reference it.
+    fn materialize(&mut self, node: &NodeSpec) -> io::Result<(u64, Vec<u8>)> {
+        let mut inodes = Vec::with_capacity(node.entries.len());
+        for entry in &node.entries {
+            match entry {
+                EntrySpec::Kv(key, value) => inodes.push(Inode {
+                    key: key.as_bytes().to_vec(),
+                    flags: 0,
+                    value: value.clone(),
+                }),
+                EntrySpec::Bucket { name, seq, node } => {
+                    let (child_pgid, _) = self.materialize(node)?;
+                    let mut value = vec![0u8; BUCKET_HEADER];
+                    value[0..8].copy_from_slice(&child_pgid.to_le_bytes());
+                    value[8..16].copy_from_slice(&seq.to_le_bytes());
+                    inodes.push(Inode {
+                        key: name.as_bytes().to_vec(),
+                        flags: BUCKET_LEAF_FLAG,
+                        value,
+                    });
                 }
-            })
-            .sum::<usize>()
+            }
+        }
+        self.spill(inodes)
+    }
+
+    fn spill(&mut self, inodes: Vec<Inode>) -> io::Result<(u64, Vec<u8>)> {
+        if inodes.is_empty() {
+            let pgid = self.write_leaf(&[]);
+            return Ok((pgid, Vec::new()));
+        }
+        let first_key = inodes[0].key.clone();
+        let leaves = self.partition(&inodes);
+        if leaves.len() == 1 {
+            // one logical node: overflow pages if a value is large
+            let pgid = self.write_leaf(&leaves[0]);
+            return Ok((pgid, first_key));
+        }
+        let mut refs = Vec::with_capacity(leaves.len());
+        for leaf in &leaves {
+            let pgid = self.write_leaf(leaf);
+            refs.push((leaf[0].key.clone(), pgid));
+        }
+        let branch_pgid = self.build_branch(refs);
+        Ok((branch_pgid, first_key))
+    }
+
+    /// Greedy split into leaves that fit a page; a single oversized inode gets
+    /// its own leaf and spills over.
+    fn partition(&self, inodes: &[Inode]) -> Vec<Vec<Inode>> {
+        let mut leaves: Vec<Vec<Inode>> = Vec::new();
+        let mut current: Vec<Inode> = Vec::new();
+        let mut size = PAGE_HEADER;
+        for inode in inodes {
+            let elem = LEAF_ELEM + inode.key.len() + inode.value.len();
+            if !current.is_empty() && size + elem > self.page_size {
+                leaves.push(std::mem::take(&mut current));
+                size = PAGE_HEADER;
+            }
+            current.push(inode.clone());
+            size += elem;
+        }
+        if !current.is_empty() {
+            leaves.push(current);
+        }
+        leaves
+    }
+
+    fn write_leaf(&mut self, inodes: &[Inode]) -> u64 {
+        let total = PAGE_HEADER
+            + LEAF_ELEM * inodes.len()
+            + inodes
+                .iter()
+                .map(|inode| inode.key.len() + inode.value.len())
+                .sum::<usize>();
+        let npages = total.div_ceil(self.page_size).max(1);
+        let pgid = self.alloc(npages);
+        let base = pgid as usize * self.page_size;
+        self.file[base..base + 8].copy_from_slice(&pgid.to_le_bytes());
+        self.file[base + 8..base + 10].copy_from_slice(&LEAF_FLAG.to_le_bytes());
+        self.file[base + 10..base + 12].copy_from_slice(&(inodes.len() as u16).to_le_bytes());
+        self.file[base + 12..base + 16].copy_from_slice(&((npages - 1) as u32).to_le_bytes());
+        let mut data_off = base + PAGE_HEADER + LEAF_ELEM * inodes.len();
+        for (i, inode) in inodes.iter().enumerate() {
+            let elem = base + PAGE_HEADER + i * LEAF_ELEM;
+            let pos = (data_off - elem) as u32;
+            self.file[elem..elem + 4].copy_from_slice(&inode.flags.to_le_bytes());
+            self.file[elem + 4..elem + 8].copy_from_slice(&pos.to_le_bytes());
+            self.file[elem + 8..elem + 12].copy_from_slice(&(inode.key.len() as u32).to_le_bytes());
+            self.file[elem + 12..elem + 16]
+                .copy_from_slice(&(inode.value.len() as u32).to_le_bytes());
+            self.file[data_off..data_off + inode.key.len()].copy_from_slice(&inode.key);
+            data_off += inode.key.len();
+            self.file[data_off..data_off + inode.value.len()].copy_from_slice(&inode.value);
+            data_off += inode.value.len();
+        }
+        pgid
+    }
+
+    /// Branch pages, recursing into branch-of-branches when the index is wide.
+    fn build_branch(&mut self, refs: Vec<(Vec<u8>, u64)>) -> u64 {
+        if branch_size(&refs) <= self.page_size {
+            return self.write_branch_page(&refs);
+        }
+        let mut groups: Vec<Vec<(Vec<u8>, u64)>> = Vec::new();
+        let mut current: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut size = PAGE_HEADER;
+        for item in refs {
+            let elem = BRANCH_ELEM + item.0.len();
+            if !current.is_empty() && size + elem > self.page_size {
+                groups.push(std::mem::take(&mut current));
+                size = PAGE_HEADER;
+            }
+            current.push(item);
+            size += elem;
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        let mut child_refs = Vec::with_capacity(groups.len());
+        for group in groups {
+            let first = group[0].0.clone();
+            let pgid = self.write_branch_page(&group);
+            child_refs.push((first, pgid));
+        }
+        self.build_branch(child_refs)
+    }
+
+    fn write_branch_page(&mut self, refs: &[(Vec<u8>, u64)]) -> u64 {
+        let pgid = self.alloc(1);
+        let base = pgid as usize * self.page_size;
+        self.file[base..base + 8].copy_from_slice(&pgid.to_le_bytes());
+        self.file[base + 8..base + 10].copy_from_slice(&BRANCH_FLAG.to_le_bytes());
+        self.file[base + 10..base + 12].copy_from_slice(&(refs.len() as u16).to_le_bytes());
+        let mut data_off = base + PAGE_HEADER + BRANCH_ELEM * refs.len();
+        for (i, (key, child)) in refs.iter().enumerate() {
+            let elem = base + PAGE_HEADER + i * BRANCH_ELEM;
+            let pos = (data_off - elem) as u32;
+            self.file[elem..elem + 4].copy_from_slice(&pos.to_le_bytes());
+            self.file[elem + 4..elem + 8].copy_from_slice(&(key.len() as u32).to_le_bytes());
+            self.file[elem + 8..elem + 16].copy_from_slice(&child.to_le_bytes());
+            self.file[data_off..data_off + key.len()].copy_from_slice(key);
+            data_off += key.len();
+        }
+        pgid
+    }
+
+    fn write_meta(&mut self, root_pgid: u64) {
+        let high_water = self.next_pgid;
+        for (id, txid) in [(0u64, 0u64), (1u64, 1u64)] {
+            let mut page = vec![0u8; self.page_size];
+            page[0..8].copy_from_slice(&id.to_le_bytes());
+            page[8..10].copy_from_slice(&META_FLAG.to_le_bytes());
+            let mut meta = vec![0u8; META_BODY];
+            meta[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+            meta[4..8].copy_from_slice(&VERSION.to_le_bytes());
+            meta[8..12].copy_from_slice(&(self.page_size as u32).to_le_bytes());
+            meta[16..24].copy_from_slice(&root_pgid.to_le_bytes());
+            meta[24..32].copy_from_slice(&0u64.to_le_bytes());
+            meta[32..40].copy_from_slice(&NO_FREELIST.to_le_bytes());
+            meta[40..48].copy_from_slice(&high_water.to_le_bytes());
+            meta[48..56].copy_from_slice(&txid.to_le_bytes());
+            let sum = fnv1a64(&meta[0..56]);
+            meta[56..64].copy_from_slice(&sum.to_le_bytes());
+            page[PAGE_HEADER..PAGE_HEADER + META_BODY].copy_from_slice(&meta);
+            let off = id as usize * self.page_size;
+            self.file[off..off + self.page_size].copy_from_slice(&page);
+        }
+    }
+}
+
+fn branch_size(refs: &[(Vec<u8>, u64)]) -> usize {
+    PAGE_HEADER + BRANCH_ELEM * refs.len() + refs.iter().map(|r| r.0.len()).sum::<usize>()
 }
 
 pub fn write(path: &Path, root: &NodeSpec) -> io::Result<()> {
-    let page_size = 4096usize;
     let root = sorted_tree(root);
-    let root = &root;
-    if node_bytes(root) > page_size {
-        return Err(err("spike writer: root node exceeds one page"));
-    }
-    let mut pages: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut next_pgid = 2u64;
-    let root_pgid = assign(root, &mut next_pgid, page_size, &mut pages)?;
-    let mut file = vec![0u8; next_pgid as usize * page_size];
-    for (pgid, bytes) in &pages {
-        let off = *pgid as usize * page_size;
-        file[off..off + bytes.len()].copy_from_slice(bytes);
-    }
-    for (id, txid) in [(0u64, 0u64), (1u64, 1u64)] {
-        let mut page = vec![0u8; page_size];
-        page[0..8].copy_from_slice(&id.to_le_bytes());
-        page[8..10].copy_from_slice(&META_FLAG.to_le_bytes());
-        let mut meta = vec![0u8; META_BODY];
-        meta[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        meta[4..8].copy_from_slice(&VERSION.to_le_bytes());
-        meta[8..12].copy_from_slice(&(page_size as u32).to_le_bytes());
-        meta[16..24].copy_from_slice(&root_pgid.to_le_bytes());
-        meta[24..32].copy_from_slice(&0u64.to_le_bytes());
-        meta[32..40].copy_from_slice(&NO_FREELIST.to_le_bytes());
-        meta[40..48].copy_from_slice(&next_pgid.to_le_bytes());
-        meta[48..56].copy_from_slice(&txid.to_le_bytes());
-        let sum = fnv1a64(&meta[0..56]);
-        meta[56..64].copy_from_slice(&sum.to_le_bytes());
-        page[PAGE_HEADER..PAGE_HEADER + META_BODY].copy_from_slice(&meta);
-        let off = id as usize * page_size;
-        file[off..off + page_size].copy_from_slice(&page);
-    }
-    fs::write(path, file)
-}
-
-fn assign(
-    node: &NodeSpec,
-    next_pgid: &mut u64,
-    page_size: usize,
-    pages: &mut Vec<(u64, Vec<u8>)>,
-) -> io::Result<u64> {
-    let mut child_pgids = Vec::new();
-    for e in &node.entries {
-        if let EntrySpec::Bucket { node, .. } = e {
-            if node_bytes(node) > page_size {
-                return Err(err("spike writer: nested node exceeds one page"));
-            }
-            child_pgids.push(assign(node, next_pgid, page_size, pages)?);
-        }
-    }
-    let pgid = *next_pgid;
-    *next_pgid += 1;
-    let count = node.entries.len() as u16;
-    let mut page = vec![0u8; page_size];
-    page[0..8].copy_from_slice(&pgid.to_le_bytes());
-    page[8..10].copy_from_slice(&LEAF_FLAG.to_le_bytes());
-    page[10..12].copy_from_slice(&count.to_le_bytes());
-
-    let mut off = PAGE_HEADER + LEAF_ELEM * node.entries.len();
-    let mut child_iter = child_pgids.into_iter();
-    for (i, e) in node.entries.iter().enumerate() {
-        let elem_off = PAGE_HEADER + i * LEAF_ELEM;
-        let (flags, key, value): (u32, &str, Vec<u8>) = match e {
-            EntrySpec::Kv(k, v) => (0, k, v.clone()),
-            EntrySpec::Bucket { name, seq, .. } => {
-                let child = child_iter.next().ok_or_else(|| err("child mismatch"))?;
-                let mut v = vec![0u8; BUCKET_HEADER];
-                v[0..8].copy_from_slice(&child.to_le_bytes());
-                v[8..16].copy_from_slice(&seq.to_le_bytes());
-                (BUCKET_LEAF_FLAG, name, v)
-            }
-        };
-        let k = key.as_bytes();
-        let sz = k.len() + value.len();
-        if off + sz > page_size {
-            return Err(err("spike writer: leaf overflow"));
-        }
-        let pos = (off - elem_off) as u32;
-        page[elem_off..elem_off + 4].copy_from_slice(&flags.to_le_bytes());
-        page[elem_off + 4..elem_off + 8].copy_from_slice(&pos.to_le_bytes());
-        page[elem_off + 8..elem_off + 12].copy_from_slice(&(k.len() as u32).to_le_bytes());
-        page[elem_off + 12..elem_off + 16].copy_from_slice(&(value.len() as u32).to_le_bytes());
-        page[off..off + k.len()].copy_from_slice(k);
-        page[off + k.len()..off + sz].copy_from_slice(&value);
-        off += sz;
-    }
-    pages.push((pgid, page));
-    Ok(pgid)
+    let mut writer = Writer::new(4096);
+    let (root_pgid, _) = writer.materialize(&root)?;
+    writer.write_meta(root_pgid);
+    fs::write(path, &writer.file)
 }

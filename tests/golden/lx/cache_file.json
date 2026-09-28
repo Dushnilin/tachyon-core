@@ -1,0 +1,38 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["direct"]
+    }
+  ],
+  "route": {
+    "final": "proxy"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/usr/share/sing-box/cache.db",
+      "cache_id": "tachyon",
+      "store_fakeip": true,
+      "store_rdrc": true,
+      "rdrc_timeout": "10m",
+      "store_dns": true
+    }
+  }
+}

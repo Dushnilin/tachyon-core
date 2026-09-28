@@ -3,6 +3,7 @@
 
 pub mod rule;
 pub mod rule_set;
+pub mod rule_set_remote;
 pub mod sniff;
 
 use std::borrow::Cow;
@@ -237,6 +238,7 @@ pub(crate) fn build_rule_sets(
     route: &serde_json::Map<String, Value>,
 ) -> anyhow::Result<rule_set::RuleSetRegistry> {
     let mut registry = rule_set::RuleSetRegistry::new();
+    let mut remotes = rule_set_remote::RemoteRegistry::new();
     let Some(list) = route.get("rule_set").filter(|value| !value.is_null()) else {
         return Ok(registry);
     };
@@ -253,7 +255,8 @@ pub(crate) fn build_rule_sets(
             .and_then(Value::as_str)
             .unwrap_or("inline");
         let tags = rule_set_tags(entry, &at)?;
-        let rules = match ty {
+        // `remote` fills its set during start; the arm yields the empty list
+        let rules: Vec<Value> = match ty {
             "inline" => entry
                 .get("rules")
                 .and_then(Value::as_array)
@@ -266,13 +269,74 @@ pub(crate) fn build_rule_sets(
                 parse_rule_set_payload(&data, entry, &at)?
             }
             "remote" => {
-                anyhow::bail!("{at}: remote rule-set download is not implemented yet");
+                let url = entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .replace("{tag}", &tags[0]);
+                if url.is_empty() {
+                    anyhow::bail!("{at}: missing url");
+                }
+                let client_spec = entry.get("http_client").filter(|v| !v.is_null());
+                let detour = entry
+                    .get("download_detour")
+                    .and_then(Value::as_str)
+                    .filter(|tag| !tag.is_empty());
+                let client = if client_spec.is_some() {
+                    if detour.is_some() {
+                        anyhow::bail!(
+                            "{at}: http_client is conflict with deprecated download_detour field"
+                        );
+                    }
+                    crate::http_client::HttpClient::from_config(client_spec, &at)?
+                } else if let Some(detour) = detour {
+                    logging::warn(format_args!(
+                        "{at}: download_detour is deprecated, use http_client"
+                    ));
+                    let mut wrapper = serde_json::Map::new();
+                    wrapper.insert("detour".into(), Value::String(detour.into()));
+                    crate::http_client::HttpClient::from_config(Some(&Value::Object(wrapper)), &at)?
+                } else {
+                    crate::http_client::HttpClient::default()
+                };
+                let update_interval = crate::outbound::urltest::parse_duration(
+                    entry.get("update_interval"),
+                    std::time::Duration::ZERO,
+                    &at,
+                )?;
+                let initial_path = entry
+                    .get("initial_path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .and_then(|path| std::path::absolute(resolve_rule_set_path(path, &tags)).ok())
+                    .map(|path| path.to_string_lossy().replace('\\', "/"));
+                let set = std::sync::Arc::new(rule_set::RuleSet::new(tags.clone(), Vec::new()));
+                remotes.push(rule_set_remote::RemoteRuleSet {
+                    tags: tags.clone(),
+                    spec: rule_set_remote::RemoteSpec {
+                        url,
+                        initial_path,
+                        update_interval,
+                        client,
+                        format: entry
+                            .get("format")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    },
+                    set: set.clone(),
+                    etag: None,
+                    last_updated: None,
+                });
+                Vec::new()
             }
             other => anyhow::bail!("{at}: unknown rule-set type: {other}"),
         };
-        logging::info(format_args!("loaded rule-set {}", tags.join(",")));
+        if ty != "remote" {
+            logging::info(format_args!("loaded rule-set {}", tags.join(",")));
+        }
         registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
     }
+    registry.attach_remotes(remotes);
     Ok(registry)
 }
 
@@ -434,10 +498,18 @@ pub struct Router {
     default: usize,
     rules: Vec<Rule>,
     defaults: RouteDefaults,
+    rule_sets: Option<rule_set::RuleSetRegistry>,
     probe_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Router {
+    /// The registry both routers share, remote sets included.
+    pub fn rule_sets(&self) -> &rule_set::RuleSetRegistry {
+        self.rule_sets
+            .as_ref()
+            .expect("route registry built in Router::new")
+    }
+
     /// Route dialing defaults (`route.auto_detect_interface`, …).
     pub fn defaults(&self) -> &RouteDefaults {
         &self.defaults
@@ -542,6 +614,7 @@ impl Router {
         }
 
         let mut rules = Vec::new();
+        let mut registry = rule_set::RuleSetRegistry::new();
         if let Some(route) = root.get("route")
             && let Some(map) = route.as_object()
         {
@@ -550,7 +623,7 @@ impl Router {
                     logging::warn(format_args!("route.{key} is not implemented yet (ignored)"));
                 }
             }
-            let registry = build_rule_sets(map)?;
+            registry = build_rule_sets(map)?;
             if let Some(list) = map.get("rules").and_then(Value::as_array) {
                 for (i, obj) in list.iter().enumerate() {
                     rules.push(Rule::build_with_rule_sets(
@@ -583,6 +656,7 @@ impl Router {
             default,
             rules,
             defaults,
+            rule_sets: Some(registry),
             probe_tasks: std::sync::Mutex::new(Vec::new()),
         });
         for outbound in &router.outbounds {

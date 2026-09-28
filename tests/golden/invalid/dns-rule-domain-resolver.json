@@ -1,0 +1,36 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "u",
+        "server": "1.1.1.1"
+      },
+      {
+        "type": "udp",
+        "tag": "r",
+        "server": "8.8.8.8"
+      }
+    ],
+    "final": "u",
+    "rules": [
+      {
+        "domain": [
+          "a.test"
+        ],
+        "action": "route",
+        "server": "u",
+        "domain_resolver": "u"
+      }
+    ]
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "d"
+    }
+  ],
+  "route": {
+    "final": "d"
+  }
+}

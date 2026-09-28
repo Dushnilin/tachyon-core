@@ -1,0 +1,22 @@
+{
+  "log": { "level": "info" },
+  "dns": {
+    "optimistic": { "enabled": true, "timeout": "1s" },
+    "servers": [
+      { "type": "udp", "tag": "local", "server": "1.1.1.1" },
+      { "type": "udp", "tag": "remote", "server": "8.8.8.8" }
+    ],
+    "rules": [{ "domain_suffix": ["example.com"], "server": "remote" }],
+    "final": "local"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": { "final": "direct", "default_domain_resolver": "local" }
+}

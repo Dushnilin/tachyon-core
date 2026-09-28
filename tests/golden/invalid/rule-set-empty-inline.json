@@ -1,0 +1,13 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "route": {
+    "rule_set": [
+      {
+        "tag": "rs",
+        "rules": []
+      }
+    ]
+  }
+}

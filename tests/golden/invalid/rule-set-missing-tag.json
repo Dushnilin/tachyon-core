@@ -1,0 +1,18 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "route": {
+    "rule_set": [
+      {
+        "rules": [
+          {
+            "domain_suffix": [
+              "a.com"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

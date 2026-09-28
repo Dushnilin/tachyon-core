@@ -1,0 +1,50 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "route": {
+    "rule_set": [
+      {
+        "type": "inline",
+        "tag": "inline",
+        "rules": [
+          {
+            "domain_suffix": [
+              "a.com"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "local",
+        "tag": "local",
+        "path": "tests/golden/rule-set/local.srs"
+      },
+      {
+        "type": "remote",
+        "tag": [
+          "geoip-cn",
+          "geosite-cn"
+        ],
+        "url": "https://example.com/{tag}.srs",
+        "download_detour": "direct",
+        "update_interval": "24h"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": [
+          "inline"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ]
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}

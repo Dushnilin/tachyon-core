@@ -26,7 +26,8 @@ anyhow = "1"
 aes = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
-blake3 = "1"
+# pure-Rust backend: the C implementation would need a cross cc for musl
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
 brotli = "9"
 bytes = "1"
 cfb-mode = "0.8"

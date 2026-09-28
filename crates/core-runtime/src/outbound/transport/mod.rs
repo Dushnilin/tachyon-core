@@ -139,15 +139,15 @@ impl Transport {
             .ok_or_else(|| anyhow::anyhow!("{at}: transport missing type"))?;
         let kind = match ty {
             "ws" => {
+                // the early-data path rewrites the upgrade request; ignoring it
+                // would silently change the handshake, so it fails instead
                 if transport
                     .get("max_early_data")
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
                     > 0
                 {
-                    crate::logging::warn(format_args!(
-                        "{at}: transport ws max_early_data is not implemented yet; ignoring"
-                    ));
+                    anyhow::bail!("{at}: transport ws max_early_data is not implemented yet");
                 }
                 Kind::Ws {
                     path: transport
@@ -278,6 +278,8 @@ impl Transport {
     }
 }
 
+/// `transport.grpc` keepalive knobs: the h2 layer does not send PINGs yet, so
+/// the values are parsed (validating the duration) and reported as a gap.
 fn warn_unimplemented_grpc_fields(transport: &serde_json::Map<String, Value>, at: &str) {
     let mut warned = false;
     for key in ["idle_timeout", "ping_timeout", "permit_without_stream"] {
@@ -290,6 +292,7 @@ fn warn_unimplemented_grpc_fields(transport: &serde_json::Map<String, Value>, at
     }
 }
 
+/// `transport.http` idle/ping timeouts: same story as the grpc knobs.
 fn warn_unimplemented_http_fields(transport: &serde_json::Map<String, Value>, at: &str) {
     for key in ["idle_timeout", "ping_timeout"] {
         if transport.contains_key(key) {

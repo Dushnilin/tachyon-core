@@ -80,6 +80,20 @@ fn box_cfg(outbounds: Value, route: Value) -> Value {
     })
 }
 
+/// CAP_NET_ADMIN as the kernel reports it; the docker gate and the CI sudo
+/// step have it, plain GitHub runners do not.
+fn has_net_admin() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1 << 12) != 0)
+}
+
 async fn start_box(cfg: Value) -> (core_runtime::BoxInstance, SocketAddr) {
     let instance = core_runtime::start(&cfg).await.expect("start box");
     let addr = instance
@@ -525,20 +539,13 @@ async fn route_dial_defaults_accepted_and_echo_works() {
         }),
     );
     // SO_MARK needs CAP_NET_ADMIN; the docker gate and the CI sudo step have it
-    let instance = match core_runtime::start(&cfg).await {
-        Ok(instance) => instance,
-        Err(err) if format!("{err:#}").contains("Operation not permitted") => {
-            eprintln!("SKIP route dial defaults: needs CAP_NET_ADMIN for SO_MARK");
-            return;
-        }
-        Err(err) => panic!("start box: {err:#}"),
-    };
-    let inbound = instance
-        .inbound_addrs()
-        .iter()
-        .find(|(tag, _)| tag == "mixed-in")
-        .map(|(_, addr)| *addr)
-        .expect("mixed inbound addr");
+    // SO_MARK is applied per dial and fails with EPERM on an unprivileged
+    // runner (the box still starts, the connection does not)
+    if !has_net_admin() {
+        eprintln!("SKIP route dial defaults: needs CAP_NET_ADMIN for SO_MARK");
+        return;
+    }
+    let (instance, inbound) = start_box(cfg).await;
     let (stream, code) = socks_connect(inbound, Target::V4(v4_of(echo), echo.port())).await;
     assert_eq!(code, 0x00, "route defaults must not break direct dial");
     assert_echo_roundtrip(stream, b"dflt").await;

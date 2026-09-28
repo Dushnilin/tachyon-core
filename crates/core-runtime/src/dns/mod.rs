@@ -70,9 +70,25 @@ pub struct DnsService {
     cache: RwLock<Cache>,
     inflight: std::sync::Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
     refreshing: std::sync::Mutex<HashSet<CacheKey>>,
+    /// Installed after the router exists, so `detour` can dial through it.
+    router: RwLock<Option<Arc<crate::route::Router>>>,
 }
 
 impl DnsService {
+    /// The transport dialer, carrying the router once the instance is up.
+    fn dialer(&self) -> transport::Dialer {
+        transport::Dialer {
+            router: self.router.read().ok().and_then(|router| router.clone()),
+        }
+    }
+
+    /// `dns.server.detour` needs the outbounds; the instance wires them in.
+    pub fn set_router(&self, router: Arc<crate::route::Router>) {
+        if let Ok(mut current) = self.router.write() {
+            *current = Some(router);
+        }
+    }
+
     /// Build from the root document; `Ok(None)` when there is no `dns` section.
     pub fn build(root: &Value) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(dns) = root.get("dns") else {
@@ -213,6 +229,7 @@ impl DnsService {
             cache: RwLock::new(Cache::new(cache_capacity)),
             inflight: std::sync::Mutex::new(HashMap::new()),
             refreshing: std::sync::Mutex::new(HashSet::new()),
+            router: RwLock::new(None),
         })))
     }
 
@@ -279,8 +296,14 @@ impl DnsService {
                     rewrite_ttl,
                     disable_cache,
                 } => {
-                    let Some(cfg) = self.servers.get(server) else {
-                        crate::logging::warn(format_args!("dns: transport not found: {server}"));
+                    // an empty server is the reference default: dns.final
+                    let tag = if server.is_empty() {
+                        self.final_tag.as_str()
+                    } else {
+                        server.as_str()
+                    };
+                    let Some(cfg) = self.servers.get(tag) else {
+                        crate::logging::warn(format_args!("dns: transport not found: {tag}"));
                         continue;
                     };
                     if cfg.is_fakeip() && !allow_fakeip {
@@ -305,6 +328,10 @@ impl DnsService {
                             "dns: query dropped by rule",
                         )),
                     };
+                }
+                Action::Predefined(predefined) => {
+                    return codec::predefined_response(&query_msg, predefined)
+                        .map_err(std::io::Error::other);
                 }
                 Action::Evaluate | Action::Respond => {
                     crate::logging::warn(format_args!(
@@ -458,7 +485,7 @@ impl DnsService {
         query: &[u8],
     ) -> std::io::Result<Vec<u8>> {
         let addr = self.resolve_server_addr(cfg, 0).await?;
-        let raw = transport::exchange(cfg, addr, query).await?;
+        let raw = transport::exchange(cfg, addr, query, &self.dialer()).await?;
         Ok(raw)
     }
 
@@ -523,7 +550,7 @@ impl DnsService {
         for qtype in self.strategy.query_types() {
             let query = codec::build_query(rand_id(), host, *qtype)?;
             let addr = self.resolve_server_addr(resolver, depth).await?;
-            let raw = transport::exchange(resolver, addr, &query).await?;
+            let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
             out.extend(codec::answer_ips(&raw)?);
         }
         Ok(out)

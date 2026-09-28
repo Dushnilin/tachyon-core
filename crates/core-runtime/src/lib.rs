@@ -78,6 +78,10 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     // aborts the start, exactly like `RemoteRuleSet.StartContext`
     router.rule_sets().start_remote(&router).await?;
     let dns_service = dns::DnsService::build(root).context("dns section")?;
+    if let Some(service) = &dns_service {
+        // `dns.server.detour` dials through the outbounds
+        service.set_router(Arc::clone(&router));
+    }
     dns::set_service(dns_service.clone());
 
     let mut tasks = Vec::new();

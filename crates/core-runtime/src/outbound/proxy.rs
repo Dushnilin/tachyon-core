@@ -1,11 +1,12 @@
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::inbound::{Conn, Target};
+use crate::inbound::{AnyStream, Conn, Target};
 use crate::route::Router;
 
 pub(crate) fn server_endpoint(
@@ -58,30 +59,65 @@ pub(crate) fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// socks outbound (SOCKS5 only; version 4/4a is rejected at build time).
+/// socks outbound; `version` is 4 or 5 (5 by default), as in the reference.
 pub struct Socks {
     server: String,
     port: u16,
+    version: u8,
     credentials: Option<(String, String)>,
 }
 
 impl Socks {
     pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
-        if let Some(version) = obj.get("version").and_then(Value::as_str)
-            && version != "5"
-        {
-            anyhow::bail!("{at}: socks version {version:?} not implemented yet");
-        }
+        let version = match obj.get("version").and_then(Value::as_str) {
+            None | Some("") => 5,
+            Some("4") => 4,
+            Some("5") => 5,
+            Some(other) => anyhow::bail!("{at}: unknown socks version {other:?}"),
+        };
         let (server, port) = server_endpoint(obj, at)?;
         Ok(Self {
             server,
             port,
+            version,
             credentials: credentials(obj),
         })
     }
 
-    pub async fn connect(&self, target: &Target) -> io::Result<TcpStream> {
-        let mut stream = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+    pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        let stream = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        if self.version == 4 {
+            let mut stream = stream;
+            self.connect_v4(&mut stream, target).await?;
+            return Ok(Box::new(stream));
+        }
+        let mut stream = stream;
+        self.connect_v5(&mut stream, target).await?;
+        Ok(Box::new(stream))
+    }
+
+    /// SOCKS4/4a: the reference resolves the destination locally
+    /// (`resolve: version == Version4`) and sends the IPv4 form; the 4a
+    /// extension (a domain behind a 0.0.0.x address) is used when a name has
+    /// no usable address.
+    async fn connect_v4(&self, stream: &mut TcpStream, target: &Target) -> io::Result<()> {
+        let request = match target {
+            Target::Ip(addr) => socks4_request(target, Some(socks4_addr(addr.ip())?), None),
+            Target::Domain(host, _) => socks4_request(target, resolve_ipv4(host).await, Some(host)),
+        }?;
+        stream.write_all(&request).await?;
+        let mut reply = [0u8; 8];
+        stream.read_exact(&mut reply).await?;
+        if reply[1] != 0x5a {
+            return Err(io::Error::other(format!(
+                "socks4 connect failed: {}",
+                reply[1]
+            )));
+        }
+        Ok(())
+    }
+
+    async fn connect_v5(&self, stream: &mut TcpStream, target: &Target) -> io::Result<()> {
         let methods: &[u8] = if self.credentials.is_some() {
             &[0x02]
         } else {
@@ -140,34 +176,83 @@ impl Socks {
         };
         let mut bnd = vec![0u8; skip + 2];
         stream.read_exact(&mut bnd).await?;
-        Ok(stream)
+        Ok(())
     }
 }
 
-/// http outbound: CONNECT tunnel (TLS wrapping not implemented yet).
+/// The SOCKS4 address field: a plain IPv4 address, or the 0.0.0.1 marker with
+/// the hostname appended when the name could not be resolved.
+fn socks4_request(
+    target: &Target,
+    address: Option<std::net::Ipv4Addr>,
+    hostname: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    let mut request = vec![0x04, 0x01];
+    request.extend_from_slice(&target.port().to_be_bytes());
+    match address {
+        Some(address) => request.extend_from_slice(&address.octets()),
+        None => {
+            let hostname = hostname.unwrap_or_default();
+            if hostname.is_empty() {
+                return Err(io::Error::other("socks4 needs an address or a name"));
+            }
+            if hostname.len() > 255 {
+                return Err(io::Error::other("domain too long"));
+            }
+            request.extend_from_slice(&[0, 0, 0, 1]);
+            request.extend_from_slice(hostname.as_bytes());
+        }
+    }
+    request.push(0x00);
+    Ok(request)
+}
+
+fn socks4_addr(ip: std::net::IpAddr) -> io::Result<std::net::Ipv4Addr> {
+    match ip {
+        std::net::IpAddr::V4(v4) => Ok(v4),
+        // a mapped address keeps the SOCKS4 encoding possible
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .ok_or_else(|| io::Error::other("socks4 cannot reach an IPv6 destination")),
+    }
+}
+
+/// A/AAAA lookup for the SOCKS4 destination; `None` when only a name is known.
+async fn resolve_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let service = crate::dns::current()?;
+    let addresses = service.resolve(host).await.ok()?;
+    addresses.into_iter().find_map(|address| match address {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    })
+}
+
+/// http outbound: CONNECT tunnel, optionally wrapped in TLS.
 pub struct HttpOut {
     server: String,
     port: u16,
     credentials: Option<(String, String)>,
+    tls: Option<Arc<crate::tls_client::TlsOptions>>,
 }
 
 impl HttpOut {
     pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
-        if let Some(tls) = obj.get("tls").and_then(Value::as_object)
-            && tls.get("enabled").and_then(Value::as_bool) == Some(true)
-        {
-            anyhow::bail!("{at}: http outbound TLS not implemented yet");
-        }
         let (server, port) = server_endpoint(obj, at)?;
+        let tls = crate::tls_client::TlsOptions::from_outbound(obj, &server, at)?;
         Ok(Self {
             server,
             port,
             credentials: credentials(obj),
+            tls: tls.map(Arc::new),
         })
     }
 
-    pub async fn connect(&self, target: &Target) -> io::Result<TcpStream> {
-        let mut stream = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+    pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let mut stream: AnyStream = match &self.tls {
+            Some(tls) => Box::new(tls.connect_stream(tcp, &[]).await?),
+            None => Box::new(tcp),
+        };
         let authority = match target {
             Target::Ip(addr) => addr.to_string(),
             Target::Domain(host, port) => format!("{host}:{port}"),
@@ -331,5 +416,29 @@ impl Selector {
             return Err(io::Error::other("selector has no members"));
         };
         router.connect_udp_index(*member, target).await
+    }
+}
+
+#[cfg(test)]
+mod socks4_tests {
+    use super::*;
+
+    #[test]
+    fn request_uses_the_resolved_address() {
+        let target = Target::Ip("10.0.0.5:443".parse().expect("target"));
+        let request =
+            socks4_request(&target, Some("1.2.3.4".parse().expect("ip")), None).expect("request");
+        assert_eq!(request, vec![0x04, 0x01, 0x01, 0xbb, 1, 2, 3, 4, 0x00]);
+    }
+
+    #[test]
+    fn request_falls_back_to_4a() {
+        let target = Target::Domain("host.test".into(), 80);
+        let request = socks4_request(&target, None, Some("host.test")).expect("request");
+        assert_eq!(&request[..8], &[0x04, 0x01, 0x00, 0x50, 0, 0, 0, 1]);
+        assert_eq!(&request[8..], b"host.test\x00");
+        // no address and no name cannot be encoded
+        let error = socks4_request(&target, None, None).unwrap_err();
+        assert!(error.to_string().contains("address or a name"));
     }
 }

@@ -7,22 +7,28 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use serde_json::Value;
 
 use crate::inbound::Target;
 use crate::route::ConnContext;
 
-/// A loaded rule set: its tags and the rules it holds.
-#[derive(Debug, Clone)]
+/// A loaded rule set: its tags and the rules it holds. The rule list sits
+/// behind a lock so a remote update is visible to the rules that already hold
+/// an `Arc` to this set (reference `RemoteRuleSet.access` + callbacks).
+#[derive(Debug)]
 pub struct RuleSet {
     tags: Vec<String>,
-    rules: Vec<Value>,
+    rules: RwLock<Vec<Value>>,
 }
 
 impl RuleSet {
     pub fn new(tags: Vec<String>, rules: Vec<Value>) -> Self {
-        Self { tags, rules }
+        Self {
+            tags,
+            rules: RwLock::new(rules),
+        }
     }
 
     pub fn tags(&self) -> &[String] {
@@ -37,14 +43,43 @@ impl RuleSet {
 
     /// `adapter.RuleSet.Match`: any headless rule of the set matches.
     pub fn matches(&self, ctx: &ConnContext) -> bool {
-        self.rules.iter().any(|rule| match_rule(rule, ctx))
+        match self.rules.read() {
+            Ok(rules) => rules.iter().any(|rule| match_rule(rule, ctx)),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .iter()
+                .any(|rule| match_rule(rule, ctx)),
+        }
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rules
+            .read()
+            .map(|rules| rules.len())
+            .unwrap_or_default()
+    }
+
+    /// `RemoteRuleSet.loadBytes`: swap the rule list in one step.
+    pub fn replace_rules(&self, rules: Vec<Value>) {
+        match self.rules.write() {
+            Ok(mut current) => *current = rules,
+            Err(poisoned) => *poisoned.into_inner() = rules,
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<Value> {
+        match self.rules.read() {
+            Ok(rules) => rules.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 }
 
 /// The tag → set registry built from `route.rule_set`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct RuleSetRegistry {
     sets: HashMap<String, Arc<RuleSet>>,
+    remotes: Option<Arc<tokio::sync::Mutex<super::rule_set_remote::RemoteRegistry>>>,
 }
 
 impl RuleSetRegistry {
@@ -64,6 +99,23 @@ impl RuleSetRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.sets.is_empty()
+    }
+
+    /// Remote sets fetch during start; the registry keeps their state.
+    pub fn attach_remotes(&mut self, remotes: super::rule_set_remote::RemoteRegistry) {
+        if !remotes.is_empty() {
+            self.remotes = Some(Arc::new(tokio::sync::Mutex::new(remotes)));
+        }
+    }
+
+    /// `RemoteRuleSet.StartContext` for every remote set, then the updaters.
+    pub async fn start_remote(&self, router: &Arc<crate::route::Router>) -> anyhow::Result<()> {
+        let Some(remotes) = &self.remotes else {
+            return Ok(());
+        };
+        remotes.lock().await.start_all(router).await?;
+        remotes.lock().await.spawn_updaters(Arc::clone(router));
+        Ok(())
     }
 
     /// `RuleSetItem.Start`: every referenced tag must exist.

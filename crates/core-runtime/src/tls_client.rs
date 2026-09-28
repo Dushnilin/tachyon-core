@@ -10,6 +10,7 @@ use core_tls::rustls;
 use rustls_pemfile::certs;
 use rustls_pemfile::private_key;
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -180,6 +181,19 @@ impl TlsOptions {
         self.connect_with_defaults(stream, &[]).await
     }
 
+    /// TLS over any stream — the runtime fetches (rule-sets, providers) may
+    /// be dialed through a proxy outbound, so the socket is not a `TcpStream`.
+    pub async fn connect_stream<S>(
+        &self,
+        stream: S,
+        default_alpn: &[&[u8]],
+    ) -> io::Result<TlsStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        self.handshake(stream, default_alpn).await
+    }
+
     /// Like [`connect`], but offers `default_alpn` when the config set none —
     /// transports such as grpc/http need `h2` and sing-box injects it there.
     pub async fn connect_with_defaults(
@@ -187,6 +201,13 @@ impl TlsOptions {
         stream: TcpStream,
         default_alpn: &[&[u8]],
     ) -> io::Result<TlsStream<TcpStream>> {
+        self.handshake(stream, default_alpn).await
+    }
+
+    async fn handshake<S>(&self, stream: S, default_alpn: &[&[u8]]) -> io::Result<TlsStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         let versions: &[&'static rustls::SupportedProtocolVersion] = if self.min_tls13 {
             &[&rustls::version::TLS13]
         } else if self.max_tls12 {
@@ -278,6 +299,22 @@ impl TlsOptions {
             self.connect_with_defaults(stream, default_alpn).await?,
         ))
     }
+}
+
+/// TLS wrap for runtime fetches without a `tls` block: any proxy stream, any
+/// certificate (the reference fetches through the same accept-any path).
+pub(crate) async fn wrap_probe_stream<S>(stream: S, server_name: &str) -> io::Result<AnyStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|_| io::Error::other(format!("invalid fetch server_name {server_name:?}")))?;
+    Ok(Box::new(connector.connect(name, stream).await?))
 }
 
 /// TLS wrap for runtime probes (urltest): any proxy stream, any certificate.

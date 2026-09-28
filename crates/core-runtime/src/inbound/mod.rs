@@ -32,6 +32,21 @@ pub enum Conn {
     Shadowsocks(Box<SsReader<AnyRead>>, SsWriter<AnyWrite>),
 }
 
+// A `Conn` is a finished upstream stream; the runtime fetches (rule-sets,
+// provider updates) read and write one directly.
+impl Conn {
+    /// Box a plain upstream stream; shadowsocks connections cannot be split
+    /// into a reader/writer pair, so they are rejected here.
+    pub fn into_plain(self) -> io::Result<AnyStream> {
+        match self {
+            Conn::Plain(stream) => Ok(stream),
+            Conn::Shadowsocks(_, _) => Err(io::Error::other(
+                "runtime fetch does not support the shadowsocks codec stream",
+            )),
+        }
+    }
+}
+
 /// SOCKS reply state on the client side of a mixed inbound connection.
 enum LazyReply {
     /// HTTP CONNECT path: no SOCKS reply is due.

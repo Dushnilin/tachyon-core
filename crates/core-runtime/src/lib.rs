@@ -1,6 +1,7 @@
 pub mod clash_api;
 pub mod clash_state;
 pub mod dns;
+pub mod http_client;
 pub mod inbound;
 pub mod logging;
 pub mod ntp;
@@ -73,6 +74,9 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     }
 
     let router = Router::new(root)?;
+    // remote rule sets fetch before the instance is up: a failed first fetch
+    // aborts the start, exactly like `RemoteRuleSet.StartContext`
+    router.rule_sets().start_remote(&router).await?;
     let dns_service = dns::DnsService::build(root).context("dns section")?;
     dns::set_service(dns_service.clone());
 

@@ -7,7 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SB_REF_VERSION: v1.14.2-lx.3
+  SB_REF_VERSION: v1.14.2-lx.8
 
 jobs:
   differential:

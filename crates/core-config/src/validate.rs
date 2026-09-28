@@ -510,6 +510,7 @@ fn validate_dns_rules(rules: &Value) -> Result<(), String> {
         let rule = rule
             .as_object()
             .ok_or_else(|| format!("{at}: must be an object"))?;
+        reject_unknown_fields(rule, DNS_RULE_FIELDS, &format!("dns.rules[{i}]"))?;
         if let Some(value) = rule.get("rule_set").filter(|value| !prunes_value(value)) {
             check_listable_string_field(value, &format!("dns.rules[{i}].rule_set"))?;
         }
@@ -3942,6 +3943,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
     if let Some(experimental) = root.get("experimental") {
         validate_experimental(experimental)?;
     }
+    validate_domain_resolver_gate(&Value::Object(root.clone()))?;
     let mut dns_tags: HashSet<String> = HashSet::new();
     let mut has_outbounds = false;
     if let Some(route) = root.get("route") {
@@ -4327,6 +4329,145 @@ fn validate_clash_api(clash: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Fields the reference accepts in `route.rules[]` / `dns.rules[]` / the `dns`
+/// object. Derived by probing v1.14.2-lx.8 rather than by reading the Go
+/// structs: the rule option types still embed dial and action option structs
+/// that the decoder no longer unmarshals inside a rule, so a struct walk
+/// over-approximates badly (43 phantom fields on a route rule).
+///
+/// `action`/`type`/`mode`/`rules` and the predefined-response keys cannot be
+/// classified by a plain value sweep (they need meaningful values), so they are
+/// listed here next to the probed names. The generic probe answers "is this key
+/// known at all"; these are the ones whose value had to be a valid enum or a
+/// nested object to get an answer.
+const ROUTE_RULE_FIELDS: &[&str] = &[
+    "action",
+    "auth_user",
+    "clash_mode",
+    "client",
+    "domain",
+    "domain_keyword",
+    "domain_regex",
+    "domain_suffix",
+    "fallback_delay",
+    "inbound",
+    "invert",
+    "ip_cidr",
+    "ip_is_private",
+    "method",
+    "mode",
+    "network",
+    "network_is_constrained",
+    "network_is_expensive",
+    "network_type",
+    "no_drop",
+    "outbound",
+    "override_address",
+    "override_port",
+    "package_name",
+    "package_name_regex",
+    "port",
+    "port_range",
+    "preferred_by",
+    "process_name",
+    "process_path",
+    "process_path_regex",
+    "protocol",
+    "rule_set",
+    "rule_set_ip_cidr_match_source",
+    "rule_set_ipcidr_match_source",
+    "rules",
+    "source_hostname",
+    "source_ip_is_private",
+    "source_mac_address",
+    "source_port",
+    "source_port_range",
+    "tls_fragment",
+    "tls_record_fragment",
+    "tls_spoof",
+    "type",
+    "udp_connect",
+    "udp_disable_domain_unmapping",
+    "user",
+    "user_id",
+    "wifi_bssid",
+    "wifi_ssid",
+];
+
+const DNS_RULE_FIELDS: &[&str] = &[
+    "action",
+    "answer",
+    "auth_user",
+    "clash_mode",
+    "client_subnet",
+    "disable_cache",
+    "disable_optimistic_cache",
+    "domain",
+    "domain_keyword",
+    "domain_regex",
+    "domain_suffix",
+    "extra",
+    "inbound",
+    "invert",
+    "ip_accept_any",
+    "ip_cidr",
+    "ip_is_private",
+    "method",
+    "mode",
+    "network",
+    "network_is_constrained",
+    "network_is_expensive",
+    "network_type",
+    "no_drop",
+    "ns",
+    "package_name",
+    "package_name_regex",
+    "port",
+    "port_range",
+    "preferred_by",
+    "process_name",
+    "process_path",
+    "process_path_regex",
+    "protocol",
+    "query_client_subnet",
+    "query_dnssec",
+    "query_type",
+    "rcode",
+    "remove_client_subnet",
+    "rewrite_ttl",
+    "rule_set_ip_cidr_accept_empty",
+    "rule_set_ip_cidr_match_source",
+    "rule_set_ipcidr_match_source",
+    "rules",
+    "server",
+    "source_hostname",
+    "source_ip_is_private",
+    "source_mac_address",
+    "source_port",
+    "source_port_range",
+    "speculative",
+    "type",
+    "user",
+    "user_id",
+    "wifi_bssid",
+    "wifi_ssid",
+];
+
+const DNS_TOP_FIELDS: &[&str] = &[
+    "cache_capacity",
+    "client_subnet",
+    "disable_cache",
+    "disable_expire",
+    "final",
+    "independent_cache",
+    "optimistic",
+    "reverse_mapping",
+    "rules",
+    "servers",
+    "strategy",
+    "timeout",
+];
+
 fn validate_route(route: &Value) -> Result<(), String> {
     let obj = route
         .as_object()
@@ -4353,6 +4494,7 @@ fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), Strin
     let rule = rule
         .as_object()
         .ok_or_else(|| format!("{at}: must be an object"))?;
+    reject_unknown_fields(rule, ROUTE_RULE_FIELDS, at)?;
 
     if nested {
         for key in NESTED_ACTION_KEYS {
@@ -4433,12 +4575,154 @@ fn check_route_rule_action(
     Ok(())
 }
 
+/// `common/dialer`: with two or more DNS transports a dialer needs an explicit
+/// resolver — `domain_resolver` on the dial fields, or
+/// `route.default_domain_resolver`. A single DNS transport is the default and
+/// needs nothing. The reference reaches this while building each outbound's
+/// dialer, so `block` (which has none) does not trigger it, and an unknown tag
+/// fails with its own message.
+fn validate_domain_resolver_gate(root: &Value) -> Result<(), String> {
+    let Some(dns) = root.get("dns").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(servers) = dns.get("servers").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if servers.len() < 2 {
+        return Ok(());
+    }
+    let default_resolver = root
+        .get("route")
+        .and_then(|route| route.get("default_domain_resolver"))
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty());
+    if let Some(tag) = default_resolver {
+        if !servers.iter().any(|server| {
+            server
+                .get("tag")
+                .and_then(Value::as_str)
+                .is_some_and(|known| known == tag)
+        }) {
+            return Err(format!(
+                "initialize network manager: default domain resolver not found: {tag}"
+            ));
+        }
+        return Ok(());
+    }
+    // an explicit tag must name a dns server; the reference builds endpoints
+    // before outbounds, so an endpoint with a bad tag is reported first
+    let empty = Vec::new();
+    let known = |tag: &str| {
+        servers.iter().any(|server| {
+            server
+                .get("tag")
+                .and_then(Value::as_str)
+                .is_some_and(|known| known == tag)
+        })
+    };
+    for (kind, list) in [
+        ("endpoint", root.get("endpoints").and_then(Value::as_array)),
+        ("outbound", root.get("outbounds").and_then(Value::as_array)),
+    ] {
+        for (i, entry) in list.unwrap_or(&empty).iter().enumerate() {
+            let Some(tag) = entry
+                .get("domain_resolver")
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+            else {
+                continue;
+            };
+            if !known(tag) {
+                let ty = entry.get("type").and_then(Value::as_str).unwrap_or("");
+                return Err(format!(
+                    "initialize {kind}[{i}] {ty}: domain resolver not found: {tag}"
+                ));
+            }
+        }
+    }
+    // every dialer-carrying outbound needs its own resolver otherwise
+    for outbound in root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty)
+    {
+        let Some(obj) = outbound.as_object() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) == Some("block") {
+            continue;
+        }
+        if obj
+            .get("domain_resolver")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| !tag.is_empty())
+        {
+            continue;
+        }
+        return Err(
+            "missing `route.default_domain_resolver` or `domain_resolver` in dial fields is \
+             deprecated in sing-box 1.12.0 and will be removed in sing-box 1.14.0, checkout \
+             documentation for migration: \
+             https://sing-box.sagernet.org/migration/#migrate-outbound-dns-rule-items-to-domain-resolver"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// `option.OptimisticDNSOptions` unmarshals from a bare bool (the marshalled
+/// form when no timeout is set) or from `{enabled, timeout}`.
+fn validate_dns_optimistic(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Bool(_) => Ok(()),
+        Value::Object(obj) => {
+            for (key, field) in obj {
+                let at = format!("dns.optimistic.{key}");
+                match key.as_str() {
+                    "enabled" => {
+                        if !matches!(field, Value::Bool(_)) {
+                            return Err(format!(
+                                "{at}: json: cannot unmarshal {} into Go struct field \
+                                 _OptimisticDNSOptions.enabled of type bool",
+                                json_kind(field)
+                            ));
+                        }
+                    }
+                    "timeout" => {
+                        let text = field.as_str().ok_or_else(|| {
+                            format!(
+                                "{at}: json: cannot unmarshal {} into Go struct field \
+                                 _OptimisticDNSOptions.timeout of type duration",
+                                json_kind(field)
+                            )
+                        })?;
+                        go_parse_duration(text)?;
+                    }
+                    other => {
+                        return Err(format!("{at}: json: unknown field \"{other}\""));
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "dns.optimistic: json: cannot unmarshal {} into Go struct field \
+             _DNSServerOptions.optimistic of type option.OptimisticDNSOptions",
+            json_kind(other)
+        )),
+    }
+}
+
 fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
     let obj = dns
         .as_object()
         .ok_or_else(|| "dns: must be a JSON object".to_string())?;
+    reject_unknown_fields(obj, DNS_TOP_FIELDS, "dns")?;
     if let Some(rules) = obj.get("rules").filter(|value| !prunes_value(value)) {
         validate_dns_rules(rules)?;
+    }
+    if let Some(optimistic) = obj.get("optimistic").filter(|value| !value.is_null()) {
+        validate_dns_optimistic(optimistic)?;
     }
     let Some(servers) = obj.get("servers") else {
         return Ok(());

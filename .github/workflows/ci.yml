@@ -39,7 +39,9 @@ jobs:
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
         if: runner.os == 'Linux'
-        run: sudo -E env "PATH=$PATH" cargo test -p core-runtime --test exit_gate -- --nocapture
+        run: |
+          sudo -E env "PATH=$PATH" cargo test -p core-runtime --test exit_gate -- --nocapture
+          sudo -E env "PATH=$PATH" cargo test -p core-runtime --test inbounds -- --nocapture
 
   cross:
     name: Cross build (musl)

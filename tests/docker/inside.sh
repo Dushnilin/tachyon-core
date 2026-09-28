@@ -6,6 +6,26 @@ cd /src
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/cache/target}"
 export TACHYON_CORE_BIN="$CARGO_TARGET_DIR/debug/tachyon-core"
 export SING_BOX_REF="${SING_BOX_REF:-/usr/local/bin/sing-box-ref}"
+# The target dir is a persistent volume, so cargo keeps every artifact of every
+# past commit: a few dozen runs and it reaches tens of GB. Incremental data is
+# worthless here (tests always rebuild) and stale outputs are never reused, so
+# the cache is trimmed when it outgrows the budget below.
+export CARGO_INCREMENTAL=0
+TARGET_BUDGET_MB="${TARGET_BUDGET_MB:-10240}"
+
+trim_target() {
+    local size_mb
+    size_mb="$(du -sm "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1 || echo 0)"
+    if [[ "$size_mb" -gt "$TARGET_BUDGET_MB" ]]; then
+        echo "== target cache ${size_mb} MB > ${TARGET_BUDGET_MB} MB: cleaning"
+        cargo clean
+        # the gate needs the reference binaries and nothing else from the volume
+        rm -rf "${CARGO_TARGET_DIR:?}"/*/incremental
+    fi
+}
+
+echo "== target cache budget"
+trim_target
 
 echo "== rustfmt"
 cargo fmt --all -- --check
@@ -33,5 +53,9 @@ file "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core"
 
 echo "== differential vs $SING_BOX_REF (STRICT=1)"
 STRICT=1 bash tests/differential/run.sh
+
+# Trimming after the gate keeps the volume small; a big run leaves fresh
+# artifacts behind, and those are the only ones the next run can reuse.
+trim_target
 
 echo "ALL DOCKER TESTS PASSED"

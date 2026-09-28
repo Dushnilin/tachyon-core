@@ -135,9 +135,6 @@ impl DnsService {
             .enumerate()
         {
             let at = format!("dns.rules[{i}]");
-            if obj.get("type").and_then(Value::as_str) == Some("logical") {
-                anyhow::bail!("{at}: logical dns rules are not implemented yet");
-            }
             rules.push(Rule::build_with_rule_sets(obj, &at, &rule_sets)?);
         }
 

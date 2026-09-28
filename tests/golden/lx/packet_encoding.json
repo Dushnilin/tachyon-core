@@ -1,0 +1,60 @@
+{
+  "log": { "level": "info" },
+  "dns": {
+    "servers": [{ "type": "udp", "tag": "u", "server": "1.1.1.1" }],
+    "final": "u"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-xudp",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "packet_encoding": "xudp"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-none",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "packet_encoding": ""
+    },
+    {
+      "type": "vless",
+      "tag": "vless-packetaddr",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "packet_encoding": "packetaddr"
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-xudp",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "packet_encoding": "xudp"
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-packetaddr",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "packet_encoding": "packetaddr"
+    }
+  ],
+  "route": { "final": "vless-xudp", "default_domain_resolver": "u" }
+}

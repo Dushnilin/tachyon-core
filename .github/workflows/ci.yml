@@ -56,6 +56,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # the toolchains are static musl: link with the bundled rust-lld and the
+      # self-contained CRT objects instead of a host gcc that is not there
+      - name: Link musl with rust-lld
+        run: |
+          echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
       - run: cargo build --workspace --release --target ${{ matrix.target }}
       - name: Size budget (<= 12 MiB)
         run: |

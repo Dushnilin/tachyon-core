@@ -1,0 +1,55 @@
+{
+  "log": { "level": "info" },
+  "dns": {
+    "servers": [{ "type": "udp", "tag": "u", "server": "1.1.1.1" }],
+    "final": "u"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "early",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "ws",
+        "path": "/ray",
+        "max_early_data": 2048
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-early",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "security": "auto",
+      "transport": { "type": "ws", "path": "/ray", "max_early_data": 2048 }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-early",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "transport": { "type": "ws", "path": "/ray", "max_early_data": 2048 }
+    },
+    {
+      "type": "vless",
+      "tag": "plain-ws",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": { "type": "ws", "path": "/ray" }
+    }
+  ],
+  "route": { "final": "early", "default_domain_resolver": "u" }
+}

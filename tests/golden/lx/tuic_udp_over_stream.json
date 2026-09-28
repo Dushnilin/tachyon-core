@@ -1,0 +1,40 @@
+{
+  "log": { "level": "info" },
+  "dns": {
+    "servers": [{ "type": "udp", "tag": "u", "server": "1.1.1.1" }],
+    "final": "u"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "ovs",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "password": "secret",
+      "udp_over_stream": true,
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": true,
+      "tls": { "enabled": true, "server_name": "example.com" }
+    },
+    {
+      "type": "tuic",
+      "tag": "quic-relay",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "password": "secret",
+      "udp_relay_mode": "quic",
+      "tls": { "enabled": true, "server_name": "example.com" }
+    }
+  ],
+  "route": { "final": "ovs", "default_domain_resolver": "u" }
+}

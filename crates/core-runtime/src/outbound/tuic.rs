@@ -19,8 +19,10 @@ use crate::outbound::quic::{
     bind_udp, io_from_datagram, io_from_quinn, put_sing_addr_empty, put_sing_addr_port,
     resolve_host, sing_addr_port_len, udp_loopback_pair,
 };
+use crate::outbound::uot::{UOT_DEFAULT_VERSION, magic_authority, request_header, spawn_bridge};
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
+use tokio::io::AsyncWriteExt;
 
 const TUIC_VERSION: u8 = 5;
 const CMD_AUTHENTICATE: u8 = 0;
@@ -39,6 +41,9 @@ pub struct Tuic {
     password: String,
     congestion: CongestionKind,
     udp_stream: bool,
+    /// `udp_over_stream`: relay datagrams over a CONNECT stream carrying the
+    /// udp-over-tcp framing, instead of a QUIC stream
+    udp_over_stream: bool,
     zero_rtt: bool,
     heartbeat: Duration,
     want_tcp: bool,
@@ -84,8 +89,13 @@ impl Tuic {
             "quic" => true,
             other => anyhow::bail!("{at}: unknown udp_relay_mode: {other}"),
         };
-        if obj.get("udp_over_stream").and_then(Value::as_bool) == Some(true) {
-            anyhow::bail!("{at}: tuic udp_over_stream not implemented yet");
+        let udp_over_stream = obj
+            .get("udp_over_stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // the reference rejects the pair even for the default `native`
+        if udp_over_stream && !udp_relay_mode.is_empty() {
+            anyhow::bail!("{at}: udp_over_stream is conflict with udp_relay_mode");
         }
 
         let zero_rtt = obj
@@ -114,6 +124,7 @@ impl Tuic {
             password,
             congestion,
             udp_stream,
+            udp_over_stream,
             zero_rtt,
             heartbeat,
             want_tcp: network_includes_tcp(obj),
@@ -241,6 +252,9 @@ impl Tuic {
         if !self.want_udp {
             return Err(io::Error::other("tuic: udp not enabled in network field"));
         }
+        if self.udp_over_stream {
+            return self.connect_udp_over_stream(target).await;
+        }
         let shared = self.shared().await?;
         let (local, peer) = udp_loopback_pair().await?;
         let sid = shared.next_session.fetch_add(1, Ordering::Relaxed);
@@ -287,6 +301,21 @@ impl Tuic {
             let _ = shared_f.conn.send_datagram(out.into());
         });
         shared.handles.lock().expect("handles").push(handle);
+        Ok(local)
+    }
+
+    /// `udp_over_stream`: a CONNECT stream to the udp-over-tcp magic address,
+    /// then the request header and bare datagrams on that stream.
+    async fn connect_udp_over_stream(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
+        let (local, peer) = udp_loopback_pair().await?;
+        let mut stream = self
+            .connect(&Target::Domain(
+                magic_authority(UOT_DEFAULT_VERSION).to_string(),
+                0,
+            ))
+            .await?;
+        stream.write_all(&request_header(false, target)?).await?;
+        spawn_bridge(stream, peer);
         Ok(local)
     }
 }
@@ -589,6 +618,7 @@ async fn send_tuic_datagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn tuic_packet_roundtrip() {
@@ -632,5 +662,63 @@ mod tests {
         assert_eq!(next_packet_id(&c), 1);
         c.store(65_534, Ordering::Relaxed);
         assert_eq!(next_packet_id(&c), 0);
+    }
+
+    fn options(extra: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+        let mut obj = json!({
+            "type": "tuic",
+            "tag": "t",
+            "server": "example.com",
+            "server_port": 443,
+            "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "password": "secret",
+            "tls": {"enabled": true, "server_name": "example.com"},
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+        for (key, value) in extra {
+            obj.insert((*key).to_string(), value.clone());
+        }
+        obj
+    }
+
+    #[test]
+    fn udp_over_stream_is_accepted() {
+        let tuic = Tuic::build(
+            &options(&[("udp_over_stream", json!(true))]),
+            "outbounds[0]",
+        )
+        .expect("build");
+        assert!(tuic.udp_over_stream);
+        assert!(!tuic.udp_stream, "the two relay modes stay exclusive");
+    }
+
+    #[test]
+    fn udp_over_stream_conflicts_with_udp_relay_mode() {
+        // the reference rejects the pair even when the mode is the default
+        for mode in ["native", "quic"] {
+            let err = match Tuic::build(
+                &options(&[
+                    ("udp_over_stream", json!(true)),
+                    ("udp_relay_mode", json!(mode)),
+                ]),
+                "outbounds[0]",
+            ) {
+                Ok(_) => panic!("udp_over_stream + udp_relay_mode must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(err.contains("udp_over_stream is conflict"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn the_udp_over_stream_request_names_the_target() {
+        let target = Target::Domain("dns.example.com".into(), 53);
+        let header = request_header(false, &target).expect("header");
+        assert_eq!(header[0], 0, "a relay request, not a connect request");
+        assert_eq!(&header[1..3], &[0x02, 15], "domain with its length");
+        assert_eq!(&header[3..18], b"dns.example.com");
+        assert_eq!(&header[18..], &53u16.to_be_bytes());
     }
 }

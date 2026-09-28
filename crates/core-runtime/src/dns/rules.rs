@@ -35,6 +35,17 @@ pub enum Action {
     Evaluate,
     /// `respond` — known gap (requires evaluated responses).
     Respond,
+    /// `predefined`: a synthesized answer (rcode + answer/ns/extra records).
+    Predefined(PredefinedResponse),
+}
+
+/// `option.DNSRouteActionPredefined`, already decoded into wire records.
+#[derive(Debug, Clone, Default)]
+pub struct PredefinedResponse {
+    pub rcode: Option<u8>,
+    pub answer: Vec<hickory_proto::rr::Record>,
+    pub ns: Vec<hickory_proto::rr::Record>,
+    pub extra: Vec<hickory_proto::rr::Record>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +70,10 @@ pub struct Rule {
     pub match_response: bool,
     pub action: Action,
     pub reject_method: RejectMethod,
+    /// `type: logical` — the sub rules and the `and`/`or` mode.
+    pub sub_rules: Vec<Rule>,
+    pub logical: bool,
+    pub mode_or: bool,
 }
 
 /// Options accumulated by `route` / `route-options` actions along the walk.
@@ -78,9 +93,23 @@ impl Rule {
         at: &str,
         registry: &crate::route::rule_set::RuleSetRegistry,
     ) -> anyhow::Result<Self> {
+        Self::build_nested(obj, at, registry, false)
+    }
+
+    /// `nested` marks a logical rule's sub rule: it is a pure matcher and may
+    /// carry no action of its own.
+    fn build_nested(
+        obj: &Value,
+        at: &str,
+        registry: &crate::route::rule_set::RuleSetRegistry,
+        _nested: bool,
+    ) -> anyhow::Result<Self> {
         let map = obj
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
+        if obj.get("type").and_then(Value::as_str) == Some("logical") {
+            return Self::build_logical(obj, at, registry);
+        }
 
         let inbound = string_list(map, "inbound", at)?;
         let query_type = string_list(map, "query_type", at)?
@@ -131,30 +160,20 @@ impl Rule {
 
         let mut reject_method = RejectMethod::Refused;
         let action = match action_raw {
-            "" => {
-                let server = map
-                    .get("server")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("{at}: missing action or server"))?
-                    .to_string();
-                Action::Route {
-                    server,
+            "route" | "" => match map.get("server").and_then(Value::as_str) {
+                Some(server) => Action::Route {
+                    server: server.to_string(),
                     rewrite_ttl,
                     disable_cache,
-                }
-            }
-            "route" => {
-                let server = map
-                    .get("server")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("{at}: route action requires server"))?
-                    .to_string();
-                Action::Route {
-                    server,
+                },
+                // a nested rule is only a matcher; the parent carries the action
+                // an empty server means the dns final transport
+                None => Action::Route {
+                    server: String::new(),
                     rewrite_ttl,
                     disable_cache,
-                }
-            }
+                },
+            },
             "route-options" => Action::RouteOptions {
                 rewrite_ttl,
                 disable_cache,
@@ -169,7 +188,7 @@ impl Rule {
             }
             "evaluate" => Action::Evaluate,
             "respond" => Action::Respond,
-            "predefined" => anyhow::bail!("{at}: predefined DNS action is not implemented yet"),
+            "predefined" => Action::Predefined(build_predefined(map, at)?),
             other => anyhow::bail!("{at}: unknown dns rule action {other:?}"),
         };
 
@@ -187,12 +206,59 @@ impl Rule {
             match_response,
             action,
             reject_method,
+            sub_rules: Vec::new(),
+            logical: false,
+            mode_or: false,
         })
     }
 
     pub fn matches(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
         let hit = self.matches_inner(meta, query);
         hit != self.invert
+    }
+
+    /// `option.LogicalDNSRule`: the action lives on the parent, the sub rules
+    /// are pure matchers (`DNS rule action is not supported in nested rules`).
+    fn build_logical(
+        obj: &Value,
+        at: &str,
+        registry: &crate::route::rule_set::RuleSetRegistry,
+    ) -> anyhow::Result<Self> {
+        let map = obj
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
+        let mode = map.get("mode").and_then(Value::as_str).unwrap_or("and");
+        if !matches!(mode, "and" | "or") {
+            anyhow::bail!("{at}: bad option: logical rule mode {mode:?}");
+        }
+        let mut sub_rules = Vec::new();
+        for (i, sub) in map
+            .get("rules")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            let sub_at = format!("{at}.rules[{i}]");
+            if sub
+                .as_object()
+                .is_some_and(|object| object.contains_key("action"))
+            {
+                anyhow::bail!("{sub_at}: DNS rule action is not supported in nested rules");
+            }
+            sub_rules.push(Rule::build_nested(sub, &sub_at, registry, true)?);
+        }
+        let mut rule = Rule::build_with_rule_sets(
+            &serde_json::json!({ "action": map.get("action").cloned().unwrap_or(Value::Null) }),
+            at,
+            registry,
+        )?;
+        rule.invert = map.get("invert").and_then(Value::as_bool).unwrap_or(false);
+        rule.sub_rules = sub_rules;
+        rule.logical = true;
+        rule.mode_or = mode == "or";
+        Ok(rule)
     }
 
     /// The rule-set view of a DNS query: domain, source and destination ports.
@@ -214,6 +280,14 @@ impl Rule {
     }
 
     fn matches_inner(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
+        if self.logical {
+            return if self.mode_or {
+                self.sub_rules.iter().any(|sub| sub.matches(meta, query))
+            } else {
+                !self.sub_rules.is_empty()
+                    && self.sub_rules.iter().all(|sub| sub.matches(meta, query))
+            };
+        }
         if !self.inbound.is_empty() {
             let Some(inbound) = meta.inbound.as_deref() else {
                 return false;
@@ -272,6 +346,71 @@ impl Rule {
     }
 }
 
+/// `option.DNSRouteActionPredefined`: rcode plus wire-encoded records.
+fn build_predefined(
+    map: &serde_json::Map<String, Value>,
+    at: &str,
+) -> anyhow::Result<PredefinedResponse> {
+    let rcode = match map.get("rcode").and_then(Value::as_str) {
+        None | Some("") => None,
+        Some(name) => Some(
+            name.parse::<u8>()
+                .map_err(|_| anyhow::anyhow!("{at}: bad option: unknown rcode {name:?}"))?,
+        ),
+    };
+    let records = |key: &str| -> anyhow::Result<Vec<hickory_proto::rr::Record>> {
+        let list = match map.get(key) {
+            None | Some(Value::Null) => return Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{at}.{key}: must be an array"))?,
+        };
+        let mut out = Vec::with_capacity(list.len());
+        for (i, record) in list.iter().enumerate() {
+            let record_at = format!("{at}.{key}[{i}]");
+            out.push(
+                crate::dns::codec::decode_record(record, &record_at)
+                    .map_err(|error| anyhow::anyhow!("{record_at}: {error}"))?,
+            );
+        }
+        Ok(out)
+    };
+    Ok(PredefinedResponse {
+        rcode,
+        answer: records("answer")?,
+        ns: records("ns")?,
+        extra: records("extra")?,
+    })
+}
+
+/// Standard base64 with padding, as the reference decoder expects.
+pub fn base64_decode(raw: &str) -> anyhow::Result<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut lookup = [255u8; 256];
+    for (index, byte) in TABLE.iter().enumerate() {
+        lookup[*byte as usize] = index as u8;
+    }
+    let mut out = Vec::with_capacity(raw.len() / 4 * 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in raw.bytes() {
+        if byte == b'=' || byte == b'\n' || byte == b'\r' {
+            continue;
+        }
+        let value = lookup[byte as usize];
+        if value == 255 {
+            anyhow::bail!("illegal base64 data at input byte {byte}");
+        }
+        buffer = (buffer << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 fn domain_suffix_match(name: &str, suffix: &str) -> bool {
     let suffix = super::codec::normalize_name(suffix);
     name == suffix || name.ends_with(&format!(".{suffix}"))
@@ -299,7 +438,150 @@ fn string_list(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logical_rules_combine_sub_rules() {
+        let rule = Rule::build(
+            &serde_json::json!({
+                "type": "logical",
+                "mode": "and",
+                "action": "route",
+                "server": "d",
+                "rules": [
+                    {"domain_suffix": ["rambler.ru"]},
+                    {"query_type": ["A"]}
+                ]
+            }),
+            "rules[0]",
+        )
+        .expect("logical and");
+        assert!(rule.logical);
+        let meta = QueryMeta::default();
+        assert!(rule.matches(&meta, &info("x.rambler.ru", RecordType::A)));
+        assert!(!rule.matches(&meta, &info("x.rambler.ru", RecordType::AAAA)));
+        assert!(!rule.matches(&meta, &info("x.other.ru", RecordType::A)));
+
+        let rule = Rule::build(
+            &serde_json::json!({
+                "type": "logical",
+                "mode": "or",
+                "action": "reject",
+                "rules": [{"domain": ["a.test"]}, {"domain": ["b.test"]}]
+            }),
+            "rules[1]",
+        )
+        .expect("logical or");
+        assert!(rule.matches(&meta, &info("a.test", RecordType::A)));
+        assert!(rule.matches(&meta, &info("b.test", RecordType::A)));
+        assert!(!rule.matches(&meta, &info("c.test", RecordType::A)));
+
+        // invert wraps the whole logical rule
+        let rule = Rule::build(
+            &serde_json::json!({
+                "type": "logical",
+                "mode": "or",
+                "invert": true,
+                "action": "reject",
+                "rules": [{"domain": ["a.test"]}]
+            }),
+            "rules[2]",
+        )
+        .expect("logical invert");
+        assert!(!rule.matches(&meta, &info("a.test", RecordType::A)));
+        assert!(rule.matches(&meta, &info("z.test", RecordType::A)));
+
+        // a sub rule may not carry its own action
+        let error = Rule::build(
+            &serde_json::json!({
+                "type": "logical",
+                "action": "reject",
+                "rules": [{"domain": ["a.test"], "action": "reject"}]
+            }),
+            "rules[3]",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DNS rule action is not supported in nested rules"),
+            "{error}"
+        );
+        // and the mode is checked
+        let error = Rule::build(
+            &serde_json::json!({
+                "type": "logical",
+                "mode": "xor",
+                "rules": [{"domain": ["a.test"]}]
+            }),
+            "rules[4]",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("logical rule mode"), "{error}");
+    }
+
+    #[test]
+    fn predefined_action_decodes_records() {
+        let rule = Rule::build(
+            &serde_json::json!({
+                "action": "predefined",
+                "rcode": "3",
+                "answer": [
+                    {"type": "A", "name": "blocked.test", "ttl": 60, "value": "203.0.113.7"},
+                    {"type": "TXT", "name": "blocked.test", "value": "hello"}
+                ],
+                "extra": [{"type": "AAAA", "name": "blocked.test", "value": "2001:db8::1"}]
+            }),
+            "rules[0]",
+        )
+        .expect("predefined");
+        let Action::Predefined(response) = &rule.action else {
+            panic!("expected a predefined action");
+        };
+        assert_eq!(response.rcode, Some(3));
+        assert_eq!(response.answer.len(), 2);
+        assert_eq!(response.answer[0].record_type(), RecordType::A);
+        assert_eq!(response.answer[1].record_type(), RecordType::TXT);
+        assert_eq!(response.extra.len(), 1);
+        assert_eq!(response.extra[0].record_type(), RecordType::AAAA);
+
+        // the answer is spliced into a real response
+        let query = codec::parse_message(
+            &codec::build_query(0x1234, "blocked.test", RecordType::A).expect("query"),
+        )
+        .expect("message");
+        let raw = codec::predefined_response(&query, response).expect("response");
+        let message = codec::parse_message(&raw).expect("decode");
+        assert_eq!(message.answers.len(), 2);
+        assert_eq!(message.id, 0x1234);
+
+        // base64 wire records decode as well: host. A IN, 203.0.113.7
+        let mut wire: Vec<u8> = vec![4, b'h', b'o', b's', b't', 0];
+        wire.extend_from_slice(&1u16.to_be_bytes()); // A
+        wire.extend_from_slice(&1u16.to_be_bytes()); // IN
+        wire.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        wire.extend_from_slice(&4u16.to_be_bytes()); // rdlength
+        wire.extend_from_slice(&[203, 0, 113, 7]);
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wire);
+        let decoded = codec::decode_record(&serde_json::json!(encoded), "r").expect("wire record");
+        assert_eq!(decoded.record_type(), RecordType::A);
+        assert_eq!(decoded.ttl, 60);
+
+        // an unknown record type is a start error, not a silent drop
+        let error = Rule::build(
+            &serde_json::json!({
+                "action": "predefined",
+                "answer": [{"type": "SRV", "name": "x.test", "value": {"type": "SRV"}}]
+            }),
+            "rules[1]",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported record type"),
+            "{error}"
+        );
+    }
+
     use super::*;
+    use crate::dns::codec;
     use serde_json::json;
 
     fn info(name: &str, qtype: RecordType) -> QueryInfo {

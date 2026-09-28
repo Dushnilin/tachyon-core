@@ -5,6 +5,8 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+
+use crate::inbound::AnyStream;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -39,6 +41,8 @@ pub struct ServerConfig {
     pub inet4: Option<IpPrefix>,
     pub inet6: Option<IpPrefix>,
     pub store: Option<Arc<FakeIpStore>>,
+    /// Outbound tag the transport is dialed through (`dns.server.detour`).
+    pub detour: Option<String>,
 }
 
 /// Minimal CIDR prefix (host bits masked off).
@@ -366,9 +370,11 @@ impl ServerConfig {
         if kind != Kind::Fakeip && server.is_empty() {
             anyhow::bail!("{at}: missing server");
         }
-        if map.get("detour").is_some_and(|d| !d.is_null()) {
-            anyhow::bail!("{at}: dns server detour is not implemented yet");
-        }
+        let detour = map
+            .get("detour")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string);
 
         let store = if kind == Kind::Fakeip {
             Some(Arc::new(FakeIpStore::new(inet4, inet6)))
@@ -388,6 +394,7 @@ impl ServerConfig {
             inet4,
             inet6,
             store,
+            detour,
         })
     }
 
@@ -396,25 +403,94 @@ impl ServerConfig {
     }
 }
 
+/// How a transport reaches the wire: a detour outbound when the config set
+/// `detour`, otherwise a direct dial to the resolved address.
+#[derive(Clone, Default)]
+pub struct Dialer {
+    pub router: Option<Arc<crate::route::Router>>,
+}
+
+impl Dialer {
+    async fn tcp(&self, cfg: &ServerConfig, addr: SocketAddr) -> io::Result<AnyStream> {
+        let Some(router) = &self.router else {
+            return Ok(Box::new(TcpStream::connect(addr).await?));
+        };
+        let target = crate::inbound::Target::Ip(addr);
+        match &cfg.detour {
+            Some(tag) => {
+                let index = router
+                    .index_of(tag)
+                    .ok_or_else(|| io::Error::other(format!("dns: detour {tag:?} not found")))?;
+                router.connect_index(index, &target).await?.into_plain()
+            }
+            None => router.connect(&target).await?.into_plain(),
+        }
+    }
+
+    /// TLS over the dialed stream (the detour may be a proxy outbound, so the
+    /// socket is not necessarily a `TcpStream`).
+    async fn tls(
+        &self,
+        cfg: &ServerConfig,
+        addr: SocketAddr,
+        tls: &TlsOptions,
+        alpn: &[&[u8]],
+    ) -> io::Result<(AnyStream, Option<Vec<u8>>)> {
+        let stream = self.tcp(cfg, addr).await?;
+        let connected = tls.connect_stream(stream, alpn).await?;
+        let negotiated = connected.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(connected), negotiated))
+    }
+
+    async fn udp(&self, cfg: &ServerConfig, addr: SocketAddr) -> io::Result<UdpSocket> {
+        let Some(router) = &self.router else {
+            let bind: SocketAddr = if addr.is_ipv4() {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                "[::]:0".parse().unwrap()
+            };
+            return UdpSocket::bind(bind).await;
+        };
+        let target = crate::inbound::Target::Ip(addr);
+        match &cfg.detour {
+            Some(tag) => {
+                let index = router
+                    .index_of(tag)
+                    .ok_or_else(|| io::Error::other(format!("dns: detour {tag:?} not found")))?;
+                router.connect_udp_index(index, &target).await
+            }
+            None => {
+                router
+                    .connect_udp_index(router.default_index(), &target)
+                    .await
+            }
+        }
+    }
+}
+
 /// Run one query against a resolved server address.
-pub async fn exchange(cfg: &ServerConfig, addr: SocketAddr, query: &[u8]) -> io::Result<Vec<u8>> {
+pub async fn exchange(
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+    query: &[u8],
+    dialer: &Dialer,
+) -> io::Result<Vec<u8>> {
     let fut = async {
         match cfg.kind {
-            Kind::Udp => exchange_udp(addr, query).await,
+            Kind::Udp => exchange_udp(dialer, cfg, addr, query).await,
             Kind::Tcp => {
-                let stream = TcpStream::connect(addr).await?;
+                let stream = dialer.tcp(cfg, addr).await?;
                 exchange_stream(stream, query).await
             }
             Kind::Tls => {
-                let tcp = TcpStream::connect(addr).await?;
                 let tls = cfg
                     .tls
                     .as_ref()
                     .ok_or_else(|| io::Error::other("dns: tls server without tls options"))?;
-                let stream = tls.wrap(tcp).await?;
+                let (stream, _) = dialer.tls(cfg, addr, tls, &[]).await?;
                 exchange_stream(stream, query).await
             }
-            Kind::Https => exchange_doh(cfg, addr, query).await,
+            Kind::Https => exchange_doh(cfg, addr, query, dialer).await,
             Kind::Fakeip => Err(io::Error::other(
                 "dns: fakeip transport must not reach the wire",
             )),
@@ -425,13 +501,13 @@ pub async fn exchange(cfg: &ServerConfig, addr: SocketAddr, query: &[u8]) -> io:
         .map_err(|_| io::Error::other(format!("dns: timeout after {:?}", cfg.timeout)))?
 }
 
-async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> io::Result<Vec<u8>> {
-    let bind: SocketAddr = if addr.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let socket = UdpSocket::bind(bind).await?;
+async fn exchange_udp(
+    dialer: &Dialer,
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    let socket = dialer.udp(cfg, addr).await?;
     socket.send_to(query, addr).await?;
     let mut buf = vec![0u8; 65535];
     let (n, _from) = socket.recv_from(&mut buf).await?;
@@ -458,18 +534,22 @@ async fn exchange_stream(
     Ok(resp)
 }
 
-async fn exchange_doh(cfg: &ServerConfig, addr: SocketAddr, query: &[u8]) -> io::Result<Vec<u8>> {
-    let tcp = TcpStream::connect(addr).await?;
+async fn exchange_doh(
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+    query: &[u8],
+    dialer: &Dialer,
+) -> io::Result<Vec<u8>> {
     let tls = cfg
         .tls
         .as_ref()
         .ok_or_else(|| io::Error::other("dns: https server without tls options"))?;
-    let tls = tls
-        .connect_with_defaults(tcp, &[b"h2"])
+    let (tls, negotiated) = dialer
+        .tls(cfg, addr, tls, &[b"h2"])
         .await
         .map_err(|e| io::Error::other(format!("dns: DoH tls: {e}")))?;
 
-    match tls.get_ref().1.alpn_protocol() {
+    match negotiated.as_deref() {
         Some(b"h2") => exchange_doh_h2(cfg, tls, query).await,
         _ => exchange_doh_h1(cfg, tls, query).await,
     }
@@ -477,7 +557,7 @@ async fn exchange_doh(cfg: &ServerConfig, addr: SocketAddr, query: &[u8]) -> io:
 
 async fn exchange_doh_h2(
     cfg: &ServerConfig,
-    stream: tokio_rustls::client::TlsStream<TcpStream>,
+    stream: AnyStream,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     let authority = doh_authority(cfg);
@@ -518,7 +598,7 @@ async fn exchange_doh_h2(
 
 async fn exchange_doh_h1(
     cfg: &ServerConfig,
-    mut stream: tokio_rustls::client::TlsStream<TcpStream>,
+    mut stream: AnyStream,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     let authority = doh_authority(cfg);

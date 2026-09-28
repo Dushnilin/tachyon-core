@@ -38,6 +38,200 @@ pub fn parse_query(raw: &[u8]) -> io::Result<(Message, QueryInfo)> {
     Ok((msg, info))
 }
 
+/// One `option.DNSRecordOptions` entry. The reference unmarshals the JSON
+/// into a `dns.RR`; the rdata union used by `predefined` answers is `A`,
+/// `AAAA`, `CNAME`, `TXT` and `MX`, plus the base64 wire form a marshalled
+/// config carries.
+pub fn decode_record(record: &serde_json::Value, at: &str) -> io::Result<Record> {
+    if let Some(raw) = record.as_str() {
+        let wire = super::rules::base64_decode(raw)
+            .map_err(|error| io::Error::other(format!("{at}: {error}")))?;
+        return record_from_wire(&wire, at);
+    }
+    let object = record
+        .as_object()
+        .ok_or_else(|| io::Error::other(format!("{at}: must be an object or base64 string")))?;
+    let ttl = object
+        .get("ttl")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(600) as u32;
+    let name = match object.get("name").and_then(serde_json::Value::as_str) {
+        Some(name) => hickory_proto::rr::Name::from_str(&format!("{name}."))
+            .map_err(|e| io::Error::other(format!("{at}: bad name: {e}")))?,
+        None => hickory_proto::rr::Name::root(),
+    };
+    let rdata = match object.get("value") {
+        Some(serde_json::Value::String(text)) => match IpAddr::from_str(text) {
+            Ok(IpAddr::V4(addr)) => RData::A(A(addr)),
+            Ok(IpAddr::V6(addr)) => RData::AAAA(AAAA(addr)),
+            Err(_) => RData::TXT(hickory_proto::rr::rdata::TXT::new(vec![text.to_string()])),
+        },
+        Some(value @ serde_json::Value::Object(_)) => record_rdata(value, at)?,
+        _ => {
+            return Err(io::Error::other(format!(
+                "{at}: value must be a string or a typed record object"
+            )));
+        }
+    };
+    Ok(Record::from_rdata(name, ttl, rdata))
+}
+
+fn record_rdata(value: &serde_json::Value, at: &str) -> io::Result<RData> {
+    let rtype = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| io::Error::other(format!("{at}: value is missing type")))?;
+    match rtype {
+        "A" | "AAAA" => {
+            let ip = value
+                .get("ip")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io::Error::other(format!("{at}: missing ip")))?;
+            match IpAddr::from_str(ip)
+                .map_err(|e| io::Error::other(format!("{at}: bad ip {ip:?}: {e}")))?
+            {
+                IpAddr::V4(addr) => Ok(RData::A(A(addr))),
+                IpAddr::V6(addr) => Ok(RData::AAAA(AAAA(addr))),
+            }
+        }
+        "CNAME" => {
+            let target = value
+                .get("domain")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io::Error::other(format!("{at}: missing domain")))?;
+            Ok(RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                hickory_proto::rr::Name::from_str(&format!("{target}."))
+                    .map_err(|e| io::Error::other(format!("{at}: bad domain: {e}")))?,
+            )))
+        }
+        "TXT" => {
+            let text = value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io::Error::other(format!("{at}: missing text")))?;
+            Ok(RData::TXT(hickory_proto::rr::rdata::TXT::new(vec![
+                text.to_string(),
+            ])))
+        }
+        "MX" => {
+            let preference = value
+                .get("preference")
+                .and_then(|value| value.as_u64().and_then(|v| u16::try_from(v).ok()))
+                .ok_or_else(|| io::Error::other(format!("{at}: missing preference")))?;
+            let exchange = value
+                .get("domain")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io::Error::other(format!("{at}: missing domain")))?;
+            Ok(RData::MX(hickory_proto::rr::rdata::MX::new(
+                preference,
+                hickory_proto::rr::Name::from_str(&format!("{exchange}."))
+                    .map_err(|e| io::Error::other(format!("{at}: bad domain: {e}")))?,
+            )))
+        }
+        other => Err(io::Error::other(format!(
+            "{at}: unsupported record type {other:?}"
+        ))),
+    }
+}
+
+/// Minimal wire-format reader for the base64 form: name, type, class, ttl and
+/// rdata, which is all a `Record` needs.
+fn record_from_wire(wire: &[u8], at: &str) -> io::Result<Record> {
+    let mut offset = 0usize;
+    let name = read_wire_name(wire, &mut offset, at)?;
+    let rtype = read_u16(wire, &mut offset, at)?;
+    let _class = read_u16(wire, &mut offset, at)?;
+    let ttl = read_u32(wire, &mut offset, at)?;
+    let rdlength = read_u16(wire, &mut offset, at)? as usize;
+    let rdata = wire
+        .get(offset..offset + rdlength)
+        .ok_or_else(|| io::Error::other(format!("{at}: truncated rdata")))?;
+    let rdata = match RecordType::from(rtype) {
+        RecordType::A => {
+            let bytes: [u8; 4] = rdata
+                .try_into()
+                .map_err(|_| io::Error::other(format!("{at}: bad A rdata")))?;
+            RData::A(A(std::net::Ipv4Addr::from(bytes)))
+        }
+        RecordType::AAAA => {
+            let bytes: [u8; 16] = rdata
+                .try_into()
+                .map_err(|_| io::Error::other(format!("{at}: bad AAAA rdata")))?;
+            RData::AAAA(AAAA(std::net::Ipv6Addr::from(bytes)))
+        }
+        RecordType::TXT => {
+            let mut text = String::new();
+            let mut rest = rdata;
+            while let Some((&len, tail)) = rest.split_first() {
+                let len = len as usize;
+                let chunk = tail
+                    .get(..len)
+                    .ok_or_else(|| io::Error::other(format!("{at}: bad TXT rdata")))?;
+                text.push_str(&String::from_utf8_lossy(chunk));
+                rest = &tail[len..];
+            }
+            RData::TXT(hickory_proto::rr::rdata::TXT::new(vec![text]))
+        }
+        RecordType::CNAME => {
+            let mut inner = 0usize;
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(read_wire_name(
+                rdata, &mut inner, at,
+            )?))
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "{at}: unsupported record type {other:?}"
+            )));
+        }
+    };
+    Ok(Record::from_rdata(name, ttl, rdata))
+}
+
+fn read_wire_name(
+    wire: &[u8],
+    offset: &mut usize,
+    at: &str,
+) -> io::Result<hickory_proto::rr::Name> {
+    let mut labels: Vec<String> = Vec::new();
+    loop {
+        let len = *wire
+            .get(*offset)
+            .ok_or_else(|| io::Error::other(format!("{at}: truncated name")))?
+            as usize;
+        *offset += 1;
+        if len == 0 {
+            break;
+        }
+        if len > 63 {
+            return Err(io::Error::other(format!("{at}: bad label length")));
+        }
+        let end = *offset + len;
+        let label = wire
+            .get(*offset..end)
+            .ok_or_else(|| io::Error::other(format!("{at}: truncated label")))?;
+        labels.push(String::from_utf8_lossy(label).to_string());
+        *offset = end;
+    }
+    hickory_proto::rr::Name::from_labels(labels)
+        .map_err(|e| io::Error::other(format!("{at}: bad name: {e}")))
+}
+
+fn read_u16(wire: &[u8], offset: &mut usize, at: &str) -> io::Result<u16> {
+    let bytes = wire
+        .get(*offset..*offset + 2)
+        .ok_or_else(|| io::Error::other(format!("{at}: truncated record")))?;
+    *offset += 2;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(wire: &[u8], offset: &mut usize, at: &str) -> io::Result<u32> {
+    let bytes = wire
+        .get(*offset..*offset + 4)
+        .ok_or_else(|| io::Error::other(format!("{at}: truncated record")))?;
+    *offset += 4;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 pub fn parse_message(raw: &[u8]) -> io::Result<Message> {
     Message::from_vec(raw).map_err(|e| io::Error::other(format!("dns: decode message: {e}")))
 }
@@ -92,6 +286,31 @@ pub fn synth_address(query: &Message, addr: IpAddr, ttl: u32) -> io::Result<Vec<
     };
     resp.answers
         .push(Record::from_rdata(q.name().clone(), ttl, rdata));
+    encode(&resp)
+}
+
+/// `action: predefined` — a synthesized answer from the configured records.
+pub fn predefined_response(
+    query: &Message,
+    predefined: &super::rules::PredefinedResponse,
+) -> io::Result<Vec<u8>> {
+    let rcode = predefined
+        .rcode
+        .map(|value| ResponseCode::from(value & 0x0f, 0))
+        .unwrap_or(ResponseCode::NoError);
+    let mut resp = response_skeleton(query, rcode);
+    let mut append = |records: &[Record], section: u8| {
+        for record in records {
+            match section {
+                0 => resp.answers.push(record.clone()),
+                1 => resp.authorities.push(record.clone()),
+                _ => resp.additionals.push(record.clone()),
+            }
+        }
+    };
+    append(&predefined.answer, 0);
+    append(&predefined.ns, 1);
+    append(&predefined.extra, 2);
     encode(&resp)
 }
 

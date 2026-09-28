@@ -668,6 +668,11 @@ impl Router {
         Ok(router)
     }
 
+    /// Index of the outbound `route.final` points at (the direct default).
+    pub fn default_index(&self) -> usize {
+        self.default
+    }
+
     pub fn index_of(&self, tag: &str) -> Option<usize> {
         self.tags.get(tag).copied()
     }

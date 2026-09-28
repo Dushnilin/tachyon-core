@@ -521,3 +521,61 @@ fn router_main_dns_section_builds() {
     assert_eq!(svc.strategy(), core_runtime::dns::Strategy::PreferIPv4);
     assert!(!svc.fakeip_stores().is_empty(), "router config uses fakeip");
 }
+
+#[tokio::test]
+async fn tcp_transport_uses_the_detour_outbound() {
+    // a TCP DNS responder behind the `direct` outbound: the detour plumbing is
+    // what is under test
+    let (addr, _hits) = spawn_tcp_dns(Ipv4Addr::new(127, 0, 0, 1)).await;
+    let router = core_runtime::route::Router::new(&serde_json::json!({
+        "log": {"level": "error"},
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            {"type": "socks", "tag": "unused", "server": "127.0.0.1", "server_port": 1}
+        ]
+    }))
+    .expect("router");
+    let dialer = core_runtime::dns::transport::Dialer {
+        router: Some(Arc::clone(&router)),
+    };
+    let server = core_runtime::dns::transport::ServerConfig::build(
+        &serde_json::json!({
+            "type": "tcp",
+            "tag": "detoured",
+            "server": "127.0.0.1",
+            "server_port": addr.port(),
+            "detour": "direct"
+        }),
+        "dns.servers[0]",
+    )
+    .expect("server");
+    assert_eq!(server.detour.as_deref(), Some("direct"));
+    let query = core_runtime::dns::codec::build_query(
+        0x2222,
+        "detour.test",
+        hickory_proto::rr::RecordType::A,
+    )
+    .expect("query");
+    let raw = core_runtime::dns::transport::exchange(&server, addr, &query, &dialer)
+        .await
+        .expect("detoured exchange");
+    let message = core_runtime::dns::codec::parse_message(&raw).expect("response");
+    assert_eq!(message.answers.len(), 1);
+
+    // an unknown detour tag fails the query instead of going direct
+    let server = core_runtime::dns::transport::ServerConfig::build(
+        &serde_json::json!({
+            "type": "tcp",
+            "tag": "bad",
+            "server": "127.0.0.1",
+            "server_port": 53,
+            "detour": "missing"
+        }),
+        "dns.servers[1]",
+    )
+    .expect("server");
+    let error = core_runtime::dns::transport::exchange(&server, addr, &query, &dialer)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("detour"), "{error}");
+}

@@ -211,9 +211,27 @@ async fn direct_inbound_override_port_only() {
     instance.shutdown();
 }
 
+/// CAP_NET_ADMIN, as the linux kernel reports it. The privileged docker gate
+/// and the CI sudo step have it; plain GitHub runners do not.
+fn has_net_admin() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1 << 12) != 0)
+}
+
 #[tokio::test]
 async fn redirect_inbound_without_nat_closes_connection() {
     let _g = test_guard().await;
+    if !has_net_admin() {
+        eprintln!("SKIP redirect inbound: needs CAP_NET_ADMIN for the NAT table");
+        return;
+    }
     let cfg = base_cfg(
         json!([
             {
@@ -272,7 +290,7 @@ async fn tproxy_inbound_linux_accepts_and_routes() {
     );
     let instance = match core_runtime::start(&cfg).await {
         Ok(i) => i,
-        Err(err) if err.to_string().contains("Operation not permitted") => {
+        Err(err) if format!("{err:#}").contains("Operation not permitted") => {
             eprintln!("tproxy test skipped: {err}");
             return;
         }

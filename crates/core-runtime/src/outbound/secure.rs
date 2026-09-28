@@ -76,13 +76,15 @@ fn parse_uuid(raw: &str) -> io::Result<[u8; 16]> {
     Ok(uuid)
 }
 
-/// vless outbound (TCP command; flow-based Vision is not implemented yet).
+/// vless outbound (TCP command, with the `xtls-rprx-vision` flow).
 pub struct Vless {
     server: String,
     port: u16,
     uuid: [u8; 16],
     transport: Transport,
     tls: Option<TlsOptions>,
+    /// `flow: xtls-rprx-vision` — the payload is framed, see `vision`.
+    vision: bool,
 }
 
 impl Vless {
@@ -93,11 +95,12 @@ impl Vless {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("{at}: missing uuid"))?;
         let uuid = parse_uuid(uuid_raw).map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
-        if let Some(flow) = obj.get("flow").and_then(Value::as_str)
-            && !flow.is_empty()
-        {
-            anyhow::bail!("{at}: vless flow {flow:?} is not implemented yet");
-        }
+        let flow = obj.get("flow").and_then(Value::as_str).unwrap_or("");
+        let vision = match flow {
+            "" => false,
+            "xtls-rprx-vision" => true,
+            other => anyhow::bail!("{at}: vless flow {other:?} is not supported"),
+        };
         let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
         Ok(Self {
@@ -106,6 +109,7 @@ impl Vless {
             uuid,
             transport,
             tls,
+            vision,
         })
     }
 
@@ -123,12 +127,20 @@ impl Vless {
             .connect(tcp, self.tls.as_ref(), &self.server, self.port, &header)
             .await?;
         stream.write_all(&header[consumed..]).await?;
-        Ok(Box::new(VlessStream {
+        let framed: AnyStream = Box::new(VlessStream {
             inner: stream,
             header_pending: true,
             need: 2,
             buf: Vec::new(),
-        }))
+        });
+        if self.vision {
+            // Vision frames the payload that follows the request header
+            Ok(Box::new(crate::outbound::vision::VisionStream::new(
+                framed, self.uuid,
+            )))
+        } else {
+            Ok(framed)
+        }
     }
 }
 
@@ -256,3 +268,6 @@ impl Trojan {
         Ok(stream)
     }
 }
+
+#[cfg(test)]
+mod tests;

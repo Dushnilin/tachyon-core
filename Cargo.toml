@@ -21,6 +21,7 @@ argon2 = "0.5"
 blake2 = { version = "0.10", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
 anyhow = "1"
 aes = "0.8"
 aes-gcm = "0.10"

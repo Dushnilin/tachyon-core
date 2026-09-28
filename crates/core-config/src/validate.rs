@@ -486,6 +486,139 @@ const LISTEN_IN_FIELDS: &[&str] = &[
     "proxy_protocol_accept_no_header",
 ];
 
+/// reference `route/rule/rule_dns.go`: a top-level DNS rule with the `route`
+/// action (or none) must name a server, and its matchers decode like the
+/// reference listables.
+fn validate_dns_rules(rules: &Value) -> Result<(), String> {
+    let rules = rules
+        .as_array()
+        .ok_or_else(|| "dns.rules: must be an array".to_string())?;
+    for (i, rule) in rules.iter().enumerate() {
+        let at = format!("initialize dns router: parse dns rule[{i}]");
+        let rule = rule
+            .as_object()
+            .ok_or_else(|| format!("{at}: must be an object"))?;
+        if let Some(value) = rule.get("rule_set").filter(|value| !prunes_value(value)) {
+            check_listable_string_field(value, &format!("dns.rules[{i}].rule_set"))?;
+        }
+        let action = rule.get("action").and_then(Value::as_str).unwrap_or("");
+        let server = rule.get("server").and_then(Value::as_str).unwrap_or("");
+        match action {
+            "" | "route" | "evaluate" => {
+                if server.is_empty() {
+                    return Err(format!("{at}: missing server field"));
+                }
+            }
+            "reject" if rule.get("method").and_then(Value::as_str) == Some("reply") => {
+                return Err(format!(
+                    "{at}: reject method `reply` is not supported for DNS rules"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `badoption.Listable[string]` field: the reference reports both shapes.
+fn check_listable_string_field(value: &Value, at: &str) -> Result<(), String> {
+    match value {
+        Value::Null | Value::String(_) => Ok(()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if !matches!(item, Value::String(_) | Value::Null) {
+                    return Err(format!(
+                        "{at}: (json: cannot unmarshal array into Go value of type string | [{index}]: json: cannot unmarshal {} into Go value of type string)",
+                        json_kind(item)
+                    ));
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "{at}: (json: cannot unmarshal {} into Go value of type string | json: cannot unmarshal {} into Go value of type []string)",
+            json_kind(other),
+            json_kind(other)
+        )),
+    }
+}
+
+/// reference `option.DefaultHeadlessRule` (a rule-set rule): the matchers a
+/// headless rule may carry, plus the `type` switch.
+const HEADLESS_RULE_FIELDS: &[&str] = &[
+    "type",
+    "query_type",
+    "network",
+    "domain",
+    "domain_suffix",
+    "domain_keyword",
+    "domain_regex",
+    "source_ip_cidr",
+    "ip_cidr",
+    "source_port",
+    "source_port_range",
+    "port",
+    "port_range",
+    "process_name",
+    "process_path",
+    "process_path_regex",
+    "package_name",
+    "package_name_regex",
+    "network_type",
+    "network_is_expensive",
+    "network_is_constrained",
+    "wifi_ssid",
+    "wifi_bssid",
+    "network_interface_address",
+    "default_interface_address",
+    "invert",
+];
+
+/// reference `option._RuleSet` + the inline/local/remote option structs.
+const RULE_SET_INLINE_FIELDS: &[&str] = &["type", "tag", "format", "rules"];
+const RULE_SET_LOCAL_FIELDS: &[&str] = &["type", "tag", "format", "path"];
+const RULE_SET_REMOTE_FIELDS: &[&str] = &[
+    "type",
+    "tag",
+    "format",
+    "url",
+    "initial_path",
+    "http_client",
+    "update_interval",
+    "download_detour",
+];
+
+/// reference `option.HTTPClientOptions` (shared by the remote rule sets and the
+/// 1.15 `default_http_client` gate).
+const HTTP_CLIENT_FIELDS: &[&str] = &[
+    "url",
+    "headers",
+    "proxy",
+    "dialer",
+    "tls",
+    "idle_timeout",
+    "insecure",
+    "address_resolver",
+    "address_strategy",
+    "network",
+    "network_type",
+    "network_is_expensive",
+    "network_is_constrained",
+    "bind_interface",
+    "inet4_bind_address",
+    "inet6_bind_address",
+    "udp_fragment",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "disable_tcp_keep_alive",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+];
+
+/// `C.RuleSetTagPlaceholder` — the `{tag}` a multi-tag local/remote rule set
+/// must interpolate in its path or url.
+const RULE_SET_TAG_PLACEHOLDER: &str = "{tag}";
+
 /// Go struct that embeds `option.ListenOptions` for every inbound type, as the
 /// strict decoder names it in `cannot unmarshal ... into Go struct field ...`.
 const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
@@ -2887,6 +3020,285 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
     Ok(())
 }
 
+/// reference `option.RuleSet.UnmarshalJSON` plus the router init that parses
+/// the rule sets: tag, variant fields, format defaults, the `{tag}`
+/// placeholder, and the empty-inline/local-file checks.
+fn validate_rule_sets(route: &Map<String, Value>) -> Result<(), String> {
+    let Some(list) = route.get("rule_set").filter(|value| !prunes_value(value)) else {
+        return Ok(());
+    };
+    let entries = list
+        .as_array()
+        .ok_or_else(|| "route.rule_set: must be an array".to_string())?;
+    for (i, entry) in entries.iter().enumerate() {
+        let at = format!("route.rule_set[{i}]");
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| format!("{at}: must be an object"))?;
+        let ty = match entry.get("type") {
+            None | Some(Value::Null) => "inline",
+            Some(Value::String(text)) => text.as_str(),
+            Some(other) => {
+                return Err(format!(
+                    "{at}.type: json: cannot unmarshal {} into Go struct field _RuleSet.type of type string",
+                    json_kind(other)
+                ));
+            }
+        };
+        let allowed: &[&str] = match ty {
+            "inline" => RULE_SET_INLINE_FIELDS,
+            "local" => RULE_SET_LOCAL_FIELDS,
+            "remote" => RULE_SET_REMOTE_FIELDS,
+            other => return Err(format!("{at}: unknown rule-set type: {other}")),
+        };
+        // the tag is read before the variant fields, like the reference
+        let tags = rule_set_tags(entry, &at)?;
+        reject_unknown_fields(entry, allowed, &at)?;
+
+        let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
+        let url = entry.get("url").and_then(Value::as_str).unwrap_or("");
+        let initial_path = entry
+            .get("initial_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // `format` defaults from the path/url extension outside inline
+        let mut format = entry
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if ty != "inline" && format.is_empty() {
+            format = rule_set_default_format(if ty == "local" { path } else { url });
+            if format.is_empty() {
+                return Err(format!("{at}: missing format"));
+            }
+        }
+        if !format.is_empty() && !matches!(format.as_str(), "source" | "binary") {
+            return Err(format!("{at}: unknown rule-set format: {format}"));
+        }
+        if tags.len() > 1 {
+            match ty {
+                "inline" => {
+                    return Err(format!(
+                        "{at}: inline rule-set does not support multiple tags"
+                    ));
+                }
+                "local" => {
+                    if !path.contains(RULE_SET_TAG_PLACEHOLDER) {
+                        return Err(format!(
+                            "{at}: missing {RULE_SET_TAG_PLACEHOLDER} placeholder in path"
+                        ));
+                    }
+                }
+                _ => {
+                    if !url.contains(RULE_SET_TAG_PLACEHOLDER) {
+                        return Err(format!(
+                            "{at}: missing {RULE_SET_TAG_PLACEHOLDER} placeholder in url"
+                        ));
+                    }
+                    if !initial_path.is_empty() && !initial_path.contains(RULE_SET_TAG_PLACEHOLDER)
+                    {
+                        return Err(format!(
+                            "{at}: missing {RULE_SET_TAG_PLACEHOLDER} placeholder in initial_path"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(interval) = entry.get("update_interval").filter(|v| !prunes_value(v)) {
+            check_duration_field(
+                interval,
+                &format!("{at}.update_interval"),
+                "RemoteRuleSet",
+                "update_interval",
+            )?;
+        }
+        if let Some(client) = entry.get("http_client").filter(|v| !prunes_value(v)) {
+            let client = client.as_object().ok_or_else(|| {
+                format!("{at}.http_client: json: cannot unmarshal {} into Go value of type option.HTTPClientOptions", json_kind(client))
+            })?;
+            reject_unknown_fields(client, HTTP_CLIENT_FIELDS, &format!("{at}.http_client"))?;
+        }
+        if let Some(rules) = entry.get("rules").filter(|v| !prunes_value(v)) {
+            let rules = rules.as_array().ok_or_else(|| {
+                format!("{at}.rules: json: cannot unmarshal {} into Go value of type []option.HeadlessRule", json_kind(rules))
+            })?;
+            for (index, rule) in rules.iter().enumerate() {
+                let rule_at = format!("{at}.rules[{index}]");
+                let rule = rule.as_object().ok_or_else(|| {
+                    format!("{rule_at}: json: cannot unmarshal {} into Go value of type option.HeadlessRule", json_kind(rule))
+                })?;
+                reject_unknown_fields(rule, HEADLESS_RULE_FIELDS, &rule_at)?;
+            }
+        }
+    }
+    // reference `initialize router`: the rule sets are parsed after the config
+    // decodes, so the errors carry the router prefix.
+    for (i, entry) in entries.iter().enumerate() {
+        let entry = match entry.as_object() {
+            Some(entry) => entry,
+            None => continue,
+        };
+        let ty = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("inline");
+        let at_init = format!("initialize router: parse rule-set[{i}]");
+        match ty {
+            "inline" => {
+                let rules = entry
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .map(|rules| rules.as_slice())
+                    .unwrap_or(&[]);
+                if rules.is_empty() || rules.iter().any(|rule| !headless_rule_is_valid(rule)) {
+                    return Err(format!("{at_init}: empty inline rule-set"));
+                }
+            }
+            "local" => {
+                let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
+                if path.is_empty() {
+                    continue;
+                }
+                let absolute = std::path::absolute(path)
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string());
+                let data = std::fs::read(path).map_err(|err| {
+                    format!("{at_init}: {}", go_path_error("open", &absolute, &err))
+                })?;
+                check_rule_set_payload(&data, entry, &at_init)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `option.RuleSet.tag`: a listable of non-empty strings.
+fn rule_set_tags(entry: &Map<String, Value>, at: &str) -> Result<Vec<String>, String> {
+    let raw = match entry.get("tag") {
+        None | Some(Value::Null) => return Err(format!("{at}: missing tag")),
+        Some(value) => value,
+    };
+    let mut tags = Vec::new();
+    match raw {
+        Value::String(text) => tags.push(text.clone()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                match item {
+                    Value::String(text) => tags.push(text.clone()),
+                    other => {
+                        return Err(format!(
+                            "{at}.tag[{index}]: json: cannot unmarshal {} into Go value of type string",
+                            json_kind(other)
+                        ));
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "{at}.tag: json: cannot unmarshal {} into Go value of type string",
+                json_kind(other)
+            ));
+        }
+    }
+    if tags.is_empty() || tags.iter().any(|tag| tag.is_empty()) {
+        return Err(format!("{at}: missing tag"));
+    }
+    Ok(tags)
+}
+
+/// `ruleSetDefaultFormat`: the extension of the path or url, url query ignored.
+fn rule_set_default_format(path: &str) -> String {
+    let path = match path.split_once('?') {
+        Some((head, _)) if path.starts_with("http") => head,
+        _ => path,
+    };
+    if path.ends_with(".json") {
+        return "source".to_string();
+    }
+    if path.ends_with(".srs") {
+        return "binary".to_string();
+    }
+    String::new()
+}
+
+/// `DefaultHeadlessRule.IsValid`: a rule that carries no matcher (beyond
+/// `invert`) is not a rule.
+fn headless_rule_is_valid(rule: &Value) -> bool {
+    let Some(rule) = rule.as_object() else {
+        return false;
+    };
+    rule.keys().any(|key| key != "invert" && key != "type")
+}
+
+/// The payload of a local rule set: source JSON or the binary SRS container.
+fn check_rule_set_payload(data: &[u8], entry: &Map<String, Value>, at: &str) -> Result<(), String> {
+    let format = rule_set_payload_format(entry);
+    if format == "binary" {
+        return match crate::srs::read(data) {
+            Ok(_) => Ok(()),
+            Err(message) => Err(format!("{at}: {message}")),
+        };
+    }
+    let text = match std::str::from_utf8(data) {
+        Ok(text) => text,
+        Err(_) => return Err(format!("{at}: invalid sing-box rule-set file")),
+    };
+    let value: Value =
+        serde_json::from_str(text).map_err(|err| format!("{at}: parse rule-set source: {err}"))?;
+    let Some(object) = value.as_object() else {
+        return Err(format!("{at}: parse rule-set source: must be an object"));
+    };
+    match object.get("version") {
+        Some(Value::Number(number)) => {
+            let version = number.as_u64().unwrap_or(0);
+            if !(1..=5).contains(&version) {
+                return Err(format!("{at}: unknown rule-set version: {version}"));
+            }
+        }
+        Some(Value::Null) | None => {
+            return Err(format!("{at}: missing rule-set version"));
+        }
+        Some(other) => {
+            return Err(format!(
+                "{at}.version: json: cannot unmarshal {} into Go struct field _PlainRuleSetCompat.version of type uint8",
+                json_kind(other)
+            ));
+        }
+    }
+    if let Some(rules) = object.get("rules").filter(|value| !prunes_value(value)) {
+        let rules = rules.as_array().ok_or_else(|| {
+            format!(
+                "{at}.rules: json: cannot unmarshal {} into Go value of type []option.HeadlessRule",
+                json_kind(rules)
+            )
+        })?;
+        if rules.is_empty() || rules.iter().any(|rule| !headless_rule_is_valid(rule)) {
+            return Err(format!("{at}: empty rule-set"));
+        }
+    }
+    reject_unknown_fields(object, &["version", "rules"], at)?;
+    Ok(())
+}
+
+/// The effective format of a local rule set entry.
+fn rule_set_payload_format(entry: &Map<String, Value>) -> String {
+    let explicit = entry.get("format").and_then(Value::as_str).unwrap_or("");
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
+    if path.ends_with(".srs") {
+        "binary".to_string()
+    } else if path.ends_with(".json") {
+        "source".to_string()
+    } else {
+        "binary".to_string()
+    }
+}
+
 fn check_udp_timeout(value: &Value, at: &str) -> Result<(), String> {
     match value {
         Value::Null => Err(format!("{at}: time: invalid duration \"\"")),
@@ -3876,6 +4288,7 @@ fn validate_route(route: &Value) -> Result<(), String> {
             validate_route_rule(rule, &format!("route.rules[{i}]"), false)?;
         }
     }
+    validate_rule_sets(obj)?;
     Ok(())
 }
 
@@ -3895,6 +4308,9 @@ fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), Strin
         }
     }
 
+    if let Some(value) = rule.get("rule_set").filter(|value| !prunes_value(value)) {
+        check_listable_string_field(value, &format!("{at}.rule_set"))?;
+    }
     let ty = rule.get("type").and_then(Value::as_str).unwrap_or("");
     match ty {
         "" | "default" => {
@@ -3965,6 +4381,9 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
     let obj = dns
         .as_object()
         .ok_or_else(|| "dns: must be a JSON object".to_string())?;
+    if let Some(rules) = obj.get("rules").filter(|value| !prunes_value(value)) {
+        validate_dns_rules(rules)?;
+    }
     let Some(servers) = obj.get("servers") else {
         return Ok(());
     };

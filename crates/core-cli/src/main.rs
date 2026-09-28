@@ -1,3 +1,5 @@
+mod rule_set;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -189,6 +191,7 @@ fn main() -> ExitCode {
         "check" => cmd_check(&args),
         "run" => cmd_run(&args),
         "api" => cmd_api(&args),
+        "rule-set" => rule_set::cmd_rule_set(&args),
         "help" | "-h" | "--help" => {
             print!("{}", usage());
             Ok(())

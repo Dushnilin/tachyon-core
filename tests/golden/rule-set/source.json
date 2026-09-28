@@ -1,0 +1,20 @@
+{
+  "version": 3,
+  "rules": [
+    {
+      "domain_suffix": [
+        "a.com",
+        "b.org"
+      ]
+    },
+    {
+      "ip_cidr": [
+        "10.0.0.0/8"
+      ],
+      "port": [
+        80,
+        443
+      ]
+    }
+  ]
+}

@@ -40,6 +40,18 @@ fn assert_content(db: &core_experimental::bbolt::Db) {
         Some(&b"deep"[..]),
         "cache/sub/nested"
     );
+    // a value spanning several overflow pages
+    assert_eq!(db.get(&["cache"], b"big").unwrap(), Some(pattern(20000)));
+    // a bucket wide enough to sit behind branch pages
+    assert!(db.has_bucket(&["wide"]).unwrap(), "wide bucket");
+    for i in 0..500u32 {
+        let key = format!("key-{i:04}");
+        assert_eq!(
+            db.get(&["wide"], key.as_bytes()).unwrap(),
+            Some(vec![i as u8]),
+            "wide/{key}"
+        );
+    }
 }
 
 #[test]
@@ -59,12 +71,18 @@ fn writes_db_go_can_verify() {
         entries: vec![
             EntrySpec::Kv("k1".into(), b"v1".to_vec()),
             EntrySpec::Kv("k2".into(), pattern(3000)),
+            EntrySpec::Kv("big".into(), pattern(20000)),
             EntrySpec::Bucket {
                 name: "sub".into(),
                 seq: 0,
                 node: sub,
             },
         ],
+    };
+    let wide = NodeSpec {
+        entries: (0..500u32)
+            .map(|i| EntrySpec::Kv(format!("key-{i:04}"), vec![i as u8]))
+            .collect(),
     };
     let root = NodeSpec {
         entries: vec![
@@ -79,6 +97,11 @@ fn writes_db_go_can_verify() {
                 name: "cache".into(),
                 seq: 0,
                 node: cache,
+            },
+            EntrySpec::Bucket {
+                name: "wide".into(),
+                seq: 0,
+                node: wide,
             },
         ],
     };

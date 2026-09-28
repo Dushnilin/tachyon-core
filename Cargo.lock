@@ -421,6 +421,7 @@ dependencies = [
  "cipher 0.5.2",
  "core-config",
  "core-crypto",
+ "core-experimental",
  "core-tls",
  "ctr",
  "des",

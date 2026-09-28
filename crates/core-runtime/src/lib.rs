@@ -1,3 +1,4 @@
+pub mod cache_file;
 pub mod clash_api;
 pub mod clash_state;
 pub mod dns;
@@ -24,6 +25,7 @@ pub struct BoxInstance {
     inbounds: Vec<(String, SocketAddr)>,
     dns: Option<Arc<dns::DnsService>>,
     clash_api: Option<SocketAddr>,
+    cache_file: Option<Arc<std::sync::Mutex<cache_file::CacheFile>>>,
 }
 
 impl BoxInstance {
@@ -35,6 +37,11 @@ impl BoxInstance {
     /// The configured dns service (`None` without a `dns` section).
     pub fn dns(&self) -> Option<Arc<dns::DnsService>> {
         self.dns.clone()
+    }
+
+    /// The `experimental.cache_file` store (`None` when not configured).
+    pub fn cache_file(&self) -> Option<cache_file::SharedCacheFile> {
+        self.cache_file.clone()
     }
 
     /// Bound clash-api external controller (`None` when not configured).
@@ -73,10 +80,18 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         logging::set_disabled();
     }
 
+    // experimental.cache_file: the bbolt store for rule-sets, fakeip and DNS
+    let cache_file: Option<cache_file::SharedCacheFile> = cache_file::CacheFile::open(
+        cache_file::CacheFileOptions::from_config(root.get("experimental"))?,
+    )?
+    .map(|store| Arc::new(std::sync::Mutex::new(store)));
     let router = Router::new(root)?;
     // remote rule sets fetch before the instance is up: a failed first fetch
     // aborts the start, exactly like `RemoteRuleSet.StartContext`
-    router.rule_sets().start_remote(&router).await?;
+    router
+        .rule_sets()
+        .start_remote(&router, cache_file.clone())
+        .await?;
     let dns_service = dns::DnsService::build(root).context("dns section")?;
     if let Some(service) = &dns_service {
         // `dns.server.detour` dials through the outbounds
@@ -154,6 +169,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         inbounds,
         dns: dns_service,
         clash_api,
+        cache_file,
     })
 }
 

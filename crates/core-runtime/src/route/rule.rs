@@ -171,8 +171,8 @@ pub struct DefaultRule {
     dest_ip_cidr: Vec<IpCidrItem>,
     dest_port: Vec<PortItem>,
     has_items: bool,
-    /// `rule_set` present: whole rule never matches (before invert), F3 gap.
-    rule_set_never_match: bool,
+    /// The rule sets this rule consults (empty when it has no `rule_set`).
+    rule_sets: Vec<std::sync::Arc<super::rule_set::RuleSet>>,
     invert: bool,
     action: Action,
 }
@@ -275,6 +275,20 @@ impl Rule {
     /// Top-level `route.rules[i]` entry (`check_outbound` matches reference
     /// `NewRule(..., true)`).
     pub fn build(obj: &Value, at: &str, check_outbound: bool) -> anyhow::Result<Self> {
+        Self::build_with_rule_sets(
+            obj,
+            at,
+            check_outbound,
+            &super::rule_set::RuleSetRegistry::new(),
+        )
+    }
+
+    pub fn build_with_rule_sets(
+        obj: &Value,
+        at: &str,
+        check_outbound: bool,
+        registry: &super::rule_set::RuleSetRegistry,
+    ) -> anyhow::Result<Self> {
         let map = obj
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
@@ -290,7 +304,7 @@ impl Rule {
                 {
                     anyhow::bail!("{at}: missing outbound field");
                 }
-                let rule = Self::build_default(map, at, action)?;
+                let rule = Self::build_default(map, at, action, registry)?;
                 Ok(rule)
             }
             "logical" => {
@@ -303,7 +317,7 @@ impl Rule {
                 {
                     anyhow::bail!("{at}: missing outbound field");
                 }
-                Self::build_logical(map, at, action)
+                Self::build_logical(map, at, action, registry)
             }
             other => anyhow::bail!("{at}: unknown rule type: {other}"),
         }
@@ -313,6 +327,7 @@ impl Rule {
         map: &serde_json::Map<String, Value>,
         at: &str,
         action: Action,
+        registry: &super::rule_set::RuleSetRegistry,
     ) -> anyhow::Result<Self> {
         let mut plain = Vec::new();
         let mut source_address = Vec::new();
@@ -320,7 +335,7 @@ impl Rule {
         let mut dest_address = Vec::new();
         let mut dest_ip_cidr = Vec::new();
         let mut dest_port = Vec::new();
-        let mut rule_set_never_match = false;
+        let mut rule_set_tags: Vec<String> = Vec::new();
 
         if let Some(v) = string_list(map, "inbound", at)? {
             plain.push(PlainItem::Inbound(v));
@@ -450,21 +465,10 @@ impl Rule {
             }
         }
 
-        if map.get("rule_set").is_some_and(|v| !v.is_null()) {
-            crate::logging::warn(format_args!(
-                "{at}: rule_set matchers land in F3 (rule never matches)"
-            ));
-            rule_set_never_match = true;
+        if let Some(v) = string_list(map, "rule_set", at)? {
+            rule_set_tags = v;
         }
-        if map
-            .get("rule_set_ipcidr_match_source")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            crate::logging::warn(format_args!(
-                "{at}: rule_set_ip_cidr_match_source is ignored (rule_set unimplemented)"
-            ));
-        }
+        let rule_sets = registry.resolve(&rule_set_tags)?;
 
         let invert = map.get("invert").and_then(Value::as_bool).unwrap_or(false);
         let has_items = !plain.is_empty()
@@ -473,7 +477,7 @@ impl Rule {
             || !dest_address.is_empty()
             || !dest_ip_cidr.is_empty()
             || !dest_port.is_empty()
-            || rule_set_never_match;
+            || !rule_set_tags.is_empty();
 
         Ok(Rule::Default(Box::new(DefaultRule {
             plain,
@@ -483,7 +487,7 @@ impl Rule {
             dest_ip_cidr,
             dest_port,
             has_items,
-            rule_set_never_match,
+            rule_sets,
             invert,
             action,
         })))
@@ -493,6 +497,7 @@ impl Rule {
         map: &serde_json::Map<String, Value>,
         at: &str,
         action: Action,
+        registry: &super::rule_set::RuleSetRegistry,
     ) -> anyhow::Result<Self> {
         let mode = match map.get("mode").and_then(Value::as_str) {
             Some("and") => LogicalMode::And,
@@ -508,7 +513,7 @@ impl Rule {
         for (i, sub) in subs.iter().enumerate() {
             let sub_at = format!("{at}: sub rule[{i}]");
             reject_nested_action(sub, &sub_at)?;
-            rules.push(Self::build(sub, &sub_at, false)?);
+            rules.push(Self::build_with_rule_sets(sub, &sub_at, false, registry)?);
         }
         let invert = map.get("invert").and_then(Value::as_bool).unwrap_or(false);
         Ok(Rule::Logical(Box::new(LogicalRule {
@@ -658,9 +663,6 @@ impl DefaultRule {
     }
 
     fn matches(&self, ctx: &ConnContext) -> bool {
-        if self.rule_set_never_match {
-            return false;
-        }
         if !self.has_items {
             // Empty allItems → true, invert ignored (reference Match).
             return true;
@@ -716,6 +718,14 @@ impl DefaultRule {
                 .any(|item| item.matches(ctx.destination.port()))
             {
                 satisfied |= DEST_PORT;
+            }
+        }
+
+        if !self.rule_sets.is_empty() {
+            // `RuleSetItem`: any referenced set matching satisfies the item
+            required |= DEST_ADDRESS;
+            if satisfied & DEST_ADDRESS == 0 && self.rule_sets.iter().any(|set| set.matches(ctx)) {
+                satisfied |= DEST_ADDRESS;
             }
         }
 
@@ -827,7 +837,7 @@ impl IpCidrItem {
     }
 }
 
-fn domain_host(ctx: &ConnContext) -> Option<String> {
+pub(super) fn domain_host(ctx: &ConnContext) -> Option<String> {
     if let Some(d) = &ctx.domain {
         return Some(d.to_ascii_lowercase());
     }
@@ -838,7 +848,7 @@ fn domain_host(ctx: &ConnContext) -> Option<String> {
 }
 
 /// Label-boundary suffix match; a leading-dot suffix is a pure string suffix.
-fn domain_suffix_match(host: &str, suffix: &str) -> bool {
+pub(super) fn domain_suffix_match(host: &str, suffix: &str) -> bool {
     if suffix.starts_with('.') {
         host.ends_with(suffix)
     } else {

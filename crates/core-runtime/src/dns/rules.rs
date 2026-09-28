@@ -53,8 +53,8 @@ pub struct Rule {
     pub domain_regex: Vec<Regex>,
     pub source_ip_cidr: Vec<super::transport::IpPrefix>,
     pub network: Vec<String>,
-    /// `rule_set` present: whole rule never matches (before invert), F3 gap.
-    pub never_match: bool,
+    /// The rule sets this DNS rule consults.
+    pub rule_sets: Vec<std::sync::Arc<crate::route::rule_set::RuleSet>>,
     pub invert: bool,
     pub match_response: bool,
     pub action: Action,
@@ -70,6 +70,14 @@ pub struct WalkOptions {
 
 impl Rule {
     pub fn build(obj: &Value, at: &str) -> anyhow::Result<Self> {
+        Self::build_with_rule_sets(obj, at, &crate::route::rule_set::RuleSetRegistry::new())
+    }
+
+    pub fn build_with_rule_sets(
+        obj: &Value,
+        at: &str,
+        registry: &crate::route::rule_set::RuleSetRegistry,
+    ) -> anyhow::Result<Self> {
         let map = obj
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
@@ -93,12 +101,8 @@ impl Rule {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let network = string_list(map, "network", at)?;
-        let never_match = map.get("rule_set").is_some_and(|v| !v.is_null());
-        if never_match {
-            crate::logging::warn(format_args!(
-                "{at}: rule_set matchers land in F3 (rule never matches)"
-            ));
-        }
+        let rule_set_tags = string_list(map, "rule_set", at)?;
+        let rule_sets = registry.resolve(&rule_set_tags)?;
         let source_ip_cidr = string_list(map, "source_ip_cidr", at)?
             .into_iter()
             .map(|raw| {
@@ -178,7 +182,7 @@ impl Rule {
             domain_regex,
             source_ip_cidr,
             network,
-            never_match,
+            rule_sets,
             invert,
             match_response,
             action,
@@ -187,11 +191,26 @@ impl Rule {
     }
 
     pub fn matches(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
-        if self.never_match {
-            return false;
-        }
         let hit = self.matches_inner(meta, query);
         hit != self.invert
+    }
+
+    /// The rule-set view of a DNS query: domain, source and destination ports.
+    fn matches_rule_sets(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
+        if self.rule_sets.is_empty() {
+            return false;
+        }
+        let source = meta
+            .source
+            .map(|address| std::net::SocketAddr::new(address, 0))
+            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        let context = crate::route::ConnContext::new(
+            meta.inbound.as_deref().unwrap_or(""),
+            source,
+            crate::inbound::Target::Domain(query.name.clone(), 0),
+            "udp",
+        );
+        self.rule_sets.iter().any(|set| set.matches(&context))
     }
 
     fn matches_inner(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
@@ -224,6 +243,9 @@ impl Rule {
         }
         if !self.domain.is_empty() && !self.domain.iter().any(|d| d == &query.name) {
             return false;
+        }
+        if !self.rule_sets.is_empty() && self.matches_rule_sets(meta, query) {
+            return true;
         }
         if !self.domain_suffix.is_empty()
             && !self

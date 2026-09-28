@@ -18,9 +18,9 @@ trim_target() {
     size_mb="$(du -sm "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1 || echo 0)"
     if [[ "$size_mb" -gt "$TARGET_BUDGET_MB" ]]; then
         echo "== target cache ${size_mb} MB > ${TARGET_BUDGET_MB} MB: cleaning"
-        cargo clean
-        # the gate needs the reference binaries and nothing else from the volume
-        rm -rf "${CARGO_TARGET_DIR:?}"/*/incremental
+        # the dir is a volume mount point, so cargo clean cannot remove it;
+        # emptying the contents is what actually frees the host disk
+        find "$CARGO_TARGET_DIR" -mindepth 1 -delete
     fi
 }
 

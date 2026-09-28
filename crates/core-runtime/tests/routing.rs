@@ -524,7 +524,21 @@ async fn route_dial_defaults_accepted_and_echo_works() {
             "default_mark": 134217728
         }),
     );
-    let (instance, inbound) = start_box(cfg).await;
+    // SO_MARK needs CAP_NET_ADMIN; the docker gate and the CI sudo step have it
+    let instance = match core_runtime::start(&cfg).await {
+        Ok(instance) => instance,
+        Err(err) if format!("{err:#}").contains("Operation not permitted") => {
+            eprintln!("SKIP route dial defaults: needs CAP_NET_ADMIN for SO_MARK");
+            return;
+        }
+        Err(err) => panic!("start box: {err:#}"),
+    };
+    let inbound = instance
+        .inbound_addrs()
+        .iter()
+        .find(|(tag, _)| tag == "mixed-in")
+        .map(|(_, addr)| *addr)
+        .expect("mixed inbound addr");
     let (stream, code) = socks_connect(inbound, Target::V4(v4_of(echo), echo.port())).await;
     assert_eq!(code, 0x00, "route defaults must not break direct dial");
     assert_echo_roundtrip(stream, b"dflt").await;

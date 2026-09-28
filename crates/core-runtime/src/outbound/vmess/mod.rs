@@ -119,12 +119,6 @@ impl Vmess {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
-        let mut stream: AnyStream = self
-            .transport
-            .connect(tcp, self.tls.as_ref(), &self.server, self.port)
-            .await?;
-
         let mut request_key = [0u8; 16];
         let mut request_iv = [0u8; 16];
         let mut response_header = [0u8; 1];
@@ -153,7 +147,7 @@ impl Vmess {
             self.security,
             target,
         )?;
-        if let Some(alter_key) = &self.alter_key {
+        let first = if let Some(alter_key) = &self.alter_key {
             // Legacy header: HMAC-MD5(alterKey, ts) || CFB(cmdKey, md5(ts x4)).
             let timestamp = unix_now()?;
             let mut request = Vec::with_capacity(16 + header.len());
@@ -163,11 +157,17 @@ impl Vmess {
                 .map_err(|_| io::Error::other("cfb init"))?;
             cfb.encrypt(&mut encrypted);
             request.extend_from_slice(&encrypted);
-            stream.write_all(&request).await?;
+            request
         } else {
-            let sealed = seal_request_header(&self.cmd_key, &header)?;
-            stream.write_all(&sealed).await?;
-        }
+            seal_request_header(&self.cmd_key, &header)?
+        };
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        // a ws transport with early data carries the request in the upgrade head
+        let (mut stream, consumed) = self
+            .transport
+            .connect(tcp, self.tls.as_ref(), &self.server, self.port, &first)
+            .await?;
+        stream.write_all(&first[consumed..]).await?;
 
         let (response_key, response_iv) = derive_response_keys(&request_key, &request_iv);
         let (len_key, len_nonce, hdr_key, hdr_nonce) =

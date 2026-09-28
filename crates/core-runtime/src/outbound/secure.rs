@@ -110,19 +110,19 @@ impl Vless {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
-        let mut stream: AnyStream = self
-            .transport
-            .connect(tcp, self.tls.as_ref(), &self.server, self.port)
-            .await?;
-
         let mut header = Vec::with_capacity(24 + 8);
         header.push(0x00);
         header.extend_from_slice(&self.uuid);
         header.push(0x00);
         header.push(0x01);
         header.extend_from_slice(&encode_vless_target(target)?);
-        stream.write_all(&header).await?;
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        // a ws transport with early data carries the request in the upgrade head
+        let (mut stream, consumed) = self
+            .transport
+            .connect(tcp, self.tls.as_ref(), &self.server, self.port, &header)
+            .await?;
+        stream.write_all(&header[consumed..]).await?;
         Ok(Box::new(VlessStream {
             inner: stream,
             header_pending: true,
@@ -241,19 +241,18 @@ impl Trojan {
         let Some(tls) = &self.tls else {
             return Err(io::Error::other("trojan requires TLS"));
         };
-        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
-        let mut stream = self
-            .transport
-            .connect(tcp, Some(tls), &self.server, self.port)
-            .await?;
-
         let mut header = Vec::with_capacity(64);
         header.extend_from_slice(self.password_hash.as_bytes());
         header.extend_from_slice(b"\r\n");
         header.push(0x01);
         header.extend_from_slice(&encode_target(target)?);
         header.extend_from_slice(b"\r\n");
-        stream.write_all(&header).await?;
+        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let (mut stream, consumed) = self
+            .transport
+            .connect(tcp, Some(tls), &self.server, self.port, &header)
+            .await?;
+        stream.write_all(&header[consumed..]).await?;
         Ok(stream)
     }
 }

@@ -33,6 +33,9 @@ pub(crate) struct Transport {
     kind: Kind,
 }
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Default)]
 enum Kind {
     #[default]
@@ -41,6 +44,9 @@ enum Kind {
         path: String,
         host: Option<String>,
         headers: Vec<(String, String)>,
+        /// `max_early_data`: bytes of the first write that ride in the upgrade
+        /// request instead of a websocket frame
+        max_early_data: usize,
     },
     HttpUpgrade {
         path: String,
@@ -138,30 +144,22 @@ impl Transport {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("{at}: transport missing type"))?;
         let kind = match ty {
-            "ws" => {
-                // the early-data path rewrites the upgrade request; ignoring it
-                // would silently change the handshake, so it fails instead
-                if transport
+            "ws" => Kind::Ws {
+                path: transport
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/")
+                    .to_string(),
+                host: transport
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                headers: parse_headers(transport.get("headers"), at)?,
+                max_early_data: transport
                     .get("max_early_data")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-                {
-                    anyhow::bail!("{at}: transport ws max_early_data is not implemented yet");
-                }
-                Kind::Ws {
-                    path: transport
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .unwrap_or("/")
-                        .to_string(),
-                    host: transport
-                        .get("host")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    headers: parse_headers(transport.get("headers"), at)?,
-                }
-            }
+                    .unwrap_or(0) as usize,
+            },
             "httpupgrade" => Kind::HttpUpgrade {
                 path: transport
                     .get("path")
@@ -216,13 +214,17 @@ impl Transport {
     }
 
     /// Dial the full outbound stream: TCP → optional TLS → transport.
+    /// `early` is the first protocol write; a transport that can carry it in
+    /// its handshake (ws early data) takes as much as it declared and reports
+    /// the count so the caller writes only the rest.
     pub(crate) async fn connect(
         &self,
         tcp: TcpStream,
         tls: Option<&TlsOptions>,
         server: &str,
         port: u16,
-    ) -> io::Result<AnyStream> {
+        early: &[u8],
+    ) -> io::Result<(AnyStream, usize)> {
         // sing-box defaults ALPN to h2 for grpc/http when the user set none.
         let default_alpn: &[&[u8]] = match &self.kind {
             Kind::Grpc { .. } | Kind::Xhttp(_) => &[b"h2"],
@@ -233,15 +235,16 @@ impl Transport {
             Some(tls) => tls.wrap_with_defaults(tcp, default_alpn).await?,
             None => Box::new(tcp),
         };
-        match &self.kind {
-            Kind::None => Ok(stream),
+        let (stream, consumed) = match &self.kind {
+            Kind::None => (stream, 0),
             Kind::Ws {
                 path,
                 host,
                 headers,
+                max_early_data,
             } => {
                 let host = host.as_deref().unwrap_or(server);
-                ws_handshake(stream, path, host, headers).await
+                ws_handshake(stream, path, host, headers, early, *max_early_data).await?
             }
             Kind::HttpUpgrade {
                 path,
@@ -249,18 +252,22 @@ impl Transport {
                 headers,
             } => {
                 let host = host.as_deref().unwrap_or(server);
-                httpupgrade_handshake(stream, path, host, headers).await
+                (httpupgrade_handshake(stream, path, host, headers).await?, 0)
             }
             Kind::Grpc { service_name } => {
                 let sni = tls.map(TlsOptions::server_name).unwrap_or(server);
-                grpc::connect(stream, service_name, &authority(sni, port), tls.is_some()).await
+                (
+                    grpc::connect(stream, service_name, &authority(sni, port), tls.is_some())
+                        .await?,
+                    0,
+                )
             }
             Kind::Http {
                 host,
                 path,
                 method,
                 headers,
-            } => {
+            } => (
                 http::connect(
                     stream,
                     tls.is_some(),
@@ -271,10 +278,15 @@ impl Transport {
                     method,
                     headers,
                 )
-                .await
-            }
-            Kind::Xhttp(cfg) => xhttp::connect(stream, tls.is_some(), server, port, cfg).await,
-        }
+                .await?,
+                0,
+            ),
+            Kind::Xhttp(cfg) => (
+                xhttp::connect(stream, tls.is_some(), server, port, cfg).await?,
+                0,
+            ),
+        };
+        Ok((stream, consumed))
     }
 }
 
@@ -328,19 +340,40 @@ fn append_headers(request: &mut String, headers: &[(String, String)]) {
     }
 }
 
+/// Websocket upgrade. When `max_early_data` is set the first bytes of the
+/// tunnel ride along in `Sec-WebSocket-Protocol` (base64), which saves a round
+/// trip; the server still answers 101 and everything after it is normal
+/// framing. Returns how many bytes of `early` were consumed.
 async fn ws_handshake(
     mut stream: AnyStream,
     path: &str,
     host: &str,
     headers: &[(String, String)],
-) -> io::Result<AnyStream> {
+    early: &[u8],
+    max_early_data: usize,
+) -> io::Result<(AnyStream, usize)> {
     let mut key_bytes = [0u8; 16];
     random_bytes(&mut key_bytes)?;
     let key = base64_std(&key_bytes);
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
     );
-    append_headers(&mut request, headers);
+    // the early data owns the protocol header, so a configured one is dropped
+    let carried = early.len().min(max_early_data);
+    for (name, value) in headers {
+        if carried > 0 && name.eq_ignore_ascii_case("sec-websocket-protocol") {
+            continue;
+        }
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    if carried > 0 {
+        request.push_str("Sec-WebSocket-Protocol: ");
+        request.push_str(&base64_std(&early[..carried]));
+        request.push_str("\r\n");
+    }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await?;
 
@@ -359,7 +392,7 @@ async fn ws_handshake(
     {
         return Err(io::Error::other("ws handshake: bad Sec-WebSocket-Accept"));
     }
-    Ok(Box::new(WsStream::new(stream)))
+    Ok((Box::new(WsStream::new(stream)), carried))
 }
 
 async fn httpupgrade_handshake(

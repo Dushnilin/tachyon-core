@@ -144,11 +144,8 @@ impl Outbound {
                 .connect(target)
                 .await
                 .map(|s| Conn::Plain(Box::new(s))),
-            Outbound::Socks(socks) => socks
-                .connect(target)
-                .await
-                .map(|s| Conn::Plain(Box::new(s))),
-            Outbound::Http(http) => http.connect(target).await.map(|s| Conn::Plain(Box::new(s))),
+            Outbound::Socks(socks) => socks.connect(target).await.map(Conn::Plain),
+            Outbound::Http(http) => http.connect(target).await.map(Conn::Plain),
             Outbound::Shadowsocks(ss) => ss
                 .connect(target)
                 .await

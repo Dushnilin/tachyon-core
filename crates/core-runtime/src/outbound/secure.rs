@@ -272,13 +272,26 @@ impl Trojan {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        self.dial(0x01, target).await
+    }
+
+    /// trojan has one datagram form: the request head names the target and
+    /// every packet is length-prefixed on the same stream.
+    pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
+        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
+        let stream = self.dial(0x03, target).await?;
+        spawn_packet_bridge(stream, peer, PacketEncoding::LengthPrefixed, target.clone());
+        Ok(local)
+    }
+
+    async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
         let Some(tls) = &self.tls else {
             return Err(io::Error::other("trojan requires TLS"));
         };
         let mut header = Vec::with_capacity(64);
         header.extend_from_slice(self.password_hash.as_bytes());
         header.extend_from_slice(b"\r\n");
-        header.push(0x01);
+        header.push(command);
         header.extend_from_slice(&encode_target(target)?);
         header.extend_from_slice(b"\r\n");
         let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;

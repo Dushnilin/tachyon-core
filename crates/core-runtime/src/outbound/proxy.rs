@@ -118,6 +118,36 @@ impl Socks {
     }
 
     async fn connect_v5(&self, stream: &mut TcpStream, target: &Target) -> io::Result<()> {
+        self.handshake_v5(stream).await?;
+        let mut request = vec![0x05, 0x01, 0x00];
+        request.extend_from_slice(&encode_target(target)?);
+        stream.write_all(&request).await?;
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head).await?;
+        if head[1] != 0x00 {
+            return Err(io::Error::other(format!(
+                "socks connect failed: {}",
+                head[1]
+            )));
+        }
+        let skip = match head[3] {
+            0x01 => 4,
+            0x04 => 16,
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                usize::from(len[0])
+            }
+            _ => return Err(io::Error::other("bad address type from server")),
+        };
+        let mut bnd = vec![0u8; skip + 2];
+        stream.read_exact(&mut bnd).await?;
+        Ok(())
+    }
+
+    /// Method negotiation and, when the server asks for it, username/password
+    /// auth. Shared by CONNECT and UDP ASSOCIATE.
+    async fn handshake_v5(&self, stream: &mut TcpStream) -> io::Result<()> {
         let methods: &[u8] = if self.credentials.is_some() {
             &[0x02]
         } else {
@@ -153,30 +183,92 @@ impl Socks {
             _ => return Err(io::Error::other("no acceptable auth method")),
         }
 
-        let mut request = vec![0x05, 0x01, 0x00];
-        request.extend_from_slice(&encode_target(target)?);
-        stream.write_all(&request).await?;
-        let mut head = [0u8; 4];
-        stream.read_exact(&mut head).await?;
-        if head[1] != 0x00 {
-            return Err(io::Error::other(format!(
-                "socks connect failed: {}",
-                head[1]
-            )));
-        }
-        let skip = match head[3] {
-            0x01 => 4,
-            0x04 => 16,
-            0x03 => {
-                let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await?;
-                usize::from(len[0])
-            }
-            _ => return Err(io::Error::other("bad address type from server")),
-        };
-        let mut bnd = vec![0u8; skip + 2];
-        stream.read_exact(&mut bnd).await?;
         Ok(())
+    }
+
+    /// SOCKS5 UDP ASSOCIATE: the control connection names a relay endpoint and
+    /// every datagram then carries its own `[RSV RSV FRAG][addr][port]` header.
+    /// SOCKS4 has no datagram support at all.
+    pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
+        if self.version == 4 {
+            return Err(io::Error::other("socks4 has no udp support"));
+        }
+        let mut control = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        self.handshake_v5(&mut control).await?;
+        // 0.0.0.0:0 asks the server for its default relay
+        control
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+        let bound = read_socks5_reply(&mut control).await?;
+        let relay = match bound {
+            // the server left the address empty; the port is the useful part
+            Target::Ip(addr) if addr.ip().is_unspecified() => {
+                format!("127.0.0.1:{}", addr.port())
+            }
+            other => other.to_string(),
+        };
+        let relay: std::net::SocketAddr = relay
+            .parse()
+            .map_err(|_| io::Error::other("socks: unusable udp relay address"))?;
+
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(relay).await?;
+        // the control connection has to stay open for the whole session
+        tokio::spawn(async move {
+            let mut control = control;
+            let mut sink = [0u8; 1];
+            while let Ok(n) = control.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
+        let out_socket = std::sync::Arc::new(peer);
+        let in_socket = std::sync::Arc::clone(&out_socket);
+        let target = target.clone();
+        let socket = std::sync::Arc::new(socket);
+        let out_relay = std::sync::Arc::clone(&socket);
+        let in_relay = std::sync::Arc::clone(&socket);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            let mut datagram = Vec::with_capacity(64_000);
+            loop {
+                let Ok(n) = in_socket.recv(&mut buf).await else {
+                    break;
+                };
+                datagram.clear();
+                datagram.extend_from_slice(&[0, 0, 0]);
+                if crate::outbound::packet::put_addr_port(&mut datagram, &target).is_err() {
+                    break;
+                }
+                datagram.extend_from_slice(&buf[..n]);
+                if out_relay.send(&datagram).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok(n) = in_relay.recv(&mut buf).await else {
+                    break;
+                };
+                if n < 4 || buf[2] != 0 {
+                    // a fragment the relay did not reassemble
+                    continue;
+                }
+                let Ok((_target, payload)) = crate::outbound::packet::take_addr_port(&buf[3..n])
+                else {
+                    continue;
+                };
+                if out_socket.send(payload).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(local)
     }
 }
 
@@ -419,6 +511,43 @@ impl Selector {
     }
 }
 
+/// Reads a SOCKS5 reply head and returns the bound address.
+async fn read_socks5_reply(stream: &mut TcpStream) -> io::Result<Target> {
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await?;
+    if head[0] != 0x05 {
+        return Err(io::Error::other("bad socks version from server"));
+    }
+    if head[1] != 0x00 {
+        return Err(io::Error::other(format!(
+            "socks request failed: {}",
+            head[1]
+        )));
+    }
+    let mut body = Vec::new();
+    match head[3] {
+        0x01 => body.push(0x01),
+        0x04 => body.push(0x03),
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            body.push(0x03);
+            body.push(len[0]);
+        }
+        _ => return Err(io::Error::other("bad address type from server")),
+    }
+    let tail = match head[3] {
+        0x01 => 6,
+        0x04 => 18,
+        _ => usize::from(body[1]) + 2,
+    };
+    let mut rest = vec![0u8; tail];
+    stream.read_exact(&mut rest).await?;
+    body.extend_from_slice(&rest);
+    let (target, _) = crate::outbound::packet::take_addr_port(&body)?;
+    Ok(target)
+}
+
 #[cfg(test)]
 mod socks4_tests {
     use super::*;
@@ -440,5 +569,100 @@ mod socks4_tests {
         // no address and no name cannot be encoded
         let error = socks4_request(&target, None, None).unwrap_err();
         assert!(error.to_string().contains("address or a name"));
+    }
+}
+
+#[cfg(test)]
+mod udp_associate_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A socks5 server that hands out one relay socket and echoes datagrams.
+    async fn serve(listener: tokio::net::TcpListener) {
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay");
+        let relay_port = relay.local_addr().expect("addr").port();
+        let echo = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = relay.recv_from(&mut buf).await {
+                assert_eq!(&buf[..3], &[0, 0, 0], "a datagram carries a header");
+                let (target, payload) =
+                    crate::outbound::packet::take_addr_port(&buf[3..n]).expect("address");
+                let mut reply = vec![0, 0, 0];
+                crate::outbound::packet::put_addr_port(&mut reply, &target).expect("address");
+                reply.extend_from_slice(&payload.iter().rev().copied().collect::<Vec<u8>>());
+                relay.send_to(&reply, from).await.expect("reply");
+            }
+        });
+
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut head = [0u8; 2];
+        socket.read_exact(&mut head).await.expect("greeting");
+        let mut methods = vec![0u8; head[1] as usize];
+        socket.read_exact(&mut methods).await.expect("methods");
+        socket.write_all(&[0x05, 0x00]).await.expect("auth");
+        let mut request = [0u8; 10];
+        socket.read_exact(&mut request).await.expect("associate");
+        assert_eq!(request[..3], [0x05, 0x03, 0x00], "udp associate");
+        let mut reply = vec![0x05, 0x00, 0x00, 0x01];
+        reply.extend_from_slice(&[127, 0, 0, 1]);
+        reply.extend_from_slice(&relay_port.to_be_bytes());
+        socket.write_all(&reply).await.expect("reply");
+        // the client keeps the control connection open for the session
+        let mut sink = [0u8; 1];
+        while socket.read(&mut sink).await.unwrap_or(0) > 0 {}
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn associate_relays_datagrams_through_the_named_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(serve(listener));
+
+        let config = json!({
+            "type": "socks",
+            "tag": "s",
+            "server": "127.0.0.1",
+            "server_port": port,
+            "version": "5",
+        });
+        let socks =
+            Socks::build(config.as_object().expect("object"), "outbounds[0]").expect("build");
+        let sock = socks
+            .connect_udp(&Target::Domain("dns.example.com".into(), 53))
+            .await
+            .expect("associate");
+        sock.send(b"ping").await.expect("send");
+
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv(&mut buf))
+            .await
+            .expect("in time")
+            .expect("recv");
+        assert_eq!(&buf[..n], b"gnip", "the relay echoes what it received");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn socks4_has_no_datagrams() {
+        let config = json!({
+            "type": "socks",
+            "tag": "s",
+            "server": "127.0.0.1",
+            "server_port": 1080,
+            "version": "4",
+        });
+        let socks =
+            Socks::build(config.as_object().expect("object"), "outbounds[0]").expect("build");
+        let error = socks
+            .connect_udp(&Target::Ip("1.2.3.4:53".parse().expect("addr")))
+            .await
+            .expect_err("socks4 has no udp")
+            .to_string();
+        assert!(error.contains("socks4"), "got {error}");
     }
 }

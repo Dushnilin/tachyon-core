@@ -10,6 +10,8 @@ pub mod ntp;
 pub mod outbound;
 pub mod route;
 pub mod tls_client;
+pub mod ws;
+mod zip;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

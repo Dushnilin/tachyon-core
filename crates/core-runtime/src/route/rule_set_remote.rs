@@ -26,6 +26,30 @@ fn url_hash(url: &str) -> [u8; 32] {
 /// Reference default: 24h when `update_interval` is absent.
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Retry ladder for a set that was still empty at start: 5, 10, 20 and then
+/// every 30 seconds, the schedule podkop-engine's OpenWrt build settled on.
+/// Once one fetch lands, the periodic updater takes over.
+const RECOVERY_LADDER: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+
+/// Opt-in: keep the engine running with an empty rule-set instead of aborting
+/// the start, and fetch it in the background. `TACHYON_RULESET_SOFT_START=1`.
+///
+/// Off by default, because the reference aborts with `initial rule-set:
+/// <tag>` and an empty set means the rules pointing at it match nothing. A
+/// router booting before its WAN is up is the case this is for: failing to
+/// start there costs DNS as well as the proxy.
+pub fn soft_start_enabled() -> bool {
+    matches!(
+        std::env::var("TACHYON_RULESET_SOFT_START").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteSpec {
     pub url: String,
@@ -240,14 +264,33 @@ impl RemoteRegistry {
         self.sets.is_empty()
     }
 
-    /// Fetch every remote set once; a failure aborts the start.
+    /// Fetch every remote set once; a failure aborts the start unless
+    /// `TACHYON_RULESET_SOFT_START` asks for the set to be filled later.
     pub async fn start_all(
         &self,
-        router: &Router,
+        router: &Arc<Router>,
         cache: Option<&SharedCacheFile>,
     ) -> anyhow::Result<()> {
+        self.start_all_with(router, cache, soft_start_enabled())
+            .await
+    }
+
+    async fn start_all_with(
+        &self,
+        router: &Arc<Router>,
+        cache: Option<&SharedCacheFile>,
+        soft: bool,
+    ) -> anyhow::Result<()> {
         for set in &self.sets {
-            set.lock().await.start(router, cache).await?;
+            if let Err(error) = set.lock().await.start(router, cache).await {
+                if !soft {
+                    return Err(error.into());
+                }
+                logging::warn(format_args!(
+                    "{error}: starting with an empty rule-set, retrying in the background"
+                ));
+                spawn_recovery(Arc::clone(set), Arc::clone(router), cache.cloned());
+            }
         }
         Ok(())
     }
@@ -279,6 +322,37 @@ impl RemoteRegistry {
             });
         }
     }
+}
+
+/// Keep fetching a set that was empty at start: the recovery ladder until one
+/// attempt lands, after which the periodic updater owns it again.
+fn spawn_recovery(
+    set: Arc<Mutex<RemoteRuleSet>>,
+    router: Arc<Router>,
+    cache: Option<SharedCacheFile>,
+) {
+    tokio::spawn(async move {
+        for delay in RECOVERY_LADDER {
+            tokio::time::sleep(delay).await;
+            let mut guard = set.lock().await;
+            match guard.fetch(&router, false, cache.as_ref()).await {
+                Ok(()) => {
+                    logging::info(format_args!(
+                        "recovered rule-set {} after an empty start",
+                        guard.tag()
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    logging::warn(format_args!("fetch rule-set {}: {error}", guard.tag()));
+                }
+            }
+        }
+        logging::warn(format_args!(
+            "rule-set {} is still empty, the periodic updater will keep trying",
+            set.lock().await.tag()
+        ));
+    });
 }
 
 /// `ruleSet.Read` for a downloaded payload: the pinned `format` wins, then the
@@ -452,6 +526,61 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("initial rule-set: rs"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_start_survives_and_recovers_the_set() {
+        let router = router().await;
+        let payload = srs_with("recovered.example");
+        // 500 for the start attempts, the real set for the recovery fetch
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = [0u8; 1024];
+                let _ = stream.read(&mut head).await;
+                let response = if served
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < 2
+                {
+                    format!("HTTP/1.1 500 Internal Server Error{CRLF}{CRLF}").into_bytes()
+                } else {
+                    body_response(&payload)
+                };
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            }
+        });
+        let mut registry = RemoteRegistry::new();
+        registry.push(remote("rs", &format!("http://{addr}/ruleset.srs")));
+
+        // the reference aborts the start
+        let error = registry.start_all(&router, None).await.unwrap_err();
+        assert!(error.to_string().contains("initial rule-set: rs"), "{error}");
+
+        // soft start: the engine stays up, the set is empty for now
+        registry
+            .start_all_with(&router, None, true)
+            .await
+            .expect("soft start");
+        assert_eq!(registry.sets[0].lock().await.set.rule_count(), 0);
+
+        // and the background ladder fills it without help
+        for _ in 0..100 {
+            if registry.sets[0].lock().await.set.rule_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let set = registry.sets[0].lock().await;
+        assert_eq!(set.set.rule_count(), 1, "recovered in the background");
+        assert_eq!(set.set.snapshot()[0]["domain_suffix"][0], "recovered.example");
+        drop(set);
         server.abort();
     }
 

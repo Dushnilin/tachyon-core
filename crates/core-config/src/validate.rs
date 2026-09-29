@@ -1908,15 +1908,54 @@ fn validate_obfs(value: &Value, at: &str, go_struct: &str) -> Result<(), String>
             "{at}: json: cannot unmarshal bool into Go struct field {go_struct}.obfs of type option._Hysteria2Obfs"
         )),
         Value::Object(map) => {
-            let ty = map.get("type").and_then(Value::as_str).unwrap_or("");
-            if !OBFS_TYPES.contains(&ty) {
+            // The reference decodes the shared fields first and only runs the
+            // strict per-type pass for gecko, which is the one type with a
+            // struct of its own; salamander keeps whatever it is given.
+            let ty = map.get("type").and_then(Value::as_str);
+            if let Some(ty) = ty
+                && !OBFS_TYPES.contains(&ty)
+            {
                 return Err(format!("{at}: unknown obfs type: {ty}"));
             }
-            if ty == "gecko" {
+            let gecko = ty == Some("gecko");
+            if gecko || ty.is_none() {
                 for key in map.keys() {
-                    if key != "type" {
+                    let shared = matches!(key.as_str(), "type" | "password");
+                    let sized =
+                        gecko && matches!(key.as_str(), "min_packet_size" | "max_packet_size");
+                    if !shared && !sized {
                         return Err(format!("{at}.{key}: json: unknown field \"{key}\""));
                     }
+                }
+            }
+            let Some(_ty) = ty else {
+                return Ok(());
+            };
+            if map
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(format!("{at}: missing obfs password"));
+            }
+            if gecko {
+                // upstream defaults 0 to 512/1200 and rejects the rest
+                let read = |name: &str| -> Result<i64, String> {
+                    match map.get(name) {
+                        None | Some(Value::Null) => Ok(0),
+                        Some(Value::Number(n)) => Ok(n.as_i64().unwrap_or(-1)),
+                        Some(_) => Err(format!("{at}.{name}: json: cannot unmarshal")),
+                    }
+                };
+                let min = read("min_packet_size")?;
+                let max = read("max_packet_size")?;
+                // upstream replaces 0 with the defaults and rejects anything
+                // that is not strictly positive afterwards
+                let max = if max == 0 { 1200 } else { max };
+                let min = if min == 0 { 512 } else { min };
+                if min <= 0 || min > max || max > 2048 {
+                    return Err(format!("{at}: gecko: invalid packet size range"));
                 }
             }
             Ok(())
@@ -10268,6 +10307,63 @@ mod tests {
     }
 
     #[test]
+    fn hy2_gecko_obfs_fields_follow_the_reference() {
+        let base = |obfs: serde_json::Value| {
+            json!({
+                "outbounds": [{
+                    "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                    "password": "p", "tls": {"enabled": true, "insecure": true},
+                    "obfs": obfs
+                }]
+            })
+        };
+        // gecko merges the shared fields with its own struct
+        assert!(
+            validate(&base(json!({"type": "gecko", "password": "x"}))).is_ok(),
+            "gecko without explicit sizes is fine"
+        );
+        assert!(
+            validate(&base(json!({
+                "type": "gecko", "password": "x",
+                "min_packet_size": 700, "max_packet_size": 1500
+            })))
+            .is_ok()
+        );
+        // only the gecko branch runs the strict per-type pass
+        assert!(
+            validate(&base(
+                json!({"type": "gecko", "password": "x", "salt": "y"})
+            ))
+            .is_err(),
+            "gecko rejects a field of its own struct"
+        );
+        assert!(
+            validate(&base(
+                json!({"type": "salamander", "password": "x", "salt": "y"})
+            ))
+            .is_ok(),
+            "salamander keeps whatever it is given"
+        );
+        // an object without a type is checked against the shared fields alone
+        assert!(validate(&base(json!({}))).is_ok());
+        assert!(validate(&base(json!({"bogus": 1}))).is_err());
+        assert!(validate(&base(json!({"type": ""}))).is_err());
+        // the size range is validated up front, with 0 defaulting to 512/1200
+        for sizes in [
+            json!({"min_packet_size": 1500, "max_packet_size": 600}),
+            json!({"max_packet_size": 3000}),
+            json!({"min_packet_size": -1}),
+        ] {
+            let mut obfs = json!({"type": "gecko", "password": "x"});
+            for (key, value) in sizes.as_object().expect("object") {
+                obfs[key] = value.clone();
+            }
+            let err = validate(&base(obfs)).expect_err("invalid range");
+            assert!(err.contains("invalid packet size range"), "{err}");
+        }
+    }
+
+    #[test]
     fn hy2_out_obfs_password_required() {
         let err = validate(&json!({
             "outbounds": [{
@@ -10283,10 +10379,21 @@ mod tests {
                 "outbounds": [{
                     "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
                     "tls": {"enabled": true, "insecure": true},
-                    "obfs": {"type": "salamander"}, "password": "x"
+                    "obfs": {"type": "salamander", "password": "x"}, "password": "p"
                 }]
             }))
             .is_ok()
+        );
+        // the obfs password is the one that matters, not the tunnel password
+        assert!(
+            validate(&json!({
+                "outbounds": [{
+                    "type": "hysteria2", "tag": "t", "server": "1.2.3.4", "server_port": 443,
+                    "tls": {"enabled": true, "insecure": true},
+                    "obfs": {"type": "salamander"}, "password": "p"
+                }]
+            }))
+            .is_err()
         );
     }
 

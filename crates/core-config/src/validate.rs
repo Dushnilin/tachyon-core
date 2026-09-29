@@ -4533,6 +4533,19 @@ fn validate_route(route: &Value) -> Result<(), String> {
             validate_route_rule(rule, &format!("route.rules[{i}]"), false)?;
         }
     }
+    // `default_http_client` names one of the top-level `http_clients`, so it
+    // decodes as a plain tag: an object here is what the reference refuses
+    if let Some(value) = obj
+        .get("default_http_client")
+        .filter(|value| !value.is_null())
+    {
+        check_string_field(
+            value,
+            "route.default_http_client",
+            "RouteOptions",
+            "route.default_http_client",
+        )?;
+    }
     validate_rule_sets(obj)?;
     Ok(())
 }
@@ -9974,6 +9987,30 @@ mod tests {
         // decode errors precede the deprecation guard
         let err = run(json!({"experimental": {"clash_api": {"store_mode": 1}}}));
         assert!(!err.starts_with("create clash-server"), "{err}");
+    }
+
+    #[test]
+    fn default_http_client_is_a_client_tag() {
+        // the reference decodes it as a plain string naming a `http_clients`
+        // entry, so an object is refused before anything else looks at it
+        let err = validate(&json!({
+            "route": {"default_http_client": {"detour": "d"}},
+            "outbounds": [{"type": "direct", "tag": "d"}]
+        }))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "route.default_http_client: json: cannot unmarshal object into Go struct field \
+             RouteOptions.route.default_http_client of type string"
+        );
+        assert!(
+            validate(&json!({
+                "route": {"default_http_client": "clash"},
+                "outbounds": [{"type": "direct", "tag": "d"}]
+            }))
+            .is_ok(),
+            "a tag is accepted even though the registry is not built yet"
+        );
     }
 
     #[test]

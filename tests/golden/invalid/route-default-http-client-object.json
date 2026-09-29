@@ -1,0 +1,15 @@
+{
+  "route": {
+    "default_http_client": { "detour": "d" },
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite",
+        "format": "binary",
+        "url": "https://example.com/geosite.srs",
+        "download_detour": "d"
+      }
+    ]
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

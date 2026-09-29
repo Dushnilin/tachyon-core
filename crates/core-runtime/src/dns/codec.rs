@@ -289,6 +289,37 @@ pub fn synth_address(query: &Message, addr: IpAddr, ttl: u32) -> io::Result<Vec<
     encode(&resp)
 }
 
+/// Synthesize an A/AAAA answer carrying every address of `addrs`, which is
+/// what the `hosts` and `local` server types answer with.
+pub fn synth_addresses(query: &Message, addrs: &[IpAddr], ttl: u32) -> io::Result<Vec<u8>> {
+    let Some(q) = query.queries.first() else {
+        return Err(io::Error::other("dns: query has no question"));
+    };
+    // dns.FixedResponse only answers with the family the question asked for
+    let v4 = matches!(q.query_type(), RecordType::A);
+    let v6 = matches!(q.query_type(), RecordType::AAAA);
+    if !v4 && !v6 {
+        return encode(&response_skeleton(query, ResponseCode::NoError));
+    }
+    let mut resp = response_skeleton(query, ResponseCode::NoError);
+    for addr in addrs {
+        let rdata = match *addr {
+            IpAddr::V4(ip) if v4 => RData::A(A(ip)),
+            IpAddr::V6(ip) if v6 => RData::AAAA(AAAA(ip)),
+            _ => continue,
+        };
+        resp.answers
+            .push(Record::from_rdata(q.name().clone(), ttl, rdata));
+    }
+    encode(&resp)
+}
+
+/// NXDOMAIN, which is what the `hosts` transport answers for a name it does
+/// not know.
+pub fn name_error(query: &Message) -> io::Result<Vec<u8>> {
+    encode(&response_skeleton(query, ResponseCode::NXDomain))
+}
+
 /// `action: predefined` — a synthesized answer from the configured records.
 pub fn predefined_response(
     query: &Message,

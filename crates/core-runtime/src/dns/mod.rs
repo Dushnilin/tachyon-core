@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 
 pub use rules::{Action, QueryMeta, RejectMethod, Rule, WalkOptions};
-pub use transport::{FakeIpStore, ServerConfig};
+pub use transport::{FakeIpStore, Kind, ServerConfig};
 
 use cache::{Cache, CacheHit, CacheKey};
 use codec::QueryInfo;
@@ -345,6 +345,31 @@ impl DnsService {
                     .ok_or_else(|| std::io::Error::other("dns: final server missing"))?,
             ),
         };
+
+        // the hosts and local transports answer without touching the wire
+        match target.kind {
+            Kind::Hosts => {
+                let sources = target
+                    .hosts
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("dns: hosts server without sources"))?;
+                let addrs = sources.lookup(&info.name);
+                if addrs.is_empty() {
+                    return codec::name_error(&query_msg).map_err(std::io::Error::other);
+                }
+                return codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
+                    .map_err(std::io::Error::other);
+            }
+            Kind::Local => {
+                let addrs = system_lookup(&info.name).await;
+                if addrs.is_empty() {
+                    return codec::name_error(&query_msg).map_err(std::io::Error::other);
+                }
+                return codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
+                    .map_err(std::io::Error::other);
+            }
+            _ => {}
+        }
 
         if target.is_fakeip() {
             let store = target
@@ -697,6 +722,14 @@ pub async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
         }));
     }
     TcpStream::connect((host, port)).await
+}
+
+/// The `local` transport hands the question to the system resolver.
+pub(crate) async fn system_lookup(host: &str) -> Vec<std::net::IpAddr> {
+    match tokio::net::lookup_host((host, 0)).await {
+        Ok(addrs) => addrs.map(|addr| addr.ip()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]

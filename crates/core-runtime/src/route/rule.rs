@@ -187,7 +187,9 @@ enum PlainItem {
     AuthUser(Vec<String>),
     Protocol(Vec<String>),
     Client(Vec<String>),
-    /// Unsupported matcher (process_*, clash_mode, …): always false.
+    /// The clash mode in force, as set through the controller.
+    ClashMode(Vec<String>),
+    /// Unsupported matcher (process_*, …): always false.
     Unsupported,
 }
 
@@ -443,7 +445,6 @@ impl Rule {
             "package_name_regex",
             "user",
             "user_id",
-            "clash_mode",
             "network_type",
             "network_is_expensive",
             "network_is_constrained",
@@ -456,6 +457,10 @@ impl Rule {
             "source_hostname",
             "preferred_by",
         ];
+        if let Some(v) = string_list(map, "clash_mode", at)? {
+            plain.push(PlainItem::ClashMode(v));
+        }
+
         for key in UNSUPPORTED {
             if map.get(*key).is_some_and(|v| !v.is_null()) {
                 crate::logging::warn(format_args!(
@@ -607,7 +612,8 @@ impl DefaultRule {
                 PlainItem::AuthUser(list) => parts.push(field_list("auth_user", list)),
                 PlainItem::Protocol(list) => parts.push(field_list("protocol", list)),
                 PlainItem::Client(list) => parts.push(field_list("client", list)),
-                // process_*, clash_mode, … never match and carry no description
+                PlainItem::ClashMode(list) => parts.push(field_list("clash_mode", list)),
+                // process_* and friends never match and carry no description
                 PlainItem::Unsupported => {}
             }
         }
@@ -777,6 +783,7 @@ impl PlainItem {
                 .client
                 .as_deref()
                 .is_some_and(|c| list.iter().any(|i| i == c)),
+            PlainItem::ClashMode(list) => list.iter().any(|mode| mode == crate::clash_mode::get()),
             PlainItem::Unsupported => false,
         }
     }
@@ -1287,6 +1294,25 @@ mod tests {
             route_original_destination: None,
             matched_rule: None,
         }
+    }
+
+    #[test]
+    fn clash_mode_follows_the_controller() {
+        let rule = Rule::build(
+            &json!({"action": "route", "outbound": "o", "clash_mode": ["global"]}),
+            "r",
+            true,
+        )
+        .unwrap();
+        let ctx = ctx_to("example.com", 443);
+        crate::clash_mode::set("rule");
+        assert!(!rule.matches(&ctx), "the mode is not global yet");
+        crate::clash_mode::set("global");
+        assert!(rule.matches(&ctx));
+        crate::clash_mode::set("direct");
+        assert!(!rule.matches(&ctx), "and not after switching away");
+        // the description follows the matcher
+        assert_eq!(rule.clash_view().1, "clash_mode=global");
     }
 
     #[test]

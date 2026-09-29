@@ -354,3 +354,69 @@ async fn clash_api_rest_surface() {
 
     instance.shutdown();
 }
+
+#[tokio::test]
+async fn providers_configs_and_mode() {
+    let config = serde_json::json!({
+        "log": {"level": "error"},
+        "experimental": {"clash_api": {
+            "external_controller": "127.0.0.1:0",
+            "secret": SECRET
+        }},
+        "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 0}],
+        "outbounds": [{"type": "direct", "tag": "out"}],
+        "route": {
+            "final": "out",
+            "rules": [
+                {"clash_mode": ["global"], "outbound": "out"}
+            ]
+        }
+    });
+    let instance = core_runtime::start(&config).await.expect("start");
+    let addr = instance.clash_api_addr().expect("clash-api bound");
+
+    // --- providers: the reference has no provider runtime either --------
+    let res = request(addr, &authed("/providers/proxies")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["providers"], serde_json::json!({}));
+    let res = request(addr, &authed("/providers/rules")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["providers"], serde_json::json!([]));
+
+    // --- GET /configs reports the live mode -----------------------------
+    let res = request(addr, &authed("/configs")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["mode"], "rule");
+
+    // --- PATCH /configs switches it ------------------------------------
+    let patch = |mode: &str| {
+        let body = format!("{{\"mode\":\"{mode}\"}}");
+        format!(
+            "PATCH /configs HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let res = request(addr, &patch("global")).await;
+    assert_eq!(res.status, 204, "a mode switch answers 204");
+    let res = request(addr, &authed("/configs")).await;
+    assert_eq!(res.json()["mode"], "global");
+
+    let res = request(addr, &patch("script")).await;
+    assert_eq!(res.status, 400, "an unknown mode is a bad request");
+    let res = request(addr, &authed("/configs")).await;
+    assert_eq!(
+        res.json()["mode"],
+        "global",
+        "the mode survived the refusal"
+    );
+
+    // --- PUT /configs is a no-op with 204, like the reference ----------
+    let res = request(
+        addr,
+        &format!("PUT /configs HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(res.status, 204);
+    instance.shutdown();
+}

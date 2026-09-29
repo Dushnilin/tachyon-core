@@ -1,5 +1,6 @@
 pub mod cache_file;
 pub mod clash_api;
+pub mod clash_mode;
 pub mod clash_state;
 pub mod dns;
 pub mod http_client;
@@ -85,6 +86,8 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         cache_file::CacheFileOptions::from_config(root.get("experimental"))?,
     )?
     .map(|store| Arc::new(std::sync::Mutex::new(store)));
+    // the clash mode is persisted like the reference persists bucketMode
+    clash_mode::attach_store(cache_file.clone());
     let router = Router::new(root)?;
     // remote rule sets fetch before the instance is up: a failed first fetch
     // aborts the start, exactly like `RemoteRuleSet.StartContext`

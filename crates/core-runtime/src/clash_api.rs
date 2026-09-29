@@ -380,16 +380,13 @@ async fn handle_request(
             return handle_configs(stream, method, &headers, api, &cors).await;
         }
         Route::Providers => {
-            // No provider runtime yet: the reference lists proxy/rule
-            // providers, we report the feature instead of an empty list.
-            respond_json(
-                stream,
-                404,
-                "Not Found",
-                &json!({"message": "providers are not implemented yet"}),
-                &cors,
-            )
-            .await?;
+            // The reference has no provider runtime either: it answers with an
+            // empty map for proxies and an empty list for rules.
+            let body = match path.as_str() {
+                "/providers/rules" => json!({"providers": []}),
+                _ => json!({"providers": {}}),
+            };
+            respond_json(stream, 200, "OK", &body, &cors).await?;
         }
         Route::Static(asset) => {
             return serve_static(stream, api, &asset, &cors).await;
@@ -675,7 +672,7 @@ async fn handle_configs(
                 "redir-port": 0,
                 "tproxy-port": 0,
                 "mixed-port": 0,
-                "mode": "rule",
+                "mode": crate::clash_mode::get(),
                 "log-level": logging::level().map(logging::Level::level_name),
                 "ipv6": false,
                 "allow-lan": false,
@@ -705,37 +702,46 @@ async fn handle_configs(
                 .get("log-level")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            match requested {
-                Some(level) if !logging::set_level(&level) => {
+            if let Some(level) = &requested
+                && !logging::set_level(level)
+            {
+                respond_json(
+                    stream,
+                    400,
+                    "Bad Request",
+                    &json!({"message": "invalid log level"}),
+                    cors,
+                )
+                .await?;
+                return Ok(true);
+            }
+            if let Some(level) = &requested {
+                logging::info(format_args!("clash-api: log level set to {level}"));
+            }
+            // the reference also takes the clash mode here
+            if let Some(mode) = value.get("mode").and_then(Value::as_str) {
+                if !crate::clash_mode::set(mode) {
                     respond_json(
                         stream,
                         400,
                         "Bad Request",
-                        &json!({"message": "invalid log level"}),
+                        &json!({"message": "invalid mode"}),
                         cors,
                     )
                     .await?;
+                    return Ok(true);
                 }
-                Some(level) => {
-                    logging::info(format_args!("clash-api: log level set to {level}"));
-                    respond_no_content(stream, cors).await?;
-                }
-                None => {
-                    respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
-                }
+                logging::info(format_args!("clash-api: mode set to {mode}"));
             }
+            if requested.is_none() && value.get("mode").is_none() {
+                respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
+                return Ok(true);
+            }
+            respond_no_content(stream, cors).await?;
         }
-        _ => {
-            // PUT would reload the whole configuration; unsupported.
-            respond_json(
-                stream,
-                501,
-                "Not Implemented",
-                &json!({"message": "config reload is not implemented yet"}),
-                cors,
-            )
-            .await?;
-        }
+        // The reference answers a config upload with 204 and changes nothing:
+        // it has no reload path either.
+        _ => respond_no_content(stream, cors).await?,
     }
     Ok(true)
 }

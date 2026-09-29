@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"hysteria2","tag":"h","server":"1.2.3.4","server_port":443,"password":"pw","obfs":{"type":"salamander","password":"x","max_packet_size":1500},"tls":{"enabled":true,"insecure":true}}],"route":{"final":"h"}}

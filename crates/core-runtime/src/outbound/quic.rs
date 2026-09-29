@@ -2,12 +2,13 @@
 //! construction without ring-gated helpers, salamander obfs relay, varint and
 //! sing address codecs, padding, and a stream duplex adapter.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quinn::VarInt;
 use serde_json::Value;
@@ -391,6 +392,251 @@ pub(crate) fn salamander_open(password: &[u8], packet: &[u8]) -> Option<Vec<u8>>
     Some(out)
 }
 
+/// Gecko obfuscation: the salamander framing plus a fragmentation layer, from
+/// `sing-quic/hysteria2/gecko.go`.
+///
+/// A packet whose first byte has the fragment flag set is split into 2..=8
+/// chunks, each prefixed with `[flag][msg id][index<<4 | count][pad_len:u16]`
+/// and padded with random bytes so the datagram looks like ordinary traffic.
+/// The receiver reassembles by message id until every chunk arrived.
+const GECKO_FRAGMENT_FLAG: u8 = 0x80;
+const GECKO_HEADER_LEN: usize = 5;
+const GECKO_MIN_CHUNKS: usize = 2;
+const GECKO_MAX_CHUNKS: usize = 8;
+const GECKO_DEFAULT_MIN_PACKET: usize = 512;
+const GECKO_DEFAULT_MAX_PACKET: usize = 1200;
+const GECKO_MAX_ON_WIRE: usize = 2048;
+const GECKO_REASSEMBLY_TTL: Duration = Duration::from_secs(8);
+const GECKO_MAX_REASSEMBLY: usize = 4096;
+
+/// Reassembles gecko fragments on the way in.
+pub(crate) struct GeckoReassembler {
+    chunks: HashMap<u8, GeckoEntry>,
+    bytes: usize,
+    last_sweep: Instant,
+}
+
+struct GeckoEntry {
+    chunks: Vec<Option<Vec<u8>>>,
+    total: usize,
+    deadline: Instant,
+}
+
+impl GeckoReassembler {
+    pub(crate) fn new() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            bytes: 0,
+            last_sweep: Instant::now(),
+        }
+    }
+
+    /// `Some(packet)` once every chunk of a message arrived.
+    pub(crate) fn accept(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.is_empty() {
+            return None;
+        }
+        if packet[0] & GECKO_FRAGMENT_FLAG == 0 {
+            return Some(packet.to_vec());
+        }
+        if packet.len() < GECKO_HEADER_LEN {
+            return None;
+        }
+        let message_id = packet[1];
+        let index = usize::from(packet[2] >> 4);
+        let total = usize::from(packet[2] & 0x0f);
+        let pad = usize::from(u16::from_be_bytes([packet[3], packet[4]]));
+        if !(GECKO_MIN_CHUNKS..=GECKO_MAX_CHUNKS).contains(&total) || index >= total {
+            return None;
+        }
+        let start = GECKO_HEADER_LEN + pad;
+        if start > packet.len() {
+            return None;
+        }
+        self.sweep();
+        if !self.chunks.contains_key(&message_id) && self.chunks.len() >= GECKO_MAX_REASSEMBLY {
+            self.evict_oldest();
+        }
+        let now = Instant::now();
+        let entry = self.chunks.entry(message_id).or_insert_with(|| GeckoEntry {
+            chunks: (0..total).map(|_| None).collect(),
+            total,
+            deadline: now + GECKO_REASSEMBLY_TTL,
+        });
+        if entry.total != total {
+            return None;
+        }
+        if index >= entry.chunks.len() || entry.chunks[index].is_some() {
+            return None;
+        }
+        let chunk = packet[start..].to_vec();
+        self.bytes += chunk.len();
+        entry.chunks[index] = Some(chunk);
+        if entry.chunks.iter().any(Option::is_none) {
+            return None;
+        }
+        let entry = self.chunks.remove(&message_id)?;
+        self.bytes -= entry.chunks.iter().flatten().map(Vec::len).sum::<usize>();
+        let mut out = Vec::new();
+        for chunk in entry.chunks.into_iter().flatten() {
+            out.extend_from_slice(&chunk);
+        }
+        Some(out)
+    }
+
+    fn sweep(&mut self) {
+        if self.last_sweep.elapsed() < GECKO_REASSEMBLY_TTL / 2 {
+            return;
+        }
+        let now = Instant::now();
+        self.chunks.retain(|_, entry| entry.deadline > now);
+        self.last_sweep = now;
+    }
+
+    fn evict_oldest(&mut self) {
+        let Some(oldest) = self
+            .chunks
+            .iter()
+            .min_by_key(|(_, entry)| entry.deadline)
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        if let Some(entry) = self.chunks.remove(&oldest) {
+            self.bytes -= entry.chunks.iter().flatten().map(Vec::len).sum::<usize>();
+        }
+    }
+}
+
+/// Splits one packet into gecko frames, each already padded.
+pub(crate) fn gecko_frames(
+    payload: &[u8],
+    message_id: u8,
+    min_packet_size: usize,
+    max_packet_size: usize,
+) -> Vec<Vec<u8>> {
+    let chunks = GECKO_MIN_CHUNKS + random_below(GECKO_MAX_CHUNKS - GECKO_MIN_CHUNKS + 1);
+    let chunk_size = (payload.len() / chunks).max(1);
+    let mut frames = Vec::with_capacity(chunks);
+    for index in 0..chunks {
+        let start = (index * chunk_size).min(payload.len());
+        let end = if index + 1 < chunks {
+            (start + chunk_size).min(payload.len())
+        } else {
+            payload.len()
+        };
+        let chunk = &payload[start..end];
+        // the on-wire size is the salamander salt plus this header and chunk
+        let base = 8 + GECKO_HEADER_LEN + chunk.len();
+        let low = min_packet_size.max(base);
+        let pad = if low > max_packet_size {
+            0
+        } else {
+            low - base + random_below(max_packet_size - low + 1)
+        };
+        let mut frame = vec![0u8; GECKO_HEADER_LEN + pad + chunk.len()];
+        frame[0] = GECKO_FRAGMENT_FLAG;
+        frame[1] = message_id;
+        frame[2] = (index as u8) << 4 | chunks as u8;
+        frame[3..5].copy_from_slice(&(pad as u16).to_be_bytes());
+        let _ = random_bytes(&mut frame[GECKO_HEADER_LEN..GECKO_HEADER_LEN + pad]);
+        frame[GECKO_HEADER_LEN + pad..].copy_from_slice(chunk);
+        frames.push(frame);
+    }
+    frames
+}
+
+fn random_below(limit: usize) -> usize {
+    if limit <= 1 {
+        return 0;
+    }
+    let mut bytes = [0u8; 8];
+    let _ = random_bytes(&mut bytes);
+    (u64::from_le_bytes(bytes) % limit as u64) as usize
+}
+
+/// Two-socket relay that applies gecko on top of salamander, in both
+/// directions. The salamander password is the same; only the framing differs.
+pub(crate) async fn spawn_gecko_relay(
+    server: SocketAddr,
+    password: Vec<u8>,
+    endpoint_local: SocketAddr,
+    min_packet_size: usize,
+    max_packet_size: usize,
+) -> io::Result<SalamanderRelay> {
+    let min_packet_size = if min_packet_size == 0 {
+        GECKO_DEFAULT_MIN_PACKET
+    } else {
+        min_packet_size
+    };
+    let max_packet_size = if max_packet_size == 0 {
+        GECKO_DEFAULT_MAX_PACKET
+    } else {
+        max_packet_size
+    };
+    if min_packet_size > max_packet_size || max_packet_size > GECKO_MAX_ON_WIRE {
+        return Err(io::Error::other("gecko: invalid packet size range"));
+    }
+    let ep_bind = if server.is_ipv4() {
+        "127.0.0.1:0"
+    } else {
+        "[::1]:0"
+    };
+    let sock_ep = Arc::new(tokio::net::UdpSocket::bind(ep_bind).await?);
+    sock_ep.connect(endpoint_local).await?;
+    let local = sock_ep.local_addr()?;
+
+    let srv_bind = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock_srv = Arc::new(tokio::net::UdpSocket::bind(srv_bind).await?);
+    sock_srv.connect(server).await?;
+
+    let pw_up = password.clone();
+    let sock_ep_up = Arc::clone(&sock_ep);
+    let sock_srv_up = Arc::clone(&sock_srv);
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        let mut message_id = 0u8;
+        loop {
+            let Ok(n) = sock_ep_up.recv(&mut buf).await else {
+                break;
+            };
+            message_id = message_id.wrapping_add(1);
+            for frame in gecko_frames(&buf[..n], message_id, min_packet_size, max_packet_size) {
+                let sealed = salamander_seal(&pw_up, &frame);
+                if sock_srv_up.send(&sealed).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let down = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        let mut reassembler = GeckoReassembler::new();
+        loop {
+            let Ok(n) = sock_srv.recv(&mut buf).await else {
+                break;
+            };
+            let Some(plain) = salamander_open(&password, &buf[..n]) else {
+                continue;
+            };
+            let Some(packet) = reassembler.accept(&plain) else {
+                continue;
+            };
+            if sock_ep.send(&packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(SalamanderRelay {
+        local,
+        handles: vec![up, down],
+    })
+}
+
 /// Two-socket salamander relay in front of a quinn endpoint.
 ///
 /// * `sock_ep` — loopback, connected to the endpoint's local addr (plaintext side).
@@ -716,6 +962,70 @@ mod tests {
         );
         assert_eq!(parse_memory_bytes(Some(&json!("2k")), "t").unwrap(), 2048);
         assert!(parse_memory_bytes(Some(&json!("2xx")), "t").is_err());
+    }
+
+    #[test]
+    fn gecko_frames_split_and_reassemble() {
+        let payload: Vec<u8> = (0..600u32).map(|i| i as u8).collect();
+        let frames = gecko_frames(&payload, 7, 512, 1200);
+        assert!((2..=8).contains(&frames.len()), "chunks: {}", frames.len());
+        let mut reassembler = GeckoReassembler::new();
+        let mut out = Vec::new();
+        for frame in &frames {
+            // every frame is a legal salamander payload plus padding
+            assert_eq!(frame[0], GECKO_FRAGMENT_FLAG);
+            assert_eq!(frame[1], 7, "the message id rides along");
+            let pad = usize::from(u16::from_be_bytes([frame[3], frame[4]]));
+            assert!(GECKO_HEADER_LEN + pad <= frame.len());
+            if let Some(packet) = reassembler.accept(frame) {
+                out = packet;
+            }
+        }
+        assert_eq!(out, payload);
+        assert!(
+            reassembler.chunks.is_empty(),
+            "the reassembly buffer is released"
+        );
+    }
+
+    #[test]
+    fn gecko_frames_respect_the_size_range() {
+        let payload = vec![0u8; 1000];
+        for frame in gecko_frames(&payload, 1, 512, 1200) {
+            // the wire size is the salamander salt plus this frame
+            let wire = 8 + frame.len();
+            assert!(
+                (512..=1200).contains(&wire),
+                "frame of {wire} bytes is outside the negotiated range"
+            );
+        }
+    }
+
+    #[test]
+    fn gecko_passes_unfragmented_packets_through() {
+        let mut reassembler = GeckoReassembler::new();
+        assert_eq!(
+            reassembler.accept(&[0x40, 1, 2, 3]).expect("plain"),
+            vec![0x40, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn gecko_rejects_malformed_frames() {
+        let mut reassembler = GeckoReassembler::new();
+        // shorter than the header
+        assert!(reassembler.accept(&[GECKO_FRAGMENT_FLAG, 1]).is_none());
+        // a chunk count outside 2..=8
+        let mut frame = vec![GECKO_FRAGMENT_FLAG, 1, 1, 0, 0];
+        frame.extend_from_slice(b"x");
+        assert!(reassembler.accept(&frame).is_none());
+        // an index past the declared count
+        let mut frame = vec![GECKO_FRAGMENT_FLAG, 1, 0x22, 0, 0];
+        frame.extend_from_slice(b"x");
+        assert!(reassembler.accept(&frame).is_none());
+        // a pad length past the end of the frame
+        let frame = [GECKO_FRAGMENT_FLAG, 1, 2, 0xff, 0xff, b'x'];
+        assert!(reassembler.accept(&frame).is_none());
     }
 
     #[test]

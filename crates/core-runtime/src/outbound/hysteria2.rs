@@ -18,7 +18,7 @@ use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, QuicStream, QuicTunnelDefaults,
     QuicTunnelOptions, SalamanderRelay, VarintReader, bind_udp, bind_udp_loopback, dest_string,
     io_from_datagram, io_from_quinn, put_varint, random_padding, read_varint, resolve_host,
-    spawn_salamander_relay, udp_loopback_pair,
+    spawn_gecko_relay, spawn_salamander_relay, udp_loopback_pair,
 };
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
@@ -41,6 +41,8 @@ pub struct Hysteria2 {
     want_tcp: bool,
     want_udp: bool,
     obfs_password: Option<Vec<u8>>,
+    /// `obfs.type: gecko` adds a fragmentation layer on top of salamander
+    gecko: Option<(usize, usize)>,
     quic: QuicTunnelOptions,
     tls: TlsOptions,
     connect_timeout: Duration,
@@ -58,6 +60,7 @@ impl Hysteria2 {
             anyhow::bail!("{at}: realm is not implemented yet");
         }
 
+        let mut gecko_sizes = None;
         let obfs_password = match obj.get("obfs") {
             None | Some(Value::Null) => None,
             Some(Value::Object(m)) => {
@@ -70,7 +73,28 @@ impl Hysteria2 {
                         }
                         Some(pw.as_bytes().to_vec())
                     }
-                    "gecko" => anyhow::bail!("{at}: obfs type gecko not implemented yet"),
+                    "gecko" => {
+                        let pw = m.get("password").and_then(Value::as_str).unwrap_or("");
+                        if pw.is_empty() {
+                            anyhow::bail!("{at}: missing obfs password");
+                        }
+                        gecko_sizes = Some((
+                            m.get("min_packet_size")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as usize,
+                            m.get("max_packet_size")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0) as usize,
+                        ));
+                        // the reference rejects the range before dialling
+                        let (min, max) = gecko_sizes.expect("gecko sizes");
+                        let max = if max == 0 { 1200 } else { max };
+                        let min = if min == 0 { 512 } else { min };
+                        if min > max || max > 2048 {
+                            anyhow::bail!("{at}: gecko packet size range {min}-{max} is invalid");
+                        }
+                        Some(pw.as_bytes().to_vec())
+                    }
                     other => anyhow::bail!("{at}: unknown obfs type: {other}"),
                 }
             }
@@ -145,6 +169,7 @@ impl Hysteria2 {
             want_tcp: network_includes_tcp(obj),
             want_udp: network_includes_udp(obj),
             obfs_password,
+            gecko: gecko_sizes,
             quic,
             tls,
             connect_timeout,
@@ -189,9 +214,20 @@ impl Hysteria2 {
         endpoint.set_default_client_config(client_config);
 
         let relay = if let Some(pw) = &self.obfs_password {
-            let relay = spawn_salamander_relay(addr, pw.clone(), endpoint.local_addr()?)
-                .await
-                .map_err(|e| io::Error::other(format!("hysteria2: obfs relay: {e}")))?;
+            let relay = match self.gecko {
+                Some((min_packet_size, max_packet_size)) => {
+                    spawn_gecko_relay(
+                        addr,
+                        pw.clone(),
+                        endpoint.local_addr()?,
+                        min_packet_size,
+                        max_packet_size,
+                    )
+                    .await
+                }
+                None => spawn_salamander_relay(addr, pw.clone(), endpoint.local_addr()?).await,
+            }
+            .map_err(|e| io::Error::other(format!("hysteria2: obfs relay: {e}")))?;
             Some(relay)
         } else {
             None

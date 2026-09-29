@@ -407,6 +407,59 @@ mod tests {
     }
 
     #[test]
+    fn a_named_client_is_resolved_by_its_tag() {
+        let root = serde_json::json!({
+            "http_clients": [
+                {"tag": "clash", "detour": "proxy", "headers": {"user-agent": "meta"}},
+                {"tag": "plain"}
+            ]
+        });
+        let registry = Registry::from_config(&root).expect("registry");
+        let route = serde_json::Map::new();
+
+        // an object is the client itself, a string names a registry entry
+        assert_eq!(
+            registry
+                .resolve(Some(&serde_json::json!({"detour": "direct"})), "rs")
+                .expect("object"),
+            Some(serde_json::json!({"detour": "direct"}))
+        );
+        assert_eq!(
+            registry
+                .resolve(Some(&serde_json::json!("clash")), "rs")
+                .expect("tag")
+                .expect("entry")["detour"],
+            serde_json::json!("proxy")
+        );
+        assert!(
+            registry
+                .resolve(Some(&serde_json::json!("nope")), "rs")
+                .expect_err("unknown tag")
+                .to_string()
+                .contains("http client not found: nope")
+        );
+
+        // `route.default_http_client` is the one named for every other fetch
+        assert!(
+            registry
+                .default_client(&route)
+                .expect("no default")
+                .is_none()
+        );
+        let with_default = serde_json::Map::from_iter([(
+            "default_http_client".into(),
+            serde_json::json!("plain"),
+        )]);
+        assert!(
+            registry
+                .default_client(&with_default)
+                .expect("default")
+                .expect("entry")["tag"]
+                == "plain"
+        );
+    }
+
+    #[test]
     fn url_parsing() {
         let parsed = url("https://example.com/a/b?c=d");
         assert!(parsed.secure);
@@ -583,5 +636,79 @@ mod tests {
         server.await.ok();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"ok");
+    }
+}
+
+/// The top-level `http_clients` registry: the named clients a string
+/// `http_client` -- or `route.default_http_client` -- points at. A value
+/// that is an object is the client itself; a string is a tag into this
+/// map, exactly as `option.HTTPClient.UnmarshalJSON` resolves it.
+#[derive(Debug, Default, Clone)]
+pub struct Registry {
+    clients: std::collections::HashMap<String, Value>,
+}
+
+impl Registry {
+    pub fn from_config(root: &Value) -> anyhow::Result<Self> {
+        let mut clients = std::collections::HashMap::new();
+        let empty = Vec::new();
+        for (i, entry) in root
+            .get("http_clients")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty)
+            .iter()
+            .enumerate()
+        {
+            let at = format!("http_clients[{i}]");
+            let object = entry
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("{at}: must be a JSON object"))?;
+            let tag = object
+                .get("tag")
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("missing http client tag"))?;
+            if clients.insert(tag.to_string(), entry.clone()).is_some() {
+                anyhow::bail!("duplicate http client tag: {tag}");
+            }
+        }
+        Ok(Self { clients })
+    }
+
+    /// The object a `http_client` value stands for.
+    pub fn resolve(&self, value: Option<&Value>, at: &str) -> anyhow::Result<Option<Value>> {
+        let Some(value) = value.filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        match value {
+            Value::String(tag) => self
+                .clients
+                .get(tag)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("{at}: http client not found: {tag}")),
+            other => Ok(Some(other.clone())),
+        }
+    }
+
+    /// `route.default_http_client`, named once for every download that
+    /// carries no client of its own.
+    pub fn default_client(
+        &self,
+        route: &serde_json::Map<String, Value>,
+    ) -> anyhow::Result<Option<Value>> {
+        let tag = route
+            .get("default_http_client")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.is_empty());
+        match tag {
+            None => Ok(None),
+            Some(tag) => self
+                .clients
+                .get(tag)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("route.default_http_client: not found: {tag}")),
+        }
     }
 }

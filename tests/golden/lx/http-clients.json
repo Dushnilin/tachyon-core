@@ -1,0 +1,24 @@
+{
+  "http_clients": [
+    {
+      "tag": "clash",
+      "detour": "d",
+      "version": 3,
+      "headers": { "user-agent": "clash.meta" }
+    },
+    { "tag": "plain", "tls": { "enabled": true, "server_name": "example.com" } }
+  ],
+  "route": {
+    "default_http_client": "plain",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite",
+        "format": "binary",
+        "url": "https://example.com/geosite.srs",
+        "http_client": "clash"
+      }
+    ]
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

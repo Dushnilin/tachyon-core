@@ -2142,6 +2142,51 @@ fn validate_realm(value: &Value, at: &str, inbound: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// The top-level `http_clients` registry: `option._Options.HTTPClients`.
+/// Each entry decodes like the inline `http_client` object, plus the tag the
+/// registry is keyed by — the reference reports those two before it looks at
+/// anything inside the entry.
+fn validate_http_clients(clients: &Value) -> Result<(), String> {
+    if clients.is_null() {
+        return Ok(());
+    }
+    let list = clients.as_array().ok_or_else(|| {
+        go_type_error(
+            clients,
+            "http_clients",
+            "_Options",
+            "http_clients",
+            "[]option.HTTPClient",
+        )
+    })?;
+    let mut tags: HashSet<String> = HashSet::new();
+    for (i, entry) in list.iter().enumerate() {
+        let at = format!("http_clients[{i}]");
+        let object = entry.as_object().ok_or_else(|| {
+            go_type_error(
+                entry,
+                &at,
+                "_Options",
+                "http_clients",
+                "option._HTTPClientOptions",
+            )
+        })?;
+        let tag = object
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.is_empty());
+        match tag {
+            None => return Err("missing http client tag".to_string()),
+            Some(tag) if !tags.insert(tag.to_string()) => {
+                return Err(format!("duplicate http client tag: {tag}"));
+            }
+            Some(_) => {}
+        }
+        validate_http_client(entry, &at)?;
+    }
+    Ok(())
+}
+
 fn validate_http_client(value: &Value, at: &str) -> Result<(), String> {
     if value.is_null() || value.is_string() {
         return Ok(());
@@ -3168,10 +3213,15 @@ fn validate_rule_sets(route: &Map<String, Value>) -> Result<(), String> {
             )?;
         }
         if let Some(client) = entry.get("http_client").filter(|v| !prunes_value(v)) {
-            let client = client.as_object().ok_or_else(|| {
-                format!("{at}.http_client: json: cannot unmarshal {} into Go value of type option.HTTPClientOptions", json_kind(client))
-            })?;
-            reject_unknown_fields(client, HTTP_CLIENT_FIELDS, &format!("{at}.http_client"))?;
+            // a string is a `http_clients` tag, resolved when the set starts
+            if let Some(client) = client.as_object() {
+                reject_unknown_fields(client, HTTP_CLIENT_FIELDS, &format!("{at}.http_client"))?;
+            } else if !client.is_string() {
+                return Err(format!(
+                    "{at}.http_client: json: cannot unmarshal {} into Go value of type option.HTTPClientOptions",
+                    json_kind(client)
+                ));
+            }
         }
         if let Some(rules) = entry.get("rules").filter(|v| !prunes_value(v)) {
             let rules = rules.as_array().ok_or_else(|| {
@@ -3975,6 +4025,9 @@ pub fn validate(root: &Value) -> Result<(), String> {
     }
     resolve_lx_values(&lx)?;
 
+    if let Some(clients) = root.get("http_clients") {
+        validate_http_clients(clients)?;
+    }
     if let Some(log) = root.get("log") {
         validate_log(log)?;
     }
@@ -9987,6 +10040,40 @@ mod tests {
         // decode errors precede the deprecation guard
         let err = run(json!({"experimental": {"clash_api": {"store_mode": 1}}}));
         assert!(!err.starts_with("create clash-server"), "{err}");
+    }
+
+    #[test]
+    fn the_http_clients_registry_needs_unique_tags() {
+        let base = serde_json::json!({"outbounds": [{"type": "direct", "tag": "d"}]});
+        let with = |clients: serde_json::Value| {
+            let mut root = base.clone();
+            root["http_clients"] = clients;
+            validate(&root)
+        };
+        assert!(
+            with(serde_json::json!([{"tag": "a"}, {"tag": "a"}]))
+                .unwrap_err()
+                .contains("duplicate http client tag: a")
+        );
+        assert_eq!(
+            with(serde_json::json!([{"detour": "d"}])).unwrap_err(),
+            "missing http client tag"
+        );
+        assert_eq!(
+            with(serde_json::json!(["a"])).unwrap_err(),
+            "http_clients[0]: json: cannot unmarshal string into Go struct field \
+             _Options.http_clients of type option._HTTPClientOptions"
+        );
+        assert!(
+            with(serde_json::json!([{"tag": "a", "bogus": 1}]))
+                .unwrap_err()
+                .contains("http_clients[0].bogus: json: unknown field \"bogus\""),
+            "an entry decodes like the inline object form"
+        );
+        assert!(
+            with(serde_json::json!([{"tag": "a", "detour": "d"}])).is_ok(),
+            "a tag is the only thing it adds"
+        );
     }
 
     #[test]

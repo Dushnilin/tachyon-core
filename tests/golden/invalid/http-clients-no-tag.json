@@ -1,0 +1,4 @@
+{
+  "http_clients": [{ "detour": "d" }],
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

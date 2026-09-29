@@ -63,6 +63,10 @@ pub struct Rule {
     pub domain_keyword: Vec<String>,
     pub domain_regex: Vec<Regex>,
     pub source_ip_cidr: Vec<super::transport::IpPrefix>,
+    /// `route.find_neighbor`: the asking client's hardware address and DHCP
+    /// hostname.
+    pub source_mac: Vec<crate::route::neighbor::MacAddr>,
+    pub source_hostname: Vec<String>,
     pub network: Vec<String>,
     /// The rule sets this DNS rule consults.
     pub rule_sets: Vec<std::sync::Arc<crate::route::rule_set::RuleSet>>,
@@ -200,6 +204,11 @@ impl Rule {
             domain_keyword,
             domain_regex,
             source_ip_cidr,
+            source_mac: string_list(map, "source_mac_address", at)?
+                .iter()
+                .map(|raw| crate::route::neighbor::parse_mac(raw).unwrap_or([0; 6]))
+                .collect(),
+            source_hostname: string_list(map, "source_hostname", at)?,
             network,
             rule_sets,
             invert,
@@ -317,6 +326,29 @@ impl Rule {
         }
         if !self.domain.is_empty() && !self.domain.iter().any(|d| d == &query.name) {
             return false;
+        }
+        if !self.source_mac.is_empty() || !self.source_hostname.is_empty() {
+            // the neighbour tables, when they are running at all
+            let found = meta.source.and_then(|source| {
+                crate::route::neighbor::current().map(|resolver| {
+                    (
+                        resolver.lookup_mac(source),
+                        resolver.lookup_hostname(source),
+                    )
+                })
+            });
+            let (mac, hostname) = found.unwrap_or((None, None));
+            if !self.source_mac.is_empty() && !mac.is_some_and(|mac| self.source_mac.contains(&mac))
+            {
+                return false;
+            }
+            if !self.source_hostname.is_empty()
+                && !hostname
+                    .as_deref()
+                    .is_some_and(|name| self.source_hostname.iter().any(|item| item == name))
+            {
+                return false;
+            }
         }
         if !self.rule_sets.is_empty() && self.matches_rule_sets(meta, query) {
             return true;

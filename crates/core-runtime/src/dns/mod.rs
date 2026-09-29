@@ -446,7 +446,10 @@ impl DnsService {
                 return self.answer(&target, &raw, info.id);
             }
             Kind::Local => {
-                let addrs = system_lookup(&info.name).await;
+                let addrs = match self.neighbor_lookup(&target, &info.name) {
+                    Some(addresses) => addresses,
+                    None => system_lookup(&info.name).await,
+                };
                 if addrs.is_empty() {
                     return codec::name_error(&query_msg).map_err(std::io::Error::other);
                 }
@@ -660,6 +663,33 @@ impl DnsService {
         })
     }
 
+    /// The `local` transport's `neighbor_domain`: `<host><suffix>` answered from
+    /// the neighbour tables, the way the reference's
+    /// `PreferredDomainResolver` answers before it falls back to the system.
+    fn neighbor_lookup(&self, cfg: &ServerConfig, name: &str) -> Option<Vec<IpAddr>> {
+        if cfg.neighbor_domain.is_empty() {
+            return None;
+        }
+        let resolver = crate::route::neighbor::current()?;
+        let canonical = codec::normalize_name(name);
+        for entry in &cfg.neighbor_domain {
+            // the entries keep their leading dot (`check` insists on it), so
+            // the suffix is matched as written
+            let suffix = codec::normalize_name(entry);
+            if !suffix.starts_with('.') {
+                continue;
+            }
+            let Some(host) = canonical.strip_suffix(&suffix) else {
+                continue;
+            };
+            let addresses = resolver.lookup_addresses(host);
+            if !addresses.is_empty() {
+                return Some(addresses);
+            }
+        }
+        None
+    }
+
     /// One member exchange for a group: straight to the transport, with no
     /// rule walk and no cache of its own — the group owns both, and a nested
     /// group runs its own selection.
@@ -679,7 +709,10 @@ impl DnsService {
         }
         if cfg.kind == Kind::Local {
             let (query_msg, info) = codec::parse_query(query)?;
-            let addrs = system_lookup(&info.name).await;
+            let addrs = match self.neighbor_lookup(cfg, &info.name) {
+                Some(addresses) => addresses,
+                None => system_lookup(&info.name).await,
+            };
             if addrs.is_empty() {
                 return codec::name_error(&query_msg).map_err(std::io::Error::other);
             }

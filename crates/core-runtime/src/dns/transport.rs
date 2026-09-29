@@ -60,6 +60,9 @@ pub struct ServerConfig {
     /// `type: group`: the lx group this tag stands for, with its members'
     /// tags and its own budget. Present only for a group.
     pub group: Option<Arc<super::group::Group>>,
+    /// `type: local` with `neighbor_domain`: the suffixes a `<host><suffix>`
+    /// name is answered from the neighbour tables under.
+    pub neighbor_domain: Vec<String>,
 }
 
 /// The `hosts` server's sources: the files it reads and the inline entries,
@@ -588,6 +591,16 @@ impl ServerConfig {
             }
             _ => None,
         };
+        let neighbor_domain = match map.get("neighbor_domain") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(entry)) => vec![entry.clone()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(_) => anyhow::bail!("{at}.neighbor_domain: must be a string or a list"),
+        };
         Ok(Self {
             tag,
             kind,
@@ -604,6 +617,7 @@ impl ServerConfig {
             headers,
             hosts,
             group,
+            neighbor_domain,
         })
     }
 

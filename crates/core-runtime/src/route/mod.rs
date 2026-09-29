@@ -1,6 +1,7 @@
 //! Routing engine: rule walk with actions (route / route-options / reject /
 //! hijack-dns / sniff / resolve), connection context, and outbound dispatch.
 
+pub mod neighbor;
 pub mod rule;
 pub mod rule_set;
 pub mod rule_set_remote;
@@ -78,6 +79,11 @@ pub struct ConnContext {
     pub route_original_destination: Option<Target>,
     /// Clash connection view: the rule that produced the decision.
     pub matched_rule: Option<(String, String)>,
+    /// `route.find_neighbor`: the client's hardware address, when the
+    /// neighbour tables know it.
+    pub source_mac: Option<neighbor::MacAddr>,
+    /// `route.find_neighbor`: the client's DHCP hostname.
+    pub source_hostname: Option<String>,
 }
 
 use std::net::IpAddr;
@@ -107,6 +113,8 @@ impl ConnContext {
             ip_version: None,
             route_original_destination: None,
             matched_rule: None,
+            source_mac: None,
+            source_hostname: None,
         }
     }
 }
@@ -400,8 +408,6 @@ const ROUTE_UNIMPL_FIELDS: &[&str] = &[
     "geoip",
     "geosite",
     "find_process",
-    "find_neighbor",
-    "dhcp_lease_files",
     "override_android_vpn",
     "default_network_strategy",
     "default_network_type",
@@ -418,6 +424,8 @@ pub struct RouteDefaults {
     pub default_mark: Option<u32>,
     /// `route.default_domain_resolver` server tag (string form or `.server`).
     pub default_domain_resolver: Option<String>,
+    /// `route.find_neighbor`: learn the client's MAC and DHCP hostname.
+    pub find_neighbor: bool,
 }
 
 impl RouteDefaults {
@@ -439,6 +447,10 @@ impl RouteDefaults {
                 .and_then(Value::as_u64)
                 .map(|v| v as u32),
             default_domain_resolver: None,
+            find_neighbor: map
+                .get("find_neighbor")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
         match map.get("default_domain_resolver") {
             None | Some(Value::Null) => {}
@@ -501,6 +513,21 @@ pub struct Router {
     defaults: RouteDefaults,
     rule_sets: Option<rule_set::RuleSetRegistry>,
     probe_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// A `local` DNS server with `neighbor_domain` answers from the same tables.
+fn neighbor_domain_configured(root: &Value) -> bool {
+    root.get("dns")
+        .and_then(|dns| dns.get("servers"))
+        .and_then(Value::as_array)
+        .is_some_and(|servers| {
+            servers.iter().any(|server| {
+                server.get("type").and_then(Value::as_str) == Some("local")
+                    && server
+                        .get("neighbor_domain")
+                        .is_some_and(|value| !value.is_null())
+            })
+        })
 }
 
 impl Router {
@@ -651,6 +678,30 @@ impl Router {
             }
             None => 0,
         };
+        // `route.find_neighbor`, a rule that asks for the client's MAC or
+        // hostname, or a `local` DNS server with `neighbor_domain`: any of
+        // them needs the tables the reference builds once per process.
+        let lease_files: Vec<String> = root
+            .get("route")
+            .and_then(|route| route.get("dhcp_lease_files"))
+            .map(|value| match value {
+                Value::String(path) => vec![path.clone()],
+                Value::Array(list) => list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        if defaults.find_neighbor
+            || rules.iter().any(Rule::needs_neighbor)
+            || neighbor_domain_configured(&root)
+        {
+            let resolver = neighbor::NeighborResolver::new(&lease_files);
+            resolver.start();
+            neighbor::install(resolver);
+        }
         let router = Arc::new(Router {
             outbounds,
             tags,
@@ -867,6 +918,12 @@ fn prepare(ctx: &mut ConnContext) {
         // domain rules get to see the name the answer came from
         ctx.domain = Some(domain.clone());
         logging::debug(format_args!("route: found reverse mapped domain: {domain}"));
+    }
+    // `route.find_neighbor`: the client's own identity, for the
+    // `source_mac_address` / `source_hostname` rule items
+    if let Some(resolver) = neighbor::current() {
+        ctx.source_mac = resolver.lookup_mac(ctx.source.ip());
+        ctx.source_hostname = resolver.lookup_hostname(ctx.source.ip());
     }
     ctx.ip_version = match ctx.destination {
         Target::Ip(a) => Some(if a.is_ipv6() { 6 } else { 4 }),

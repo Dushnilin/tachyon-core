@@ -1,0 +1,10 @@
+{
+  "route": {
+    "find_neighbor": true,
+    "rules": [
+      { "source_hostname": ["tv"], "action": "route", "outbound": "d" }
+    ],
+    "final": "d"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

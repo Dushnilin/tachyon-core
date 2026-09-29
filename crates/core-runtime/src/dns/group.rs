@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -139,7 +140,17 @@ impl Group {
         members: Arc<dyn Members>,
         query: &[u8],
     ) -> io::Result<Vec<u8>> {
-        match tokio::time::timeout(self.budget, self.exchange_inner(members, query)).await {
+        // the reference records a failure only while the request budget is
+        // alive: a result that arrives after the answer says nothing about the
+        // server, it only says the caller is gone
+        let live = Arc::new(AtomicBool::new(true));
+        let result = tokio::time::timeout(
+            self.budget,
+            self.exchange_inner(members, query, Arc::clone(&live)),
+        )
+        .await;
+        live.store(false, Ordering::SeqCst);
+        match result {
             Ok(result) => result,
             Err(_) => Err(io::Error::other(format!(
                 "group[{}]: no answer within {:?}",
@@ -152,12 +163,15 @@ impl Group {
         self: &Arc<Self>,
         members: Arc<dyn Members>,
         query: &[u8],
+        live: Arc<AtomicBool>,
     ) -> io::Result<Vec<u8>> {
         match self.select()? {
-            Selection::Fan { tags, election } => self.fan(members, query, &tags, election).await,
+            Selection::Fan { tags, election } => {
+                self.fan(members, query, &tags, election, live).await
+            }
             Selection::Survival { tag } => self.survival(members, query, &tag).await,
             Selection::Single { tag, provisional } => {
-                self.single(members, query, &tag, provisional).await
+                self.single(members, query, &tag, provisional, live).await
             }
         }
     }
@@ -221,6 +235,7 @@ impl Group {
         query: &[u8],
         tag: &str,
         provisional: bool,
+        live: Arc<AtomicBool>,
     ) -> io::Result<Vec<u8>> {
         // a provisional pick (an election-window concurrent) serves the query
         // but must not move the sticky target
@@ -239,7 +254,7 @@ impl Group {
         if rescuers.is_empty() {
             return failure(tag, response, error, &self.tag);
         }
-        self.fan(members, query, &rescuers, false).await
+        self.fan(members, query, &rescuers, false, live).await
     }
 
     /// Survival: no clean member, so exactly one attempt with the full budget —
@@ -273,6 +288,7 @@ impl Group {
         query: &[u8],
         tags: &[String],
         election: bool,
+        live: Arc<AtomicBool>,
     ) -> io::Result<Vec<u8>> {
         let (results, mut rx) = tokio::sync::mpsc::channel(tags.len().max(1));
         let (winners, mut winner_rx) = tokio::sync::mpsc::channel(1);
@@ -298,6 +314,9 @@ impl Group {
                     Err(error) => (None, Some(error)),
                 };
                 if is_failure(response.as_deref(), error.as_ref()) {
+                    if !live.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     group.note_error(&tag);
                     errors.push(match error {
                         Some(error) => format!("{tag}: {error}"),
@@ -305,8 +324,9 @@ impl Group {
                     });
                     continue;
                 }
+                // a late answer is discarded but still heals its server
                 group.note_success(&tag, rtt);
-                if delivered {
+                if delivered || !live.load(Ordering::SeqCst) {
                     continue;
                 }
                 delivered = true;

@@ -4,6 +4,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use core_runtime::dns::{DnsService, QueryMeta};
 use hickory_proto::op::Message;
@@ -23,6 +24,33 @@ fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
 
 fn build_answer(query: &Message, ip: Ipv4Addr) -> Vec<u8> {
     core_runtime::dns::codec::synth_address(query, ip.into(), 60).expect("encode answer")
+}
+
+/// A udp responder that takes its time, so a test can order a failure and an
+/// answer deliberately.
+async fn spawn_udp_dns_after(answer_ip: Ipv4Addr, delay: Duration) -> (SocketAddr, Hits) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+    let addr = sock.local_addr().expect("udp addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok(query) = Message::from_vec(&buf[..n]) else {
+                continue;
+            };
+            hits2.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            let resp = build_answer(&query, answer_ip);
+            if sock.send_to(&resp, from).await.is_err() {
+                return;
+            }
+        }
+    });
+    (addr, hits)
 }
 
 async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
@@ -312,20 +340,37 @@ fn subnet_record(family: u16, netmask: u8, address: &[u8]) -> Vec<u8> {
     record
 }
 
+/// A TCP listener that accepts and hangs up: the client's framed write lands in
+/// a closed socket, so the exchange fails at once on every platform — a port
+/// that was bound and dropped would be handed to another test in between, and a
+/// UDP port nobody listens on only times out on Linux.
+async fn spawn_refusing_tcp() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind dead");
+    let port = listener.local_addr().expect("dead addr").port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    port
+}
+
 #[tokio::test]
 async fn a_group_answers_from_the_member_that_is_alive() {
-    // one live member and one that never answers: the group must still serve
-    let (live, hits) = spawn_udp_dns(Ipv4Addr::new(10, 4, 4, 4)).await;
-    let dead = UdpSocket::bind("127.0.0.1:0").await.expect("bind dead");
-    let dead_port = dead.local_addr().expect("dead addr").port();
-    drop(dead);
+    // The dead member hangs up on connect; the live one answers late, so the
+    // failure is recorded while the query is still running — a result that
+    // arrives after the answer is not evidence about the server, which is the
+    // reference's rule.
+    let (live, hits) =
+        spawn_udp_dns_after(Ipv4Addr::new(10, 4, 4, 4), Duration::from_millis(200)).await;
+    let dead_port = spawn_refusing_tcp().await;
     let config = json!({
         "dns": {
             "servers": [
-                {"type": "udp", "tag": "dead", "server": "127.0.0.1", "server_port": dead_port},
+                {"type": "tcp", "tag": "dead", "server": "127.0.0.1", "server_port": dead_port},
                 {"type": "udp", "tag": "live", "server": "127.0.0.1", "server_port": live.port()},
                 {"type": "group", "tag": "grp", "servers": ["dead", "live"],
-                 "mode": "parallel", "error_ttl": "1s", "timeout": "3s"}
+                 "mode": "parallel", "error_ttl": "1s", "timeout": "5s"}
             ],
             "final": "grp",
             "disable_cache": true
@@ -339,29 +384,16 @@ async fn a_group_answers_from_the_member_that_is_alive() {
         vec![ip(10, 4, 4, 4)],
         "the answer came from the member that answered"
     );
-    // The dead member becomes dirty, and the second query goes straight to the
-    // live one instead of fanning again. The record is written by the fan's
-    // collector, which keeps running after the winner is delivered — exactly
-    // as the reference does — so the assertion waits for it.
+    // the refused member is dirty now, so the second query goes straight to the
+    // live one instead of fanning again
     let group = svc
         .server("grp")
         .and_then(|cfg| cfg.group.clone())
         .expect("the group runtime");
-    for _ in 0..200 {
-        let dead = group
-            .snapshot()
-            .into_iter()
-            .find(|m| m.tag == "dead")
-            .expect("the dead member");
-        if !dead.clean {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    let state = group.snapshot();
     assert!(
-        !group
-            .snapshot()
-            .into_iter()
+        !state
+            .iter()
             .find(|m| m.tag == "dead")
             .expect("the dead member")
             .clean,

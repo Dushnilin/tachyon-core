@@ -760,6 +760,9 @@ mod tests {
         settings.apply_compress("stub").expect("stub");
         let mut sender = framing(settings, 68);
         let mut receiver = framing(settings, 68);
+        // the start sequence is random, so pin it: the jump below only clears
+        // the receive window when it is a real jump
+        sender.outgoing_sequence = 100;
         let payload: Vec<u8> = (0..500u32).map(|i| i as u8).collect();
         let first = sender.encode(&payload);
         assert!(receiver.decode(&first[0]).expect("decode").is_none());

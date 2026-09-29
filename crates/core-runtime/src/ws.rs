@@ -74,11 +74,7 @@ pub fn validate(headers: &[(String, String)]) -> Result<String, Rejection> {
         return Err(reject(400, "", "handshake error: bad \"Host\" header"));
     }
     if !wants_upgrade(headers) {
-        return Err(reject(
-            400,
-            "",
-            "handshake error: bad \"Upgrade\" header",
-        ));
+        return Err(reject(400, "", "handshake error: bad \"Upgrade\" header"));
     }
     let connection = header(headers, "connection").unwrap_or("");
     if connection != "Upgrade"
@@ -166,7 +162,9 @@ fn text_frame(payload: &[u8]) -> Vec<u8> {
 
 /// Send the handshake for `client_key` and switch this stream to the socket.
 pub async fn accept(stream: &mut TcpStream, client_key: &str) -> io::Result<()> {
-    stream.write_all(handshake_head(client_key).as_bytes()).await
+    stream
+        .write_all(handshake_head(client_key).as_bytes())
+        .await
 }
 
 /// Write one text frame carrying `payload`.
@@ -216,9 +214,10 @@ mod tests {
             accept_value("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
-        assert!(handshake_head("dGhlIHNhbXBsZSBub25jZQ==").contains(
-            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
-        ));
+        assert!(
+            handshake_head("dGhlIHNhbXBsZSBub25jZQ==")
+                .contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+        );
     }
 
     #[test]
@@ -248,17 +247,16 @@ mod tests {
              Content-Length: 47\r\n\r\nhandshake error: bad \"Sec-WebSocket-Key\" header"
         );
 
-        let short = validate(&browser(&[("Sec-WebSocket-Key", "short")]))
-            .expect_err("short key");
+        let short = validate(&browser(&[("Sec-WebSocket-Key", "short")])).expect_err("short key");
         assert_eq!(short.status, 400);
 
-        let version = validate(&browser(&[("Sec-WebSocket-Version", "8")]))
-            .expect_err("unsupported version");
+        let version =
+            validate(&browser(&[("Sec-WebSocket-Version", "8")])).expect_err("unsupported version");
         assert_eq!(version.status, 426);
         assert!(version.response().contains("Sec-WebSocket-Version: 13\r\n"));
 
-        let connection = validate(&browser(&[("Connection", "close")]))
-            .expect_err("connection token");
+        let connection =
+            validate(&browser(&[("Connection", "close")])).expect_err("connection token");
         assert_eq!(connection.status, 400);
 
         let host = validate(&headers(&[

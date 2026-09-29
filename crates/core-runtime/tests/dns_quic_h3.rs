@@ -144,8 +144,11 @@ async fn serve_h3(connection: quinn::Connection, seen: Seen) -> Option<()> {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
-        *seen.lock().expect("seen lock") =
-            Some(format!("{}|{}", probe.unwrap_or("-"), content_type.unwrap_or("-")));
+        *seen.lock().expect("seen lock") = Some(format!(
+            "{}|{}",
+            probe.unwrap_or("-"),
+            content_type.unwrap_or("-")
+        ));
         let mut body = Vec::new();
         while let Some(chunk) = stream.recv_data().await.ok()? {
             body.extend_from_slice(bytes::Buf::chunk(&chunk));

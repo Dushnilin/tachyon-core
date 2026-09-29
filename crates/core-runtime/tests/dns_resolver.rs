@@ -263,6 +263,119 @@ async fn exchange_ok(svc: &Arc<DnsService>, raw: &[u8]) -> Vec<u8> {
         .expect("exchange")
 }
 
+/// A udp responder that keeps the raw query, so a test can look at the bytes
+/// that actually went out.
+async fn spawn_udp_dns_capture(
+    answer_ip: Ipv4Addr,
+) -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+    let addr = sock.local_addr().expect("udp addr");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok(query) = Message::from_vec(&buf[..n]) else {
+                continue;
+            };
+            if let Ok(mut guard) = sink.lock() {
+                *guard = buf[..n].to_vec();
+            }
+            let resp = build_answer(&query, answer_ip);
+            if sock.send_to(&resp, from).await.is_err() {
+                return;
+            }
+        }
+    });
+    (addr, seen)
+}
+
+/// The OPT record the reference builds for `client_subnet`: payload size 0,
+/// no DO bit, and a single SUBNET option carrying the masked address.
+fn subnet_record(family: u16, netmask: u8, address: &[u8]) -> Vec<u8> {
+    let mut rdata = Vec::new();
+    rdata.extend_from_slice(&8u16.to_be_bytes());
+    rdata.extend_from_slice(&((4 + address.len()) as u16).to_be_bytes());
+    rdata.extend_from_slice(&family.to_be_bytes());
+    rdata.push(netmask);
+    rdata.push(0);
+    rdata.extend_from_slice(address);
+    let mut record = vec![0x00];
+    record.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
+    record.extend_from_slice(&0u16.to_be_bytes()); // CLASS
+    record.extend_from_slice(&0u32.to_le_bytes()); // TTL
+    record.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    record.extend_from_slice(&rdata);
+    record
+}
+
+#[tokio::test]
+async fn client_subnet_rides_along_on_upstream_queries() {
+    let (addr, seen) = spawn_udp_dns_capture(Ipv4Addr::new(10, 0, 0, 9)).await;
+    let mut config = udp_service_config(addr.port());
+    config["dns"]["client_subnet"] = json!("1.2.3.4/24");
+    let svc = service(&config);
+
+    let resp = exchange_ok(&svc, &query("ecs.test", "A")).await;
+    assert_eq!(
+        core_runtime::dns::codec::answer_ips(&resp).expect("decode"),
+        vec![ip(10, 0, 0, 9)],
+        "the query still resolves"
+    );
+    let raw = seen.lock().expect("captured").clone();
+    let want = subnet_record(1, 24, &[1, 2, 3, 0]);
+    assert_eq!(
+        &raw[raw.len() - want.len()..],
+        want.as_slice(),
+        "the masked prefix rides along as an EDNS0 option"
+    );
+}
+
+#[tokio::test]
+async fn a_bare_client_subnet_is_a_host_prefix() {
+    let (addr, seen) = spawn_udp_dns_capture(Ipv4Addr::new(10, 0, 0, 8)).await;
+    let mut config = udp_service_config(addr.port());
+    config["dns"]["client_subnet"] = json!("198.51.100.7");
+    let svc = service(&config);
+
+    exchange_ok(&svc, &query("bare.test", "A")).await;
+    let raw = seen.lock().expect("captured").clone();
+    let want = subnet_record(1, 32, &[198, 51, 100, 7]);
+    assert_eq!(&raw[raw.len() - want.len()..], want.as_slice());
+}
+
+#[tokio::test]
+async fn an_ipv6_client_subnet_is_carried_whole() {
+    let (addr, seen) = spawn_udp_dns_capture(Ipv4Addr::new(10, 0, 0, 7)).await;
+    let mut config = udp_service_config(addr.port());
+    config["dns"]["client_subnet"] = json!("2001:db8::/48");
+    let svc = service(&config);
+
+    exchange_ok(&svc, &query("v6.test", "A")).await;
+    let raw = seen.lock().expect("captured").clone();
+    let mut address = [0u8; 16];
+    address[0] = 0x20;
+    address[1] = 0x01;
+    address[2] = 0x0d;
+    address[3] = 0xb8;
+    let want = subnet_record(2, 48, &address);
+    assert_eq!(&raw[raw.len() - want.len()..], want.as_slice());
+}
+
+#[tokio::test]
+async fn without_client_subnet_no_opt_is_added() {
+    let (addr, seen) = spawn_udp_dns_capture(Ipv4Addr::new(10, 0, 0, 6)).await;
+    let svc = service(&udp_service_config(addr.port()));
+    let sent = query("plain.test", "A");
+
+    exchange_ok(&svc, &sent).await;
+    let raw = seen.lock().expect("captured").clone();
+    assert_eq!(raw, sent, "the query goes out untouched");
+}
+
 #[tokio::test]
 async fn udp_exchange_caches_single_uplink() {
     let (addr, hits) = spawn_udp_dns(Ipv4Addr::new(10, 9, 8, 7)).await;

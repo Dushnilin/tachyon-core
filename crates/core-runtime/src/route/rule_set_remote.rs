@@ -544,10 +544,7 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut head = [0u8; 1024];
                 let _ = stream.read(&mut head).await;
-                let response = if served
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    < 2
-                {
+                let response = if served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                     format!("HTTP/1.1 500 Internal Server Error{CRLF}{CRLF}").into_bytes()
                 } else {
                     body_response(&payload)
@@ -561,7 +558,10 @@ mod tests {
 
         // the reference aborts the start
         let error = registry.start_all(&router, None).await.unwrap_err();
-        assert!(error.to_string().contains("initial rule-set: rs"), "{error}");
+        assert!(
+            error.to_string().contains("initial rule-set: rs"),
+            "{error}"
+        );
 
         // soft start: the engine stays up, the set is empty for now
         registry
@@ -579,7 +579,10 @@ mod tests {
         }
         let set = registry.sets[0].lock().await;
         assert_eq!(set.set.rule_count(), 1, "recovered in the background");
-        assert_eq!(set.set.snapshot()[0]["domain_suffix"][0], "recovered.example");
+        assert_eq!(
+            set.set.snapshot()[0]["domain_suffix"][0],
+            "recovered.example"
+        );
         drop(set);
         server.abort();
     }

@@ -2,6 +2,7 @@
 //! hijack-dns / sniff / resolve), connection context, and outbound dispatch.
 
 pub mod neighbor;
+pub mod process;
 pub mod rule;
 pub mod rule_set;
 pub mod rule_set_remote;
@@ -84,6 +85,8 @@ pub struct ConnContext {
     pub source_mac: Option<neighbor::MacAddr>,
     /// `route.find_neighbor`: the client's DHCP hostname.
     pub source_hostname: Option<String>,
+    /// `route.find_process`: the process that opened the connection.
+    pub process: Option<process::ProcessInfo>,
 }
 
 use std::net::IpAddr;
@@ -115,6 +118,7 @@ impl ConnContext {
             matched_rule: None,
             source_mac: None,
             source_hostname: None,
+            process: None,
         }
     }
 }
@@ -698,6 +702,15 @@ impl Router {
                 _ => Vec::new(),
             })
             .unwrap_or_default();
+        // `route.find_process`, or any rule that names a process: either way
+        // the searcher is armed, the walk itself is per connection
+        process::set_wanted(
+            root.get("route")
+                .and_then(|route| route.get("find_process"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                || rules.iter().any(Rule::needs_process),
+        );
         if defaults.find_neighbor
             || rules.iter().any(Rule::needs_neighbor)
             || neighbor_domain_configured(&root)
@@ -928,6 +941,23 @@ fn prepare(ctx: &mut ConnContext) {
     if let Some(resolver) = neighbor::current() {
         ctx.source_mac = resolver.lookup_mac(ctx.source.ip());
         ctx.source_hostname = resolver.lookup_hostname(ctx.source.ip());
+    }
+    // `route.find_process`: the process behind the socket, for the
+    // `process_name` / `process_path` / `user` rule items
+    let destination = match ctx.origin_destination.as_ref().unwrap_or(&ctx.destination) {
+        Target::Ip(addr) => Some(*addr),
+        Target::Domain(..) => None,
+    };
+    if let Some(info) = process::find_owner(ctx.network, ctx.source, destination) {
+        logging::info(format_args!(
+            "found process path: {}{}",
+            info.path,
+            match &info.user_name {
+                Some(name) => format!(", user: {name}"),
+                None => String::new(),
+            }
+        ));
+        ctx.process = Some(info);
     }
     ctx.ip_version = match ctx.destination {
         Target::Ip(a) => Some(if a.is_ipv6() { 6 } else { 4 }),

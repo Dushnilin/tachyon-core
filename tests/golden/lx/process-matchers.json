@@ -1,0 +1,14 @@
+{
+  "route": {
+    "find_process": true,
+    "rules": [
+      { "process_name": ["curl"], "outbound": "d" },
+      { "process_path": ["/usr/bin/curl"], "outbound": "d" },
+      { "process_path_regex": ["^/usr/bin/.*"], "outbound": "d" },
+      { "user": ["root"], "outbound": "d" },
+      { "user_id": [0], "outbound": "d" }
+    ],
+    "final": "d"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

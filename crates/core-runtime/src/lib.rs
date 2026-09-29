@@ -31,6 +31,62 @@ pub struct BoxInstance {
     cache_file: Option<Arc<std::sync::Mutex<cache_file::CacheFile>>>,
 }
 
+/// Dialer options `check` accepts and the runtime does not read. The reference
+/// applies each of them to the outbound's own sockets; saying so once per
+/// entry beats leaving a mistyped `netns` looking like it worked.
+const UNHONORED_DIALER_FIELDS: &[&str] = &[
+    "bind_address_no_port",
+    "disable_tcp_keep_alive",
+    "domain_strategy",
+    "fallback_delay",
+    "fallback_network_type",
+    "inet4_bind_address",
+    "inet6_bind_address",
+    "netns",
+    "network_strategy",
+    "network_type",
+    "protect_path",
+    "reuse_addr",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "tcp_multi_path",
+    "udp_fragment",
+];
+
+/// One warning per entry per field, so a shared option is not repeated.
+fn warn_unhonored_options(root: &Value) {
+    for (section, index, field) in unhonored_options(root) {
+        logging::warn(format_args!(
+            "{section}[{index}].{field}: accepted by check, not applied at runtime (ignored)"
+        ));
+    }
+}
+
+/// Which entries carry an option we accept but do not apply.
+fn unhonored_options(root: &Value) -> Vec<(&'static str, usize, &'static str)> {
+    let mut out = Vec::new();
+    for section in ["outbounds", "endpoints", "inbounds"] {
+        let empty = Vec::new();
+        for (i, entry) in root
+            .get(section)
+            .and_then(Value::as_array)
+            .unwrap_or(&empty)
+            .iter()
+            .enumerate()
+        {
+            let Some(object) = entry.as_object() else {
+                continue;
+            };
+            for field in UNHONORED_DIALER_FIELDS {
+                if object.contains_key(*field) && !object[*field].is_null() {
+                    out.push((section, i, *field));
+                }
+            }
+        }
+    }
+    out
+}
+
 impl BoxInstance {
     /// Local addresses of all started inbounds.
     pub fn inbound_addrs(&self) -> &[(String, SocketAddr)] {
@@ -63,6 +119,7 @@ impl BoxInstance {
 /// Build and start the data plane from a parsed configuration document.
 pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     core_tls::install_default_provider();
+    warn_unhonored_options(root);
     let log = root.get("log");
     let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
     let output = log.and_then(|l| l.get("output")).and_then(Value::as_str);
@@ -203,5 +260,35 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn options_we_accept_but_do_not_apply_are_named() {
+        let config = json!({
+            "outbounds": [
+                {"type": "direct", "tag": "d", "netns": "n", "network_strategy": "prefer_ipv4",
+                 "routing_mark": 99, "bind_interface": "eth0"},
+                {"type": "block", "tag": "b", "reuse_addr": true, "network_strategy": null}
+            ],
+            "inbounds": [
+                {"type": "mixed", "tag": "in", "tcp_multi_path": true}
+            ]
+        });
+        assert_eq!(
+            unhonored_options(&config),
+            vec![
+                ("outbounds", 0, "netns"),
+                ("outbounds", 0, "network_strategy"),
+                ("outbounds", 1, "reuse_addr"),
+                ("inbounds", 0, "tcp_multi_path"),
+            ],
+            "the honored options stay quiet and a null is not an option"
+        );
     }
 }

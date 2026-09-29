@@ -1,0 +1,57 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "quic",
+        "tag": "doq",
+        "server": "dns.adguard-dns.com",
+        "server_port": 853,
+        "domain_resolver": "upstream",
+        "tls": {
+          "server_name": "dns.adguard-dns.com"
+        }
+      },
+      {
+        "type": "h3",
+        "tag": "doh3",
+        "server": "dns.cloudflare.com",
+        "path": "/dns-query",
+        "method": "POST",
+        "headers": {
+          "accept": "application/dns-message"
+        },
+        "domain_resolver": "upstream",
+        "tls": {
+          "server_name": "cloudflare-dns.com"
+        }
+      },
+      {
+        "type": "udp",
+        "tag": "upstream",
+        "server": "1.1.1.1"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".adguard.local"
+        ],
+        "server": "doq"
+      }
+    ],
+    "final": "doh3"
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct",
+    "default_domain_resolver": "upstream"
+  }
+}

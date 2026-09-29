@@ -1,0 +1,15 @@
+{
+  "log": { "level": "info" },
+  "dns": {
+    "servers": [
+      { "type": "hosts", "tag": "hosts", "predefined": { "static.test": "10.1.2.3" } },
+      { "type": "hosts", "tag": "hosts-file", "path": ["/etc/hosts"] },
+      { "type": "local", "tag": "local" },
+      { "type": "udp", "tag": "upstream", "server": "1.1.1.1" }
+    ],
+    "rules": [{ "domain_suffix": ["static.test"], "server": "hosts" }],
+    "final": "local"
+  },
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": { "final": "direct", "default_domain_resolver": "upstream" }
+}

@@ -27,6 +27,10 @@ pub enum Kind {
     Tls,
     Https,
     Fakeip,
+    /// the system resolver
+    Local,
+    /// the hosts file(s) plus inline `predefined` entries
+    Hosts,
 }
 
 pub struct ServerConfig {
@@ -43,6 +47,86 @@ pub struct ServerConfig {
     pub store: Option<Arc<FakeIpStore>>,
     /// Outbound tag the transport is dialed through (`dns.server.detour`).
     pub detour: Option<String>,
+    /// `type: hosts` — files to read and inline `predefined` entries
+    pub hosts: Option<Hosts>,
+}
+
+/// The `hosts` server's sources: the files it reads and the inline entries,
+/// which take precedence (reference `dns/transport/hosts`).
+#[derive(Debug, Clone, Default)]
+pub struct Hosts {
+    pub paths: Vec<String>,
+    pub predefined: Vec<(String, Vec<std::net::IpAddr>)>,
+}
+
+impl Hosts {
+    /// `mDNS.CanonicalName`: the name lower-cased with a trailing dot.
+    fn canonical(name: &str) -> String {
+        super::codec::normalize_name(&name.to_ascii_lowercase())
+    }
+
+    /// The reference caches a parsed file for five seconds and reloads it when
+    /// the size or mtime changed; a lookup goes straight to disk here, which is
+    /// the same answer without the bookkeeping.
+    pub fn lookup(&self, name: &str) -> Vec<std::net::IpAddr> {
+        let canonical = Self::canonical(name);
+        for (key, addrs) in &self.predefined {
+            if Self::canonical(key) == canonical {
+                return addrs.clone();
+            }
+        }
+        for path in &self.paths {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                for (name, addrs) in parse_hosts(&text) {
+                    if name == canonical {
+                        return addrs;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// `Transport.PreferredDomain`: the transport claims the name when it knows
+    /// it, which keeps a hosts server ahead of a real one.
+    pub fn knows(&self, name: &str) -> bool {
+        !self.lookup(name).is_empty()
+    }
+}
+
+/// The platform's hosts file.
+fn default_hosts_path() -> String {
+    if cfg!(windows) {
+        "C:\\Windows\\System32\\drivers\\etc\\hosts".to_string()
+    } else {
+        "/etc/hosts".to_string()
+    }
+}
+
+/// One hosts file: `[addr][name...]` per line, `#` starts a comment.
+pub fn parse_hosts(text: &str) -> Vec<(String, Vec<std::net::IpAddr>)> {
+    let mut by_name: Vec<(String, Vec<std::net::IpAddr>)> = Vec::new();
+    for line in text.lines() {
+        let line = match line.find('#') {
+            Some(at) => &line[..at],
+            None => line,
+        };
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let Ok(addr) = fields[0].parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        for name in &fields[1..] {
+            let canonical = Hosts::canonical(name);
+            match by_name.iter_mut().find(|(key, _)| *key == canonical) {
+                Some((_, addrs)) => addrs.push(addr),
+                None => by_name.push((canonical, vec![addr])),
+            }
+        }
+    }
+    by_name
 }
 
 /// Minimal CIDR prefix (host bits masked off).
@@ -292,7 +376,43 @@ impl ServerConfig {
             "tls" => Kind::Tls,
             "https" => Kind::Https,
             "fakeip" => Kind::Fakeip,
+            "local" => Kind::Local,
+            "hosts" => Kind::Hosts,
             other => anyhow::bail!("{at}: dns server type {other:?} not implemented yet"),
+        };
+        let hosts = match kind {
+            Kind::Hosts => {
+                let mut sources = Hosts::default();
+                match map.get("path") {
+                    Some(Value::String(path)) => sources.paths.push(path.clone()),
+                    Some(Value::Array(list)) => {
+                        sources
+                            .paths
+                            .extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+                    }
+                    None => sources.paths.push(default_hosts_path()),
+                    Some(_) => anyhow::bail!("{at}.path: must be a string or a list"),
+                }
+                if let Some(Value::Object(entries)) = map.get("predefined") {
+                    for (name, value) in entries {
+                        let addrs = match value {
+                            Value::String(text) => match text.parse() {
+                                Ok(addr) => vec![addr],
+                                Err(_) => continue,
+                            },
+                            Value::Array(list) => list
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .filter_map(|t| t.parse().ok())
+                                .collect(),
+                            _ => continue,
+                        };
+                        sources.predefined.push((name.clone(), addrs));
+                    }
+                }
+                Some(sources)
+            }
+            _ => None,
         };
         let tag = map
             .get("tag")
@@ -311,7 +431,7 @@ impl ServerConfig {
             .unwrap_or(match kind {
                 Kind::Udp | Kind::Tcp | Kind::Tls => 53,
                 Kind::Https => 443,
-                Kind::Fakeip => 0,
+                Kind::Fakeip | Kind::Local | Kind::Hosts => 0,
             });
         // dns tls/https servers implicitly use TLS: `enabled` defaults to true
         // for these types when the key is absent (as in sing-box configs).
@@ -367,7 +487,9 @@ impl ServerConfig {
         } else {
             (None, None)
         };
-        if kind != Kind::Fakeip && server.is_empty() {
+        // fakeip, local and hosts never dial a server, so they need no address
+        let needs_server = !matches!(kind, Kind::Fakeip | Kind::Local | Kind::Hosts);
+        if needs_server && server.is_empty() {
             anyhow::bail!("{at}: missing server");
         }
         let detour = map
@@ -395,6 +517,7 @@ impl ServerConfig {
             inet6,
             store,
             detour,
+            hosts,
         })
     }
 
@@ -491,8 +614,8 @@ pub async fn exchange(
                 exchange_stream(stream, query).await
             }
             Kind::Https => exchange_doh(cfg, addr, query, dialer).await,
-            Kind::Fakeip => Err(io::Error::other(
-                "dns: fakeip transport must not reach the wire",
+            Kind::Fakeip | Kind::Local | Kind::Hosts => Err(io::Error::other(
+                "dns: this transport answers without reaching the wire",
             )),
         }
     };

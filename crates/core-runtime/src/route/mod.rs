@@ -858,6 +858,15 @@ fn prepare(ctx: &mut ConnContext) {
             "route: found fakeip domain: {}",
             ctx.destination
         ));
+    } else if ctx.domain.is_none()
+        && let Target::Ip(addr) = ctx.destination
+        && let Some(dns) = dns::current()
+        && let Some(domain) = dns.reverse_domain(addr.ip())
+    {
+        // `dns.reverse_mapping`: the dial target stays the IP, only the
+        // domain rules get to see the name the answer came from
+        ctx.domain = Some(domain.clone());
+        logging::debug(format_args!("route: found reverse mapped domain: {domain}"));
     }
     ctx.ip_version = match ctx.destination {
         Target::Ip(a) => Some(if a.is_ipv6() { 6 } else { 4 }),

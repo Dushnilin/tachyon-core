@@ -12,9 +12,9 @@ pub mod transport;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{RData, RecordType};
 use serde_json::Value;
 use tokio::net::TcpStream;
 
@@ -26,6 +26,8 @@ use codec::QueryInfo;
 
 const DEFAULT_CACHE_CAPACITY: usize = 1024;
 const DEFAULT_OPTIMISTIC_TIMEOUT: Duration = Duration::from_secs(3 * 24 * 3600);
+/// `dns.reverse_mapping` cache, same size as the reference's LRU.
+const REVERSE_CAPACITY: usize = 1024;
 /// Address resolution probes both families unless the strategy says otherwise.
 const RESOLVE_TIMEOUT_GUARD: Duration = Duration::from_secs(10);
 
@@ -72,6 +74,16 @@ pub struct DnsService {
     refreshing: std::sync::Mutex<HashSet<CacheKey>>,
     /// Installed after the router exists, so `detour` can dial through it.
     router: RwLock<Option<Arc<crate::route::Router>>>,
+    /// `dns.reverse_mapping`: ip → domain learned from A/AAAA answers, present
+    /// only when the option is on (the reference leaves its LRU nil).
+    reverse: Option<RwLock<HashMap<IpAddr, ReverseEntry>>>,
+}
+
+/// One learned `ip → domain` binding and when it stops being valid.
+#[derive(Debug, Clone)]
+struct ReverseEntry {
+    domain: String,
+    expires: Instant,
 }
 
 impl DnsService {
@@ -208,9 +220,8 @@ impl DnsService {
             .unwrap_or(DEFAULT_CACHE_CAPACITY)
             .max(1024);
 
-        if map.get("reverse_mapping").and_then(Value::as_bool) == Some(true) {
-            crate::logging::warn(format_args!("dns.reverse_mapping is not implemented yet"));
-        }
+        // reference `dns.reverse_mapping`: an off option keeps the LRU nil
+        let reverse_mapping = map.get("reverse_mapping").and_then(Value::as_bool) == Some(true);
         if map.get("client_subnet").is_some_and(|v| !v.is_null()) {
             crate::logging::warn(format_args!("dns.client_subnet is not implemented yet"));
         }
@@ -227,6 +238,7 @@ impl DnsService {
             inflight: std::sync::Mutex::new(HashMap::new()),
             refreshing: std::sync::Mutex::new(HashSet::new()),
             router: RwLock::new(None),
+            reverse: reverse_mapping.then(|| RwLock::new(HashMap::new())),
         })))
     }
 
@@ -247,6 +259,64 @@ impl DnsService {
         self.servers
             .values()
             .find_map(|s| s.store.as_ref().and_then(|f| f.lookup_domain(ip)))
+    }
+
+    /// `dns.reverse_mapping` on: every A/AAAA answer becomes `ip → domain`
+    /// for its TTL, so a connection that dials that IP can still match
+    /// domain rules. FakeIP answers are skipped — they have their own map.
+    fn record_reverse(&self, raw: &[u8], from_fakeip: bool) {
+        let Some(reverse) = &self.reverse else {
+            return;
+        };
+        if from_fakeip {
+            return;
+        }
+        let Ok(message) = codec::parse_message(raw) else {
+            return;
+        };
+        if message.answers.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let Ok(mut map) = reverse.write() else {
+            return;
+        };
+        map.retain(|_, entry| entry.expires > now);
+        if map.len() >= REVERSE_CAPACITY {
+            // ponytail: the reference is an LRU of 1024; dropping the whole
+            // map at the cap holds the same memory ceiling without the
+            // recency bookkeeping. Replace with an LRU if it ever bites.
+            map.clear();
+        }
+        for answer in &message.answers {
+            let ip = match &answer.data {
+                RData::A(a) => IpAddr::V4(a.0),
+                RData::AAAA(aaaa) => IpAddr::V6(aaaa.0),
+                _ => continue,
+            };
+            map.insert(
+                ip,
+                ReverseEntry {
+                    domain: codec::normalize_name(&answer.name.to_string()),
+                    expires: now + Duration::from_secs(answer.ttl as u64),
+                },
+            );
+        }
+    }
+
+    /// Reference `LookupReverseMapping`: the domain an IP was last answered
+    /// under, while that answer's TTL still holds.
+    pub fn reverse_domain(&self, ip: IpAddr) -> Option<String> {
+        let map = self.reverse.as_ref()?.read().ok()?;
+        let entry = map.get(&ip)?;
+        (entry.expires > Instant::now()).then(|| entry.domain.clone())
+    }
+
+    /// What the caller gets back: reverse-mapping bookkeeping, then the
+    /// client's own id stamped onto the response.
+    fn answer(&self, target: &ServerConfig, raw: &[u8], id: u16) -> std::io::Result<Vec<u8>> {
+        self.record_reverse(raw, target.is_fakeip());
+        codec::set_id(raw, id)
     }
 
     /// Run the rule walk and produce the raw response for `query`.
@@ -327,8 +397,12 @@ impl DnsService {
                     };
                 }
                 Action::Predefined(predefined) => {
-                    return codec::predefined_response(&query_msg, predefined)
-                        .map_err(std::io::Error::other);
+                    let raw = codec::predefined_response(&query_msg, predefined)
+                        .map_err(std::io::Error::other)?;
+                    // a rule answer has no transport behind it, and the
+                    // reference records those as well
+                    self.record_reverse(&raw, false);
+                    return Ok(raw);
                 }
                 Action::Evaluate | Action::Respond => {
                     crate::logging::warn(format_args!(
@@ -357,16 +431,18 @@ impl DnsService {
                 if addrs.is_empty() {
                     return codec::name_error(&query_msg).map_err(std::io::Error::other);
                 }
-                return codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
-                    .map_err(std::io::Error::other);
+                let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
+                    .map_err(std::io::Error::other)?;
+                return self.answer(&target, &raw, info.id);
             }
             Kind::Local => {
                 let addrs = system_lookup(&info.name).await;
                 if addrs.is_empty() {
                     return codec::name_error(&query_msg).map_err(std::io::Error::other);
                 }
-                return codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
-                    .map_err(std::io::Error::other);
+                let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
+                    .map_err(std::io::Error::other)?;
+                return self.answer(&target, &raw, info.id);
             }
             _ => {}
         }
@@ -395,10 +471,10 @@ impl DnsService {
             let now = std::time::Instant::now();
             let hit = self.cache.read().expect("dns cache").get(&key, now);
             match hit {
-                Some(CacheHit::Fresh(raw)) => return codec::set_id(&raw, info.id),
+                Some(CacheHit::Fresh(raw)) => return self.answer(&target, &raw, info.id),
                 Some(CacheHit::Stale(raw)) => {
                     self.spawn_refresh(meta.clone(), query.to_vec(), allow_fakeip, key.clone());
-                    return codec::set_id(&raw, info.id);
+                    return self.answer(&target, &raw, info.id);
                 }
                 None => {}
             }
@@ -417,7 +493,7 @@ impl DnsService {
             let now = std::time::Instant::now();
             if let Some(CacheHit::Fresh(raw)) = self.cache.read().expect("dns cache").get(&key, now)
             {
-                return codec::set_id(&raw, info.id);
+                return self.answer(&target, &raw, info.id);
             }
         }
 
@@ -447,7 +523,7 @@ impl DnsService {
                 cache.insert(key.clone(), rewritten.clone(), &meta_for_insert, optimistic);
             }
         }
-        codec::set_id(&rewritten, info.id)
+        self.answer(&target, &rewritten, info.id)
     }
 
     fn spawn_refresh(

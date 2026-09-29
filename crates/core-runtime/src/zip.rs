@@ -67,9 +67,7 @@ fn find_eocd(bytes: &[u8]) -> io::Result<usize> {
         }
         at -= 1;
     }
-    Err(io::Error::other(
-        "zip: no end of central directory record",
-    ))
+    Err(io::Error::other("zip: no end of central directory record"))
 }
 
 /// Read the central directory and locate every entry's payload.
@@ -165,7 +163,7 @@ pub fn extract(bytes: &[u8], dest: &Path) -> io::Result<()> {
                     return Err(io::Error::other(format!(
                         "zip: unsafe entry path {:?}",
                         entry.path
-                    )))
+                    )));
                 }
             }
         }
@@ -322,7 +320,10 @@ mod tests {
         }]);
         let dest = scratch("flat");
         extract(&archive, &dest).expect("extract");
-        assert_eq!(std::fs::read(dest.join("index.html")).expect("file"), b"root");
+        assert_eq!(
+            std::fs::read(dest.join("index.html")).expect("file"),
+            b"root"
+        );
         let _ = std::fs::remove_dir_all(&dest);
     }
 
@@ -347,8 +348,8 @@ mod tests {
             data: b"x".to_vec(),
             deflate: false,
         }]);
-        let err = extract(&archive[..archive.len() - 10], &scratch("short"))
-            .expect_err("truncated");
+        let err =
+            extract(&archive[..archive.len() - 10], &scratch("short")).expect_err("truncated");
         assert!(err.to_string().contains("zip:"), "{err}");
 
         let mut zip64 = archive.clone();

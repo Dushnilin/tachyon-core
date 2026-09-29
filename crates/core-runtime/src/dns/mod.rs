@@ -77,6 +77,9 @@ pub struct DnsService {
     /// `dns.reverse_mapping`: ip → domain learned from A/AAAA answers, present
     /// only when the option is on (the reference leaves its LRU nil).
     reverse: Option<RwLock<HashMap<IpAddr, ReverseEntry>>>,
+    /// `dns.client_subnet`: the EDNS0 client subnet every upstream query
+    /// carries, already masked, with its prefix length.
+    client_subnet: Option<(IpAddr, u8)>,
 }
 
 /// One learned `ip → domain` binding and when it stops being valid.
@@ -222,9 +225,7 @@ impl DnsService {
 
         // reference `dns.reverse_mapping`: an off option keeps the LRU nil
         let reverse_mapping = map.get("reverse_mapping").and_then(Value::as_bool) == Some(true);
-        if map.get("client_subnet").is_some_and(|v| !v.is_null()) {
-            crate::logging::warn(format_args!("dns.client_subnet is not implemented yet"));
-        }
+        let client_subnet = parse_client_subnet(map.get("client_subnet"))?;
 
         Ok(Some(Arc::new(Self {
             servers,
@@ -239,6 +240,7 @@ impl DnsService {
             refreshing: std::sync::Mutex::new(HashSet::new()),
             router: RwLock::new(None),
             reverse: reverse_mapping.then(|| RwLock::new(HashMap::new())),
+            client_subnet,
         })))
     }
 
@@ -583,7 +585,13 @@ impl DnsService {
         query: &[u8],
     ) -> std::io::Result<Vec<u8>> {
         let addr = self.resolve_server_addr(cfg, 0).await?;
-        let raw = transport::exchange(cfg, addr, query, &self.dialer()).await?;
+        // reference `prepareExchangeMessage`: `client_subnet` rides along on
+        // every query we send upstream
+        let query = match self.client_subnet {
+            Some((subnet, bits)) => codec::set_client_subnet(query, subnet, bits),
+            None => query.to_vec(),
+        };
+        let raw = transport::exchange(cfg, addr, &query, &self.dialer()).await?;
         Ok(raw)
     }
 
@@ -717,6 +725,52 @@ impl DnsService {
         tokio::time::timeout(RESOLVE_TIMEOUT_GUARD, fut)
             .await
             .map_err(|_| std::io::Error::other(format!("dns: resolve timeout for {host:?}")))?
+    }
+}
+
+/// `dns.client_subnet`: a CIDR, or a bare address which the reference turns
+/// into a host prefix. Returns the masked address and its prefix length.
+fn parse_client_subnet(value: Option<&Value>) -> anyhow::Result<Option<(IpAddr, u8)>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        anyhow::bail!("dns.client_subnet: must be a string");
+    };
+    let bad = || anyhow::anyhow!("dns.client_subnet: {raw:?} is not an IP prefix");
+    let (addr, bits) = match raw.rsplit_once('/') {
+        Some((addr, bits)) => (
+            transport::is_ip_literal(addr).ok_or_else(bad)?,
+            bits.parse().map_err(|_| bad())?,
+        ),
+        None => {
+            let addr = transport::is_ip_literal(raw).ok_or_else(bad)?;
+            (addr, if addr.is_ipv4() { 32 } else { 128 })
+        }
+    };
+    if bits > if addr.is_ipv4() { 32 } else { 128 } {
+        return Err(bad());
+    }
+    Ok(Some((mask_host_bits(addr, bits), bits)))
+}
+
+/// Zero the host bits, the way `netip.ParsePrefix` stores a prefix.
+fn mask_host_bits(addr: IpAddr, bits: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => {
+            let masked = match bits {
+                0 => 0,
+                bits => u32::from(v4) & (!0u32 << (32 - bits)),
+            };
+            IpAddr::V4(masked.into())
+        }
+        IpAddr::V6(v6) => {
+            let masked = match bits {
+                0 => 0,
+                bits => u128::from(v6) & (!0u128 << (128 - bits)),
+            };
+            IpAddr::V6(masked.into())
+        }
     }
 }
 

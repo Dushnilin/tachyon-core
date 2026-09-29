@@ -913,9 +913,10 @@ async fn exchange_h3(
         .map_err(|e| io::Error::other(format!("dns: h3 connect: {e}")))?
         .await
         .map_err(|e| io::Error::other(format!("dns: h3 handshake: {e}")))?;
-    let (mut h3_connection, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
-        .await
-        .map_err(|e| io::Error::other(format!("dns: h3 handshake: {e}")))?;
+    let (mut h3_connection, mut send_request) =
+        h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .map_err(|e| io::Error::other(format!("dns: h3 handshake: {e}")))?;
     let conn_task = tokio::spawn(async move {
         // the h3 connection is driven by this future; it only ends once the
         // connection is gone
@@ -980,10 +981,9 @@ async fn quic_endpoint(
     socket.set_nonblocking(true)?;
     let mut reset = [0u8; 32];
     let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut reset);
-    let endpoint_config =
-        quinn::EndpointConfig::new(Arc::new(crate::outbound::quic::HmacSha256Wrapper::new(
-            &reset,
-        )));
+    let endpoint_config = quinn::EndpointConfig::new(Arc::new(
+        crate::outbound::quic::HmacSha256Wrapper::new(&reset),
+    ));
     let mut endpoint = quinn::Endpoint::new(
         endpoint_config,
         None,

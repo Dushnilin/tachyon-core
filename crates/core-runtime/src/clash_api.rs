@@ -687,7 +687,8 @@ async fn stream_traffic(
     loop {
         ticker.tick().await;
         let (_, up, down) = clash_state::snapshot();
-        out.send(&json!({"up": up, "down": down}).to_string()).await?;
+        out.send(&json!({"up": up, "down": down}).to_string())
+            .await?;
     }
 }
 
@@ -707,7 +708,10 @@ fn connections_snapshot() -> Value {
 /// 1000). The reference rejects a non-integer after it has already hijacked
 /// the connection, so the client never sees that 400 — we fall back instead.
 fn connections_interval(query: &[(String, String)]) -> Duration {
-    let raw = query.iter().find(|(k, _)| k == "interval").map(|(_, v)| v.as_str());
+    let raw = query
+        .iter()
+        .find(|(k, _)| k == "interval")
+        .map(|(_, v)| v.as_str());
     match raw.and_then(|raw| raw.parse::<u64>().ok()) {
         // `time.NewTicker(0)` panics in the reference; 1ms is the same intent
         Some(0) => Duration::from_millis(1),
@@ -967,7 +971,10 @@ async fn serve_static(
             return Ok(true);
         }
     };
-    for part in asset.split('/').filter(|part| !part.is_empty() && *part != ".") {
+    for part in asset
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
         if part == ".." {
             respond_text(
                 stream,
@@ -1602,7 +1609,15 @@ async fn respond_redirect(
     };
     let mut headers = cors.to_vec();
     headers.push(format!("Location: {location}"));
-    respond_text(stream, status, reason, "", &headers, "text/plain; charset=utf-8").await
+    respond_text(
+        stream,
+        status,
+        reason,
+        "",
+        &headers,
+        "text/plain; charset=utf-8",
+    )
+    .await
 }
 
 async fn respond_text(

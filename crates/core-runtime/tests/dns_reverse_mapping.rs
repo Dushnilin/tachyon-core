@@ -120,7 +120,10 @@ async fn spawn_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
 /// SOCKS5 CONNECT to an IPv4 destination; returns the reply code.
 async fn socks_connect(inbound: std::net::SocketAddr, ip: Ipv4Addr, port: u16) -> u8 {
     let mut stream = TcpStream::connect(inbound).await.expect("connect inbound");
-    stream.write_all(&[0x05, 0x01, 0x00]).await.expect("greeting");
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting");
     let mut auth = [0u8; 2];
     stream.read_exact(&mut auth).await.expect("auth reply");
 

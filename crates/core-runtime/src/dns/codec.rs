@@ -391,6 +391,37 @@ pub fn set_id(raw: &[u8], id: u16) -> io::Result<Vec<u8>> {
     encode(&msg)
 }
 
+/// Attach the configured client subnet to a query, the shape the reference
+/// puts on the wire: an OPT record with payload size 0 and no DO bit, whose
+/// only option is EDNS0 SUBNET with the configured netmask (RFC 7871).
+///
+/// ponytail: the query is always ours — `build_query` sets no EDNS — and there
+/// is no DNS server inbound, so nothing can arrive with an OPT already on it;
+/// the reference instead replaces an existing SUBNET option. Revisit with the
+/// server inbound.
+pub fn set_client_subnet(query: &[u8], addr: IpAddr, bits: u8) -> Vec<u8> {
+    let (family, octets): (u16, Vec<u8>) = match addr {
+        IpAddr::V4(v4) => (1, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (2, v6.octets().to_vec()),
+    };
+    let mut rdata = Vec::with_capacity(8 + octets.len());
+    rdata.extend_from_slice(&8u16.to_be_bytes()); // option code: EDNS0 SUBNET
+    rdata.extend_from_slice(&((4 + octets.len()) as u16).to_be_bytes());
+    rdata.extend_from_slice(&family.to_be_bytes());
+    rdata.push(bits); // source prefix length
+    rdata.push(0); // scope prefix length
+    rdata.extend_from_slice(&octets);
+
+    let mut out = query.to_vec();
+    out.push(0); // root name
+    out.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
+    out.extend_from_slice(&0u16.to_be_bytes()); // CLASS = requestor payload size
+    out.extend_from_slice(&0u32.to_be_bytes()); // TTL: no extended flags, no DO
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata);
+    out
+}
+
 pub fn parse_record_type(raw: &str) -> Option<RecordType> {
     RecordType::from_str(raw).ok()
 }

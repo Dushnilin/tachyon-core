@@ -340,14 +340,9 @@ fn dns_server_fields(ty: &str) -> Vec<&'static str> {
         "https" => {
             fields.extend_from_slice(&["server", "server_port", "tls", "path", "method", "headers"])
         }
-        "h3" => fields.extend_from_slice(&[
-            "server",
-            "server_port",
-            "tls",
-            "path",
-            "method",
-            "headers",
-        ]),
+        "h3" => {
+            fields.extend_from_slice(&["server", "server_port", "tls", "path", "method", "headers"])
+        }
         "hosts" => fields.extend_from_slice(&["path", "predefined"]),
         "fakeip" => fields.extend_from_slice(&["inet4_range", "inet6_range"]),
         "local" => fields.extend_from_slice(&["prefer_go", "neighbor_domain"]),
@@ -4771,6 +4766,14 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
         .as_object()
         .ok_or_else(|| "dns: must be a JSON object".to_string())?;
     reject_unknown_fields(obj, DNS_TOP_FIELDS, "dns")?;
+    if let Some(value) = obj.get("client_subnet").filter(|value| !value.is_null()) {
+        check_prefixable_field(
+            value,
+            "dns.client_subnet",
+            "RawDNSOptions.DNSClientOptions",
+            "client_subnet",
+        )?;
+    }
     if let Some(rules) = obj.get("rules").filter(|value| !prunes_value(value)) {
         validate_dns_rules(rules)?;
     }
@@ -8927,6 +8930,37 @@ fn prefix_parse_reason(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `badoption.Prefixable` field: a CIDR string, or a bare address the
+/// reference turns into a host prefix. The failure is the decode error Go
+/// reports, and a string that is neither keeps the `netip.ParsePrefix` text
+/// the reference falls back to.
+fn check_prefixable_field(
+    value: &Value,
+    at: &str,
+    go_struct: &str,
+    go_field: &str,
+) -> Result<(), String> {
+    let wrong_type = |kind: &str| {
+        format!(
+            "{at}: json: cannot unmarshal {kind} into Go struct field {go_struct}.{go_field} of type string"
+        )
+    };
+    match value {
+        Value::String(s) => match prefix_parse_reason(s) {
+            Ok(()) => Ok(()),
+            // ParsePrefix fails first on a bare address, then the reference
+            // retries it as one
+            Err(_) if parse_ip_addr(s).is_some() => Ok(()),
+            Err(reason) => Err(format!("{at}: netip.ParsePrefix({s:?}): {reason}")),
+        },
+        Value::Number(_) => Err(wrong_type("number")),
+        Value::Bool(_) => Err(wrong_type("bool")),
+        Value::Array(_) => Err(wrong_type("array")),
+        Value::Object(_) => Err(wrong_type("object")),
+        Value::Null => Ok(()),
+    }
+}
+
 /// IPv4/IPv6 literal parser (netip.ParseAddr subset): dotted quad without
 /// leading zeros, or colon-hex with at most one `::` and an optional
 /// trailing v4 / `%zone`.
@@ -9940,6 +9974,60 @@ mod tests {
         // decode errors precede the deprecation guard
         let err = run(json!({"experimental": {"clash_api": {"store_mode": 1}}}));
         assert!(!err.starts_with("create clash-server"), "{err}");
+    }
+
+    #[test]
+    fn client_subnet_check_parity() {
+        let run = |raw: Value| {
+            validate(&json!({
+                "dns": {"servers": [{"type": "udp", "tag": "d", "server": "1.1.1.1"}], "final": "d",
+                        "client_subnet": raw}
+            }))
+            .unwrap_err()
+        };
+        let ok = |raw: Value| {
+            validate(&json!({
+                "dns": {"servers": [{"type": "udp", "tag": "d", "server": "1.1.1.1"}], "final": "d",
+                        "client_subnet": raw}
+            }))
+        };
+
+        // a CIDR, and a bare address the reference makes a host prefix of
+        assert!(ok(json!("1.2.3.0/24")).is_ok());
+        assert!(ok(json!("1.2.3.4")).is_ok());
+        assert!(ok(json!("2001:db8::/32")).is_ok());
+        assert!(
+            ok(json!("1.2.3.4/24")).is_ok(),
+            "the prefix is masked, not refused"
+        );
+
+        // the reference decodes a single string, not a list
+        let err = run(json!(["1.2.3.0/24"]));
+        assert_eq!(
+            err,
+            "dns.client_subnet: json: cannot unmarshal array into Go struct field \
+             RawDNSOptions.DNSClientOptions.client_subnet of type string"
+        );
+        let err = run(json!(5));
+        assert_eq!(
+            err,
+            "dns.client_subnet: json: cannot unmarshal number into Go struct field \
+             RawDNSOptions.DNSClientOptions.client_subnet of type string"
+        );
+        // a string that is neither a prefix nor an address keeps the
+        // ParsePrefix failure the reference falls back to
+        let err = run(json!("nonsense"));
+        assert_eq!(
+            err,
+            "dns.client_subnet: netip.ParsePrefix(\"nonsense\"): no '/'"
+        );
+        let err = run(json!(""));
+        assert_eq!(err, "dns.client_subnet: netip.ParsePrefix(\"\"): no '/'");
+        let err = run(json!("1.2.3.0/33"));
+        assert_eq!(
+            err,
+            "dns.client_subnet: netip.ParsePrefix(\"1.2.3.0/33\"): prefix length out of range"
+        );
     }
 
     #[test]

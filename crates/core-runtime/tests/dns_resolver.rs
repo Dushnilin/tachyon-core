@@ -339,15 +339,32 @@ async fn a_group_answers_from_the_member_that_is_alive() {
         vec![ip(10, 4, 4, 4)],
         "the answer came from the member that answered"
     );
-    // the dead member is now dirty, and the second query goes straight to the
-    // live one instead of fanning again
+    // The dead member becomes dirty, and the second query goes straight to the
+    // live one instead of fanning again. The record is written by the fan's
+    // collector, which keeps running after the winner is delivered — exactly
+    // as the reference does — so the assertion waits for it.
     let group = svc
         .server("grp")
         .and_then(|cfg| cfg.group.clone())
         .expect("the group runtime");
-    let state = group.snapshot();
+    for _ in 0..200 {
+        let dead = group
+            .snapshot()
+            .into_iter()
+            .find(|m| m.tag == "dead")
+            .expect("the dead member");
+        if !dead.clean {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(
-        !state.iter().find(|m| m.tag == "dead").expect("dead").clean,
+        !group
+            .snapshot()
+            .into_iter()
+            .find(|m| m.tag == "dead")
+            .expect("the dead member")
+            .clean,
         "a refused connection is an error record"
     );
     let before = hits.load(Ordering::SeqCst);

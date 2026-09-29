@@ -114,6 +114,74 @@ enum UplinkPlacement {
     Cookie,
 }
 
+/// The stream handed back to the caller: it releases its pooled connection when
+/// it is dropped, which is the only place a stream knows it is finished.
+struct Pooled {
+    inner: AnyStream,
+    pool: std::sync::Arc<super::xmux::Pool>,
+    client: std::sync::Arc<super::xmux::Client>,
+}
+
+impl Pooled {
+    fn wrap(
+        cfg: &XhttpConfig,
+        inner: AnyStream,
+        client: std::sync::Arc<super::xmux::Client>,
+    ) -> AnyStream {
+        Box::new(Self {
+            inner,
+            pool: std::sync::Arc::clone(&cfg.pool),
+            client,
+        })
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        // Drop cannot await, so the release is handed to the runtime; a
+        // connection whose task is already gone is aborted right here.
+        let pool = std::sync::Arc::clone(&self.pool);
+        let client = std::sync::Arc::clone(&self.client);
+        tokio::spawn(async move {
+            pool.release(&client).await;
+        });
+    }
+}
+
+impl tokio::io::AsyncRead for Pooled {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, out)
+    }
+}
+
+impl tokio::io::AsyncWrite for Pooled {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Normalized placement/key/method selection (reference `metaConfig`).
 #[derive(Debug, Clone)]
 struct Meta {
@@ -254,7 +322,7 @@ impl Meta {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct XhttpConfig {
     host: Option<String>,
     path: String,
@@ -263,6 +331,10 @@ pub(crate) struct XhttpConfig {
     padding: Range,
     no_grpc_header: bool,
     meta: Meta,
+    /// XHTTP connection reuse, shared by every dial of this transport
+    pool: std::sync::Arc<super::xmux::Pool>,
+    /// the pooled connection this stream runs on, filled in per dial
+    client: Option<std::sync::Arc<super::xmux::Client>>,
 }
 
 impl XhttpConfig {
@@ -309,7 +381,19 @@ impl XhttpConfig {
             )?,
             no_grpc_header: t.get("no_grpc_header").and_then(Value::as_bool) == Some(true),
             meta: Meta::resolve(t, mode)?,
+            pool: super::xmux::Pool::new(super::xmux::XmuxConfig::parse(
+                t.get("xmux"),
+                "v2ray-xhttp.xmux",
+            )?),
+            client: None,
         })
+    }
+
+    /// A copy of the config bound to the pooled connection a stream runs on.
+    fn with_client(&self, client: std::sync::Arc<super::xmux::Client>) -> Self {
+        let mut copy = self.clone();
+        copy.client = Some(client);
+        copy
     }
 
     fn resolved_mode(&self, tls: bool) -> Mode {
@@ -338,13 +422,30 @@ pub(crate) async fn connect(
     port: u16,
     cfg: &XhttpConfig,
 ) -> io::Result<AnyStream> {
-    let (send_request, connection) = h2::client::handshake(stream)
-        .await
-        .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
-    let conn_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    // a pooled connection is reused whenever one can take another stream; the
+    // connection task belongs to the pool entry, not to the stream
+    let (send_request, client) = match cfg.pool.acquire().await {
+        Some(client) => (client.send.clone(), client),
+        None => {
+            let (send_request, connection) = h2::client::handshake(stream)
+                .await
+                .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
+            let client = cfg
+                .pool
+                .insert(
+                    send_request.clone(),
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    }),
+                )
+                .await;
+            (send_request, client)
+        }
+    };
 
+    // from here on the config carries this stream's connection, so every
+    // request it issues is accounted against the pool's limits
+    let cfg = &cfg.with_client(std::sync::Arc::clone(&client));
     let authority = cfg.host.clone().unwrap_or_else(|| {
         if server.contains(':') && !server.starts_with('[') {
             format!("[{server}]:{port}")
@@ -368,12 +469,13 @@ pub(crate) async fn connect(
                 true,
             )
             .await?;
-            Ok(Box::new(H2Io {
-                h2: H2Stream::new(response, send, conn_task),
-            }))
+            let body: AnyStream = Box::new(H2Io {
+                h2: H2Stream::shared(response, send),
+            });
+            Ok(Pooled::wrap(cfg, body, client))
         }
         Mode::StreamUp => {
-            let mut this = SplitConn::new(cfg, send_request.clone(), conn_task);
+            let mut this = SplitConn::new(cfg, send_request.clone());
             // Download: GET with the session id, no seq.
             let (dl_resp, _) = issue(
                 send_request.clone(),
@@ -400,13 +502,14 @@ pub(crate) async fn connect(
             )
             .await?;
             this.up = Up::Stream(send);
-            Ok(Box::new(XhttpConn {
+            let body: AnyStream = Box::new(XhttpConn {
                 split: Box::new(this),
-            }))
+            });
+            Ok(Pooled::wrap(cfg, body, client))
         }
         _ => {
             // packet-up (and auto→packet-up)
-            let mut this = SplitConn::new(cfg, send_request, conn_task);
+            let mut this = SplitConn::new(cfg, send_request);
             let (dl_resp, _) = issue(
                 this.send_request(),
                 cfg,
@@ -431,9 +534,10 @@ pub(crate) async fn connect(
                 }),
                 in_flight: None,
             }));
-            Ok(Box::new(XhttpConn {
+            let body: AnyStream = Box::new(XhttpConn {
                 split: Box::new(this),
-            }))
+            });
+            Ok(Pooled::wrap(cfg, body, client))
         }
     }
 }
@@ -453,6 +557,12 @@ async fn issue(
         .ready()
         .await
         .map_err(|e| io::Error::other(format!("xhttp: h2 ready: {e}")))?;
+    // one HTTP request against the pool's h_max_request_times: a packet-up
+    // stream issues one POST per write, and a connection that ignored those
+    // would outlive the limit the server was told about
+    if let Some(client) = &cfg.client {
+        client.take_request();
+    }
     let request = cfg.build_request(scheme, authority, method, session, seq.as_deref(), body)?;
     let (response, send) = ready
         .send_request(request, false)
@@ -575,7 +685,6 @@ struct SplitConn {
     up: Up,
     session_id: String,
     send_request: h2::client::SendRequest<Bytes>,
-    conn_task: tokio::task::JoinHandle<()>,
 }
 
 type InFlight = Option<Pin<Box<dyn Future<Output = io::Result<(PostWriter, usize)>> + Send>>>;
@@ -593,11 +702,7 @@ enum Up {
 }
 
 impl SplitConn {
-    fn new(
-        cfg: &XhttpConfig,
-        send_request: h2::client::SendRequest<Bytes>,
-        conn_task: tokio::task::JoinHandle<()>,
-    ) -> Self {
+    fn new(cfg: &XhttpConfig, send_request: h2::client::SendRequest<Bytes>) -> Self {
         let session_id = new_session_id(&cfg.meta);
         let (_, dl) = mpsc::channel(4);
         Self {
@@ -607,7 +712,6 @@ impl SplitConn {
             up: Up::None,
             session_id,
             send_request,
-            conn_task,
         }
     }
 
@@ -762,7 +866,6 @@ impl AsyncWrite for XhttpConn {
 impl Drop for SplitConn {
     fn drop(&mut self) {
         self.dl_task.abort();
-        self.conn_task.abort();
     }
 }
 

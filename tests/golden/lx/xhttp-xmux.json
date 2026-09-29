@@ -1,0 +1,54 @@
+{
+  "log": { "level": "info" },
+  "dns": {
+    "servers": [{ "type": "udp", "tag": "u", "server": "1.1.1.1" }],
+    "final": "u"
+  },
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "xhttp",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "transport": { "type": "xhttp", "path": "/x", "mode": "packet-up" }
+    },
+    {
+      "type": "vless",
+      "tag": "xhttp-max-connections",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "transport": {
+        "type": "xhttp",
+        "path": "/x",
+        "xmux": { "max_connections": 4, "c_max_reuse_times": "8-16" }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "xhttp-max-concurrency",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "transport": {
+        "type": "xhttp",
+        "path": "/x",
+        "xmux": { "max_concurrency": 8, "h_max_reusable_secs": 60 }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "xhttp-empty-xmux",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "transport": { "type": "xhttp", "path": "/x", "xmux": {} }
+    }
+  ],
+  "route": { "final": "xhttp", "default_domain_resolver": "u" }
+}

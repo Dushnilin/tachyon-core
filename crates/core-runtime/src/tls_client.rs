@@ -69,7 +69,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TlsOptions {
     server_name: String,
     insecure: bool,

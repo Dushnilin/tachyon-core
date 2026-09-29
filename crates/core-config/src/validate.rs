@@ -6682,6 +6682,12 @@ fn validate_plain_out_decode(
     if matches!(ty, "shadowsocks" | "vmess" | "vless" | "trojan")
         && let Some(v) = obj.get("multiplex")
     {
+        // the reference switches on the protocol name whatever `enabled` says
+        if let Some(Value::String(protocol)) = v.get("protocol")
+            && !matches!(protocol.as_str(), "" | "h2mux" | "smux" | "yamux")
+        {
+            return Err(format!("{at}: unknown protocol: {protocol}"));
+        }
         check_out_multiplex(v, &format!("{at}.multiplex"), go_base)?;
     }
     if has_tls

@@ -7,14 +7,17 @@
 //! (`experimental/clashapi` in the sing-box reference, probed against
 //! `sing-box 1.14.2-lx.3`).
 //!
-//! Also serves the reference data views: `GET /logs` and `GET /traffic`
-//! (chunked streams), `GET|DELETE /connections` (with
-//! `DELETE /connections/{id}`), `GET /rules` and `GET|PATCH /configs`, plus
-//! `external_ui` static files when configured.
+//! Also serves the reference data views: `GET /logs` and `GET /traffic`,
+//! `GET /connections` (with `DELETE /connections/{id}`), `GET /rules` and
+//! `GET|PATCH /configs`. The three streaming endpoints answer a
+//! `Upgrade: websocket` request with the RFC 6455 handshake and stream text
+//! frames, exactly as the reference upgrades them; without the header they
+//! stay chunked HTTP streams. `external_ui` is mounted under `/ui/` and,
+//! when the directory is empty, filled once from `external_ui_download_url`
+//! (Yacd-meta by default), the way `checkAndDownloadExternalUI` does it.
 //!
 //! Known gaps (roadmap): proxy/rule providers (404 — no provider runtime),
-//! `external_ui` auto-download, and cache.db persistence of the delay
-//! history, fakeip and DNS cache.
+//! and cache.db persistence of the delay history, fakeip and DNS cache.
 //!
 //! Known deviations (deliberate): HTTP keep-alive loop without `Date`
 //! headers; version string reports `tachyon-core`.
@@ -32,7 +35,7 @@ use tokio::task::JoinHandle;
 use crate::clash_state;
 use crate::inbound::Target;
 use crate::route::{Outbound, Router, SelectError};
-use crate::{logging, tls_client};
+use crate::{logging, tls_client, ws, zip};
 
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024;
@@ -51,11 +54,13 @@ pub struct ClashApi {
     secret: Option<String>,
     allow_origins: Vec<String>,
     allow_private_network: bool,
-    /// `experimental.clash_api.external_ui` directory served for unknown GETs.
+    /// `experimental.clash_api.external_ui` directory, mounted under `/ui/`.
     external_ui: Option<String>,
-    /// `external_ui-download-url`: the reference fetches a dashboard bundle;
-    /// we only report it as unimplemented.
-    external_ui_download: Option<String>,
+    /// `external_ui_download_url`: where an empty `external_ui` is filled
+    /// from (the reference's default is the Yacd-meta bundle).
+    external_ui_download_url: Option<String>,
+    /// `external_ui_download_detour`: the outbound the fetch dials through.
+    external_ui_download_detour: Option<String>,
 }
 
 impl ClashApi {
@@ -120,28 +125,26 @@ impl ClashApi {
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
             .map(str::to_string);
-        if let Some(dir) = external_ui.as_deref()
-            && !std::path::Path::new(dir).is_dir()
-        {
-            anyhow::bail!("external_ui: {dir} is not a directory");
-        }
-        let external_ui_download = obj
+        let external_ui_download_url = obj
             .get("external_ui_download_url")
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
             .map(str::to_string);
-        if external_ui_download.is_some() {
-            logging::warn(format_args!(
-                "external_ui_download_url: fetching a dashboard bundle is not implemented yet (ignored)"
-            ));
-        }
+        let external_ui_download_detour = obj
+            .get("external_ui_download_detour")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        // The directory may not exist yet: the reference creates it and
+        // fills it on start (`checkAndDownloadExternalUI`).
         Ok(Some(Self {
             bind,
             secret,
             allow_origins,
             allow_private_network,
             external_ui,
-            external_ui_download,
+            external_ui_download_url,
+            external_ui_download_detour,
         }))
     }
 
@@ -150,12 +153,68 @@ impl ClashApi {
         self,
         router: Arc<Router>,
     ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
+        // reference order: the dashboard is in place before the listener opens
+        self.ensure_external_ui(&router).await;
         let listener = TcpListener::bind(normalize_bind(&self.bind))
             .await
             .with_context(|| "external controller listen error")?;
         let addr = listener.local_addr()?;
         let handle = tokio::spawn(serve(listener, Arc::new(self), router));
         Ok((addr, handle))
+    }
+
+    /// Reference `checkAndDownloadExternalUI`: create the directory, and when
+    /// it is still empty unpack `external_ui_download_url` into it.
+    async fn ensure_external_ui(&self, router: &Arc<Router>) {
+        let Some(dir) = self.external_ui.as_deref() else {
+            return;
+        };
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            logging::warn(format_args!("external_ui: cannot create {dir}: {err}"));
+            return;
+        }
+        let empty = match std::fs::read_dir(dir) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(err) => {
+                logging::warn(format_args!("external_ui: cannot read {dir}: {err}"));
+                return;
+            }
+        };
+        if !empty {
+            return;
+        }
+        let url = self.external_ui_download_url.clone().unwrap_or_else(|| {
+            "https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip".to_string()
+        });
+        let client = match download_client(self.external_ui_download_detour.as_deref()) {
+            Ok(client) => client,
+            Err(err) => {
+                logging::warn(format_args!("external_ui: {err}"));
+                return;
+            }
+        };
+        logging::info(format_args!("downloading external ui from {url}"));
+        match client.get(router, &url, &[]).await {
+            Ok(response) if response.status == 200 => {
+                if let Err(err) = zip::extract(&response.body, std::path::Path::new(dir)) {
+                    logging::warn(format_args!("external_ui: {err}"));
+                    clear_directory(dir);
+                } else {
+                    logging::info(format_args!("external_ui: installed into {dir}"));
+                }
+            }
+            Ok(response) => {
+                logging::warn(format_args!(
+                    "external_ui: downloading {url} failed: HTTP {}",
+                    response.status
+                ));
+                clear_directory(dir);
+            }
+            Err(err) => {
+                logging::warn(format_args!("external_ui: downloading {url} failed: {err}"));
+                clear_directory(dir);
+            }
+        }
     }
 
     /// `Access-Control-Allow-Origin` for this request, if any.
@@ -190,6 +249,31 @@ fn normalize_bind(addr: &str) -> String {
         format!("0.0.0.0{addr}")
     } else {
         addr.to_string()
+    }
+}
+
+/// The fetch client for the dashboard bundle: `external_ui_download_detour`
+/// picks the outbound, everything else is the runtime's own HTTP client.
+fn download_client(detour: Option<&str>) -> anyhow::Result<crate::http_client::HttpClient> {
+    let Some(detour) = detour else {
+        return Ok(crate::http_client::HttpClient::default());
+    };
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert("detour".into(), Value::String(detour.into()));
+    crate::http_client::HttpClient::from_config(
+        Some(&Value::Object(wrapper)),
+        "experimental.clash_api.external_ui_download_detour",
+    )
+}
+
+/// Reference `removeAllInDirectory`: a failed download must not leave a
+/// half-unpacked bundle behind, or the next start would think it is current.
+fn clear_directory(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
@@ -321,9 +405,37 @@ async fn handle_request(
         return Ok(true);
     }
 
+    // The three streaming endpoints upgrade when the client asks; the
+    // handshake is validated the way the reference's upgrader does and a
+    // rejection is written straight to the wire (Go hijacks first).
+    let ws_key = if ws::wants_upgrade(&headers)
+        && matches!(route, Route::Logs | Route::Traffic | Route::Connections)
+    {
+        match ws::validate(&headers) {
+            Ok(key) => Some(key),
+            Err(rejection) => {
+                stream.write_all(rejection.response().as_bytes()).await?;
+                return Ok(true);
+            }
+        }
+    } else {
+        None
+    };
+
     match route {
         Route::Root => {
-            respond_json(stream, 200, "OK", &json!({"hello": "clash"}), &cors).await?;
+            // `hello(redirect)`: with a dashboard configured, a navigation
+            // that did not ask for JSON is sent to /ui/
+            let wants_json = header_get(&headers, "content-type")
+                .is_some_and(|value| value == "application/json");
+            if api.external_ui.is_some() && !wants_json {
+                respond_redirect(stream, 307, "/ui/", &cors).await?;
+            } else {
+                respond_json(stream, 200, "OK", &json!({"hello": "clash"}), &cors).await?;
+            }
+        }
+        Route::UiRoot => {
+            respond_redirect(stream, 301, "/ui/", &cors).await?;
         }
         Route::Version => {
             let version = format!("tachyon-core {}", env!("CARGO_PKG_VERSION"));
@@ -361,13 +473,13 @@ async fn handle_request(
             .await;
         }
         Route::Logs => {
-            return stream_logs(stream, &query, &cors).await;
+            return stream_logs(stream, &query, &cors, ws_key).await;
         }
         Route::Traffic => {
-            return stream_traffic(stream, &cors).await;
+            return stream_traffic(stream, &cors, ws_key).await;
         }
         Route::Connections => {
-            return handle_connections(stream, method, &cors).await;
+            return handle_connections(stream, method, &query, &cors, ws_key).await;
         }
         Route::Connection(id) => {
             return handle_connection(stream, method, id, &cors).await;
@@ -409,7 +521,9 @@ enum Route {
     Rules,
     Configs,
     Providers,
-    /// unknown path with `external_ui` configured: try a static file
+    /// `/ui`: the permanent redirect to `/ui/`
+    UiRoot,
+    /// asset under `/ui/`
     Static(String),
     Unknown,
 }
@@ -456,17 +570,69 @@ fn classify_proxies(path: &str, external_ui: bool) -> (Route, &'static [&'static
                 None => (Route::Unknown, GET_ONLY),
             }
         }
-        None if external_ui && !path.contains("..") => (Route::Static(path.to_string()), GET_ONLY),
+        None if external_ui => classify_ui(path),
         None => (Route::Unknown, GET_ONLY),
     }
 }
 
-/// `GET /logs`: replay the ring buffer, then stream live lines. The response
-/// is chunked, like the reference's flusher-based handler.
+/// `external_ui` is mounted where the reference mounts it: only under `/ui`,
+/// with `/ui` itself redirected to `/ui/`.
+fn classify_ui(path: &str) -> (Route, &'static [&'static str]) {
+    if path.contains("..") {
+        return (Route::Unknown, GET_ONLY);
+    }
+    match path.strip_prefix("/ui") {
+        Some("") => (Route::UiRoot, GET_ONLY),
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(asset) => (Route::Static(asset.to_string()), GET_ONLY),
+            // `/uixyz` is outside the mount
+            None => (Route::Unknown, GET_ONLY),
+        },
+        None => (Route::Unknown, GET_ONLY),
+    }
+}
+
+/// A live stream: an HTTP chunked body, or a websocket after the 101. The
+/// reference writes the same JSON either way — `wsutil.WriteServerText` on
+/// an upgraded connection, the flusher on a plain one.
+struct Live<'a> {
+    stream: &'a mut TcpStream,
+    ws: bool,
+}
+
+impl<'a> Live<'a> {
+    /// Open the stream: handshake first when the client upgraded, otherwise
+    /// the chunked head of a JSON stream.
+    async fn open(
+        stream: &'a mut TcpStream,
+        cors: &[String],
+        ws_key: Option<String>,
+    ) -> std::io::Result<Live<'a>> {
+        if let Some(key) = ws_key {
+            ws::accept(stream, &key).await?;
+            return Ok(Live { stream, ws: true });
+        }
+        let mut headers = cors.to_vec();
+        headers.push("Content-Type: application/json".to_string());
+        send_chunked_head(stream, &headers).await?;
+        Ok(Live { stream, ws: false })
+    }
+
+    async fn send(&mut self, body: &str) -> std::io::Result<()> {
+        if self.ws {
+            ws::write_text(self.stream, body.as_bytes()).await
+        } else {
+            write_chunk(self.stream, body).await
+        }
+    }
+}
+
+/// `GET /logs`: replay the ring buffer, then stream live lines.
 async fn stream_logs(
     stream: &mut TcpStream,
     query: &[(String, String)],
     cors: &[String],
+    ws_key: Option<String>,
 ) -> std::io::Result<bool> {
     let level_raw = query
         .iter()
@@ -485,15 +651,15 @@ async fn stream_logs(
         }
     };
     let (id, mut live) = logging::subscribe();
-    let mut headers = cors.to_vec();
-    headers.push("Content-Type: application/json".to_string());
-    send_chunked_head(stream, &headers).await?;
+    // the reference validates `level` before it upgrades: a bad level is a
+    // plain 400, never a 101 followed by nothing
+    let mut out = Live::open(stream, cors, ws_key).await?;
     for line in logging::recent(level) {
-        write_chunk(stream, &log_entry(level_raw, level, &line)).await?;
+        out.send(&log_entry(level_raw, level, &line)).await?;
     }
     while let Some((entry_level, line)) = live.recv().await {
         if entry_level >= level {
-            write_chunk(stream, &log_entry(level_raw, level, &line)).await?;
+            out.send(&log_entry(level_raw, level, &line)).await?;
         }
     }
     logging::unsubscribe(id);
@@ -510,16 +676,43 @@ fn log_entry(requested: &str, level: logging::Level, message: &str) -> String {
 }
 
 /// `GET /traffic`: one JSON object per second with the running totals.
-async fn stream_traffic(stream: &mut TcpStream, cors: &[String]) -> std::io::Result<bool> {
-    let mut headers = cors.to_vec();
-    headers.push("Content-Type: application/json".to_string());
-    send_chunked_head(stream, &headers).await?;
+async fn stream_traffic(
+    stream: &mut TcpStream,
+    cors: &[String],
+    ws_key: Option<String>,
+) -> std::io::Result<bool> {
+    let mut out = Live::open(stream, cors, ws_key).await?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.tick().await;
     loop {
         ticker.tick().await;
         let (_, up, down) = clash_state::snapshot();
-        write_chunk(stream, &json!({"up": up, "down": down}).to_string()).await?;
+        out.send(&json!({"up": up, "down": down}).to_string()).await?;
+    }
+}
+
+/// The `/connections` snapshot: totals, memory and one entry per live conn.
+fn connections_snapshot() -> Value {
+    let (views, up, down) = clash_state::snapshot();
+    let connections: Vec<Value> = views.iter().map(connection_json).collect();
+    json!({
+        "downloadTotal": down,
+        "uploadTotal": up,
+        "connections": connections,
+        "memory": 0,
+    })
+}
+
+/// `?interval=` for the websocket stream, in milliseconds (reference default
+/// 1000). The reference rejects a non-integer after it has already hijacked
+/// the connection, so the client never sees that 400 — we fall back instead.
+fn connections_interval(query: &[(String, String)]) -> Duration {
+    let raw = query.iter().find(|(k, _)| k == "interval").map(|(_, v)| v.as_str());
+    match raw.and_then(|raw| raw.parse::<u64>().ok()) {
+        // `time.NewTicker(0)` panics in the reference; 1ms is the same intent
+        Some(0) => Duration::from_millis(1),
+        Some(ms) => Duration::from_millis(ms),
+        None => Duration::from_secs(1),
     }
 }
 
@@ -527,20 +720,24 @@ async fn stream_traffic(stream: &mut TcpStream, cors: &[String]) -> std::io::Res
 async fn handle_connections(
     stream: &mut TcpStream,
     method: &str,
+    query: &[(String, String)],
     cors: &[String],
+    ws_key: Option<String>,
 ) -> std::io::Result<bool> {
     match method {
-        "GET" => {
-            let (views, up, down) = clash_state::snapshot();
-            let connections: Vec<Value> = views.iter().map(connection_json).collect();
-            let body = json!({
-                "downloadTotal": down,
-                "uploadTotal": up,
-                "connections": connections,
-                "memory": 0,
-            });
-            respond_json(stream, 200, "OK", &body, cors).await?;
-        }
+        "GET" => match ws_key {
+            Some(key) => {
+                ws::accept(stream, &key).await?;
+                let mut ticker = tokio::time::interval(connections_interval(query));
+                loop {
+                    ticker.tick().await;
+                    ws::write_text(stream, connections_snapshot().to_string().as_bytes()).await?;
+                }
+            }
+            None => {
+                respond_json(stream, 200, "OK", &connections_snapshot(), cors).await?;
+            }
+        },
         _ => {
             let closed = clash_state::close_all();
             logging::info(format_args!("clash-api: closed {closed} connections"));
@@ -678,7 +875,7 @@ async fn handle_configs(
                 "allow-lan": false,
                 "external-controller": api.bind,
                 "external-ui": api.external_ui,
-                "external-ui-download-url": api.external_ui_download,
+                "external-ui-download-url": api.external_ui_download_url,
             });
             respond_json(stream, 200, "OK", &body, cors).await?;
         }
@@ -746,60 +943,70 @@ async fn handle_configs(
     Ok(true)
 }
 
-/// `external_ui` static files; unknown paths fall back to `index.html`.
+/// `external_ui` static files, mounted under `/ui/` the way the reference
+/// mounts `http.FileServer`: a missing asset is a 404, there is no
+/// single-page fallback to paper over it.
 async fn serve_static(
     stream: &mut TcpStream,
     api: &ClashApi,
     asset: &str,
     cors: &[String],
 ) -> std::io::Result<bool> {
-    let Some(dir) = api.external_ui.as_deref() else {
-        respond_text(
-            stream,
-            404,
-            "Not Found",
-            "404 page not found\n",
-            cors,
-            "text/plain; charset=utf-8",
-        )
-        .await?;
-        return Ok(true);
+    let mut path = match api.external_ui.as_deref() {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => {
+            respond_text(
+                stream,
+                404,
+                "Not Found",
+                "404 page not found\n",
+                cors,
+                "text/plain; charset=utf-8",
+            )
+            .await?;
+            return Ok(true);
+        }
     };
-    let relative = asset.trim_start_matches('/');
-    let relative = if relative.is_empty() {
-        "index.html"
-    } else {
-        relative
-    };
-    let mut path = std::path::PathBuf::from(dir);
-    for part in relative.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            continue;
+    for part in asset.split('/').filter(|part| !part.is_empty() && *part != ".") {
+        if part == ".." {
+            respond_text(
+                stream,
+                404,
+                "Not Found",
+                "404 page not found\n",
+                cors,
+                "text/plain; charset=utf-8",
+            )
+            .await?;
+            return Ok(true);
         }
         path.push(part);
     }
+    // a directory answers with its index.html, `/ui/` included
+    if path.is_dir() {
+        path.push("index.html");
+    }
     let body = match std::fs::read(&path) {
         Ok(body) => body,
-        Err(_) => match std::fs::read(std::path::PathBuf::from(dir).join("index.html")) {
-            Ok(body) => body,
-            Err(_) => {
-                respond_text(
-                    stream,
-                    404,
-                    "Not Found",
-                    "404 page not found\n",
-                    cors,
-                    "text/plain; charset=utf-8",
-                )
-                .await?;
-                return Ok(true);
-            }
-        },
+        Err(_) => {
+            respond_text(
+                stream,
+                404,
+                "Not Found",
+                "404 page not found\n",
+                cors,
+                "text/plain; charset=utf-8",
+            )
+            .await?;
+            return Ok(true);
+        }
     };
     let mime = mime_for(&path);
     let mut headers = cors.to_vec();
     headers.push(format!("Content-Type: {mime}"));
-    send(stream, 200, "OK", None, &headers, &body, false).await?;
+    // `http.FileServer` always states a length, which is also what keeps the
+    // connection reusable instead of read-until-close
+    send(stream, 200, "OK", None, &headers, &body, true).await?;
     Ok(true)
 }
 
@@ -1381,6 +1588,23 @@ async fn respond_json(
     .await
 }
 
+/// `http.Redirect` without its HTML body: CORS headers plus `Location`.
+async fn respond_redirect(
+    stream: &mut TcpStream,
+    status: u16,
+    location: &str,
+    cors: &[String],
+) -> std::io::Result<()> {
+    let reason = match status {
+        301 => "Moved Permanently",
+        307 => "Temporary Redirect",
+        _ => "Redirect",
+    };
+    let mut headers = cors.to_vec();
+    headers.push(format!("Location: {location}"));
+    respond_text(stream, status, reason, "", &headers, "text/plain; charset=utf-8").await
+}
+
 async fn respond_text(
     stream: &mut TcpStream,
     status: u16,
@@ -1444,7 +1668,8 @@ mod tests {
             allow_origins: vec!["*".into()],
             allow_private_network: false,
             external_ui: None,
-            external_ui_download: None,
+            external_ui_download_url: None,
+            external_ui_download_detour: None,
         }
     }
 

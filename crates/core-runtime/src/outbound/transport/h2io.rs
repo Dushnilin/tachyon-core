@@ -25,7 +25,8 @@ pub(crate) struct H2Stream {
     out_pos: usize,
     report: usize,
     eof: bool,
-    conn_task: JoinHandle<()>,
+    /// `None` when a shared owner drives the connection, as mux does
+    conn_task: Option<JoinHandle<()>>,
 }
 
 impl H2Stream {
@@ -33,6 +34,19 @@ impl H2Stream {
         response: ResponseFuture,
         send: h2::SendStream<Bytes>,
         conn_task: JoinHandle<()>,
+    ) -> Self {
+        Self::build(response, send, Some(conn_task))
+    }
+
+    /// A stream that borrows a connection task owned by a session pool.
+    pub(crate) fn shared(response: ResponseFuture, send: h2::SendStream<Bytes>) -> Self {
+        Self::build(response, send, None)
+    }
+
+    fn build(
+        response: ResponseFuture,
+        send: h2::SendStream<Bytes>,
+        conn_task: Option<JoinHandle<()>>,
     ) -> Self {
         Self {
             send: Some(send),
@@ -158,7 +172,9 @@ impl Drop for H2Stream {
         if let Some(mut send) = self.send.take() {
             send.send_reset(h2::Reason::CANCEL);
         }
-        self.conn_task.abort();
+        if let Some(task) = self.conn_task.take() {
+            task.abort();
+        }
     }
 }
 

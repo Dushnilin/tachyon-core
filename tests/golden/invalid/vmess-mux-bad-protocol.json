@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"vmess","tag":"v","server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","security":"auto","multiplex":{"enabled":true,"protocol":"mptcp"}}],"route":{"final":"v"}}

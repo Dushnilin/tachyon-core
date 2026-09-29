@@ -29,7 +29,7 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Transport {
     kind: Kind,
 }
@@ -37,7 +37,7 @@ pub(crate) struct Transport {
 #[cfg(test)]
 mod tests;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 enum Kind {
     #[default]
     None,

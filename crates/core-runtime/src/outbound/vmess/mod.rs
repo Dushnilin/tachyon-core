@@ -9,6 +9,7 @@ mod wire;
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use cfb_mode::cipher::KeyIvInit;
@@ -16,6 +17,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::inbound::{AnyStream, Target};
+use crate::outbound::mux;
 use crate::outbound::packet::{CMD_TCP, PacketEncoding, ResponseHeaderStream, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
@@ -39,6 +41,7 @@ const OPT_CHUNK_MASKING: u8 = 0x04;
 const OPT_GLOBAL_PADDING: u8 = 0x08;
 const OPT_AUTHENTICATED_LENGTH: u8 = 0x10;
 
+#[derive(Clone)]
 pub struct Vmess {
     server: String,
     port: u16,
@@ -51,6 +54,8 @@ pub struct Vmess {
     tls: Option<TlsOptions>,
     /// how datagrams are framed on the stream, see `packet`
     packet_encoding: PacketEncoding,
+    /// Mux.Cool session pool; `None` when multiplexing is off
+    mux: Option<Arc<mux::Client>>,
 }
 
 impl Vmess {
@@ -68,14 +73,12 @@ impl Vmess {
             0 => None,
             _ => Some(kdf::alter_key(&uuid)),
         };
-        if obj
-            .get("multiplex")
-            .and_then(|m| m.get("enabled"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            anyhow::bail!("{at}: vmess multiplex not implemented yet");
-        }
+        let multiplex = match obj.get("multiplex") {
+            Some(value) if !value.is_null() => {
+                mux::MuxOptions::parse(value, &format!("{at}.multiplex"))?
+            }
+            _ => mux::MuxOptions::default(),
+        };
         let packet_encoding =
             PacketEncoding::parse(obj.get("packet_encoding").and_then(Value::as_str), at)?;
 
@@ -115,6 +118,17 @@ impl Vmess {
             transport: Transport::parse(obj, at)?,
             tls,
             packet_encoding,
+            mux: if multiplex.min_streams > 0
+                || multiplex.max_connections > 0
+                || multiplex.max_streams > 0
+            {
+                Some(mux::Client::new(
+                    multiplex,
+                    packet_encoding == PacketEncoding::PacketAddr,
+                )?)
+            } else {
+                None
+            },
         })
     }
 
@@ -195,6 +209,25 @@ impl Vmess {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        if let Some(mux) = &self.mux {
+            if !mux.has_dialer().await {
+                // a session is opened against the magic destination through the
+                // same request machinery a normal connection uses
+                let copy = self.clone();
+                mux.set_dialer(Arc::new(move || {
+                    let copy = copy.clone();
+                    let target = mux::mux_target();
+                    Box::pin(async move { copy.connect_direct(&target).await })
+                }))
+                .await;
+            }
+            let stream = mux.open(target).await?;
+            return Ok(Box::new(stream));
+        }
+        self.connect_direct(target).await
+    }
+
+    async fn connect_direct(&self, target: &Target) -> io::Result<AnyStream> {
         let mut request_key = [0u8; 16];
         let mut request_iv = [0u8; 16];
         let mut response_header = [0u8; 1];

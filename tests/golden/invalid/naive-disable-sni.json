@@ -1,0 +1,1 @@
+{"outbounds":[{"type":"naive","tag":"nv","server":"example.com","server_port":443,"tls":{"enabled":true,"server_name":"cdn.example.com","disable_sni":true}}],"route":{"final":"nv"}}

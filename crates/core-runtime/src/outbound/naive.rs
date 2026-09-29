@@ -10,6 +10,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
@@ -17,7 +18,7 @@ use tokio::io::AsyncWriteExt;
 use crate::inbound::{AnyStream, Target};
 use crate::logging;
 use crate::outbound::proxy::{base64_std, server_endpoint};
-use crate::outbound::quic::udp_loopback_pair;
+use crate::outbound::quic::{CongestionKind, udp_loopback_pair};
 use crate::outbound::transport::h2io::{H2Io, H2Stream};
 use crate::outbound::uot::{UOT_DEFAULT_VERSION, magic_authority, request_header, spawn_bridge};
 use crate::tls_client::TlsOptions;
@@ -41,6 +42,10 @@ pub struct Naive {
     extra_headers: Vec<(String, String)>,
     /// `None` → UDP unsupported; `Some(1|2)` → uot framing version
     uot_version: Option<u8>,
+    /// `quic: true` runs the tunnel over HTTP/3 instead of HTTP/2
+    quic: bool,
+    quic_tunnel: crate::outbound::quic::QuicTunnelOptions,
+    congestion: crate::outbound::quic::CongestionKind,
 }
 
 impl Naive {
@@ -49,9 +54,35 @@ impl Naive {
         let Some(tls) = TlsOptions::from_outbound(obj, &server, at)? else {
             anyhow::bail!("{at}: naive outbound requires tls");
         };
-        if obj.get("quic").and_then(Value::as_bool) == Some(true) {
-            anyhow::bail!("{at}: naive quic transport is not implemented yet");
+        // the reference refuses a naive tunnel that skips certificate checking
+        if obj
+            .get("tls")
+            .and_then(|tls| tls.get("insecure"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            anyhow::bail!("{at}: insecure is not supported on naive outbound");
         }
+        if obj
+            .get("tls")
+            .and_then(|tls| tls.get("disable_sni"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            anyhow::bail!("{at}: disable_sni is not supported on naive outbound");
+        }
+        let quic = obj.get("quic").and_then(Value::as_bool).unwrap_or(false);
+        // the switch runs whether or not quic is on, like the reference
+        let congestion = match obj
+            .get("quic_congestion_control")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            "" | "bbr" | "bbr2" => CongestionKind::Bbr,
+            "cubic" => CongestionKind::Cubic,
+            "reno" => CongestionKind::NewReno,
+            other => anyhow::bail!("{at}: unknown quic congestion control: {other}"),
+        };
         for field in TUNING_FIELDS {
             if obj.get(*field).is_some_and(|value| !value.is_null()) {
                 logging::warn(format_args!(
@@ -129,6 +160,13 @@ impl Naive {
             authorization,
             extra_headers,
             uot_version,
+            quic,
+            quic_tunnel: crate::outbound::quic::QuicTunnelOptions::parse(
+                obj,
+                at,
+                crate::outbound::quic::QuicTunnelDefaults::tuic(),
+            )?,
+            congestion,
         })
     }
 
@@ -154,6 +192,66 @@ impl Naive {
 
     /// One h2 CONNECT stream: handshake, request, wrapped as raw pipes.
     async fn tunnel(&self, authority: &str) -> io::Result<AnyStream> {
+        if self.quic {
+            return self.tunnel_quic(authority).await;
+        }
+        self.tunnel_h2(authority).await
+    }
+
+    /// The same CONNECT over HTTP/3, which is what `quic: true` asks for.
+    async fn tunnel_quic(&self, authority: &str) -> io::Result<AnyStream> {
+        let addr = crate::outbound::quic::resolve_host(&self.server, self.port).await?;
+        let sock = crate::outbound::quic::bind_udp(addr)?;
+        let (ep_config, transport) = self.quic_tunnel.build_configs(self.congestion, None, true);
+        let mut endpoint = quinn::Endpoint::new(
+            ep_config,
+            None,
+            sock,
+            quinn::default_runtime().ok_or_else(|| io::Error::other("naive: no quinn runtime"))?,
+        )?;
+        let quic_tls = self.tls.quic_config(&[b"h3"])?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
+        client_config.transport_config(Arc::new(transport));
+        endpoint.set_default_client_config(client_config);
+        let connecting = endpoint
+            .connect(addr, self.tls.server_name())
+            .map_err(|e| io::Error::other(format!("naive: quic connect: {e}")))?;
+        let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| io::Error::other("naive: quic connect timeout"))?
+            .map_err(|e| io::Error::other(format!("naive: quic connect: {e}")))?;
+        let (mut h3_connection, mut send_request) =
+            h3::client::new(h3_quinn::Connection::new(connection))
+                .await
+                .map_err(|e| io::Error::other(format!("naive: h3 handshake: {e}")))?;
+        let conn_task = tokio::spawn(async move {
+            // the h3 connection is polled by hand; `wait_idle` never returns
+            let _ = h3_connection.wait_idle().await;
+        });
+        let mut builder = http::Request::builder()
+            .method("CONNECT")
+            .uri(format!("https://{authority}"));
+        if let Some(authorization) = &self.authorization {
+            builder = builder.header("proxy-authorization", authorization.clone());
+        }
+        for (name, value) in &self.extra_headers {
+            builder = builder.header(name.clone(), value.clone());
+        }
+        let request = builder
+            .body(())
+            .map_err(|e| io::Error::other(format!("naive: build request: {e}")))?;
+        let request_stream =
+            tokio::time::timeout(CONNECT_TIMEOUT, send_request.send_request(request))
+                .await
+                .map_err(|_| io::Error::other("naive: h3 request timeout"))?
+                .map_err(|e| io::Error::other(format!("naive: h3 request: {e}")))?;
+        Ok(Box::new(
+            crate::outbound::transport::h3io::H3Stream::new(request_stream, conn_task).await?,
+        ))
+    }
+
+    /// One h2 CONNECT stream: handshake, request, wrapped as raw pipes.
+    async fn tunnel_h2(&self, authority: &str) -> io::Result<AnyStream> {
         let tcp = tokio::time::timeout(
             CONNECT_TIMEOUT,
             crate::dns::connect_tcp(&self.server, self.port),
@@ -235,14 +333,29 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_quic_transport() {
-        let err = Naive::build(&obj(json!({"quic": true})), "outbounds[0]")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "outbounds[0]: naive quic transport is not implemented yet"
+    fn build_accepts_the_quic_transport() {
+        let naive = Naive::build(&obj(json!({"quic": true})), "outbounds[0]").expect("quic");
+        assert!(naive.quic);
+        assert!(
+            !Naive::build(&obj(json!({})), "outbounds[0]")
+                .expect("plain")
+                .quic
         );
+        assert!(
+            Naive::build(
+                &obj(json!({"quic": true, "quic_congestion_control": "reno"})),
+                "outbounds[0]"
+            )
+            .is_ok()
+        );
+        let err = Naive::build(
+            &obj(json!({"quic": true, "quic_congestion_control": "wombat"})),
+            "outbounds[0]",
+        )
+        .map(|_| ())
+        .expect_err("unknown congestion control")
+        .to_string();
+        assert!(err.contains("unknown quic congestion control"), "got {err}");
     }
 
     #[test]

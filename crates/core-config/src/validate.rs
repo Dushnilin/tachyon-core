@@ -6649,6 +6649,25 @@ fn validate_plain_out_decode(
         if let Some(v) = obj.get("extra_headers") {
             check_http_header(v, &format!("{at}.extra_headers"), go_base, "extra_headers")?;
         }
+        // the reference switches on the congestion control whether or not
+        // `quic` is set, so an unknown name is a config error either way
+        if let Some(Value::String(cc)) = obj.get("quic_congestion_control")
+            && !matches!(cc.as_str(), "" | "bbr" | "bbr2" | "cubic" | "reno")
+        {
+            return Err(format!("{at}: unknown quic congestion control: {cc}"));
+        }
+        // a naive tunnel may not skip certificate checking
+        for (field, message) in [
+            ("insecure", "insecure is not supported on naive outbound"),
+            (
+                "disable_sni",
+                "disable_sni is not supported on naive outbound",
+            ),
+        ] {
+            if obj.get("tls").and_then(|tls| tls.get(field)) == Some(&Value::Bool(true)) {
+                return Err(format!("{at}: {message}"));
+            }
+        }
     }
     if ty == "http"
         && let Some(v) = obj.get("headers")

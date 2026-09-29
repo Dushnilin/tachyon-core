@@ -6,6 +6,7 @@
 
 mod cache;
 pub mod codec;
+pub mod group;
 mod rules;
 pub mod transport;
 
@@ -133,6 +134,7 @@ impl DnsService {
             order.push(cfg.tag.clone());
             servers.insert(cfg.tag.clone(), Arc::new(cfg));
         }
+        start_dns_groups(&servers, &order)?;
 
         let mut rules = Vec::new();
         // dns rules consult the same rule sets as the route rules
@@ -246,6 +248,12 @@ impl DnsService {
 
     pub fn strategy(&self) -> Strategy {
         self.strategy
+    }
+
+    /// One configured server by tag, with the runtime state it owns (a group's
+    /// record tables, a fakeip pool).
+    pub fn server(&self, tag: &str) -> Option<Arc<ServerConfig>> {
+        self.servers.get(tag).cloned()
     }
 
     /// All fakeip stores (for reverse lookups from routing/sniffing later).
@@ -449,6 +457,14 @@ impl DnsService {
             _ => {}
         }
 
+        // the group sits under the cache: only the answer it returns is cached
+        if let Some(group) = target.group.clone() {
+            let service: Arc<DnsService> = Arc::clone(self);
+            let members: Arc<dyn group::Members> = service;
+            let raw = group.exchange(members, query).await?;
+            return self.answer(&target, &raw, info.id);
+        }
+
         if target.is_fakeip() {
             let store = target
                 .store
@@ -644,6 +660,35 @@ impl DnsService {
         })
     }
 
+    /// One member exchange for a group: straight to the transport, with no
+    /// rule walk and no cache of its own — the group owns both, and a nested
+    /// group runs its own selection.
+    async fn exchange_member(
+        self: &Arc<Self>,
+        tag: &str,
+        query: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        let cfg = self
+            .servers
+            .get(tag)
+            .ok_or_else(|| std::io::Error::other(format!("DNS server not found: {tag}")))?;
+        if let Some(group) = cfg.group.clone() {
+            let service: Arc<DnsService> = Arc::clone(self);
+            let members: Arc<dyn group::Members> = service;
+            return group.exchange(members, query).await;
+        }
+        if cfg.kind == Kind::Local {
+            let (query_msg, info) = codec::parse_query(query)?;
+            let addrs = system_lookup(&info.name).await;
+            if addrs.is_empty() {
+                return codec::name_error(&query_msg).map_err(std::io::Error::other);
+            }
+            return codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
+                .map_err(std::io::Error::other);
+        }
+        self.exchange_remote(cfg, query).await
+    }
+
     /// Address lookup strictly through `resolver` (bootstrap), bypassing the
     /// rule walk so the chain cannot loop back onto itself.
     async fn lookup_via(
@@ -725,6 +770,86 @@ impl DnsService {
         tokio::time::timeout(RESOLVE_TIMEOUT_GUARD, fut)
             .await
             .map_err(|_| std::io::Error::other(format!("dns: resolve timeout for {host:?}")))?
+    }
+}
+
+/// Reference `TransportManager.Start`: every group member must exist, must be
+/// a transport that can fail over (`fakeip` and `hosts` cannot), and the
+/// dependencies must resolve — what is left over is a cycle, reported with the
+/// same text the reference's start loop produces.
+fn start_dns_groups(
+    servers: &HashMap<String, Arc<ServerConfig>>,
+    order: &[String],
+) -> anyhow::Result<()> {
+    for tag in order {
+        let Some(cfg) = servers.get(tag) else {
+            continue;
+        };
+        let Some(group) = cfg.group.as_ref() else {
+            continue;
+        };
+        for member in &group.members {
+            let Some(other) = servers.get(member) else {
+                anyhow::bail!("group[{tag}]: DNS server not found: {member}");
+            };
+            let kind = match other.kind {
+                Kind::Fakeip => "fakeip",
+                Kind::Hosts => "hosts",
+                _ => continue,
+            };
+            anyhow::bail!("group[{tag}]: server type {kind} is not allowed in a group: {member}");
+        }
+    }
+    // white/grey/black walk over the group dependencies; grey is a cycle
+    let mut done: HashSet<&str> = HashSet::new();
+    for tag in order {
+        let mut path: Vec<&str> = Vec::new();
+        if let Some(cycle) = group_cycle(servers, tag, &mut path, &mut done) {
+            anyhow::bail!("circular server dependency: {}", cycle.join(" -> "));
+        }
+    }
+    Ok(())
+}
+
+fn group_cycle<'a>(
+    servers: &'a HashMap<String, Arc<ServerConfig>>,
+    tag: &'a str,
+    path: &mut Vec<&'a str>,
+    done: &mut HashSet<&'a str>,
+) -> Option<Vec<String>> {
+    if done.contains(tag) {
+        return None;
+    }
+    if let Some(at) = path.iter().position(|seen| *seen == tag) {
+        let mut cycle: Vec<String> = path[at..].iter().map(|tag| tag.to_string()).collect();
+        cycle.push(tag.to_string());
+        return Some(cycle);
+    }
+    path.push(tag);
+    let members: Vec<String> = servers
+        .get(tag)
+        .and_then(|cfg| cfg.group.as_ref())
+        .map(|group| group.members.clone())
+        .unwrap_or_default();
+    for member in members {
+        let found = servers.get_key_value(&member).map(|(key, _)| key.as_str());
+        let Some(key) = found else { continue };
+        if let Some(cycle) = group_cycle(servers, key, path, done) {
+            return Some(cycle);
+        }
+    }
+    path.pop();
+    done.insert(tag);
+    None
+}
+
+impl group::Members for DnsService {
+    fn exchange(
+        self: Arc<Self>,
+        tag: String,
+        query: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>> {
+        Box::pin(async move { self.exchange_member(&tag, &query).await })
     }
 }
 

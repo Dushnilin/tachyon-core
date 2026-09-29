@@ -1,0 +1,19 @@
+{
+  "dns": {
+    "servers": [
+      { "type": "udp", "tag": "a", "server": "1.1.1.1" },
+      { "type": "udp", "tag": "b", "server": "8.8.8.8" },
+      {
+        "type": "group",
+        "tag": "grp",
+        "servers": ["a", "b"],
+        "mode": "fastest",
+        "error_ttl": "1m",
+        "win_ttl": "5m"
+      }
+    ],
+    "final": "grp"
+  },
+  "route": { "default_domain_resolver": "a" },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

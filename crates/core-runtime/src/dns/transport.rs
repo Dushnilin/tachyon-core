@@ -1,5 +1,5 @@
-//! DNS server transports: udp / tcp / tls (DoT) / https (DoH) / fakeip —
-//! one exchange per query (no connection pooling yet).
+//! DNS server transports: udp / tcp / tls (DoT) / https (DoH) / quic (DoQ) /
+//! h3 (DoH over HTTP/3) / fakeip — one exchange per query.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -26,6 +26,10 @@ pub enum Kind {
     Tcp,
     Tls,
     Https,
+    /// DNS over QUIC (RFC 9250), ALPN `doq`
+    Quic,
+    /// DNS over HTTP/3 (DoH with `h3`), ALPN `h3`
+    H3,
     Fakeip,
     /// the system resolver
     Local,
@@ -49,6 +53,8 @@ pub struct ServerConfig {
     pub detour: Option<String>,
     /// `type: hosts` — files to read and inline `predefined` entries
     pub hosts: Option<Hosts>,
+    /// `dns.headers` for https / h3: sent with every request
+    pub headers: Vec<(String, String)>,
 }
 
 /// The `hosts` server's sources: the files it reads and the inline entries,
@@ -375,6 +381,8 @@ impl ServerConfig {
             "tcp" => Kind::Tcp,
             "tls" => Kind::Tls,
             "https" => Kind::Https,
+            "quic" => Kind::Quic,
+            "h3" => Kind::H3,
             "fakeip" => Kind::Fakeip,
             "local" => Kind::Local,
             "hosts" => Kind::Hosts,
@@ -430,27 +438,31 @@ impl ServerConfig {
             .map(|p| p as u16)
             .unwrap_or(match kind {
                 Kind::Udp | Kind::Tcp | Kind::Tls => 53,
-                Kind::Https => 443,
+                Kind::Https | Kind::H3 => 443,
+                Kind::Quic => 853,
                 Kind::Fakeip | Kind::Local | Kind::Hosts => 0,
             });
-        // dns tls/https servers implicitly use TLS: `enabled` defaults to true
-        // for these types when the key is absent (as in sing-box configs).
+        // dns tls/https/quic/h3 servers implicitly use TLS: the reference
+        // forces `enabled` on when the key is absent, and builds a client with
+        // the system roots and the server name when there is no `tls` block at
+        // all. Synthesising the block here gives us exactly that.
         let owned;
-        let map_ref: &serde_json::Map<String, Value> = if matches!(kind, Kind::Tls | Kind::Https)
-            && map
-                .get("tls")
-                .and_then(Value::as_object)
-                .is_some_and(|t| !t.contains_key("enabled"))
-        {
-            let mut m = map.clone();
-            if let Some(Value::Object(t)) = m.get_mut("tls") {
-                t.insert("enabled".to_string(), Value::Bool(true));
-            }
-            owned = m;
-            &owned
-        } else {
-            map
-        };
+        let map_ref: &serde_json::Map<String, Value> =
+            if matches!(kind, Kind::Tls | Kind::Https | Kind::Quic | Kind::H3) {
+                let mut m = map.clone();
+                let entry = m
+                    .entry("tls")
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if let Value::Object(t) = entry
+                    && !t.contains_key("enabled")
+                {
+                    t.insert("enabled".to_string(), Value::Bool(true));
+                }
+                owned = m;
+                &owned
+            } else {
+                map
+            };
         let tls = TlsOptions::from_outbound(map_ref, &server, at)?;
         let path = map
             .get("path")
@@ -504,6 +516,31 @@ impl ServerConfig {
             None
         };
 
+        let headers = match map.get("headers") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Object(entries)) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (name, value) in entries {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("{at}.headers.{name}: must be a string"))?;
+                    // the h1 transport writes the head by hand, so a CR or LF
+                    // in a name or value would inject headers of its own
+                    if name.is_empty()
+                        || name.contains('\r')
+                        || name.contains('\n')
+                        || name.contains(':')
+                        || value.contains('\r')
+                        || value.contains('\n')
+                    {
+                        anyhow::bail!("{at}.headers.{name}: invalid header name or value");
+                    }
+                    out.push((name.clone(), value.to_string()));
+                }
+                out
+            }
+            Some(_) => anyhow::bail!("{at}.headers: must be an object"),
+        };
         Ok(Self {
             tag,
             kind,
@@ -517,6 +554,7 @@ impl ServerConfig {
             inet6,
             store,
             detour,
+            headers,
             hosts,
         })
     }
@@ -614,6 +652,8 @@ pub async fn exchange(
                 exchange_stream(stream, query).await
             }
             Kind::Https => exchange_doh(cfg, addr, query, dialer).await,
+            Kind::Quic => exchange_doq(cfg, addr, query, dialer).await,
+            Kind::H3 => exchange_h3(cfg, addr, query, dialer).await,
             Kind::Fakeip | Kind::Local | Kind::Hosts => Err(io::Error::other(
                 "dns: this transport answers without reaching the wire",
             )),
@@ -663,6 +703,9 @@ async fn exchange_doh(
     query: &[u8],
     dialer: &Dialer,
 ) -> io::Result<Vec<u8>> {
+    // the reference posts these with `Id = 0`, as RFC 8484/9250 allow
+    let wire = wire_query(query);
+    let query = wire.as_slice();
     let tls = cfg
         .tls
         .as_ref()
@@ -695,13 +738,7 @@ async fn exchange_doh_h2(
         .await
         .map_err(|e| io::Error::other(format!("dns: DoH h2 ready: {e}")))?;
 
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{authority}{}", cfg.path))
-        .header("content-type", "application/dns-message")
-        .header("accept", "application/dns-message")
-        .body(())
-        .map_err(|e| io::Error::other(format!("dns: DoH request: {e}")))?;
+    let request = doh_request(cfg, &authority)?;
     let (response, send) = send_request
         .send_request(request, false)
         .map_err(|e| io::Error::other(format!("dns: DoH send: {e}")))?;
@@ -725,8 +762,18 @@ async fn exchange_doh_h1(
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     let authority = doh_authority(cfg);
+    let mut extra = String::new();
+    for (name, value) in &cfg.headers {
+        if name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("accept") {
+            continue;
+        }
+        extra.push_str(name);
+        extra.push_str(": ");
+        extra.push_str(value);
+        extra.push_str("\r\n");
+    }
     let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
         cfg.path,
         query.len()
     );
@@ -784,13 +831,199 @@ async fn exchange_doh_h1(
     Ok(body)
 }
 
-fn doh_authority(cfg: &ServerConfig) -> String {
-    if let Some(tls) = &cfg.tls {
-        return tls.server_name().to_string();
+/// DNS over QUIC (RFC 9250): one query per bidirectional stream, framed with
+/// the same two-octet length prefix TCP uses.
+async fn exchange_doq(
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+    query: &[u8],
+    dialer: &Dialer,
+) -> io::Result<Vec<u8>> {
+    if query.len() > u16::MAX as usize {
+        return Err(io::Error::other("dns: query too large for DoQ framing"));
     }
-    match cfg.port {
-        443 => cfg.server.clone(),
-        port => format!("{}:{port}", cfg.server),
+    // RFC 9250: the DNS ID is 0 on a QUIC stream
+    let wire = wire_query(query);
+    let query = wire.as_slice();
+    let tls = cfg
+        .tls
+        .as_ref()
+        .ok_or_else(|| io::Error::other("dns: quic server without tls options"))?;
+    let endpoint = quic_endpoint(cfg, addr, tls, &[b"doq"], dialer).await?;
+    let connection = endpoint
+        .connect(addr, tls.server_name())
+        .map_err(|e| io::Error::other(format!("dns: DoQ connect: {e}")))?
+        .await
+        .map_err(|e| io::Error::other(format!("dns: DoQ handshake: {e}")))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| io::Error::other(format!("dns: DoQ stream: {e}")))?;
+
+    let mut framed = Vec::with_capacity(2 + query.len());
+    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    framed.extend_from_slice(query);
+    send.write_all(&framed).await?;
+    send.shutdown().await?;
+
+    let mut len = [0u8; 2];
+    recv.read_exact(&mut len)
+        .await
+        .map_err(|e| io::Error::other(format!("dns: DoQ read: {e}")))?;
+    let mut response = vec![0u8; u16::from_be_bytes(len) as usize];
+    recv.read_exact(&mut response)
+        .await
+        .map_err(|e| io::Error::other(format!("dns: DoQ read: {e}")))?;
+
+    // the endpoint owns the socket: dropping it closes the connection, which
+    // is what we want after a single query
+    drop(connection);
+    drop(endpoint);
+    Ok(response)
+}
+
+/// The DNS ID the reference sends over https / h3 / quic: always 0
+/// (`exMessage.Id = 0` in `dns/transport`); `exchange_inner` restamps the
+/// client's own ID on the response on the way out.
+fn wire_query(query: &[u8]) -> Vec<u8> {
+    let mut wire = query.to_vec();
+    if wire.len() >= 2 {
+        wire[0] = 0;
+        wire[1] = 0;
+    }
+    wire
+}
+
+/// DNS over HTTP/3: the same POST DoH sends, carried over QUIC.
+async fn exchange_h3(
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+    query: &[u8],
+    dialer: &Dialer,
+) -> io::Result<Vec<u8>> {
+    let wire = wire_query(query);
+    let query = wire.as_slice();
+    let tls = cfg
+        .tls
+        .as_ref()
+        .ok_or_else(|| io::Error::other("dns: h3 server without tls options"))?;
+    let endpoint = quic_endpoint(cfg, addr, tls, &[b"h3"], dialer).await?;
+    let connection = endpoint
+        .connect(addr, tls.server_name())
+        .map_err(|e| io::Error::other(format!("dns: h3 connect: {e}")))?
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 handshake: {e}")))?;
+    let (mut h3_connection, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 handshake: {e}")))?;
+    let conn_task = tokio::spawn(async move {
+        // the h3 connection is driven by this future; it only ends once the
+        // connection is gone
+        let _ = h3_connection.wait_idle().await;
+    });
+
+    let authority = doh_authority(cfg);
+    let request = doh_request(cfg, &authority)?;
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 send: {e}")))?;
+
+    // the body goes out before the response head: a DoH server does not
+    // answer until the POST body has arrived
+    stream
+        .send_data(bytes::Bytes::copy_from_slice(query))
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 write: {e}")))?;
+    stream
+        .finish()
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 finish: {e}")))?;
+
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 response: {e}")))?;
+    if response.status() != http::StatusCode::OK {
+        return Err(io::Error::other(format!(
+            "dns: h3 unexpected status: {}",
+            response.status()
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|e| io::Error::other(format!("dns: h3 read: {e}")))?
+    {
+        body.extend_from_slice(bytes::Buf::chunk(&chunk));
+    }
+
+    conn_task.abort();
+    drop(endpoint);
+    if body.is_empty() {
+        return Err(io::Error::other("dns: empty h3 response"));
+    }
+    Ok(body)
+}
+
+/// A QUIC endpoint over the socket the dialer picked: direct by default, and
+/// through `dns.server.detour` when the config named one.
+async fn quic_endpoint(
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+    tls: &TlsOptions,
+    alpn: &[&[u8]],
+    dialer: &Dialer,
+) -> io::Result<quinn::Endpoint> {
+    let socket = dialer.udp(cfg, addr).await?.into_std()?;
+    socket.set_nonblocking(true)?;
+    let mut reset = [0u8; 32];
+    let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut reset);
+    let endpoint_config =
+        quinn::EndpointConfig::new(Arc::new(crate::outbound::quic::HmacSha256Wrapper::new(
+            &reset,
+        )));
+    let mut endpoint = quinn::Endpoint::new(
+        endpoint_config,
+        None,
+        socket,
+        quinn::default_runtime()
+            .ok_or_else(|| io::Error::other("dns: no async QUIC runtime available"))?,
+    )?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(tls.quic_config(alpn)?)));
+    Ok(endpoint)
+}
+
+/// The DoH request head: `dns.headers` are cloned onto the request the way
+/// the reference does it, with Content-Type and Accept overwritten after.
+fn doh_request(cfg: &ServerConfig, authority: &str) -> io::Result<http::Request<()>> {
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{authority}{}", cfg.path));
+    for (name, value) in &cfg.headers {
+        if name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("accept") {
+            continue;
+        }
+        request = request.header(name.as_str(), value.as_str());
+    }
+    request
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message")
+        .body(())
+        .map_err(|e| io::Error::other(format!("dns: DoH request: {e}")))
+}
+
+fn doh_authority(cfg: &ServerConfig) -> String {
+    let host = match &cfg.tls {
+        Some(tls) => tls.server_name().to_string(),
+        None => cfg.server.clone(),
+    };
+    // the reference appends the port whenever it is not the scheme default
+    if cfg.port == 443 {
+        host
+    } else {
+        format!("{host}:{}", cfg.port)
     }
 }
 

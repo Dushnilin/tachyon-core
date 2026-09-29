@@ -1,0 +1,31 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "h3",
+        "tag": "doh3",
+        "server": "1.1.1.1",
+        "prefer_go": true
+      },
+      {
+        "type": "udp",
+        "tag": "upstream",
+        "server": "1.1.1.1"
+      }
+    ],
+    "final": "doh3"
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct",
+    "default_domain_resolver": "upstream"
+  }
+}

@@ -340,7 +340,14 @@ fn dns_server_fields(ty: &str) -> Vec<&'static str> {
         "https" => {
             fields.extend_from_slice(&["server", "server_port", "tls", "path", "method", "headers"])
         }
-        "h3" => fields.extend_from_slice(&["server", "server_port", "tls", "path"]),
+        "h3" => fields.extend_from_slice(&[
+            "server",
+            "server_port",
+            "tls",
+            "path",
+            "method",
+            "headers",
+        ]),
         "hosts" => fields.extend_from_slice(&["path", "predefined"]),
         "fakeip" => fields.extend_from_slice(&["inet4_range", "inet6_range"]),
         "local" => fields.extend_from_slice(&["prefer_go", "neighbor_domain"]),

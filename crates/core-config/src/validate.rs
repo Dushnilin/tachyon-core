@@ -516,6 +516,12 @@ fn validate_dns_rules(rules: &Value) -> Result<(), String> {
         if let Some(value) = rule.get("rule_set").filter(|value| !prunes_value(value)) {
             check_listable_string_field(value, &format!("dns.rules[{i}].rule_set"))?;
         }
+        for field in ["domain_regex", "process_path_regex"] {
+            if let Some(value) = rule.get(field).filter(|value| !prunes_value(value)) {
+                check_listable_string_field(value, &format!("dns.rules[{i}].{field}"))?;
+                check_regex_listable(value, &format!("dns.rules[{i}].{field}"))?;
+            }
+        }
         let action = rule.get("action").and_then(Value::as_str).unwrap_or("");
         let server = rule.get("server").and_then(Value::as_str).unwrap_or("");
         match action {
@@ -552,6 +558,65 @@ fn check_listable_string_field(value: &Value, at: &str) -> Result<(), String> {
         }
         other => Err(format!(
             "{at}: (json: cannot unmarshal {} into Go value of type string | json: cannot unmarshal {} into Go value of type []string)",
+            json_kind(other),
+            json_kind(other)
+        )),
+    }
+}
+
+/// A `*_regex` listable: the reference compiles every expression while it
+/// parses the rule (`parse expression N: ...`), so a pattern it cannot read is
+/// a config error, not a runtime surprise. Go's regexp and the `regex` crate
+/// are both RE2, so a pattern one accepts the other does too.
+fn check_regex_listable(value: &Value, at: &str) -> Result<(), String> {
+    let list = match value {
+        Value::Null => return Ok(()),
+        Value::String(_) => vec![value],
+        Value::Array(items) => items.iter().collect(),
+        other => {
+            return Err(format!(
+                "{at}: (json: cannot unmarshal {} into Go value of type string | json: cannot unmarshal {} into Go value of type []string)",
+                json_kind(other),
+                json_kind(other)
+            ));
+        }
+    };
+    for (index, item) in list.iter().enumerate() {
+        let Some(pattern) = item.as_str() else {
+            return Err(format!(
+                "{at}: (json: cannot unmarshal array into Go value of type string | [{index}]: json: cannot unmarshal {} into Go value of type string)",
+                json_kind(item)
+            ));
+        };
+        if let Err(err) = regex::Regex::new(pattern) {
+            return Err(format!(
+                "{at}: parse expression {index}: error parsing regexp: {err}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `badoption.Listable[int32]` field: same two shapes, an int32 instead of a
+/// string (`user_id`, whose -1 the reference reserves for "unknown").
+fn check_listable_int_field(value: &Value, at: &str) -> Result<(), String> {
+    let int32 = |v: &Value| v.as_i64().is_some_and(|n| i32::try_from(n).is_ok());
+    match value {
+        Value::Null => Ok(()),
+        Value::Number(_) if int32(value) => Ok(()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if !int32(item) {
+                    return Err(format!(
+                        "{at}: (json: cannot unmarshal array into Go value of type int32 | [{index}]: json: cannot unmarshal {} into Go value of type int32)",
+                        json_kind(item)
+                    ));
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "{at}: (json: cannot unmarshal {} into Go value of type int32 | json: cannot unmarshal {} into Go value of type []int32)",
             json_kind(other),
             json_kind(other)
         )),
@@ -4622,6 +4687,21 @@ fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), Strin
 
     if let Some(value) = rule.get("rule_set").filter(|value| !prunes_value(value)) {
         check_listable_string_field(value, &format!("{at}.rule_set"))?;
+    }
+    // the process matchers are listables too, and the reference decodes them
+    // before it ever looks at a rule's contents
+    for field in ["process_name", "process_path", "process_path_regex", "user"] {
+        if let Some(value) = rule.get(field).filter(|value| !prunes_value(value)) {
+            check_listable_string_field(value, &format!("{at}.{field}"))?;
+        }
+    }
+    for field in ["domain_regex", "process_path_regex"] {
+        if let Some(value) = rule.get(field).filter(|value| !prunes_value(value)) {
+            check_regex_listable(value, &format!("{at}.{field}"))?;
+        }
+    }
+    if let Some(value) = rule.get("user_id").filter(|value| !prunes_value(value)) {
+        check_listable_int_field(value, &format!("{at}.user_id"))?;
     }
     let ty = rule.get("type").and_then(Value::as_str).unwrap_or("");
     match ty {

@@ -1,0 +1,7 @@
+{
+  "route": {
+    "rules": [{ "process_name": [1], "outbound": "d" }],
+    "final": "d"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

@@ -361,6 +361,7 @@ dependencies = [
  "base64",
  "brotli",
  "flate2",
+ "regex",
  "serde",
  "serde_json",
 ]

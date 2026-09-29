@@ -1,0 +1,7 @@
+{
+  "route": {
+    "rules": [{ "user_id": ["root"], "outbound": "d" }],
+    "final": "d"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

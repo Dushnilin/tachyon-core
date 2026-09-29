@@ -11,5 +11,7 @@ rust-version.workspace = true
 base64.workspace = true
 brotli.workspace = true
 flate2.workspace = true
+# the reference compiles every `*_regex` matcher while it parses a rule
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

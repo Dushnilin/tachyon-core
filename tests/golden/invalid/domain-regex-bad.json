@@ -1,0 +1,7 @@
+{
+  "route": {
+    "rules": [{ "domain_regex": ["a", "("], "outbound": "d" }],
+    "final": "d"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

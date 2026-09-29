@@ -193,7 +193,18 @@ enum PlainItem {
     SourceMac(Vec<super::neighbor::MacAddr>),
     /// The client's DHCP hostname, from the neighbour tables.
     SourceHostname(Vec<String>),
-    /// Unsupported matcher (process_*, …): always false.
+    /// The basename of the owning process's path.
+    ProcessName(Vec<String>),
+    /// The owning process's path, whole.
+    ProcessPath(Vec<String>),
+    /// The owning process's path, by regexp.
+    ProcessPathRegex(Vec<Regex>),
+    /// The uid that owns the process. Kept signed because the reference
+    /// reserves -1 for "unknown", so a config listing it must not match.
+    UserId(Vec<i64>),
+    /// The user name that owns the process.
+    User(Vec<String>),
+    /// Unsupported matcher (package_name*, …): always false.
     Unsupported,
 }
 
@@ -215,6 +226,18 @@ enum DomainItem {
     Suffix(Vec<String>),
     Keyword(Vec<String>),
     Regex(Vec<Regex>),
+}
+
+/// The items `route/process_cache.go` looks a process up for.
+fn is_process_item(item: &PlainItem) -> bool {
+    matches!(
+        item,
+        PlainItem::ProcessName(_)
+            | PlainItem::ProcessPath(_)
+            | PlainItem::ProcessPathRegex(_)
+            | PlainItem::UserId(_)
+            | PlainItem::User(_)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -442,13 +465,8 @@ impl Rule {
         }
 
         const UNSUPPORTED: &[&str] = &[
-            "process_name",
-            "process_path",
-            "process_path_regex",
             "package_name",
             "package_name_regex",
-            "user",
-            "user_id",
             "network_type",
             "network_is_expensive",
             "network_is_constrained",
@@ -473,6 +491,30 @@ impl Rule {
         }
         if let Some(v) = string_list(map, "source_hostname", at)? {
             plain.push(PlainItem::SourceHostname(v));
+        }
+        // `route.find_process` answers these: the process behind the socket
+        if let Some(v) = string_list(map, "process_name", at)? {
+            plain.push(PlainItem::ProcessName(v));
+        }
+        if let Some(v) = string_list(map, "process_path", at)? {
+            plain.push(PlainItem::ProcessPath(v));
+        }
+        if let Some(v) = string_list(map, "process_path_regex", at)? {
+            plain.push(PlainItem::ProcessPathRegex(
+                v.iter()
+                    .map(|raw| {
+                        Regex::new(raw).map_err(|e| anyhow::anyhow!("{at}.process_path_regex: {e}"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            ));
+        }
+        if let Some(v) = int_list(map, "user_id", at)? {
+            // the reference compares against a uid, so a negative one never
+            // matches anything and is kept as the "unknown" marker
+            plain.push(PlainItem::UserId(v));
+        }
+        if let Some(v) = string_list(map, "user", at)? {
+            plain.push(PlainItem::User(v));
         }
 
         for key in UNSUPPORTED {
@@ -610,6 +652,15 @@ impl Rule {
         }
     }
 
+    /// `isProcessRule`: this rule needs the process searcher, so the router
+    /// has to arm it even without `route.find_process`.
+    pub fn needs_process(&self) -> bool {
+        match self {
+            Rule::Default(r) => r.plain.iter().any(is_process_item),
+            Rule::Logical(r) => r.rules.iter().any(Rule::needs_process),
+        }
+    }
+
     /// `isNeighborRule`: this rule needs the neighbour tables, so the router
     /// has to build them even without `route.find_neighbor`.
     pub fn needs_neighbor(&self) -> bool {
@@ -645,7 +696,18 @@ impl DefaultRule {
                     parts.push(field_list("source_mac_address", &values));
                 }
                 PlainItem::SourceHostname(list) => parts.push(field_list("source_hostname", list)),
-                // process_* and friends never match and carry no description
+                PlainItem::ProcessName(list) => parts.push(field_list("process_name", list)),
+                PlainItem::ProcessPath(list) => parts.push(field_list("process_path", list)),
+                PlainItem::ProcessPathRegex(list) => {
+                    let values: Vec<String> = list.iter().map(|re| re.as_str().into()).collect();
+                    parts.push(field_list("process_path_regex", &values));
+                }
+                PlainItem::UserId(list) => {
+                    let values: Vec<String> = list.iter().map(|n| n.to_string()).collect();
+                    parts.push(field_list("user_id", &values));
+                }
+                PlainItem::User(list) => parts.push(field_list("user", list)),
+                // package_name* and friends never match and carry no description
                 PlainItem::Unsupported => {}
             }
         }
@@ -821,6 +883,30 @@ impl PlainItem {
                 .source_hostname
                 .as_deref()
                 .is_some_and(|name| list.iter().any(|item| item == name)),
+            // the reference requires a non-empty path for all three path
+            // matchers (`ProcessPath == ""` never matches)
+            PlainItem::ProcessName(list) => ctx
+                .process
+                .as_ref()
+                .is_some_and(|info| !info.path.is_empty() && list.iter().any(|n| n == info.name())),
+            PlainItem::ProcessPath(list) => ctx
+                .process
+                .as_ref()
+                .is_some_and(|info| !info.path.is_empty() && list.contains(&info.path)),
+            PlainItem::ProcessPathRegex(list) => ctx.process.as_ref().is_some_and(|info| {
+                !info.path.is_empty() && list.iter().any(|re| re.is_match(&info.path))
+            }),
+            // -1 is the reference's "unknown uid" and matches nothing
+            PlainItem::UserId(list) => ctx
+                .process
+                .as_ref()
+                .and_then(|info| info.user_id)
+                .is_some_and(|uid| list.contains(&(uid as i64))),
+            PlainItem::User(list) => ctx.process.as_ref().is_some_and(|info| {
+                info.user_name
+                    .as_deref()
+                    .is_some_and(|name| list.iter().any(|item| item == name))
+            }),
             PlainItem::Unsupported => false,
         }
     }
@@ -1214,6 +1300,30 @@ fn string_list(
     }
 }
 
+/// `badoption.Listable[int32]`: one number or an array of them, signed because
+/// the reference's `user_id` reserves -1 for "unknown".
+fn int_list(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    let number = |v: &Value| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+            .ok_or_else(|| anyhow::anyhow!("{at}: invalid {key}"))
+    };
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v @ Value::Number(_)) => Ok(Some(vec![number(v)?])),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(number)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(anyhow::anyhow!("{at}: {key} must be a number or array")),
+    }
+}
+
 fn port_list(
     map: &serde_json::Map<String, Value>,
     key: &str,
@@ -1332,6 +1442,7 @@ mod tests {
             matched_rule: None,
             source_mac: None,
             source_hostname: None,
+            process: None,
         }
     }
 
@@ -1589,5 +1700,89 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown reject method"), "{err}");
+    }
+
+    /// The process matchers read the owner `route.find_process` found, and
+    /// every one of them needs a path — the reference treats an empty
+    /// `ProcessPath` as "no owner", whatever else it knows. One rule per item:
+    /// the items of a rule are ANDed, so mixing them would prove nothing.
+    #[test]
+    fn process_matchers_read_the_socket_owner() {
+        let rule = |item: serde_json::Value| {
+            let mut spec = item.as_object().unwrap().clone();
+            spec.insert("port".into(), json!([443]));
+            spec.insert("outbound".into(), json!("d"));
+            Rule::build(&Value::Object(spec), "r", true).expect("rule")
+        };
+        let owner = |path: &str, uid: Option<u32>, user: Option<&str>| {
+            let mut ctx = ctx_to("example.com", 443);
+            ctx.process = Some(super::super::process::ProcessInfo {
+                path: path.to_string(),
+                user_id: uid,
+                user_name: user.map(str::to_string),
+            });
+            ctx
+        };
+        let sing_box = owner("/usr/bin/sing-box", Some(0), Some("root"));
+
+        for (item, matches, why) in [
+            (
+                json!({"process_name": ["curl"]}),
+                false,
+                "the basename differs",
+            ),
+            (
+                json!({"process_name": "sing-box"}),
+                true,
+                "one string is one value",
+            ),
+            (
+                json!({"process_path": ["/usr/bin/sing-box"]}),
+                true,
+                "the whole path",
+            ),
+            (
+                json!({"process_path": ["/usr/bin/"]}),
+                false,
+                "not a prefix match",
+            ),
+            (
+                json!({"process_path_regex": ["^/usr/.*box$"]}),
+                true,
+                "by regexp",
+            ),
+            (json!({"user": ["root"]}), true, "the name from /etc/passwd"),
+            (json!({"user": ["nobody"]}), false, "another user"),
+            (json!({"user_id": [0]}), true, "the uid itself"),
+            (json!({"user_id": [1000]}), false, "another uid"),
+        ] {
+            let rule = rule(item.clone());
+            assert!(rule.needs_process(), "{item} needs the searcher");
+            assert_eq!(rule.matches(&sing_box), matches, "{item}: {why}");
+        }
+
+        assert!(
+            !rule(json!({"process_name": ["sing-box"]})).matches(&owner("", Some(0), Some("root"))),
+            "an empty path never matches, the reference guards on it"
+        );
+        assert!(
+            !rule(json!({"user_id": [0]})).matches(&owner("/usr/bin/sing-box", None, None)),
+            "a process with no readable uid matches no uid rule"
+        );
+        assert!(
+            !rule(json!({"user": ["root"]})).matches(&ctx_to("example.com", 443)),
+            "no searcher ran, so no owner"
+        );
+    }
+
+    #[test]
+    fn a_process_free_rule_never_asks_for_the_searcher() {
+        let rule = Rule::build(
+            &json!({"domain": ["example.com"], "outbound": "d"}),
+            "r",
+            true,
+        )
+        .expect("rule");
+        assert!(!rule.needs_process());
     }
 }

@@ -8,6 +8,7 @@
 //! `client_supervisor.go`, `client_restart.go`, `keepalive.go`).
 
 mod codec;
+mod framing;
 mod mss;
 mod replay;
 
@@ -67,10 +68,6 @@ const REPLY_QUEUE: usize = 64;
 const EGRESS_BUF_MAX: usize = 1 << 20;
 const MAX_DATAGRAM: usize = 65_535;
 
-/// `dataChannelFraming` stays nil in this runtime (no compression, no
-/// fragment), so the framing payload overhead fed into the MSS budget is 0.
-const FRAMING_OVERHEAD: usize = 0;
-
 /// upstream `openVPNDataChannelPingPayload`.
 const PING_PAYLOAD: [u8; 16] = [
     0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
@@ -109,8 +106,6 @@ const IGNORED_FIELDS: &[&str] = &[
 
 const OVPN_CLIENT_PROTOCOLS: &[&str] = &["", "udp", "udp4", "udp6", "tcp", "tcp4", "tcp6"];
 const OVPN_KEY_DIRECTIONS: &[&str] = &["", "server", "client"];
-const COMPRESSION_OFF: &[&str] = &["none", "no", "disabled", "off", "migrate"];
-const COMPRESSION_LZO_OFF: &[&str] = &["none", "disabled", "off"];
 
 fn endpoint_str<'a>(obj: &'a Map<String, Value>, key: &str) -> &'a str {
     obj.get(key).and_then(Value::as_str).unwrap_or("")
@@ -187,6 +182,9 @@ struct OvpnConfig {
     replay_window_time: Duration,
     mss_fix: u32,
     mss_fix_mode: String,
+    /// data-channel compression and fragmentation directives
+    compression: framing::Compression,
+    fragment: u32,
     ping_interval: Duration,
     ping_restart: Duration,
     udp_timeout: Duration,
@@ -382,18 +380,12 @@ impl OpenVpn {
         let auth = endpoint_str(obj, "auth").to_string();
         AuthKind::parse(&auth).map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
 
-        // compression / fragment wire framing is not implemented (framing nil).
-        let compression = endpoint_str(obj, "compression").trim();
-        if !compression.is_empty() && !COMPRESSION_OFF.contains(&compression) {
-            anyhow::bail!("{at}: openvpn compression is not implemented yet");
-        }
-        let compression_lzo = endpoint_str(obj, "compression_lzo").trim();
-        if !compression_lzo.is_empty() && !COMPRESSION_LZO_OFF.contains(&compression_lzo) {
-            anyhow::bail!("{at}: openvpn compression is not implemented yet");
-        }
-        if ep_u64_val(obj, "fragment") > 0 {
-            anyhow::bail!("{at}: openvpn fragment is not implemented yet");
-        }
+        let compression = framing::Compression::resolve(
+            endpoint_str(obj, "compression"),
+            endpoint_str(obj, "compression_lzo"),
+        )
+        .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
+        let fragment = ep_u64_val(obj, "fragment") as u32;
 
         // reference NewClient MSS defaulting (client.go:100-111).
         let raw_mtu = ep_u64_val(obj, "mtu") as u32;
@@ -461,6 +453,8 @@ impl OpenVpn {
                 replay_window_time,
                 mss_fix,
                 mss_fix_mode,
+                compression,
+                fragment,
                 ping_interval,
                 ping_restart,
                 udp_timeout,
@@ -746,6 +740,8 @@ impl Writer {
 struct Session {
     writer: Writer,
     codec: StaticCodec,
+    /// compression / fragmentation wire framing; `None` when neither is in use
+    framing: std::sync::Mutex<Option<framing::Framing>>,
     clamp: MssClamp,
     protocol: String,
     remote: SocketAddr,
@@ -899,10 +895,13 @@ async fn establish(
             )));
         }
     };
+    let wire_framing = framing::Framing::new(cfg.compression, cfg.fragment);
     let clamp = calculate_mss_clamp(
         cfg.mss_fix,
         &cfg.mss_fix_mode,
-        FRAMING_OVERHEAD,
+        wire_framing
+            .as_ref()
+            .map_or(0, framing::Framing::payload_overhead),
         |payload_length| codec.encoded_length(payload_length),
         transport_header_size(&protocol),
         outer_transport_overhead(&protocol, dst.is_ipv6()),
@@ -912,6 +911,7 @@ async fn establish(
         Session {
             writer,
             codec,
+            framing: std::sync::Mutex::new(wire_framing),
             clamp,
             protocol,
             remote: dst,
@@ -1447,13 +1447,22 @@ impl Stack {
     /// `dataCodec.Encode` + `mssFixup`; errors drop the packet.
     fn enqueue_packet(&mut self, sess: &mut Session, mut packet: Vec<u8>) {
         sess.clamp.apply_in_place(&mut packet);
-        match sess.codec.encode_next(&packet) {
-            Ok(frame) => self.pending.push_back(frame),
-            Err(e) => {
-                logging::warn(format_args!(
-                    "openvpn[{}]: encode data packet: {e}",
-                    self.cfg.tag
-                ));
+        let packets = match sess.framing.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(framing) => framing.encode(&packet),
+                None => vec![packet],
+            },
+            Err(_) => vec![packet],
+        };
+        for packet in packets {
+            match sess.codec.encode_next(&packet) {
+                Ok(frame) => self.pending.push_back(frame),
+                Err(e) => {
+                    logging::warn(format_args!(
+                        "openvpn[{}]: encode data packet: {e}",
+                        self.cfg.tag
+                    ));
+                }
             }
         }
     }
@@ -1482,7 +1491,7 @@ impl Stack {
 
     /// `handleIncomingDataPayloads`: decode, keepalive filtering, clamp, demux.
     fn handle_packet(&mut self, sess: &mut Session, frame: &[u8]) -> Result<(), String> {
-        let (_packet_id, mut payload) = match sess.codec.decode(frame) {
+        let (_packet_id, payload) = match sess.codec.decode(frame) {
             Ok(decoded) => decoded,
             Err(e) => {
                 // proto/connection.go: TCP treats it as fatal, UDP drops it.
@@ -1491,6 +1500,24 @@ impl Stack {
                 }
                 return Ok(());
             }
+        };
+        // the compression and fragmentation framing unwraps first
+        let mut payload = match sess.framing.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(framing) => match framing.decode(&payload) {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        if sess.writer.is_tcp() {
+                            return Err(e);
+                        }
+                        logging::debug(format_args!("openvpn[{}]: {e}", self.cfg.tag));
+                        return Ok(());
+                    }
+                },
+                None => payload,
+            },
+            Err(_) => payload,
         };
         sess.last_in = Instant::now();
         if payload.is_empty() || payload == PING_PAYLOAD {
@@ -1919,34 +1946,41 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_wire_framing_features() {
-        for value in ["stub", "lzo", "lz4", "stub-v2", "lz4-v2", "yes"] {
-            let err = build(&ovpn_obj(json!({"compression": value})))
-                .unwrap_err()
-                .to_string();
-            assert_eq!(
-                err, "endpoints[0]: openvpn compression is not implemented yet",
+    fn build_reads_wire_framing_features() {
+        // every directive the reference folds into comp.alg/comp.flags
+        for value in ["stub", "lzo", "lz4", "stub-v2", "lz4-v2"] {
+            let ovpn = build(&ovpn_obj(json!({"compression": value})))
+                .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_ne!(
+                ovpn.cfg.compression.algorithm,
+                framing::Algorithm::None,
                 "{value}"
             );
         }
         for value in ["none", "no", "disabled", "off", "migrate"] {
-            build(&ovpn_obj(json!({"compression": value})))
+            let ovpn = build(&ovpn_obj(json!({"compression": value})))
                 .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(ovpn.cfg.compression.algorithm, framing::Algorithm::None);
         }
         // comp-lzo "no" means stub in upstream, so it also needs framing
-        for value in ["adaptive", "yes", "asym", "no"] {
-            let err = build(&ovpn_obj(json!({"compression_lzo": value})))
-                .unwrap_err()
-                .to_string();
-            assert_eq!(
-                err, "endpoints[0]: openvpn compression is not implemented yet",
-                "{value}"
-            );
+        for value in ["adaptive", "yes", "asym"] {
+            let ovpn = build(&ovpn_obj(json!({"compression_lzo": value})))
+                .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(ovpn.cfg.compression.algorithm, framing::Algorithm::Lzo);
         }
-        let err = build(&ovpn_obj(json!({"fragment": 1300})))
+        let ovpn = build(&ovpn_obj(json!({"compression_lzo": "no"}))).expect("comp-lzo no");
+        assert_eq!(ovpn.cfg.compression.algorithm, framing::Algorithm::Stub);
+
+        let ovpn = build(&ovpn_obj(json!({"fragment": 1300}))).expect("fragment");
+        assert_eq!(ovpn.cfg.fragment, 1300);
+        // an unknown directive is still a config error
+        let err = build(&ovpn_obj(json!({"compression": "zstd"})))
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "endpoints[0]: openvpn fragment is not implemented yet");
+        assert!(
+            err.contains("unsupported compression directive"),
+            "got {err}"
+        );
     }
 
     #[test]

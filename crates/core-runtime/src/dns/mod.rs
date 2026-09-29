@@ -143,7 +143,10 @@ impl DnsService {
             .get("route")
             .and_then(Value::as_object)
             .unwrap_or(&empty_route);
-        let rule_sets = crate::route::build_rule_sets(route)?;
+        let rule_sets = crate::route::build_rule_sets(
+            route,
+            &crate::http_client::Registry::from_config(root)?,
+        )?;
         for (i, obj) in map
             .get("rules")
             .and_then(Value::as_array)

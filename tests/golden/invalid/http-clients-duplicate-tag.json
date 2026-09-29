@@ -1,0 +1,4 @@
+{
+  "http_clients": [{ "tag": "a" }, { "tag": "a" }],
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

@@ -245,6 +245,7 @@ impl Outbound {
 /// being silently ignored.
 pub(crate) fn build_rule_sets(
     route: &serde_json::Map<String, Value>,
+    clients: &crate::http_client::Registry,
 ) -> anyhow::Result<rule_set::RuleSetRegistry> {
     let mut registry = rule_set::RuleSetRegistry::new();
     let mut remotes = rule_set_remote::RemoteRegistry::new();
@@ -297,7 +298,9 @@ pub(crate) fn build_rule_sets(
                             "{at}: http_client is conflict with deprecated download_detour field"
                         );
                     }
-                    crate::http_client::HttpClient::from_config(client_spec, &at)?
+                    // a string names one of the `http_clients` entries
+                    let spec = clients.resolve(client_spec, &at)?;
+                    crate::http_client::HttpClient::from_config(spec.as_ref(), &at)?
                 } else if let Some(detour) = detour {
                     logging::warn(format_args!(
                         "{at}: download_detour is deprecated, use http_client"
@@ -306,7 +309,9 @@ pub(crate) fn build_rule_sets(
                     wrapper.insert("detour".into(), Value::String(detour.into()));
                     crate::http_client::HttpClient::from_config(Some(&Value::Object(wrapper)), &at)?
                 } else {
-                    crate::http_client::HttpClient::default()
+                    // no client of its own: `route.default_http_client`
+                    let spec = clients.default_client(route)?;
+                    crate::http_client::HttpClient::from_config(spec.as_ref(), &at)?
                 };
                 let update_interval = crate::outbound::urltest::parse_duration(
                     entry.get("update_interval"),
@@ -413,7 +418,6 @@ const ROUTE_UNIMPL_FIELDS: &[&str] = &[
     "default_network_type",
     "default_fallback_network_type",
     "default_fallback_delay",
-    "default_http_client",
 ];
 
 /// Parsed `route` section dialing defaults (reference `NetworkOptions`).
@@ -651,7 +655,7 @@ impl Router {
                     logging::warn(format_args!("route.{key} is not implemented yet (ignored)"));
                 }
             }
-            registry = build_rule_sets(map)?;
+            registry = build_rule_sets(map, &crate::http_client::Registry::from_config(&root)?)?;
             if let Some(list) = map.get("rules").and_then(Value::as_array) {
                 for (i, obj) in list.iter().enumerate() {
                     rules.push(Rule::build_with_rule_sets(

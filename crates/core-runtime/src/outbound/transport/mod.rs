@@ -3,6 +3,7 @@
 
 mod grpc;
 pub(crate) mod h2io;
+pub(crate) mod h3io;
 mod http;
 pub(crate) mod xhttp;
 

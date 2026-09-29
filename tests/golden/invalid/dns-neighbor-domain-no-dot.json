@@ -1,0 +1,7 @@
+{
+  "dns": {
+    "servers": [{ "type": "local", "tag": "lan", "neighbor_domain": ["lan"] }],
+    "final": "lan"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

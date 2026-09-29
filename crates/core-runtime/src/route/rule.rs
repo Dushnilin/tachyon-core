@@ -189,6 +189,10 @@ enum PlainItem {
     Client(Vec<String>),
     /// The clash mode in force, as set through the controller.
     ClashMode(Vec<String>),
+    /// The client's hardware address, from the neighbour tables.
+    SourceMac(Vec<super::neighbor::MacAddr>),
+    /// The client's DHCP hostname, from the neighbour tables.
+    SourceHostname(Vec<String>),
     /// Unsupported matcher (process_*, …): always false.
     Unsupported,
 }
@@ -453,12 +457,22 @@ impl Rule {
             "interface_address",
             "network_interface_address",
             "default_interface_address",
-            "source_mac_address",
-            "source_hostname",
             "preferred_by",
         ];
         if let Some(v) = string_list(map, "clash_mode", at)? {
             plain.push(PlainItem::ClashMode(v));
+        }
+        // the neighbour tables answer these two, so they need `find_neighbor`
+        // (or a `local` server with `neighbor_domain`) to be running
+        if let Some(v) = string_list(map, "source_mac_address", at)? {
+            plain.push(PlainItem::SourceMac(
+                v.iter()
+                    .map(|raw| super::neighbor::parse_mac(raw).unwrap_or([0; 6]))
+                    .collect(),
+            ));
+        }
+        if let Some(v) = string_list(map, "source_hostname", at)? {
+            plain.push(PlainItem::SourceHostname(v));
         }
 
         for key in UNSUPPORTED {
@@ -595,6 +609,18 @@ impl Rule {
             Rule::Logical(r) => r.matches(ctx),
         }
     }
+
+    /// `isNeighborRule`: this rule needs the neighbour tables, so the router
+    /// has to build them even without `route.find_neighbor`.
+    pub fn needs_neighbor(&self) -> bool {
+        match self {
+            Rule::Default(r) => r
+                .plain
+                .iter()
+                .any(|item| matches!(item, PlainItem::SourceMac(_) | PlainItem::SourceHostname(_))),
+            Rule::Logical(r) => r.rules.iter().any(Rule::needs_neighbor),
+        }
+    }
 }
 
 impl DefaultRule {
@@ -613,6 +639,12 @@ impl DefaultRule {
                 PlainItem::Protocol(list) => parts.push(field_list("protocol", list)),
                 PlainItem::Client(list) => parts.push(field_list("client", list)),
                 PlainItem::ClashMode(list) => parts.push(field_list("clash_mode", list)),
+                PlainItem::SourceMac(list) => {
+                    let values: Vec<String> =
+                        list.iter().map(super::neighbor::mac_string).collect();
+                    parts.push(field_list("source_mac_address", &values));
+                }
+                PlainItem::SourceHostname(list) => parts.push(field_list("source_hostname", list)),
                 // process_* and friends never match and carry no description
                 PlainItem::Unsupported => {}
             }
@@ -784,6 +816,11 @@ impl PlainItem {
                 .as_deref()
                 .is_some_and(|c| list.iter().any(|i| i == c)),
             PlainItem::ClashMode(list) => list.iter().any(|mode| mode == crate::clash_mode::get()),
+            PlainItem::SourceMac(list) => ctx.source_mac.is_some_and(|mac| list.contains(&mac)),
+            PlainItem::SourceHostname(list) => ctx
+                .source_hostname
+                .as_deref()
+                .is_some_and(|name| list.iter().any(|item| item == name)),
             PlainItem::Unsupported => false,
         }
     }
@@ -1293,6 +1330,8 @@ mod tests {
             ip_version: None,
             route_original_destination: None,
             matched_rule: None,
+            source_mac: None,
+            source_hostname: None,
         }
     }
 

@@ -1,0 +1,21 @@
+{
+  "dns": {
+    "servers": [
+      { "type": "local", "tag": "lan", "neighbor_domain": [".lan", ".home.arpa"] },
+      { "type": "group", "tag": "grp", "servers": ["lan"] }
+    ],
+    "final": "grp",
+    "rules": [{ "source_hostname": ["tv"], "server": "lan" }]
+  },
+  "route": {
+    "find_neighbor": true,
+    "dhcp_lease_files": ["/tmp/dhcp.leases"],
+    "default_domain_resolver": "lan",
+    "rules": [
+      { "source_hostname": ["tv"], "action": "route", "outbound": "d" },
+      { "source_mac_address": ["aa:bb:cc:dd:ee:ff"], "action": "route", "outbound": "d" }
+    ],
+    "final": "d"
+  },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

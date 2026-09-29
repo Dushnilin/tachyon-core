@@ -313,6 +313,99 @@ fn subnet_record(family: u16, netmask: u8, address: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn a_group_answers_from_the_member_that_is_alive() {
+    // one live member and one that never answers: the group must still serve
+    let (live, hits) = spawn_udp_dns(Ipv4Addr::new(10, 4, 4, 4)).await;
+    let dead = UdpSocket::bind("127.0.0.1:0").await.expect("bind dead");
+    let dead_port = dead.local_addr().expect("dead addr").port();
+    drop(dead);
+    let config = json!({
+        "dns": {
+            "servers": [
+                {"type": "udp", "tag": "dead", "server": "127.0.0.1", "server_port": dead_port},
+                {"type": "udp", "tag": "live", "server": "127.0.0.1", "server_port": live.port()},
+                {"type": "group", "tag": "grp", "servers": ["dead", "live"],
+                 "mode": "parallel", "error_ttl": "1s", "timeout": "3s"}
+            ],
+            "final": "grp",
+            "disable_cache": true
+        }
+    });
+    let svc = service(&config);
+
+    let resp = exchange_ok(&svc, &query("grouped.test", "A")).await;
+    assert_eq!(
+        core_runtime::dns::codec::answer_ips(&resp).expect("decode"),
+        vec![ip(10, 4, 4, 4)],
+        "the answer came from the member that answered"
+    );
+    // the dead member is now dirty, and the second query goes straight to the
+    // live one instead of fanning again
+    let group = svc
+        .server("grp")
+        .and_then(|cfg| cfg.group.clone())
+        .expect("the group runtime");
+    let state = group.snapshot();
+    assert!(
+        !state.iter().find(|m| m.tag == "dead").expect("dead").clean,
+        "a refused connection is an error record"
+    );
+    let before = hits.load(Ordering::SeqCst);
+    exchange_ok(&svc, &query("grouped.test", "A")).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before + 1,
+        "the clean member answered alone"
+    );
+}
+
+#[tokio::test]
+async fn a_group_refuses_what_the_reference_refuses() {
+    // a member that does not exist
+    let config = json!({
+        "dns": {"servers": [{"type": "group", "tag": "grp", "servers": ["nope"]}], "final": "grp"}
+    });
+    let error = DnsService::build(&config).err().expect("unknown member");
+    assert!(
+        error
+            .to_string()
+            .contains("group[grp]: DNS server not found: nope"),
+        "{error}"
+    );
+    // fakeip cannot fail over, so it is not a legal member
+    let config = json!({
+        "dns": {
+            "servers": [
+                {"type": "fakeip", "tag": "fp", "inet4_range": "198.18.0.0/15"},
+                {"type": "group", "tag": "grp", "servers": ["fp"]}
+            ],
+            "final": "grp"
+        }
+    });
+    let error = DnsService::build(&config).err().expect("fakeip member");
+    assert!(
+        error
+            .to_string()
+            .contains("group[grp]: server type fakeip is not allowed in a group: fp"),
+        "{error}"
+    );
+    // a cycle is reported with the start loop's own text
+    let config = json!({
+        "dns": {"servers": [
+            {"type": "group", "tag": "g1", "servers": ["g2"]},
+            {"type": "group", "tag": "g2", "servers": ["g1"]}
+        ], "final": "g1"}
+    });
+    let error = DnsService::build(&config).err().expect("cycle");
+    assert!(
+        error
+            .to_string()
+            .starts_with("circular server dependency: "),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn client_subnet_rides_along_on_upstream_queries() {
     let (addr, seen) = spawn_udp_dns_capture(Ipv4Addr::new(10, 0, 0, 9)).await;
     let mut config = udp_service_config(addr.port());

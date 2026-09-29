@@ -1,14 +1,11 @@
 {
-  "log": {
-    "disabled": true
-  },
   "dns": {
     "servers": [
-      {
-        "type": "group",
-        "tag": "g",
-        "servers": []
-      }
-    ]
-  }
+      { "type": "udp", "tag": "a", "server": "1.1.1.1" },
+      { "type": "group", "tag": "grp", "servers": [] }
+    ],
+    "final": "grp"
+  },
+  "route": { "default_domain_resolver": "a" },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
 }

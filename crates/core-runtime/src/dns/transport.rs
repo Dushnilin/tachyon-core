@@ -35,6 +35,8 @@ pub enum Kind {
     Local,
     /// the hosts file(s) plus inline `predefined` entries
     Hosts,
+    /// lx `group`: several member servers behind one tag
+    Group,
 }
 
 pub struct ServerConfig {
@@ -55,6 +57,9 @@ pub struct ServerConfig {
     pub hosts: Option<Hosts>,
     /// `dns.headers` for https / h3: sent with every request
     pub headers: Vec<(String, String)>,
+    /// `type: group`: the lx group this tag stands for, with its members'
+    /// tags and its own budget. Present only for a group.
+    pub group: Option<Arc<super::group::Group>>,
 }
 
 /// The `hosts` server's sources: the files it reads and the inline entries,
@@ -386,6 +391,7 @@ impl ServerConfig {
             "fakeip" => Kind::Fakeip,
             "local" => Kind::Local,
             "hosts" => Kind::Hosts,
+            "group" => Kind::Group,
             other => anyhow::bail!("{at}: dns server type {other:?} not implemented yet"),
         };
         let hosts = match kind {
@@ -440,7 +446,7 @@ impl ServerConfig {
                 Kind::Udp | Kind::Tcp | Kind::Tls => 53,
                 Kind::Https | Kind::H3 => 443,
                 Kind::Quic => 853,
-                Kind::Fakeip | Kind::Local | Kind::Hosts => 0,
+                Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Group => 0,
             });
         // dns tls/https/quic/h3 servers implicitly use TLS: the reference
         // forces `enabled` on when the key is absent, and builds a client with
@@ -499,8 +505,9 @@ impl ServerConfig {
         } else {
             (None, None)
         };
-        // fakeip, local and hosts never dial a server, so they need no address
-        let needs_server = !matches!(kind, Kind::Fakeip | Kind::Local | Kind::Hosts);
+        // fakeip, local, hosts and group never dial a server, so they need no
+        // address
+        let needs_server = !matches!(kind, Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Group);
         if needs_server && server.is_empty() {
             anyhow::bail!("{at}: missing server");
         }
@@ -541,6 +548,46 @@ impl ServerConfig {
             }
             Some(_) => anyhow::bail!("{at}.headers: must be an object"),
         };
+        let group = match kind {
+            Kind::Group => {
+                let members = match map.get("servers") {
+                    Some(Value::String(tag)) => vec![tag.clone()],
+                    Some(Value::Array(list)) => list
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(_) => anyhow::bail!("{at}.servers: must be a string or a list"),
+                };
+                if members.is_empty() {
+                    anyhow::bail!("{at}: servers is required and must not be empty");
+                }
+                let mode_raw = map.get("mode").and_then(Value::as_str).unwrap_or("");
+                let mode = super::group::Mode::parse(mode_raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown mode: {mode_raw} (expected stable, fastest or parallel)"
+                    )
+                })?;
+                Some(super::group::Group::new(
+                    tag.clone(),
+                    members,
+                    mode,
+                    parse_duration(
+                        map.get("error_ttl"),
+                        Duration::ZERO,
+                        &format!("{at}: error_ttl"),
+                    )?,
+                    parse_duration(
+                        map.get("win_ttl"),
+                        Duration::ZERO,
+                        &format!("{at}: win_ttl"),
+                    )?,
+                    timeout,
+                ))
+            }
+            _ => None,
+        };
         Ok(Self {
             tag,
             kind,
@@ -556,6 +603,7 @@ impl ServerConfig {
             detour,
             headers,
             hosts,
+            group,
         })
     }
 
@@ -654,7 +702,7 @@ pub async fn exchange(
             Kind::Https => exchange_doh(cfg, addr, query, dialer).await,
             Kind::Quic => exchange_doq(cfg, addr, query, dialer).await,
             Kind::H3 => exchange_h3(cfg, addr, query, dialer).await,
-            Kind::Fakeip | Kind::Local | Kind::Hosts => Err(io::Error::other(
+            Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Group => Err(io::Error::other(
                 "dns: this transport answers without reaching the wire",
             )),
         }

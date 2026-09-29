@@ -1,0 +1,11 @@
+{
+  "dns": {
+    "servers": [
+      { "type": "udp", "tag": "a", "server": "1.1.1.1" },
+      { "type": "group", "tag": "grp", "servers": ["a"], "mode": "failover" }
+    ],
+    "final": "grp"
+  },
+  "route": { "default_domain_resolver": "a" },
+  "outbounds": [{ "type": "direct", "tag": "d" }]
+}

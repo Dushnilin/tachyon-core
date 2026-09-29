@@ -196,16 +196,33 @@ async fn data_views_answer_over_http() {
     );
     let (head, _) = request(addr, &patch("/configs", r#"{"log-level":"nope"}"#)).await;
     assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+    // the reference answers a config upload with 204 and changes nothing
     let (head, _) = request(
         addr,
         "PUT /configs HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     )
     .await;
-    assert!(head.starts_with("HTTP/1.1 501"), "{head}");
+    assert!(head.starts_with("HTTP/1.1 204"), "{head}");
 
-    // providers are not implemented: explicit 404, not an empty list
-    let (head, _) = request(addr, &get("/providers/proxies")).await;
-    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    // the reference has no provider runtime either: an empty list, not a 404
+    let (head, body) = request(addr, &get("/providers/proxies")).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(String::from_utf8_lossy(&body), r#"{"providers":{}}"#);
+    let (head, body) = request(addr, &get("/providers/rules")).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(String::from_utf8_lossy(&body), r#"{"providers":[]}"#);
+
+    // the clash mode is switchable and reported back
+    let (head, _) = request(addr, &patch("/configs", r#"{"mode":"global"}"#)).await;
+    assert!(head.starts_with("HTTP/1.1 204"), "{head}");
+    let (_, body) = request(addr, &get("/configs")).await;
+    let body = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        body.contains(r#""mode":"global""#),
+        "the mode did not take: {body}"
+    );
+    let (head, _) = request(addr, &patch("/configs", r#"{"mode":"script"}"#)).await;
+    assert!(head.starts_with("HTTP/1.1 400"), "{head}");
 
     // /logs and /traffic stream chunked JSON
     let (head, body) = request(addr, &get("/logs")).await;

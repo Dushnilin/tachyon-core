@@ -30,8 +30,8 @@ use crate::verify::CertVerifier;
 /// buffer. It is async because everything this crate is called from is -- a
 /// blocking handshake here would mean blocking a runtime worker to do it, and a
 /// blocking call inside a `poll` is worse.
-pub trait Stream: AsyncRead + AsyncWrite + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Unpin> Stream for T {}
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())

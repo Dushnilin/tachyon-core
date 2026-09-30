@@ -127,9 +127,14 @@ mod tests {
     #[test]
     fn fresh_then_miss() {
         let mut cache = Cache::new(16);
-        let now = Instant::now();
-        assert!(cache.get(&key(), now).is_none());
+        let before = Instant::now();
+        assert!(cache.get(&key(), before).is_none());
         cache.insert(key(), b"resp".to_vec(), &meta(Some(60)), None);
+        // `insert` reads the clock itself, so the instant this test measures
+        // from has to be taken after it: sampling before leaves the entry's own
+        // timestamp a hair later, and the 61-second probe then lands just under
+        // the 61 seconds it meant to be, which is a test that fails at random.
+        let now = Instant::now();
         assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(_))));
         assert!(cache.get(&key(), now + Duration::from_secs(61)).is_none());
     }

@@ -174,6 +174,9 @@ pub fn build(
                 },
                 body.clone(),
             ),
+            // an empty name is `disable_sni`: the extension is left out rather
+            // than sent with a zero-length host, which is not the same thing
+            Ext::Sni if sni.is_empty() => continue,
             Ext::Sni => (0x0000, build_sni(sni)?),
             Ext::Alpn => (0x0010, build_alpn(alpn)?),
             Ext::KeyShare(raw) => (

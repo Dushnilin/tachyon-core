@@ -13,6 +13,7 @@ fn ext_id(e: &Ext) -> u16 {
     match e {
         Ext::Static(id, _) => *id,
         Ext::Sni => 0,
+        Ext::Alpn => 0x10,
         Ext::KeyShare(_) => 0x33,
     }
 }
@@ -33,7 +34,7 @@ fn parses_captured_chrome_hello() {
     );
     let ext_ids: Vec<u16> = hello.template.extensions.iter().map(ext_id).collect();
     assert!(ext_ids.contains(&0x002b), "supported_versions present");
-    assert!(ext_ids.contains(&0x000a), "ALPN present");
+    assert!(ext_ids.contains(&0x0010), "ALPN present");
     assert!(ext_ids.contains(&0x0033), "key_share present");
 
     let ks = hello
@@ -65,6 +66,7 @@ fn rebuilds_captured_hello_byte_for_byte() {
         &hello.random,
         &hello.session_id,
         &hello.sni,
+        &[b"h2", b"http/1.1"],
         None,
     )
     .expect("build");
@@ -88,6 +90,7 @@ fn rebuild_with_fresh_randomness_differs_only_in_random_fields() {
         &random,
         &session_id,
         &hello.sni,
+        &[b"h2", b"http/1.1"],
         Some(&key),
     )
     .expect("build");

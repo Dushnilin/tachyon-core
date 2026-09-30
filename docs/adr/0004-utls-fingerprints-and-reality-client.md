@@ -59,3 +59,29 @@ defeats the static-musl goal) and pure-Rust Hello builders.
   will be vendored as static tables from utls-lx fingerprint sources (F2),
   with this byte-diff harness as the verification method.
 - REALITY live handshake against Xray remains an F2 verification item.
+
+## Fingerprint tables (F2, 2026-09-30)
+
+- `tests/spikes/clienthello/capture_fingerprints.sh` runs the *reference* as a
+  uTLS client against a sink and writes its first record, once per
+  fingerprint. `tools/fingerprint_tables.py` turns those captures into
+  `crates/core-tls/src/fingerprints.rs`: a fingerprint is a cipher list, an
+  extension order and the bodies of the extensions that do not change per
+  connection. `Ext::KeyShare` keeps the captured body, so the modern Chrome
+  table still offers X25519MLKEM768 (SPEC 083/089).
+- `crates/core-tls/tests/fingerprints.rs` rebuilds every table and compares it
+  with the capture it came from, ignoring only what the reference itself
+  randomizes per handshake: GREASE values, the `random` field, and the session
+  id *content* (its length is the claim — REALITY seals its auth key into 32
+  bytes of it).
+- **The reference is not byte-stable either.** `HelloChrome_Auto` picks a Chrome
+  version per handshake: three connections from one process produced three
+  different hellos (`tests/spikes/clienthello/chrome_stability.sh`, three
+  distinct md5s). So the exit criterion "the fingerprint bytes match the
+  reference" has to mean *structurally*, per version — which is what the table
+  test checks. A vendored table is one stable Chrome version, which is what
+  REALITY deployments use in practice.
+- No rustls fork is needed, and none is planned: the ClientHello is ours, and
+  the handshake on top of it uses the pure-Rust crypto provider (`core-crypto`)
+  and `rustls-webpki` for chain verification. Both are already in the tree, and
+  neither is a fork.

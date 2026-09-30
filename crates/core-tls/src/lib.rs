@@ -4,6 +4,7 @@
 //! `rustls-rustcrypto`/oxitls fork with QUIC support) so the same binary
 //! builds for MIPS softfloat targets where `ring`/`aws-lc-rs` do not exist.
 
+pub mod fingerprints;
 pub mod hello;
 pub mod quic;
 

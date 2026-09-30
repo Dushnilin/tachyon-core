@@ -47,8 +47,23 @@ fn suite_of(id: u16) -> io::Result<(CipherSuite, Hash)> {
     }
 }
 
+/// Seconds since the epoch, which is what a REALITY session id carries.
+fn unix_time() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or_default()
+}
+
 fn entropy(into: &mut [u8]) -> io::Result<()> {
     getrandom::fill(into).map_err(|e| bad(format!("no entropy: {e}")))
+}
+
+/// REALITY: the server's public key and the short id its session id seal names.
+#[derive(Debug, Clone, Copy)]
+pub struct RealitySeal<'a> {
+    pub public_key: &'a [u8; 32],
+    pub short_id: &'a [u8],
 }
 
 /// What the caller configures. There is no `Default`: a client that has not been
@@ -60,6 +75,9 @@ pub struct Config<'a> {
     /// ALPN protocols, in the order to offer them.
     pub alpn: &'a [&'a [u8]],
     pub verifier: &'a dyn CertVerifier,
+    /// Set for a REALITY client: the session id is sealed with the key this
+    /// hello's X25519 exchange produces, and the verifier is told that key.
+    pub reality: Option<RealitySeal<'a>>,
 }
 
 /// One handshake. [`Handshake::run`] is the whole thing over a blocking stream.
@@ -83,6 +101,10 @@ pub struct Handshake<'a> {
     leaf: Option<CertificateDer<'static>>,
     /// the protocol the server chose, if it sent ALPN
     pub alpn: Option<Vec<u8>>,
+    reality: Option<RealitySeal<'a>>,
+    /// The auth key this handshake sealed its session id with, kept for a caller
+    /// that has to explain a failure after the fact.
+    auth_key: Option<[u8; 32]>,
 }
 
 impl<'a> Handshake<'a> {
@@ -120,8 +142,15 @@ impl<'a> Handshake<'a> {
             sealer: None,
             leaf: None,
             alpn: None,
+            reality: config.reality,
+            auth_key: None,
             config,
         })
+    }
+
+    /// The REALITY auth key, once the hello has been sealed with it.
+    pub fn auth_key(&self) -> Option<[u8; 32]> {
+        self.auth_key
     }
 
     /// The key shares this handshake offers, for a caller that needs to know what
@@ -166,8 +195,14 @@ impl<'a> Handshake<'a> {
     pub async fn start(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
         let mut random = [0u8; 32];
         entropy(&mut random)?;
-        entropy(&mut self.session_id)?;
-        let record = hello::build(
+        if let Some(reality) = self.reality {
+            // 32 bytes of compat space carrying the version, the time and the
+            // short id; the first half of it is sealed below
+            self.session_id = crate::reality::session_id(reality.short_id, unix_time()).to_vec();
+        } else {
+            entropy(&mut self.session_id)?;
+        }
+        let mut record = hello::build(
             self.config.template,
             &random,
             &self.session_id,
@@ -175,6 +210,16 @@ impl<'a> Handshake<'a> {
             self.config.alpn,
             Some(&self.shares),
         )?;
+        if let Some(reality) = self.reality {
+            // The auth key is the X25519 half of the share we just offered, and
+            // the verifier cannot be told about it before this point: it does
+            // not exist before the hello goes out.
+            let secret = self.shares.reality_secret(reality.public_key)?;
+            let key = crate::reality::auth_key(&secret, &random);
+            crate::reality::seal_hello(&mut record, &key)?;
+            self.auth_key = Some(key);
+            self.config.verifier.set_reality_auth_key(&key);
+        }
         self.transcript.extend_from_slice(&record[5..]);
         stream.write_all(&record).await?;
         stream.flush().await

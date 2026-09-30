@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use core_tls::client::{self, Config, Handshake};
 use core_tls::fingerprints;
+use core_tls::hello::parse_record;
 use core_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use core_tls::rustls::{self, RootCertStore, ServerConfig};
 use core_tls::verify::{CertVerifier, WebpkiVerifier};
@@ -133,6 +134,7 @@ async fn shake(
         server_name,
         alpn: &alpn,
         verifier,
+        reality: None,
     };
     let mut client = Handshake::new(config).map_err(|e| e.to_string())?;
     let mut sock = client_side;
@@ -306,6 +308,7 @@ async fn application_data_flows_after_the_handshake() {
         server_name: "localhost",
         alpn: &alpn,
         verifier: &verifier,
+        reality: None,
     };
     let mut client = Handshake::new(config).expect("a handshake");
     let mut sock = client_side;
@@ -341,4 +344,103 @@ async fn application_data_flows_after_the_handshake() {
         .expect("the server task does not hang")
         .expect("the server task");
     assert_eq!(request, "GET / HTTP/1.1\r\n\r\n");
+}
+
+/// The client half of REALITY, checked against the server's half computed here.
+///
+/// A REALITY server never answers this handshake in a way we could test without
+/// one, but the *seal* can be checked from the outside: the test holds the
+/// server's X25519 private key, reads the X25519 share out of the hello we sent,
+/// runs the exchange itself, derives the auth key from the hello's own random
+/// and opens the session id. If any of that disagreed with the server's own
+/// arithmetic by one byte, the seal would not open.
+#[tokio::test]
+async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
+    use core_tls::keyshare::X25519MLKEM768;
+    use core_tls::reality;
+
+    let (certs, _) = fixture();
+    let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
+    let template = fingerprints::by_name("chrome").expect("a chrome table");
+    let server_secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let server_public: [u8; 32] = *x25519_dalek::PublicKey::from(&server_secret).as_bytes();
+    let short_id = b"\x12\x34\xab\xcd";
+
+    let (mut client_side, mut server_side) = tokio::io::duplex(64 * 1024);
+    let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+    let config = Config {
+        template: &template,
+        server_name: "www.gstatic.com",
+        alpn: &alpn,
+        verifier: &verifier,
+        reality: Some(core_tls::client::RealitySeal {
+            public_key: &server_public,
+            short_id,
+        }),
+    };
+    let mut client = Handshake::new(config).expect("a handshake");
+    client.start(&mut client_side).await.expect("hello");
+
+    // everything the server would read out of the record
+    let mut header = [0u8; 5];
+    server_side
+        .read_exact(&mut header)
+        .await
+        .expect("record header");
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let mut record = vec![0u8; len];
+    server_side
+        .read_exact(&mut record)
+        .await
+        .expect("record body");
+    let mut full = header.to_vec();
+    full.extend_from_slice(&record);
+
+    let parsed = parse_record(&full).expect("a ClientHello");
+    assert_eq!(parsed.sni, "www.gstatic.com");
+    assert_eq!(
+        parsed.session_id.len(),
+        32,
+        "REALITY needs the compat space"
+    );
+
+    // the session id on the wire is ciphertext: only the server can read the
+    // version, the time and the short id out of it
+    let id = &full[reality::SESSION_ID_OFFSET..reality::SESSION_ID_OFFSET + 32];
+    assert_ne!(
+        &id[..3],
+        &reality::VERSION,
+        "the session id went out unsealed"
+    );
+
+    // the X25519 share we offered is the tail of the hybrid entry
+    let key_share = parsed
+        .template
+        .extensions
+        .iter()
+        .find_map(|e| match e {
+            core_tls::hello::Ext::KeyShare(body) => Some(body.clone()),
+            _ => None,
+        })
+        .expect("the chrome key share");
+    let shares = core_tls::keyshare::entries(&key_share).expect("the share list");
+    let (_, hybrid) = shares
+        .iter()
+        .find(|(group, _)| *group == X25519MLKEM768)
+        .expect("the hybrid share");
+    let offered: [u8; 32] = hybrid[1184..].try_into().expect("32 bytes");
+
+    // the server's half of the exchange, computed here
+    let shared = server_secret.diffie_hellman(&offered.into());
+    let random: [u8; 32] = full[11..43].try_into().expect("32 bytes of random");
+    let auth_key = reality::auth_key(shared.as_bytes(), &random);
+
+    // and the seal opens, which is the whole claim
+    let opened = reality::open_session_id(&full, &auth_key).expect("the session id opens");
+    assert_eq!(&opened[..3], &reality::VERSION);
+    assert_eq!(&opened[8..12], short_id);
+    let time = u32::from_be_bytes(opened[4..8].try_into().expect("4 bytes"));
+    assert!(time > 1_700_000_000, "a plausible unix time, got {time}");
+    // the auth key we used is the one the handshake says it used
+    assert_eq!(client.auth_key().expect("an auth key"), auth_key);
 }

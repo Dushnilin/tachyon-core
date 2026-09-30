@@ -32,9 +32,6 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
 #[cfg(unix)]
-use socket2::SockAddr;
-
-#[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
 
 /// The reference's `C.TCPConnectTimeout` when `connect_timeout` is absent.
@@ -85,14 +82,14 @@ impl DialOptions {
         };
         let seconds = |key: &str| -> anyhow::Result<Option<Duration>> {
             let value = obj.get(key).filter(|value| !value.is_null());
-            if let Some(value) = value
-                && !value.is_string()
-                && !value.is_number()
-            {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            if !value.is_string() && !value.is_number() {
                 anyhow::bail!("{key}: must be a duration string");
             }
             Ok(Some(crate::outbound::urltest::parse_duration(
-                value,
+                Some(value),
                 Duration::ZERO,
                 key,
             )?))
@@ -311,10 +308,46 @@ fn new_socket(addr: &SocketAddr, udp: bool) -> io::Result<RawFd> {
     Ok(fd)
 }
 
+/// A libc `sockaddr` for the address, written by hand: `socket2::SockAddr` is
+/// a wrapper type on Linux, not a `sockaddr`, so it cannot be handed to
+/// `bind`/`connect` directly.
+#[cfg(unix)]
+fn raw_addr(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: sockaddr_in is the first member-compatible layout of a
+            // zeroed sockaddr_storage of at least its size
+            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: as above, for the v6 layout
+            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_scope_id = v6.scope_id();
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (storage, len as libc::socklen_t)
+}
+
 #[cfg(unix)]
 fn bind_local(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
-    let local = SockAddr::from(*addr);
-    let result = unsafe { libc::bind(fd, local.as_ptr(), local.as_ptr_len()) };
+    let (storage, len) = raw_addr(addr);
+    // SAFETY: a zeroed sockaddr_storage of `len` bytes, valid for the family
+    let ptr: *const libc::sockaddr = (&storage as *const libc::sockaddr_storage).cast();
+    let result = unsafe { libc::bind(fd, ptr, len) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -323,8 +356,10 @@ fn bind_local(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
 
 #[cfg(unix)]
 fn connect_socket(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
-    let peer = SockAddr::from(*addr);
-    let result = unsafe { libc::connect(fd, peer.as_ptr(), peer.as_ptr_len()) };
+    let (storage, len) = raw_addr(addr);
+    // SAFETY: as above
+    let ptr: *const libc::sockaddr = (&storage as *const libc::sockaddr_storage).cast();
+    let result = unsafe { libc::connect(fd, ptr, len) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -440,13 +475,13 @@ async fn dial_tcp(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpStre
 #[cfg(unix)]
 pub async fn connect_udp(addr: SocketAddr, options: &DialOptions) -> io::Result<UdpSocket> {
     if options.is_empty() {
-        return UdpSocket::bind(match addr {
+        let socket = UdpSocket::bind(match addr {
             SocketAddr::V4(_) => "0.0.0.0:0",
             SocketAddr::V6(_) => "[::]:0",
         })
-        .await?
-        .connect(addr)
-        .await;
+        .await?;
+        socket.connect(addr).await?;
+        return Ok(socket);
     }
     let options = options.clone();
     let std = tokio::task::spawn_blocking(move || -> io::Result<std::net::UdpSocket> {

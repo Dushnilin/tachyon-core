@@ -5,7 +5,7 @@ FROM rust:1-bookworm
 COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:/usr/local/cargo/bin:$PATH
 
-ARG SB_REF_VERSION=v1.14.2-lx.3
+ARG SB_REF_VERSION=v1.14.2-lx.11
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends musl-tools; \

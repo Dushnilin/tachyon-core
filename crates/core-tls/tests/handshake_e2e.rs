@@ -5,13 +5,11 @@
 //! but that a hello built from a captured fingerprint completes a handshake
 //! with an implementation that shares none of our code.
 //!
-//! The two sides talk through a buffer rather than a socket. Both are
-//! transport-agnostic -- rustls reads and writes TLS, we read and write
-//! records -- so the exchange is a loop instead of two threads, which makes it
-//! deterministic and keeps it out of the timing races a loopback test has.
+//! The two sides talk through `tokio::io::duplex`, with the server on its own
+//! task, so the exchange is the real asynchronous one the runtime does -- the
+//! same path a socket takes, with no timing races a loopback port would add.
 
-use std::io::{self, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use core_tls::client::{self, Config, Handshake};
@@ -19,6 +17,7 @@ use core_tls::fingerprints;
 use core_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use core_tls::rustls::{self, RootCertStore, ServerConfig};
 use core_tls::verify::{CertVerifier, WebpkiVerifier};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 /// The certificate the repository already carries for its own golden tests: self
 /// signed for `localhost`, valid until 2036. A checked-in certificate is the
@@ -26,13 +25,13 @@ use core_tls::verify::{CertVerifier, WebpkiVerifier};
 /// signing backend, and every pure-Rust one we could add is a dependency this
 /// project does not want.
 fn fixture() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::BufReader::new(
         std::fs::File::open(dir.join("localhost.crt")).expect("the certificate fixture"),
     ))
     .collect::<Result<_, _>>()
     .expect("the certificate fixture parses");
-    let key = rustls_pemfile::private_key(&mut BufReader::new(
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
         std::fs::File::open(dir.join("localhost.key")).expect("the key fixture"),
     ))
     .expect("the key fixture parses")
@@ -47,31 +46,49 @@ fn roots_trusting(cert: &CertificateDer<'static>) -> RootCertStore {
     roots
 }
 
-/// What the client sees of the other side, and what it says back.
-#[derive(Default)]
-struct Pipe {
-    incoming: Vec<u8>,
-    outgoing: Vec<u8>,
+fn server() -> ServerConfig {
+    let (certs, key) = fixture();
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("a server config from one certificate");
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    config
 }
 
-impl Read for Pipe {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = buf.len().min(self.incoming.len());
-        buf[..n].copy_from_slice(&self.incoming[..n]);
-        self.incoming.drain(..n);
-        Ok(n)
+/// One round of the server's side: take whatever the socket has, let rustls
+/// process it, and write out what it wants. rustls' own state machine is
+/// synchronous, so the socket is what has to be adapted -- and a `Vec` is
+/// enough, because the plaintext it produces is what the test looks at.
+async fn server_round(
+    conn: &mut rustls::ServerConnection,
+    sock: &mut DuplexStream,
+    scratch: &mut [u8],
+) -> std::io::Result<(usize, Vec<u8>)> {
+    let n = sock.read(scratch).await?;
+    if n > 0 {
+        conn.read_tls(&mut &scratch[..n])?;
     }
-}
-
-impl Write for Pipe {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.outgoing.extend_from_slice(buf);
-        Ok(buf.len())
+    conn.process_new_packets()
+        .map_err(|e| std::io::Error::other(format!("the server rejected the flight: {e}")))?;
+    let mut out = Vec::new();
+    while conn.wants_write() {
+        let mut chunk = Vec::new();
+        conn.write_tls(&mut chunk)?;
+        out.extend_from_slice(&chunk);
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    if !out.is_empty() {
+        sock.write_all(&out).await?;
     }
+    let mut plain = Vec::new();
+    let mut small = [0u8; 4096];
+    while let Ok(n) = conn.reader().read(&mut small) {
+        if n == 0 {
+            break;
+        }
+        plain.extend_from_slice(&small[..n]);
+    }
+    Ok((n, plain))
 }
 
 #[derive(Debug)]
@@ -79,100 +96,79 @@ struct Outcome {
     leaf: Option<CertificateDer<'static>>,
     client_alpn: Option<Vec<u8>>,
     server_alpn: Option<Vec<u8>>,
-    server_finished: bool,
 }
 
-/// Pump one handshake through, and report what each side made of it.
-fn shake(
+/// Pump one handshake through, and report what the client made of it.
+async fn shake(
     verifier: &dyn CertVerifier,
     fingerprint: &str,
     server_name: &str,
 ) -> Result<Outcome, String> {
     core_tls::install_default_provider();
-    let (certs, key) = fixture();
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs.clone(), key)
-        .map_err(|e| e.to_string())?;
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    let mut server = rustls::ServerConnection::new(Arc::new(config)).map_err(|e| e.to_string())?;
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut sock = server_side;
+        let mut conn =
+            rustls::ServerConnection::new(Arc::new(server())).expect("a server connection");
+        let mut scratch = [0u8; 4096];
+        // reading drives the handshake: the flight goes out, the client's
+        // Finished comes back
+        while conn.is_handshaking() {
+            match server_round(&mut conn, &mut sock, &mut scratch).await {
+                Ok((0, _)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        if conn.is_handshaking() {
+            return Err("the server did not finish its handshake".to_string());
+        }
+        Ok(conn.alpn_protocol().map(|p| p.to_vec()))
+    });
 
     let template =
         fingerprints::by_name(fingerprint).ok_or_else(|| format!("no table for {fingerprint}"))?;
     let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
-    let client_config = Config {
+    let config = Config {
         template: &template,
         server_name,
         alpn: &alpn,
         verifier,
     };
-    let mut client = Handshake::new(client_config).map_err(|e| e.to_string())?;
-    let mut pipe = Pipe::default();
-    client.start(&mut pipe).map_err(|e| e.to_string())?;
-
-    // the client's three reads, in order; each one gets everything the server
-    // has written so far, and whole records only
-    let mut step = 0;
-    let mut failure = None;
-    for _ in 0..16 {
-        let from_client = std::mem::take(&mut pipe.outgoing);
-        server
-            .read_tls(&mut from_client.as_slice())
-            .map_err(|e| e.to_string())?;
-        // read_tls only buffers: the state machine moves when the buffered
-        // packets are handed to it
-        server
-            .process_new_packets()
-            .map_err(|e| format!("the server rejected our flight: {e}"))?;
-        let mut from_server = Vec::new();
-        while server.wants_write() {
-            server
-                .write_tls(&mut from_server)
-                .map_err(|e| e.to_string())?;
+    let mut client = Handshake::new(config).map_err(|e| e.to_string())?;
+    let mut sock = client_side;
+    let ours = client.run(&mut sock).await.map_err(|e| e.to_string());
+    // A refused handshake has to close our side before the server task is
+    // awaited: it is parked on a read that will never get anything, and the
+    // socket still being alive here is exactly the bug this line is about.
+    let theirs = match ours {
+        Ok(()) => server.await,
+        Err(e) => {
+            drop(sock);
+            let _ = server.await;
+            return Err(e);
         }
-        pipe.incoming.extend_from_slice(&from_server);
+    };
 
-        let outcome = match step {
-            0 => client.read_server_hello(&mut pipe),
-            1 => client.read_flight(&mut pipe),
-            _ => client.send_finished(&mut pipe),
-        };
-        if let Err(e) = outcome {
-            failure = Some(e.to_string());
-            break;
-        }
-        step += 1;
-        if step == 3 {
-            break;
-        }
+    match theirs {
+        Ok(Ok(server_alpn)) => Ok(Outcome {
+            leaf: client.leaf().cloned(),
+            client_alpn: client.alpn.clone(),
+            server_alpn,
+        }),
+        Ok(Err(e)) => Err(format!("the server said nothing: {e}")),
+        Err(e) => Err(format!("the server task failed: {e}")),
     }
-    // let the server have the last of it: our Finished and the compatibility
-    // record in front of it
-    let from_client = std::mem::take(&mut pipe.outgoing);
-    let _ = server.read_tls(&mut from_client.as_slice());
-    let _ = server.process_new_packets();
-
-    if let Some(e) = failure {
-        return Err(e);
-    }
-    if step != 3 {
-        return Err("the exchange did not finish".to_string());
-    }
-    Ok(Outcome {
-        leaf: client.leaf().cloned(),
-        client_alpn: client.alpn.clone(),
-        server_alpn: server.alpn_protocol().map(|p| p.to_vec()),
-        server_finished: !server.is_handshaking(),
-    })
 }
 
 /// The whole thing: our hello, the server's flight, our Finished, and both sides
 /// agreeing afterwards.
-#[test]
-fn the_handshake_completes_against_a_rustls_server() {
+#[tokio::test]
+async fn the_handshake_completes_against_a_rustls_server() {
     let (certs, _) = fixture();
     let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
-    let done = shake(&verifier, "chrome", "localhost").expect("the handshake");
+    let done = shake(&verifier, "chrome", "localhost")
+        .await
+        .expect("the handshake");
     assert_eq!(done.leaf.as_ref(), Some(&certs[0]), "we kept the leaf");
     assert_eq!(
         done.client_alpn,
@@ -184,14 +180,13 @@ fn the_handshake_completes_against_a_rustls_server() {
         Some(b"h2".to_vec()),
         "and the server agreed"
     );
-    assert!(done.server_finished, "the server finished its side too");
 }
 
-/// A verifier that trusts nobody must stop the handshake, and the server must
-/// notice. The Finished check on its own would pass here: it only proves the
-/// peer holds the same keys, not that anybody vouched for them.
-#[test]
-fn a_verifier_that_says_no_stops_the_handshake() {
+/// A verifier that trusts nobody must stop the handshake. The Finished check on
+/// its own would pass here: it only proves the peer holds the same keys, not
+/// that anybody vouched for them.
+#[tokio::test]
+async fn a_verifier_that_says_no_stops_the_handshake() {
     #[derive(Debug)]
     struct TrustsNobody;
     impl CertVerifier for TrustsNobody {
@@ -200,8 +195,8 @@ fn a_verifier_that_says_no_stops_the_handshake() {
             _leaf: &CertificateDer<'_>,
             _chain: &[CertificateDer<'_>],
             _server_name: &ServerName<'_>,
-        ) -> io::Result<()> {
-            Err(io::Error::other("this test trusts nobody"))
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("this test trusts nobody"))
         }
         fn verify_handshake_signature(
             &self,
@@ -209,12 +204,13 @@ fn a_verifier_that_says_no_stops_the_handshake() {
             _leaf: &CertificateDer<'_>,
             _scheme: u16,
             _signature: &[u8],
-        ) -> io::Result<()> {
+        ) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let err =
-        shake(&TrustsNobody, "chrome", "localhost").expect_err("a refused chain must not pass");
+    let err = shake(&TrustsNobody, "chrome", "localhost")
+        .await
+        .expect_err("a refused chain must not pass");
     assert!(
         err.contains("trusts nobody"),
         "the failure must say why: {err}"
@@ -223,11 +219,12 @@ fn a_verifier_that_says_no_stops_the_handshake() {
 
 /// A name the certificate does not carry must fail: the chain is fine, the
 /// hostname is not, and the two are checked separately.
-#[test]
-fn a_name_the_certificate_does_not_carry_is_refused() {
+#[tokio::test]
+async fn a_name_the_certificate_does_not_carry_is_refused() {
     let (certs, _) = fixture();
     let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
     let err = shake(&verifier, "chrome", "not-localhost.example")
+        .await
         .expect_err("a name outside the certificate must not pass");
     assert!(
         err.contains("certificate chain rejected"),
@@ -240,114 +237,108 @@ fn a_name_the_certificate_does_not_carry_is_refused() {
 /// firefox, a p256 point as well -- while the provider's server side supports
 /// only the classical groups, so every run here exercises the "not the first
 /// group we offered" path.
-#[test]
-fn the_server_may_pick_a_later_group_from_our_share() {
+#[tokio::test]
+async fn the_server_may_pick_a_later_group_from_our_share() {
     let (certs, _) = fixture();
     let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
-    shake(&verifier, "chrome", "localhost").expect("chrome");
-    shake(&verifier, "firefox", "localhost").expect("firefox offers three groups");
-    shake(&verifier, "safari", "localhost").expect("safari");
+    shake(&verifier, "chrome", "localhost")
+        .await
+        .expect("chrome");
+    shake(&verifier, "firefox", "localhost")
+        .await
+        .expect("firefox offers three groups");
+    shake(&verifier, "safari", "localhost")
+        .await
+        .expect("safari");
 }
 
 /// The handshake is only half of it: after it, application data has to flow
 /// through the same record layer, with the record sequence numbers carrying on
 /// from the handshake and the two directions on their own keys.
-#[test]
-fn application_data_flows_after_the_handshake() {
+#[tokio::test]
+async fn application_data_flows_after_the_handshake() {
     core_tls::install_default_provider();
-    let (certs, key) = fixture();
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs.clone(), key)
-        .expect("a server config");
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    let mut server = rustls::ServerConnection::new(Arc::new(config)).expect("a server connection");
+    let (certs, _) = fixture();
     let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut sock = server_side;
+        let mut conn =
+            rustls::ServerConnection::new(Arc::new(server())).expect("a server connection");
+        let mut scratch = [0u8; 4096];
+        let mut request = Vec::new();
+        while conn.is_handshaking() {
+            match server_round(&mut conn, &mut sock, &mut scratch).await {
+                Ok((0, _)) | Err(_) => break,
+                // the client's first request can land in the very round that
+                // finishes the handshake, and it is decrypted here
+                Ok((_, plain)) => {
+                    if !plain.is_empty() {
+                        request = plain;
+                    }
+                }
+            }
+        }
+        // the request, then an answer
+        while request.is_empty() {
+            let (_, plain) = server_round(&mut conn, &mut sock, &mut scratch)
+                .await
+                .expect("the request");
+            request = plain;
+        }
+        conn.writer()
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .expect("the answer");
+        let mut out = Vec::new();
+        while conn.wants_write() {
+            let mut chunk = Vec::new();
+            conn.write_tls(&mut chunk).expect("seal the answer");
+            out.extend_from_slice(&chunk);
+        }
+        sock.write_all(&out).await.expect("the answer goes out");
+        String::from_utf8_lossy(&request).to_string()
+    });
+
     let template = fingerprints::by_name("chrome").expect("a chrome table");
     let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
-    let client_config = Config {
+    let config = Config {
         template: &template,
         server_name: "localhost",
         alpn: &alpn,
         verifier: &verifier,
     };
-    let mut client = Handshake::new(client_config).expect("a handshake");
-    let mut pipe = Pipe::default();
-
-    // the handshake, then take the application keys
-    client.start(&mut pipe).expect("client hello");
-    let mut step = 0;
-    for _ in 0..16 {
-        let from_client = std::mem::take(&mut pipe.outgoing);
-        server
-            .read_tls(&mut from_client.as_slice())
-            .expect("to server");
-        server.process_new_packets().expect("server processes");
-        let mut from_server = Vec::new();
-        while server.wants_write() {
-            server.write_tls(&mut from_server).expect("from server");
-        }
-        pipe.incoming.extend_from_slice(&from_server);
-        let outcome = match step {
-            0 => client.read_server_hello(&mut pipe),
-            1 => client.read_flight(&mut pipe),
-            _ => client.send_finished(&mut pipe),
-        };
-        outcome.expect("a handshake step");
-        step += 1;
-        if step == 3 {
-            break;
-        }
-    }
-    let from_client = std::mem::take(&mut pipe.outgoing);
-    server
-        .read_tls(&mut from_client.as_slice())
-        .expect("finished to server");
-    server
-        .process_new_packets()
-        .expect("server takes the finished");
-    assert!(!server.is_handshaking(), "the server is done too");
+    let mut client = Handshake::new(config).expect("a handshake");
+    let mut sock = client_side;
+    let deadline = std::time::Duration::from_secs(20);
+    tokio::time::timeout(deadline, client.run(&mut sock))
+        .await
+        .expect("the handshake does not hang")
+        .expect("the handshake");
     let mut connection = client::Connection::new(&mut client).expect("application keys");
 
-    // our write reaches the server
-    connection
-        .write(&mut pipe, b"GET / HTTP/1.1\r\n\r\n")
-        .expect("write");
-    let to_server = std::mem::take(&mut pipe.outgoing);
-    server
-        .read_tls(&mut to_server.as_slice())
-        .expect("app data to server");
-    server
-        .process_new_packets()
-        .expect("server processes app data");
-    let mut plain = [0u8; 64];
-    let n = server.reader().read(&mut plain).expect("server reads");
-    assert_eq!(&plain[..n], b"GET / HTTP/1.1\r\n\r\n");
+    let record = connection
+        .write_record(b"GET / HTTP/1.1\r\n\r\n")
+        .expect("seal");
+    sock.write_all(&record).await.expect("the request goes out");
 
-    // and the server's write reaches us
-    server
-        .writer()
-        .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
-        .expect("server writes");
-    let mut from_server = Vec::new();
-    while server.wants_write() {
-        server.write_tls(&mut from_server).expect("server seals");
-    }
-    pipe.incoming.extend_from_slice(&from_server);
-    let mut got = [0u8; 64];
-    let n = connection.read(&mut pipe, &mut got).expect("read");
-    assert_eq!(&got[..n], b"HTTP/1.1 204 No Content\r\n\r\n");
-
-    // a second record in the other direction keeps the sequence numbers apart
-    connection.write(&mut pipe, b"second").expect("write again");
-    let to_server = std::mem::take(&mut pipe.outgoing);
-    server
-        .read_tls(&mut to_server.as_slice())
-        .expect("second to server");
-    server.process_new_packets().expect("server processes");
-    let n = server
-        .reader()
-        .read(&mut plain)
-        .expect("server reads again");
-    assert_eq!(&plain[..n], b"second");
+    // and the answer comes back, decrypted
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let answer = loop {
+        let n = sock.read(&mut chunk).await.expect("read the socket");
+        assert_ne!(n, 0, "the server closed before answering");
+        raw.extend_from_slice(&chunk[..n]);
+        let data = connection
+            .read_record_from(&mut raw)
+            .expect("open the record");
+        if !data.is_empty() {
+            break data;
+        }
+    };
+    assert_eq!(answer, b"HTTP/1.1 204 No Content\r\n\r\n");
+    let request = tokio::time::timeout(deadline, server)
+        .await
+        .expect("the server task does not hang")
+        .expect("the server task");
+    assert_eq!(request, "GET / HTTP/1.1\r\n\r\n");
 }

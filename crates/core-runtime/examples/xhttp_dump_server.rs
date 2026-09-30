@@ -63,8 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The repository's own fixture: self signed for `localhost`, valid until 2036.
 fn server_config() -> Result<core_tls::rustls::ServerConfig, Box<dyn std::error::Error>> {
     use core_tls::rustls::pki_types::CertificateDer;
-    let dir =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::BufReader::new(
         std::fs::File::open(dir.join("localhost.crt"))?,
     ))

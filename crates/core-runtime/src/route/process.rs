@@ -39,27 +39,15 @@ impl ProcessInfo {
     }
 }
 
-/// `route.find_process` or a rule that needs the owner: without either, the
-/// `/proc` walk is skipped entirely, like the reference's `needFindProcess`.
-static WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_wanted(wanted: bool) {
-    WANTED.store(wanted, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn wanted() -> bool {
-    WANTED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The owner of the socket this connection runs on, or `None`.
+/// The owner of the socket this connection runs on, or `None`. The caller
+/// decides whether to look at all: without `route.find_process` and without a
+/// rule that needs it, the `/proc` walk is skipped, like the reference's
+/// `needFindProcess`.
 pub fn find_owner(
     network: &str,
     source: SocketAddr,
     destination: Option<SocketAddr>,
 ) -> Option<ProcessInfo> {
-    if !wanted() {
-        return None;
-    }
     // `searchProcessInfo` only looks at local sources: a remote client's
     // process is not something this machine can see
     if !source.ip().is_loopback() && !is_private(source.ip()) {
@@ -131,9 +119,34 @@ mod linux {
         read_process(pid_for_inode(inode)?)
     }
 
-    /// The inode of the socket with this local endpoint. The line is
-    /// `sl local_address rem_address st tx:rx tr:tm->when retrnsmt uid timeout
-    /// inode`, so the inode is the tenth field.
+    /// The inode of the socket with this local endpoint, from one table.
+    /// A row is `sl local_address rem_address st tx:rx tr:tm->when retrnsmt uid
+    /// timeout inode …`, with `sl` printed as `N:`, so the inode is the tenth
+    /// field and the addresses the second and third.
+    pub(super) fn inode_in_table(text: &str, local: &str, remote: Option<&str>) -> Option<u64> {
+        for line in text.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            fields.next()?; // `N:`
+            if fields.next()? != local {
+                continue;
+            }
+            // consumed either way: the columns after it shift without it
+            let row_remote = fields.next()?;
+            if let Some(want) = remote
+                && row_remote != want
+            {
+                continue;
+            }
+            // tx:rx, tr:tm->when, retrnsmt, uid, timeout, then the inode
+            if let Some(inode) = fields.nth(6).and_then(|f| f.parse::<u64>().ok())
+                && inode != 0
+            {
+                return Some(inode);
+            }
+        }
+        None
+    }
+
     fn socket_inode(
         files: &[&str],
         local: SocketAddr,
@@ -148,24 +161,8 @@ mod linux {
             let Ok(text) = std::fs::read_to_string(file) else {
                 continue;
             };
-            for line in text.lines().skip(1) {
-                let mut fields = line.split_whitespace();
-                let (Some(l), Some(r)) = (fields.next(), fields.next()) else {
-                    continue;
-                };
-                if l != local_hex {
-                    continue;
-                }
-                if let Some(want) = &remote_hex
-                    && r != want
-                {
-                    continue;
-                }
-                if let Some(inode) = fields.nth(8).and_then(|f| f.parse::<u64>().ok())
-                    && inode != 0
-                {
-                    return Some(inode);
-                }
+            if let Some(inode) = inode_in_table(&text, &local_hex, remote_hex.as_deref()) {
+                return Some(inode);
             }
         }
         None
@@ -269,6 +266,35 @@ mod tests {
         );
     }
 
+    /// Rows captured from a live container (`/proc/net/tcp`), so the column
+    /// layout is checked where it is actually parsed instead of only on a
+    /// machine that happens to have a socket to look up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_inode_comes_out_of_a_real_proc_net_row() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:A139 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 477963 1 0000000097aff9c4 100 0 0 10 0\n\
+   1: 0100007F:AD7A 0100007F:A139 01 00000000:00000000 00:00000000 00000000     0        0 477964 2 0000000023aa6b4e 20 0 0 10 -1\n\
+   2: 0100007F:A139 0100007F:AD7A 01 00000000:00000000 00:00000000 00000000     0        0 477965 1 000000006e3ee3bf 20 0 0 10 -1\n";
+        let local = addr_hex("127.0.0.1".parse().unwrap(), 44410);
+        let remote = addr_hex("127.0.0.1".parse().unwrap(), 41273);
+        assert_eq!(
+            linux::inode_in_table(table, &local, Some(&remote)),
+            Some(477964),
+            "the established socket, matched on both endpoints"
+        );
+        assert_eq!(
+            linux::inode_in_table(table, &local, None),
+            Some(477964),
+            "a listening lookup without a remote still finds the row"
+        );
+        assert_eq!(
+            linux::inode_in_table(table, &addr_hex("127.0.0.1".parse().unwrap(), 1), None),
+            None,
+            "a port with no row matches nothing"
+        );
+    }
+
     #[test]
     fn proc_addresses_print_as_the_kernel_does() {
         // /proc/net/tcp prints 127.0.0.1:8080 as 0100007F:1F90
@@ -284,7 +310,6 @@ mod tests {
 
     #[test]
     fn only_local_sources_are_searched() {
-        set_wanted(true);
         assert!(
             find_owner("tcp", "8.8.8.8:5000".parse().unwrap(), None).is_none(),
             "a remote client's process is not ours to look up"
@@ -293,21 +318,20 @@ mod tests {
             find_owner("icmp", "127.0.0.1:5000".parse().unwrap(), None).is_none(),
             "only tcp and udp have a socket to look up"
         );
-        set_wanted(false);
     }
 
     /// The owner of a socket this test itself opened, on Linux.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_owner_of_a_socket_is_the_process_holding_it() {
-        set_wanted(true);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let (server, _) = listener.accept().expect("accept");
         let source = client.local_addr().expect("source");
 
-        let owner = find_owner("tcp", source, Some(server.peer_addr().expect("peer")))
+        // the socket is the client's: local = the client, remote = the server
+        let owner = find_owner("tcp", source, Some(server.local_addr().expect("server")))
             .expect("the test process holds that socket");
         let own_exe = std::fs::read_link("/proc/self/exe").expect("own exe");
         assert_eq!(
@@ -327,6 +351,5 @@ mod tests {
             .expect("uid");
         assert_eq!(owner.user_id, Some(own_uid));
         drop((client, server));
-        set_wanted(false);
     }
 }

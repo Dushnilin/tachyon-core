@@ -73,6 +73,11 @@ PY
 cat > "$WORK/probe.py" <<'PY'
 import socket, struct, sys
 proxy, port, payload = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].encode()
+# PROBE_REPEAT turns the payload into a bigger one, which is how a double upload
+# shows up: sixteen bytes fit in a single packet and a duplicated write is easy to
+# miss, four kilobytes cannot hide
+repeat = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+payload = payload * repeat
 s = socket.create_connection(("127.0.0.1", proxy), timeout=15)
 s.settimeout(15)
 s.sendall(b"\x05\x01\x00")
@@ -240,7 +245,8 @@ SERVER=$!
 CLIENT=$!
 sleep 3
 
-BODY=$("$PY" "$WORK/probe.py" "$SOCKS_PORT" "$ECHO_PORT" 'xhttp-through' 2>"$OUT/probe.log")
+BODY=$("$PY" "$WORK/probe.py" "$SOCKS_PORT" "$ECHO_PORT" 'xhttp-through' \
+    "${PROBE_REPEAT:-1}" 2>"$OUT/probe.log")
 STATUS=$?
 
 kill "$CLIENT" "$SERVER" "$ECHO" $DECOY 2>/dev/null

@@ -24,8 +24,12 @@
 # so a local Go decoy cannot play this part at all. The cost is that this spike
 # needs the network, which the Docker gate has by construction.
 #
-# The control is the reference's own REALITY client against the same server: if
-# that fails too, the stand is what is wrong, not our client.
+# The control is the reference's own client against the same server, in exactly
+# the same shape -- its own mixed inbound in front of the same vless+REALITY
+# outbound, with curl in front of that -- so if it fails too, the stand is what
+# is wrong and not our client. It is deliberately *not* `tools connect`: that
+# subcommand hangs even against a plain vless server with no REALITY anywhere, so
+# as a control it measures nothing at all.
 set -uo pipefail
 
 OUT="${1:?usage: run.sh <outdir>}"
@@ -34,6 +38,7 @@ REF="${SING_BOX_REF:-sing-box-ref}"
 ECHO_PORT="${ECHO_PORT:-19001}"
 VLESS_PORT="${VLESS_PORT:-19002}"
 SOCKS_PORT="${SOCKS_PORT:-19003}"
+CONTROL_PORT="${CONTROL_PORT:-19005}"
 SNI="${SNI:-www.gstatic.com}"
 DECOY="${DECOY:-www.gstatic.com}"
 DECOY_PORT="${DECOY_PORT:-443}"
@@ -132,10 +137,13 @@ cat > "$WORK/client.json" <<JSON
 }
 JSON
 
-# the control: the reference's own REALITY client, no inbound of ours in the way
+# the control: the reference's own client, a mixed inbound and the same outbound
 cat > "$WORK/refclient.json" <<JSON
 {
   "log": {"level": "warn", "timestamp": false},
+  "inbounds": [{
+    "type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": $CONTROL_PORT
+  }],
   "outbounds": [{
     "type": "vless", "tag": "out",
     "server": "127.0.0.1", "server_port": $VLESS_PORT,
@@ -164,40 +172,70 @@ if ! "$OUR" check -c "$WORK/client.json" > "$OUT/our-check.log" 2>&1; then
     exit 1
 fi
 
+cat > "$WORK/probe.py" <<'PY'
+import socket, struct, sys
+# Speak SOCKS5 by hand and send raw bytes: an HTTP request against a raw echo
+# makes curl count things nobody can interpret, and both sides of the comparison
+# have to be measured the same way.
+proxy, port, payload = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].encode()
+s = socket.create_connection(("127.0.0.1", proxy), timeout=10)
+s.settimeout(10)
+s.sendall(b"\x05\x01\x00")
+if s.recv(2) != b"\x05\x00":
+    sys.exit("no socks greeting")
+s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack(">H", port))
+reply = s.recv(10)
+if len(reply) < 2 or reply[1] != 0:
+    sys.exit("socks connect refused: %r" % (reply,))
+s.sendall(payload)
+data = b""
+try:
+    while len(data) < len(payload) + 64:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except socket.timeout:
+    pass
+sys.stdout.write(data.decode("latin1"))
+PY
+
 python3 "$WORK/echo.py" "$ECHO_PORT" > "$OUT/echo.log" 2>&1 &
 ECHO=$!
 "$REF" run -c "$WORK/server.json" > "$OUT/server.log" 2>&1 &
 SERVER=$!
 "$OUR" run -c "$WORK/client.json" > "$OUT/client.log" 2>&1 &
 CLIENT=$!
+"$REF" run -c "$WORK/refclient.json" > "$OUT/refclient.log" 2>&1 &
+CONTROL_PROC=$!
 sleep 3
 
-BODY=$(curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" --max-time 15 \
-    --data-binary 'reality-through' http://127.0.0.1:$ECHO_PORT/ 2>"$OUT/curl.log")
+BODY=$(python3 "$WORK/probe.py" "$SOCKS_PORT" "$ECHO_PORT" 'reality-through' \
+    2>"$OUT/curl.log")
 STATUS=$?
 
-# the control, on the same server, short id and decoy
-timeout 20 "$REF" tools connect -c "$WORK/refclient.json" -o out "127.0.0.1:$ECHO_PORT" \
-    > "$OUT/control.log" 2>&1
+# the control, on the same server, short id and decoy, through the same probe
+CONTROL_BODY=$(python3 "$WORK/probe.py" "$CONTROL_PORT" "$ECHO_PORT" 'reality-through' \
+    2>"$OUT/control.log")
 CONTROL=$?
 
-kill "$CLIENT" "$SERVER" "$ECHO" 2>/dev/null
-wait "$CLIENT" "$SERVER" "$ECHO" 2>/dev/null
+kill "$CLIENT" "$CONTROL_PROC" "$SERVER" "$ECHO" 2>/dev/null
+wait "$CLIENT" "$CONTROL_PROC" "$SERVER" "$ECHO" 2>/dev/null
 
 # what the server made of our hello
 VERDICT=$(grep -c "hs.c.conn == conn: true" "$OUT/server.log" 2>/dev/null || echo 0)
 
 echo "curl exit: $STATUS"
 echo "body: $BODY"
-echo "control exit: $CONTROL"
+echo "control exit: $CONTROL body: $CONTROL_BODY"
 echo "server accepted: $VERDICT of 2"
 if [ "$STATUS" -eq 0 ] && [ "$BODY" = "echo:reality-through" ]; then
     echo "PASS  a real REALITY server took our handshake and our traffic"
     exit 0
 fi
-if [ "$CONTROL" -ne 0 ]; then
-    echo "FAIL  the reference does not accept its own client here either: the stand" >&2
-    echo "      is what is wrong -- control.log, server.log" >&2
+if [ "$CONTROL" -ne 0 ] || [ "$CONTROL_BODY" != "echo:reality-through" ]; then
+    echo "FAIL  the reference does not get through its own stand either: the" >&2
+    echo "      stand is what is wrong -- control.log, refclient.log, server.log" >&2
     exit 2
 fi
 if [ "${VERDICT:-0}" -lt 2 ]; then

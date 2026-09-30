@@ -249,6 +249,13 @@ async fn socks5(
             let dest = ctx.destination.clone();
             match router.connect_index(idx, &dest).await {
                 Ok(conn) => {
+                    // The reference reports handshake success to the client
+                    // connection the moment the upstream is up (route/conn.go,
+                    // `N.ReportConnHandshakeSuccess`), not on the first payload.
+                    // A client that waits for this reply before sending anything --
+                    // curl through SOCKS, every browser -- would otherwise wait for
+                    // a reply that only its own first packet can trigger.
+                    client.established().await?;
                     logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
                     let tracker = clash_state::ConnHandle::open(clash_meta(&ctx, router, idx));
                     pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await

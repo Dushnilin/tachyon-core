@@ -59,10 +59,10 @@ enum LazyReply {
     Done,
 }
 
-/// Client stream that flushes the SOCKS success reply lazily (reference
-/// `LazyConn`): the first read/write emits the reply, then passes through.
-/// Sniffing therefore triggers the success reply before the client sends
-/// its payload — no handshake deadlock.
+/// Client stream that flushes the SOCKS success reply as soon as the upstream
+/// connection is up (reference `ConnHandshakeSuccess`, called by the router the
+/// moment the dial returns), and defensively on the first read/write as well
+/// (reference `LazyConn`) for a path that establishes the upstream silently.
 pub struct ClientConn {
     inner: TcpStream,
     reply: LazyReply,
@@ -82,6 +82,31 @@ impl ClientConn {
         Self {
             inner,
             reply: LazyReply::None,
+        }
+    }
+
+    /// The upstream is up: flush the success reply now (reference
+    /// `ConnHandshakeSuccess`, called by the router right after the dial).
+    ///
+    /// The lazy first-payload flush stays as a second chance, for a path that
+    /// establishes the upstream without saying so -- but a client that waits for
+    /// this reply cannot be the one to trigger it.
+    pub async fn established(&mut self) -> io::Result<()> {
+        match std::mem::replace(&mut self.reply, LazyReply::Done) {
+            LazyReply::Pending(bytes) => match self.inner.write_all(&bytes).await {
+                Ok(()) => {
+                    self.reply = LazyReply::Sent;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.reply = LazyReply::Done;
+                    Err(e)
+                }
+            },
+            other => {
+                self.reply = other;
+                Ok(())
+            }
         }
     }
 

@@ -85,3 +85,37 @@ defeats the static-musl goal) and pure-Rust Hello builders.
   the handshake on top of it uses the pure-Rust crypto provider (`core-crypto`)
   and `rustls-webpki` for chain verification. Both are already in the tree, and
   neither is a fork.
+
+## Key schedule and the REALITY wire details (F2, 2026-09-30)
+
+- `core-tls/src/tls13.rs` is the TLS 1.3 key schedule (RFC 8446 §7.1): HKDF
+  over SHA-256/384, `Expand-Label`, the traffic keys, and the per-record nonce.
+  Its test reproduces **every** intermediate value RFC 8448 §3 prints for the
+  simple 1-RTT handshake, so a mistake shows up at the step it was made. The
+  schedule takes a transcript *hash*, not the messages: the handshake layer
+  keeps the running hash anyway, and the RFC prints hashes.
+- Two details the first implementation got wrong, both caught by the vectors
+  rather than by a handshake failing: an absent PSK is the all-zero IKM of the
+  hash length (not an empty message), and a literal with an odd number of hex
+  digits shifts every byte after it. The test helper now checks its own
+  literals for even length.
+- The REALITY client details come from `XTLS/Xray-core`
+  `transport/internet/reality/reality.go`, which is what the servers implement:
+  * `session_id` is 32 bytes: `[0..3]` the version triple, `[3]` zero,
+    `[4..8]` the unix time, `[8..16]` the short id; the first 16 bytes are then
+    AES-256-GCM sealed with the **whole ClientHello as AAD** and
+    `random[20..32]` as the nonce, and the 32-byte result is written back at
+    the fixed offset 39 (4 + 2 + 32 + 1).
+  * the auth key is the X25519 (or the X25519 half of X25519MLKEM768) shared
+    secret with the server key, run through `HKDF-SHA256(salt=random[:20],
+    info="REALITY")`.
+  * the server is trusted when the leaf's Ed25519 public key HMAC-SHA512's
+    under that auth key to the leaf's own signature, with a normal chain
+    verification as the fallback.
+- The fork at `GFW-knocker/Xray-core` states the fingerprint shortlist in
+  `infra/conf/reality_fingerprint_test.go`: `ios`, `edge`, `qq`, `android` and
+  `360` are replaced with `chrome` there, because a current REALITY server
+  cannot verify those hellos. **The lx reference does not do that** — it sends
+  the small hello as configured (measured: 517 bytes for `ios`/`edge`/`qq`
+  against 1789 for `chrome`, both with and without `reality`), so our captures
+  and tables serve the REALITY path unchanged and no substitution is made.

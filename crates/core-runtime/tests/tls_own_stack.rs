@@ -143,3 +143,90 @@ async fn an_empty_write_seals_nothing() {
     stream.write_all(b"hi").await.expect("the request");
     server.await.expect("the server task");
 }
+
+// Helpers for the two tests below: our client on one side of a duplex, a rustls
+// server on the other, and a `FingerprintStream` over the client side.
+async fn pair(
+    payload_from_server: usize,
+) -> (
+    FingerprintStream<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<()>,
+) {
+    core_tls::install_default_provider();
+    let (certs, key) = fixture();
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .expect("a server config from one certificate");
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let mut roots = RootCertStore::empty();
+    roots.add(certs[0].clone()).expect("add the root");
+    let verifier = WebpkiVerifier::new(Arc::new(roots)).expect("a verifier");
+    let template = fingerprints::by_name("chrome").expect("a chrome table");
+
+    let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut stream = acceptor
+            .accept(server_io)
+            .await
+            .expect("the server handshake");
+        let body: Vec<u8> = (0..payload_from_server).map(|i| i as u8).collect();
+        stream.write_all(&body).await.expect("the answer");
+        stream.flush().await.expect("flush");
+    });
+
+    let alpn: [&[u8]; 1] = [b"h2"];
+    let config = Config {
+        template: &template,
+        server_name: "localhost",
+        alpn: &alpn,
+        verifier: &verifier,
+        reality: None,
+    };
+    let mut handshake = Handshake::new(config).expect("a handshake");
+    handshake.run(&mut client_io).await.expect("the handshake");
+    let connection = Connection::new(&mut handshake).expect("application keys");
+    (FingerprintStream::new(client_io, connection), server)
+}
+
+/// A record is up to 2^14 bytes; a reader with a small buffer must still get all
+/// of it. This is the tail-drop: the adapter used to hand over what fitted and
+/// throw the rest away, so a large record lost everything past the first read.
+#[tokio::test]
+async fn a_record_larger_than_the_readers_buffer_is_not_truncated() {
+    let size = 40 * 1024;
+    let (mut stream, server) = pair(size).await;
+
+    let mut got: Vec<u8> = Vec::with_capacity(size);
+    let mut chunk = [0u8; 1024];
+    while got.len() < size {
+        let n = stream.read(&mut chunk).await.expect("a read");
+        assert!(n > 0, "the stream ended after {} bytes", got.len());
+        got.extend_from_slice(&chunk[..n]);
+    }
+    let expected: Vec<u8> = (0..size).map(|i| i as u8).collect();
+    assert_eq!(got, expected, "every byte of every record");
+    server.await.expect("the server task");
+}
+
+/// The server writes in pieces with a yield between, so records arrive split. A
+/// reader must reassemble them -- and must not, at any point, decide it has
+/// "enough" bytes and stop reading the socket.
+#[tokio::test]
+async fn records_split_across_reads_are_reassembled() {
+    let size = 20 * 1024;
+    let (mut stream, _server) = pair(size).await;
+
+    let mut got: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 777];
+    while got.len() < size {
+        let n = stream.read(&mut chunk).await.expect("a read");
+        assert!(n > 0, "the stream ended after {} bytes", got.len());
+        got.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(got.len(), size);
+    assert_eq!(got[0], 0);
+    assert_eq!(got[size - 1], (size - 1) as u8);
+}

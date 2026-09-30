@@ -26,6 +26,10 @@ pub struct FingerprintStream<S> {
     connection: Connection,
     /// transport bytes that do not make a whole record yet
     raw: Vec<u8>,
+    /// plaintext of a record bigger than the buffer a reader brought, and how much
+    /// of it has been handed over
+    pending: Vec<u8>,
+    pending_at: usize,
     /// a record waiting to go out, and how much of it has been written
     out: Option<(Vec<u8>, usize)>,
     eof: bool,
@@ -38,6 +42,8 @@ impl<S> FingerprintStream<S> {
             inner,
             connection,
             raw: Vec::new(),
+            pending: Vec::new(),
+            pending_at: 0,
             out: None,
             eof: false,
         }
@@ -64,39 +70,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
         loop {
+            // plaintext left over from a record the reader's buffer could not
+            // take whole
+            if me.pending_at < me.pending.len() {
+                let take = (me.pending.len() - me.pending_at).min(buf.remaining());
+                buf.put_slice(&me.pending[me.pending_at..me.pending_at + take]);
+                me.pending_at += take;
+                if me.pending_at == me.pending.len() {
+                    me.pending.clear();
+                    me.pending_at = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
             if me.eof || me.connection.is_closed() {
                 return Poll::Ready(Ok(()));
             }
-            // one record off the socket, then decrypt whatever whole records we
-            // now hold -- a socket can hand us half a record, which is why the
-            // leftovers stay in `raw`
-            if me.raw.len() < 5 {
-                let mut chunk = [0u8; CHUNK];
-                let mut read = ReadBuf::new(&mut chunk);
-                match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
-                    Poll::Ready(Ok(())) => {
-                        let filled = read.filled();
-                        if filled.is_empty() {
-                            me.eof = true;
-                            return Poll::Ready(Ok(()));
-                        }
-                        me.raw.extend_from_slice(filled);
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
+            // Whatever we already hold comes first, and only then the socket.
+            // The order matters: a socket hands us half a record all the time, so
+            // "five bytes buffered" says nothing about whether a record is whole.
+            // Asking the socket only when the buffer was *short* meant a split
+            // record left us spinning over the same bytes forever, never reading
+            // the rest of it -- which is what a REALITY server's post-handshake
+            // ticket is.
             let data = match me.connection.read_record_from(&mut me.raw) {
                 Ok(data) => data,
                 Err(e) => return Poll::Ready(Err(e)),
             };
-            if data.is_empty() {
-                // not a whole record yet: go round for the rest of it
+            if !data.is_empty() {
+                me.pending = data;
+                me.pending_at = 0;
                 continue;
             }
-            let take = data.len().min(buf.remaining());
-            buf.put_slice(&data[..take]);
-            return Poll::Ready(Ok(()));
+            let mut chunk = [0u8; CHUNK];
+            let mut read = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) => {
+                    let filled = read.filled();
+                    if filled.is_empty() {
+                        me.eof = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                    me.raw.extend_from_slice(filled);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }

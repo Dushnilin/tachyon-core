@@ -36,6 +36,33 @@ pub trait CertVerifier: Debug + Send + Sync {
     ) -> io::Result<()>;
 }
 
+/// The verifier a config with `insecure: true` asks for: the chain is not
+/// checked. It is a named type rather than a flag on [`WebpkiVerifier`] so that
+/// "no verification" is always a decision somebody wrote down.
+#[derive(Debug)]
+pub struct AcceptsAnything;
+
+impl CertVerifier for AcceptsAnything {
+    fn verify_chain(
+        &self,
+        _leaf: &CertificateDer<'_>,
+        _chain: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn verify_handshake_signature(
+        &self,
+        _signed: &[u8],
+        _leaf: &CertificateDer<'_>,
+        _scheme: u16,
+        _signature: &[u8],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }

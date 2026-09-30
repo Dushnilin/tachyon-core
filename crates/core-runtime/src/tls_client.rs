@@ -16,7 +16,6 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use crate::inbound::AnyStream;
-use crate::logging;
 
 const DANGEROUS_SCHEMES: &[rustls::SignatureScheme] = &[
     rustls::SignatureScheme::ED25519,
@@ -69,6 +68,23 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     }
 }
 
+/// A uTLS fingerprint, resolved from the name the config used.
+#[derive(Clone, Debug)]
+pub struct Fingerprint {
+    pub name: String,
+    pub template: core_tls::hello::Template,
+}
+
+/// REALITY: the server's public key and the short id that opens the session id
+/// seal. The verification of the borrowed certificate is not part of this yet,
+/// which is why enabling it is still refused further down.
+#[derive(Clone, Debug)]
+pub struct Reality {
+    pub public_key: [u8; 32],
+    pub short_id: Vec<u8>,
+    pub fingerprint: Option<Fingerprint>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TlsOptions {
     server_name: String,
@@ -78,6 +94,10 @@ pub struct TlsOptions {
     min_tls13: bool,
     max_tls12: bool,
     ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// Our own ClientHello instead of rustls': a captured browser fingerprint
+    /// and the handshake written for it.
+    fingerprint: Option<Fingerprint>,
+    reality: Option<Reality>,
 }
 
 impl TlsOptions {
@@ -149,24 +169,56 @@ impl TlsOptions {
                 .map_err(|e| anyhow::anyhow!("{at}: tls.certificate_path {path:?}: {e}"))?;
         }
 
-        if tls
-            .get("utls")
-            .and_then(Value::as_object)
-            .is_some_and(|u| u.get("enabled").and_then(Value::as_bool) == Some(true))
-        {
-            logging::warn(format_args!(
-                "{at}: uTLS fingerprinting is not implemented yet (F2); using plain TLS"
-            ));
-        }
-        if tls
-            .get("reality")
-            .and_then(Value::as_object)
-            .is_some_and(|r| r.get("enabled").and_then(Value::as_bool) == Some(true))
-        {
-            anyhow::bail!("{at}: REALITY is not implemented yet (F2)");
-        }
+        let fingerprint = match tls.get("utls").and_then(Value::as_object) {
+            Some(u) if u.get("enabled").and_then(Value::as_bool) == Some(true) => {
+                let name = u
+                    .get("fingerprint")
+                    .and_then(Value::as_str)
+                    .unwrap_or("chrome")
+                    .to_string();
+                let template = core_tls::fingerprints::by_name(&name).ok_or_else(|| {
+                    anyhow::anyhow!("{at}: tls.utls.fingerprint: {name:?} is not a known browser")
+                })?;
+                Some(Fingerprint { name, template })
+            }
+            _ => None,
+        };
+        let reality = match tls.get("reality").and_then(Value::as_object) {
+            Some(r) if r.get("enabled").and_then(Value::as_bool) == Some(true) => {
+                let public_key =
+                    parse_reality_key(r.get("public_key").and_then(Value::as_str).ok_or_else(
+                        || anyhow::anyhow!("{at}: tls.reality.public_key is required"),
+                    )?)
+                    .map_err(|e| anyhow::anyhow!("{at}: tls.reality.public_key: {e}"))?;
+                let short_id =
+                    parse_short_id(r.get("short_id").and_then(Value::as_str).unwrap_or(""))
+                        .map_err(|e| anyhow::anyhow!("{at}: tls.reality.short_id: {e}"))?;
+                let fingerprint = match r.get("fingerprint").and_then(Value::as_str) {
+                    Some(name) => {
+                        let template = core_tls::fingerprints::by_name(name).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "{at}: tls.reality.fingerprint: {name:?} is not a known browser"
+                            )
+                        })?;
+                        Some(Fingerprint {
+                            name: name.to_string(),
+                            template,
+                        })
+                    }
+                    None => None,
+                };
+                Some(Reality {
+                    public_key,
+                    short_id,
+                    fingerprint,
+                })
+            }
+            _ => None,
+        };
 
         Ok(Some(Self {
+            fingerprint,
+            reality,
             server_name,
             insecure,
             disable_sni,
@@ -286,8 +338,83 @@ impl TlsOptions {
             .map_err(|e| io::Error::other(format!("QUIC initial suite: {e}")))
     }
 
+    /// The fingerprint this handshake would present, and the REALITY parameters
+    /// that go with it, if the config asked for our own ClientHello.
+    pub fn fingerprint(&self) -> Option<&Fingerprint> {
+        self.fingerprint
+            .as_ref()
+            .or_else(|| self.reality.as_ref().and_then(|r| r.fingerprint.as_ref()))
+    }
+
+    pub fn reality(&self) -> Option<&Reality> {
+        self.reality.as_ref()
+    }
+
+    /// Establish the connection, with our own TLS when a fingerprint is
+    /// configured and the library's otherwise.
+    ///
+    /// Both are returned as the same boxed stream, so nothing downstream has to
+    /// know which one it got: that is the only reason the signature is this
+    /// rather than two functions at every call site.
+    pub async fn establish<S>(&self, stream: S, default_alpn: &[&[u8]]) -> io::Result<AnyStream>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if self.fingerprint().is_none() {
+            return Ok(Box::new(self.connect_stream(stream, default_alpn).await?));
+        }
+        if self.reality().is_some() {
+            return Err(io::Error::other(
+                "REALITY: the session id seal and the server's borrowed certificate \
+                 check are not wired into the runtime yet",
+            ));
+        }
+        let fingerprint = self.fingerprint().expect("checked above");
+        let alpn: Vec<&[u8]> = if self.alpn.is_empty() {
+            default_alpn.to_vec()
+        } else {
+            self.alpn.iter().map(|p| p.as_slice()).collect()
+        };
+        let verifier: Box<dyn core_tls::verify::CertVerifier> = if self.insecure {
+            Box::new(core_tls::verify::AcceptsAnything)
+        } else {
+            let roots = if self.ca_certs.is_empty() {
+                core_tls::verify::WebpkiVerifier::mozilla_roots()
+            } else {
+                let mut store = rustls::RootCertStore::empty();
+                for cert in &self.ca_certs {
+                    store
+                        .add(cert.clone())
+                        .map_err(|e| io::Error::other(format!("trust store: {e}")))?;
+                }
+                core_tls::verify::WebpkiVerifier::new(Arc::new(store))
+            };
+            Box::new(roots.map_err(|e| io::Error::other(format!("trust store: {e}")))?)
+        };
+        let config = core_tls::client::Config {
+            template: &fingerprint.template,
+            server_name: if self.disable_sni {
+                ""
+            } else {
+                &self.server_name
+            },
+            alpn: &alpn,
+            verifier: &*verifier,
+        };
+        let mut handshake = core_tls::client::Handshake::new(config)?;
+        let mut stream = stream;
+        handshake
+            .run(&mut stream)
+            .await
+            .map_err(|e| io::Error::other(format!("{} handshake: {e}", fingerprint.name)))?;
+        let connection = core_tls::client::Connection::new(&mut handshake)?;
+        Ok(Box::new(crate::tls_utls::FingerprintStream::new(
+            stream, connection,
+        )))
+    }
+
     pub async fn wrap(&self, stream: TcpStream) -> io::Result<AnyStream> {
-        Ok(Box::new(self.connect(stream).await?))
+        self.establish(stream, &[]).await
     }
 
     pub async fn wrap_with_defaults(
@@ -295,10 +422,34 @@ impl TlsOptions {
         stream: TcpStream,
         default_alpn: &[&[u8]],
     ) -> io::Result<AnyStream> {
-        Ok(Box::new(
-            self.connect_with_defaults(stream, default_alpn).await?,
-        ))
+        self.establish(stream, default_alpn).await
     }
+}
+
+/// A REALITY public key: 32 bytes of X25519, base64url without padding.
+fn parse_reality_key(value: &str) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|e| e.to_string())?;
+    raw.try_into()
+        .map_err(|_| format!("{value:?} is not 32 bytes"))
+}
+
+/// A REALITY short id: an even number of hex digits, at most 16.
+fn parse_short_id(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.len() > 16 || !value.len().is_multiple_of(2) {
+        return Err(format!("{value:?} must be 1..8 bytes of hex"));
+    }
+    (0..value.len() / 2)
+        .map(|i| {
+            u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
+                .map_err(|_| format!("{value:?} is not hex"))
+        })
+        .collect()
 }
 
 /// TLS wrap for runtime fetches without a `tls` block: any proxy stream, any
@@ -344,4 +495,106 @@ fn load_pem_certs(
 fn load_pem_key(mut pem: &[u8]) -> io::Result<()> {
     private_key(&mut pem)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn options(value: Value) -> anyhow::Result<Option<TlsOptions>> {
+        let obj = value.as_object().expect("an object").clone();
+        TlsOptions::from_outbound(&obj, "example.com", "443")
+    }
+
+    /// The whole point of the change: a fingerprint in the config is a table we
+    /// resolve now, and the hello it produces is ours.
+    #[test]
+    fn a_fingerprint_resolves_to_a_table() {
+        let tls = options(json!({
+            "server": "example.com",
+            "tls": {"enabled": true, "utls": {"enabled": true, "fingerprint": "firefox"}}
+        }))
+        .expect("valid")
+        .expect("tls present");
+        let fingerprint = tls.fingerprint().expect("a fingerprint");
+        assert_eq!(fingerprint.name, "firefox");
+        assert!(
+            fingerprint
+                .template
+                .extensions
+                .iter()
+                .any(|e| matches!(e, core_tls::hello::Ext::KeyShare(_)))
+        );
+        assert!(tls.reality().is_none());
+    }
+
+    /// An empty fingerprint is chrome, the way the reference reads it, and a
+    /// name it does not know is refused rather than quietly downgraded: the
+    /// whole point of asking for a browser is getting that browser.
+    #[test]
+    fn the_fingerprint_name_is_not_guessed_at() {
+        let chrome = options(json!({
+            "server": "example.com",
+            "tls": {"enabled": true, "utls": {"enabled": true}}
+        }))
+        .expect("valid")
+        .expect("tls present");
+        assert_eq!(chrome.fingerprint().expect("a fingerprint").name, "chrome");
+
+        let err = options(json!({
+            "server": "example.com",
+            "tls": {"enabled": true, "utls": {"enabled": true, "fingerprint": "netscape"}}
+        }))
+        .expect_err("an unknown browser is an error");
+        assert!(err.to_string().contains("netscape"), "{err}");
+    }
+
+    /// REALITY's public key is 32 bytes of X25519 and its short id is up to
+    /// eight bytes of hex; both are parsed the way the reference writes them.
+    #[test]
+    fn the_reality_parameters_are_parsed_like_the_reference_writes_them() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let tls = options(json!({
+            "server": "example.com",
+            "tls": {"enabled": true, "reality": {
+                "enabled": true, "public_key": key, "short_id": "1234abcd"
+            }}
+        }))
+        .expect("valid")
+        .expect("tls present");
+        let reality = tls.reality().expect("reality");
+        assert_eq!(reality.short_id, vec![0x12, 0x34, 0xab, 0xcd]);
+        assert_eq!(reality.public_key.len(), 32);
+
+        // no short id is legal: the server may have none configured
+        let none = options(json!({
+            "server": "example.com",
+            "tls": {"enabled": true, "reality": {"enabled": true, "public_key": key}}
+        }))
+        .expect("valid")
+        .expect("tls present");
+        assert!(none.reality().expect("reality").short_id.is_empty());
+
+        for bad in ["123", "1234567890abcdef01", "zz"] {
+            let value = json!({
+                "server": "example.com",
+                "tls": {"enabled": true, "reality": {
+                    "enabled": true, "public_key": key, "short_id": bad
+                }}
+            });
+            assert!(options(value).is_err(), "short_id {bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_reality_key_that_is_not_32_bytes_is_refused() {
+        for bad in ["", "AAAA", "not base64 at all!"] {
+            let value = json!({
+                "server": "example.com",
+                "tls": {"enabled": true, "reality": {"enabled": true, "public_key": bad}}
+            });
+            assert!(options(value).is_err(), "public_key {bad:?} was accepted");
+        }
+    }
 }

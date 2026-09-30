@@ -363,19 +363,15 @@ impl TlsOptions {
         if self.fingerprint().is_none() {
             return Ok(Box::new(self.connect_stream(stream, default_alpn).await?));
         }
-        if self.reality().is_some() {
-            return Err(io::Error::other(
-                "REALITY: the session id seal and the server's borrowed certificate \
-                 check are not wired into the runtime yet",
-            ));
-        }
         let fingerprint = self.fingerprint().expect("checked above");
         let alpn: Vec<&[u8]> = if self.alpn.is_empty() {
             default_alpn.to_vec()
         } else {
             self.alpn.iter().map(|p| p.as_slice()).collect()
         };
-        let verifier: Box<dyn core_tls::verify::CertVerifier> = if self.insecure {
+        // a REALITY server is trusted by its own borrowed certificate under the
+        // auth key, so the ordinary chain check is the fallback, not the answer
+        let plain: Box<dyn core_tls::verify::CertVerifier> = if self.insecure {
             Box::new(core_tls::verify::AcceptsAnything)
         } else {
             let roots = if self.ca_certs.is_empty() {
@@ -391,6 +387,15 @@ impl TlsOptions {
             };
             Box::new(roots.map_err(|e| io::Error::other(format!("trust store: {e}")))?)
         };
+        let reality = self.reality.as_ref();
+        let seal = reality.map(|r| core_tls::client::RealitySeal {
+            public_key: &r.public_key,
+            short_id: &r.short_id,
+        });
+        let verifier: Box<dyn core_tls::verify::CertVerifier> = match reality {
+            Some(_) => Box::new(core_tls::verify::RealityVerifier::new(plain)),
+            None => plain,
+        };
         let config = core_tls::client::Config {
             template: &fingerprint.template,
             server_name: if self.disable_sni {
@@ -400,6 +405,7 @@ impl TlsOptions {
             },
             alpn: &alpn,
             verifier: &*verifier,
+            reality: seal,
         };
         let mut handshake = core_tls::client::Handshake::new(config)?;
         let mut stream = stream;

@@ -13,6 +13,7 @@ pub struct Shadowsocks {
     port: u16,
     method: Method,
     master_key: Arc<Vec<u8>>,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl Shadowsocks {
@@ -43,6 +44,7 @@ impl Shadowsocks {
             port,
             method,
             master_key: Arc::new(key),
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
@@ -50,7 +52,8 @@ impl Shadowsocks {
         &self,
         target: &Target,
     ) -> io::Result<(SsReader<AnyRead>, SsWriter<AnyWrite>)> {
-        let mut stream = crate::dns::connect_tcp(&self.server, self.port).await?;
+        let mut stream =
+            crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial).await?;
         let mut salt = vec![0u8; self.method.salt_len()];
         random_bytes(&mut salt)?;
         let subkey = derive_subkey(self.method, &self.master_key, &salt);

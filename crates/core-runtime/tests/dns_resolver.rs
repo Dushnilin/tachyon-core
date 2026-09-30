@@ -731,9 +731,10 @@ async fn instance_getter_and_connect_tcp_via_service() {
     let svc = service(&udp_service_config(addr.port()));
     core_runtime::dns::set_service(Some(svc));
     let echo = spawn_echo().await;
-    let mut stream = core_runtime::dns::connect_tcp("echo.test", echo.port())
-        .await
-        .expect("connect via dns service");
+    let mut stream =
+        core_runtime::outbound::dial::connect_tcp("echo.test", echo.port(), &Default::default())
+            .await
+            .expect("connect via dns service");
     stream.write_all(b"ping").await.expect("write");
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf).await.expect("read");

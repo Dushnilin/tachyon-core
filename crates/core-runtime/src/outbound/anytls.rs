@@ -107,10 +107,14 @@ impl Session {
         password_sha256: &[u8; 32],
         client_metadata: Option<&str>,
         tag: &str,
+        dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<Arc<Self>> {
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, crate::dns::connect_tcp(server, port))
-            .await
-            .map_err(|_| io::Error::other("anytls: connect timeout"))??;
+        let tcp = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            crate::outbound::dial::connect_tcp(server, port, dial),
+        )
+        .await
+        .map_err(|_| io::Error::other("anytls: connect timeout"))??;
         let stream = tls.wrap_with_defaults(tcp, &[]).await?;
         Self::establish(stream, password_sha256, client_metadata, tag).await
     }
@@ -423,6 +427,7 @@ pub struct AnyTls {
     password_sha256: [u8; 32],
     client_metadata: Option<String>,
     session: AsyncMutex<Option<Arc<Session>>>,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl AnyTls {
@@ -465,6 +470,7 @@ impl AnyTls {
             password_sha256,
             client_metadata,
             session: AsyncMutex::new(None),
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
@@ -483,6 +489,7 @@ impl AnyTls {
             &self.password_sha256,
             self.client_metadata.as_deref(),
             &self.tag,
+            &self.dial,
         )
         .await?;
         *guard = Some(Arc::clone(&session));

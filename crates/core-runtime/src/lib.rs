@@ -34,23 +34,18 @@ pub struct BoxInstance {
 /// Dialer options `check` accepts and the runtime does not read. The reference
 /// applies each of them to the outbound's own sockets; saying so once per
 /// entry beats leaving a mistyped `netns` looking like it worked.
+///
+/// Everything else in `DIALER_OUT_FIELDS` is honoured by
+/// `outbound::dial::DialOptions`, which is the single place a socket is built.
 const UNHONORED_DIALER_FIELDS: &[&str] = &[
-    "bind_address_no_port",
-    "disable_tcp_keep_alive",
     "domain_strategy",
     "fallback_delay",
     "fallback_network_type",
-    "inet4_bind_address",
-    "inet6_bind_address",
     "netns",
     "network_strategy",
     "network_type",
     "protect_path",
-    "reuse_addr",
-    "tcp_keep_alive",
-    "tcp_keep_alive_interval",
     "tcp_multi_path",
-    "udp_fragment",
 ];
 
 /// One warning per entry per field, so a shared option is not repeated.
@@ -285,7 +280,6 @@ mod tests {
             vec![
                 ("outbounds", 0, "netns"),
                 ("outbounds", 0, "network_strategy"),
-                ("outbounds", 1, "reuse_addr"),
                 ("inbounds", 0, "tcp_multi_path"),
             ],
             "the honored options stay quiet and a null is not an option"

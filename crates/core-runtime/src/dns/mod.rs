@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{RData, RecordType};
 use serde_json::Value;
-use tokio::net::TcpStream;
 
 pub use rules::{Action, QueryMeta, RejectMethod, Rule, WalkOptions};
 pub use transport::{FakeIpStore, Kind, ServerConfig};
@@ -988,31 +987,6 @@ pub fn default_domain_resolver() -> Option<String> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
-}
-
-/// Connect to `host:port` through the dns service when configured, else via
-/// the OS resolver. IP literals short-circuit.
-pub async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    if let Some(ip) = transport::is_ip_literal(host) {
-        return TcpStream::connect(SocketAddr::new(ip, port)).await;
-    }
-    if let Some(service) = current() {
-        let addrs = match default_domain_resolver() {
-            Some(tag) => service.resolve_via(&tag, host).await?,
-            None => service.resolve(host).await?,
-        };
-        let mut last_err = None;
-        for addr in addrs {
-            match TcpStream::connect(SocketAddr::new(addr, port)).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        return Err(last_err.unwrap_or_else(|| {
-            std::io::Error::other(format!("dns: connect to {host}:{port} failed"))
-        }));
-    }
-    TcpStream::connect((host, port)).await
 }
 
 /// The `local` transport hands the question to the system resolver.

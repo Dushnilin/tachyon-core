@@ -122,6 +122,7 @@ pub struct Snell {
     mode: Mode,
     profile: Option<Arc<Profile>>,
     pool: Option<Arc<SnellPool>>,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl Snell {
@@ -194,11 +195,12 @@ impl Snell {
             mode,
             profile,
             pool: reuse.then(SnellPool::new),
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
     async fn dial_halves(&self) -> io::Result<(SnellWriter, SnellReader)> {
-        let tcp = crate::dns::connect_tcp(&self.server, self.port).await?;
+        let tcp = crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial).await?;
         let obfs = BoxedObfs::new(Box::new(tcp), self.obfs_mode, &self.obfs_host, "/");
         let (reader, writer) = tokio::io::split(obfs);
         Ok(if self.version == 6 {

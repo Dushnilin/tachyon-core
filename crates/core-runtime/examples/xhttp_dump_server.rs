@@ -131,9 +131,13 @@ where
         }
 
         let response = http::Response::builder().status(200).body(()).unwrap();
+        // The download stream stays open on purpose. A real one does not end
+        // until the tunnel does, and ending it here is what made a client look
+        // like it never uploaded anything.
         match respond.send_response(response, false) {
             Ok(mut send) => {
-                let _ = send.send_data(bytes::Bytes::from_static(b"server-says-hello"), true);
+                let _ = send.send_data(bytes::Bytes::from_static(b"server-says-hello"), false);
+                std::mem::forget(send);
             }
             Err(e) => eprintln!("[{peer}] send_response: {e}"),
         }

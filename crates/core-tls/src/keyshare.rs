@@ -198,31 +198,33 @@ impl Shares {
     /// The REALITY shared secret with a server's X25519 key: the X25519 half of
     /// the exchange, not the ML-KEM one. A REALITY server proves itself with an
     /// ed25519 key that has nothing to do with ML-KEM, so the classical half is
-    /// the one both sides have to agree on, and it is the tail of the hybrid
-    /// share -- or the plain share when a fingerprint offers no hybrid.
+    /// the one both sides have to agree on.
+    ///
+    /// *Which* X25519 half is the part that has to match the server. It scans
+    /// our key shares and takes the first plain X25519, falling back to the tail
+    /// of the hybrid -- so with a browser-shaped hello, where the two are
+    /// deliberately different keys, the hybrid's half is the one the server will
+    /// not use. Picking the hybrid first would produce an auth key the server
+    /// cannot derive, and it would say so by quietly proxying us to its decoy
+    /// site instead of failing.
     pub fn reality_secret(&self, server_key: &[u8; 32]) -> io::Result<[u8; 32]> {
         let peer = x25519_dalek::PublicKey::from(*server_key);
-        let secret = match &self.hybrid {
-            Some(hybrid) => {
-                let shared = hybrid.x.diffie_hellman(&peer);
-                if !shared.was_contributory() {
-                    return Err(err("the REALITY server key is a low-order point"));
-                }
-                shared.to_bytes()
-            }
-            None => {
-                let x25519 = self
-                    .x25519
-                    .as_ref()
-                    .ok_or_else(|| err("no X25519 key was offered"))?;
-                let shared = x25519.diffie_hellman(&peer);
-                if !shared.was_contributory() {
-                    return Err(err("the REALITY server key is a low-order point"));
-                }
-                shared.to_bytes()
-            }
+        let secret = match self.reality_ecdhe() {
+            Some(x) => x.diffie_hellman(&peer),
+            None => return Err(err("no X25519 key was offered")),
         };
-        Ok(secret)
+        if !secret.was_contributory() {
+            return Err(err("the REALITY server key is a low-order point"));
+        }
+        Ok(secret.to_bytes())
+    }
+
+    /// The key the server will use for REALITY: the plain share when the hello
+    /// offers one, the hybrid's X25519 half otherwise.
+    fn reality_ecdhe(&self) -> Option<&x25519_dalek::StaticSecret> {
+        self.x25519
+            .as_ref()
+            .or_else(|| self.hybrid.as_ref().map(|h| &h.x))
     }
 
     /// The public share we wrote for `group`, if we offered it.
@@ -367,6 +369,55 @@ mod tests {
                 .expect("secret"),
             expected
         );
+    }
+
+    /// The secret a REALITY handshake is keyed on comes from the *plain* X25519
+    /// share when the hello offers one, because that is the share the server
+    /// picks. The hybrid's own X25519 half is a different key and would produce
+    /// an auth key the server cannot derive.
+    #[test]
+    fn the_reality_secret_prefers_the_plain_share() {
+        let template = chrome_template();
+        let shares = Shares::for_body(&template).expect("shares");
+        let server = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let server_public: [u8; 32] = *x25519_dalek::PublicKey::from(&server).as_bytes();
+        let ours = shares.reality_secret(&server_public).expect("a secret");
+        let plain: [u8; 32] = shares
+            .public(X25519)
+            .expect("the plain share")
+            .try_into()
+            .expect("32 bytes");
+        let hybrid_tail: [u8; 32] = shares
+            .public(X25519MLKEM768)
+            .expect("the hybrid")
+            .get(MLKEM768_EK_LEN..)
+            .expect("its X25519 tail")
+            .try_into()
+            .expect("32 bytes");
+        assert_eq!(&ours[..], server.diffie_hellman(&plain.into()).as_bytes());
+        assert_ne!(
+            &ours[..],
+            server.diffie_hellman(&hybrid_tail.into()).as_bytes()
+        );
+    }
+
+    /// With no plain share in the hello, the hybrid's X25519 half is the only one
+    /// a server can find, so that is what has to be used.
+    #[test]
+    fn a_hello_without_a_plain_share_uses_the_hybrids_half() {
+        let template = body_of(&[(X25519MLKEM768, MLKEM768_EK_LEN + X_LEN)]);
+        let shares = Shares::for_body(&template).expect("shares");
+        let server = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let server_public: [u8; 32] = *x25519_dalek::PublicKey::from(&server).as_bytes();
+        let ours = shares.reality_secret(&server_public).expect("a secret");
+        let tail: [u8; 32] = shares
+            .public(X25519MLKEM768)
+            .expect("the hybrid")
+            .get(MLKEM768_EK_LEN..)
+            .expect("its X25519 tail")
+            .try_into()
+            .expect("32 bytes");
+        assert_eq!(&ours[..], server.diffie_hellman(&tail.into()).as_bytes());
     }
 
     #[test]

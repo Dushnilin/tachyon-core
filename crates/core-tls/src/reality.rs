@@ -33,6 +33,10 @@ pub const VERSION: [u8; 3] = [26, 3, 27];
 /// and the 4-byte handshake header are both counted, which is why the same
 /// number is 39 in xray, where the record is not part of the message.
 const RECORD_HEADER: usize = 5 + 4;
+/// The seal's AAD stops at the record header: the server hashes the handshake
+/// message (`clientHelloMsg.original`, which starts at the 4-byte handshake
+/// header), and a 5-byte prefix on our side would not be a prefix at all.
+const AAD_OFFSET: usize = 5;
 /// 2 bytes of client version, then 32 of random, then 1 of session id length.
 const RANDOM_OFFSET: usize = RECORD_HEADER + 2;
 /// The session id: 32 bytes of compat space right after the random.
@@ -75,7 +79,9 @@ pub fn auth_key(shared_secret: &[u8], random: &[u8; 32]) -> [u8; 32] {
 ///
 /// The additional authenticated data is the entire hello with those 16 bytes
 /// zeroed, so the seal also covers everything else about the hello: a middlebox
-/// that changes the SNI or the extensions breaks it, which is the point.
+/// that changes the SNI or the extensions breaks it, which is the point. It
+/// starts at the handshake header, because that is what the server has: the
+/// record header is not part of the message it unmarshalled.
 pub fn seal_hello(hello: &mut [u8], auth_key: &[u8; 32]) -> io::Result<()> {
     if hello.len() < SESSION_ID_OFFSET + 32 {
         return Err(bad("the hello is too short to carry a session id"));
@@ -96,8 +102,8 @@ pub fn seal_hello(hello: &mut [u8], auth_key: &[u8; 32]) -> io::Result<()> {
     // not just the sealed half. The server can only rebuild it from the hello it
     // received, and there the id is ciphertext; the plaintext's own second half
     // is zeros, which is what the server checks after opening it.
-    let mut aad = hello.to_vec();
-    aad[start..end].fill(0);
+    let mut aad = hello[AAD_OFFSET..].to_vec();
+    aad[start - AAD_OFFSET..end - AAD_OFFSET].fill(0);
 
     let cipher = Aes256Gcm::new_from_slice(auth_key).map_err(|_| bad("bad auth key"))?;
     let sealed = cipher
@@ -127,8 +133,9 @@ pub fn open_session_id(hello: &[u8], auth_key: &[u8; 32]) -> io::Result<[u8; 16]
         .ok_or_else(|| bad("the hello has no random for a nonce"))?
         .try_into()
         .expect("12 bytes");
-    let mut aad = hello.to_vec();
-    aad[SESSION_ID_OFFSET..SESSION_ID_OFFSET + 32].fill(0);
+    let mut aad = hello[AAD_OFFSET..].to_vec();
+    let start = SESSION_ID_OFFSET - AAD_OFFSET;
+    aad[start..start + 32].fill(0);
     let cipher = Aes256Gcm::new_from_slice(auth_key).map_err(|_| bad("bad auth key"))?;
     let plain = cipher
         .decrypt(
@@ -208,8 +215,16 @@ mod tests {
         let plaintext = &before[SESSION_ID_OFFSET..SESSION_ID_OFFSET + 16];
         assert_eq!(&opened[..], plaintext, "the first 16 bytes come back");
 
-        // one changed byte anywhere in the hello and it no longer opens
-        for at in [0usize, 40, 100, hello_bytes.len() - 1] {
+        // one changed byte anywhere in the *message* and it no longer opens.
+        // Byte 0 is the record header, which is not part of the message the
+        // server authenticated, so it is the one byte that does not count.
+        let mut header_changed = hello_bytes.clone();
+        header_changed[0] ^= 0x01;
+        assert!(
+            open_session_id(&header_changed, &key).is_ok(),
+            "the record header is not part of what the server authenticated"
+        );
+        for at in [5usize, 40, 100, hello_bytes.len() - 1] {
             let mut broken = hello_bytes.clone();
             broken[at] ^= 0x01;
             assert!(
@@ -271,11 +286,11 @@ mod tests {
     }
 
     /// The REALITY secret is the X25519 half of the exchange we are about to
-    /// offer, so both sides must arrive at the same 32 bytes: ours from the
-    /// hybrid we send, the server's from the X25519 key at the tail of that
-    /// same share.
+    /// offer, so both sides must arrive at the same 32 bytes. Which half is the
+    /// part that matters: a server takes the first *plain* X25519 in the hello,
+    /// and a browser-shaped hello offers one next to the hybrid on purpose.
     #[test]
-    fn the_reality_secret_is_the_x25519_half_of_the_hybrid() {
+    fn the_reality_secret_is_the_share_the_server_would_pick() {
         let template = fingerprints::by_name("chrome").expect("a chrome table");
         let key_share = template
             .extensions
@@ -296,6 +311,11 @@ mod tests {
         // the server's side, from the very key we put on the wire
         let on_wire: [u8; 32] = offered[1184..].try_into().expect("32 bytes");
         let theirs = server.diffie_hellman(&on_wire.into());
-        assert_eq!(&ours[..], theirs.as_bytes());
+        assert_ne!(
+            &ours[..],
+            theirs.as_bytes(),
+            "a browser hello offers a second, plain X25519 and that is the one a \
+             server uses"
+        );
     }
 }

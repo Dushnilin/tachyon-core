@@ -7,6 +7,7 @@
 pub mod fingerprints;
 pub mod hello;
 pub mod keyshare;
+pub mod messages;
 pub mod quic;
 pub mod record;
 pub mod tls13;

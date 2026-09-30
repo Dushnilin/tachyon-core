@@ -1,5 +1,7 @@
 use std::io;
 
+use crate::keyshare;
+
 fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
@@ -127,25 +129,9 @@ fn parse_sni(body: &[u8]) -> io::Result<String> {
 }
 
 fn extract_x25519(body: &[u8]) -> io::Result<Option<[u8; 32]>> {
-    if body.len() < 2 {
-        return Err(err("short key_share"));
-    }
-    let shares_len = u16_at(body, 0)? as usize;
-    let mut off = 2;
-    let end = 2 + shares_len;
-    if body.len() < end {
-        return Err(err("short key_share list"));
-    }
-    while off + 4 <= end {
-        let group = u16_at(body, off)?;
-        let key_len = u16_at(body, off + 2)? as usize;
-        off += 4;
-        let key = body
-            .get(off..off + key_len)
-            .ok_or_else(|| err("short key"))?;
-        off += key_len;
-        if group == 0x001d && key_len == 32 {
-            return Ok(Some(key.try_into().unwrap()));
+    for (group, key) in keyshare::entries(body)? {
+        if group == keyshare::X25519 && key.len() == 32 {
+            return Ok(Some(key.try_into().expect("32 bytes")));
         }
     }
     Ok(None)
@@ -157,7 +143,7 @@ pub fn build(
     session_id: &[u8],
     sni: &str,
     alpn: &[&[u8]],
-    key_share_override: Option<&[u8; 32]>,
+    shares: Option<&keyshare::Shares>,
 ) -> io::Result<Vec<u8>> {
     let mut hs = Vec::new();
     hs.extend_from_slice(&template.client_version);
@@ -175,13 +161,22 @@ pub fn build(
     let mut exts = Vec::new();
     for e in &template.extensions {
         let (id, body): (u16, Vec<u8>) = match e {
-            Ext::Static(id, body) => (*id, body.clone()),
+            // a GREASE extension id is reserved and fresh per handshake, the
+            // way BoringSSL draws one
+            Ext::Static(id, body) => (
+                if keyshare::is_grease(*id) {
+                    keyshare::random_grease()
+                } else {
+                    *id
+                },
+                body.clone(),
+            ),
             Ext::Sni => (0x0000, build_sni(sni)?),
             Ext::Alpn => (0x0010, build_alpn(alpn)?),
             Ext::KeyShare(raw) => (
                 0x0033,
-                match key_share_override {
-                    Some(k) => build_key_share(k)?,
+                match shares {
+                    Some(s) => s.body(raw)?,
                     None => raw.clone(),
                 },
             ),
@@ -239,28 +234,9 @@ fn build_alpn(alpn: &[&[u8]]) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
-fn build_key_share(public: &[u8; 32]) -> io::Result<Vec<u8>> {
-    let mut b = Vec::with_capacity(38);
-    b.extend_from_slice(&(36u16).to_be_bytes());
-    b.extend_from_slice(&(0x001du16).to_be_bytes());
-    b.extend_from_slice(&(32u16).to_be_bytes());
-    b.extend_from_slice(public);
-    Ok(b)
-}
-
 pub fn key_share_group(body: &[u8]) -> io::Result<Vec<u16>> {
-    if body.len() < 2 {
-        return Err(err("short key_share"));
-    }
-    let shares_len = u16_at(body, 0)? as usize;
-    let mut off = 2;
-    let end = 2 + shares_len;
-    let mut groups = Vec::new();
-    while off + 4 <= end && off + 4 <= body.len() {
-        let group = u16_at(body, off)?;
-        let key_len = u16_at(body, off + 2)? as usize;
-        off += 4 + key_len;
-        groups.push(group);
-    }
-    Ok(groups)
+    Ok(keyshare::entries(body)?
+        .into_iter()
+        .map(|(group, _)| group)
+        .collect())
 }

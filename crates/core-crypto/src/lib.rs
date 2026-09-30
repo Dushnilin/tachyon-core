@@ -365,4 +365,4 @@ mod kx;
 mod misc;
 pub mod quic;
 pub mod sign;
-mod verify;
+pub mod verify;

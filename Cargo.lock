@@ -473,6 +473,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "sha2",
  "webpki-roots 0.26.11",
  "x25519-dalek",

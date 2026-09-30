@@ -158,3 +158,56 @@ reference already differs from itself. The cost is that no hello can be
 byte-identical to a capture any more: the rebuild tests are structural, exactly
 like the table test above.
 
+Two things the first drawing of GREASE got wrong, both caught by the rustls
+server refusing our hello:
+
+- Chrome sends **two** GREASE extensions, and drawing independently for each one
+  eventually repeats a value -- a repeated extension id is a duplicate extension,
+  which every server rejects. The draws now share a pool.
+- The value is the random byte's *high* nibble, repeated, with the low one set to
+  `0xa`. Taking the low nibble and masking with `0xf0f0` leaves `0x0a0a` for
+  every hello, which is a valid GREASE value and therefore passes every check
+  that only looks at the shape. `0x0a0a` forever is exactly the fingerprint the
+  randomization was meant to remove.
+
+## The handshake itself (F2, 2026-09-30)
+
+`core-tls/src/{record,messages,client,verify}.uc` -- four layers, each with its
+own tests, and the whole thing proven against a server that shares no code with
+it (`crates/core-tls/tests/handshake_e2e.rs`: our client state machine against
+rustls' server, over a buffer rather than a socket so the exchange is
+deterministic).
+
+- `record.rs` is the framing and nothing else; the AEAD is the provider's.
+- `messages.rs` parses the server's flight. A client does not write these
+  messages, but the transcript has to be fed message by message in the right
+  order, which means the bytes have to be ours.
+- `client.rs` is the state machine: hello, ServerHello, keys, flight, Finished.
+  Each message joins the transcript as it is *processed*, never as it arrives,
+  because CertificateVerify and Finished are both computed over the transcript
+  hash and an off-by-one-message leaves nothing in the bytes to say why.
+- `verify.rs` splits the two trust questions a TLS client asks, deliberately:
+  does the chain lead somewhere we trust, and did the leaf's key sign the
+  handshake. REALITY replaces the first and keeps the second, so a single
+  boolean could not express it. There is no default verifier -- a caller has to
+  say how it trusts a server, so "no verification" cannot happen by omission.
+
+The CertificateVerify signature is checked here rather than through rustls:
+rustls 0.23 keeps `DigitallySignedStruct`'s constructor private, so the only
+public way in is a whole handshake, which is the thing being replaced. The
+verification algorithm comes from the provider's own table, so a scheme the
+provider cannot check is not accepted.
+
+Four things the e2e caught that unit tests could not have:
+
+- the server's compatibility ChangeCipherSpec arrives *in the clear* between the
+  ServerHello and the encrypted flight, and has to be skipped before the record
+  layer is asked to open it;
+- TLS 1.3 gives the certificate request context a **one**-byte length (the
+  two-byte form is TLS 1.2's), and using the wrong one shifts the whole chain;
+- an *empty* `server_name` in EncryptedExtensions is the acknowledgement RFC 6066
+  asks for -- rejecting it as "the server echoed our SNI" fails against every
+  real server;
+- the ALPN extension body is a list, so the chosen protocol has to be read out of
+  it rather than compared to the body.
+

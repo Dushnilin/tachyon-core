@@ -159,13 +159,16 @@ pub fn build(
     hs.extend_from_slice(&template.compression);
 
     let mut exts = Vec::new();
+    // GREASE ids must not repeat inside one hello, so the key share and the
+    // extension list draw from the same pool
+    let mut grease_used = Vec::new();
     for e in &template.extensions {
         let (id, body): (u16, Vec<u8>) = match e {
             // a GREASE extension id is reserved and fresh per handshake, the
             // way BoringSSL draws one
             Ext::Static(id, body) => (
                 if keyshare::is_grease(*id) {
-                    keyshare::random_grease()
+                    keyshare::unique_grease(&mut grease_used)
                 } else {
                     *id
                 },
@@ -176,7 +179,7 @@ pub fn build(
             Ext::KeyShare(raw) => (
                 0x0033,
                 match shares {
-                    Some(s) => s.body(raw)?,
+                    Some(s) => s.body(raw, &mut grease_used)?,
                     None => raw.clone(),
                 },
             ),

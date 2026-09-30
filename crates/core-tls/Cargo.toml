@@ -22,6 +22,8 @@ x25519-dalek.workspace = true
 rand_core = { version = "0.6.4", default-features = false, features = ["getrandom"] }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdh"] }
 sha2.workspace = true
+webpki-roots = "0.26"
+rustls-webpki = { version = "0.103.14", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 webpki-roots = "0.26"

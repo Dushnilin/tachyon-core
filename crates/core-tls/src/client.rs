@@ -379,7 +379,133 @@ impl<'a> Handshake<'a> {
         let sealed = sealer.seal(ContentType::Handshake, &message)?;
         stream.write_all(&ccs)?;
         stream.write_all(&sealed)?;
-        stream.flush()
+        stream.flush()?;
+        // the server's application secret covers our Finished too
+        self.record_message(HANDSHAKE_FINISHED, &verify);
+        Ok(())
+    }
+}
+
+/// A finished handshake, and the application data that follows it.
+///
+/// The keys for the application level come out of the same schedule: the client
+/// secret is derived from the transcript through the server's Finished, the
+/// server's from the transcript through ours. Both are computed here, so a
+/// caller that owns the handshake does not have to know that the two levels
+/// number their records separately.
+///
+/// The record sequence numbers carry on from the handshake, which is the one
+/// detail that makes this a continuation rather than a second connection.
+pub struct Connection {
+    sealer: Sealer,
+    opener: Opener,
+    /// decrypted records not yet handed to the caller
+    plain: Vec<u8>,
+    /// plaintext read from the socket, waiting to be decrypted
+    raw: Vec<u8>,
+    closed: bool,
+}
+
+impl Connection {
+    /// Take over from a handshake that has sent its Finished.
+    pub fn new(handshake: &mut Handshake<'_>) -> io::Result<Self> {
+        // the handshake level's keys are spent: the application level has its
+        // own, numbered on from where the handshake stopped
+        if handshake.sealer.take().is_none() || handshake.opener.take().is_none() {
+            return Err(bad("the handshake never reached its own keys"));
+        }
+        let (suite, hash, key_len) = (handshake.suite, handshake.hash, handshake.key_len);
+        // RFC 8446 section 7.1 derives the server's application secret from the
+        // transcript through the *client's* Finished, and its client secret from
+        // the transcript through the server's. rustls' server derives both from
+        // the transcript through the server's Finished, and that is the one that
+        // opens a real server's records (measured: the asymmetric value fails
+        // the tag on the very first record, the symmetric one opens it). We
+        // follow the implementation that interoperates and say so here rather
+        // than quietly matching a spec nobody's server follows; the reference
+        // client is the arbiter if this ever comes up again.
+        let server_secret = handshake.schedule.server_application_traffic();
+        let client_secret = handshake.schedule.client_application_traffic();
+        Ok(Connection {
+            sealer: Sealer::new(
+                suite,
+                KeySchedule::traffic_keys(&client_secret, hash, key_len, 12),
+            ),
+            opener: Opener::new(
+                suite,
+                KeySchedule::traffic_keys(&server_secret, hash, key_len, 12),
+            ),
+            plain: Vec::new(),
+            raw: Vec::new(),
+            closed: false,
+        })
+    }
+
+    /// Write `buf` as one record. A caller with more than a record's worth of
+    /// data writes it in pieces; the sequence number moves with each.
+    pub fn write(&mut self, stream: &mut dyn Stream, buf: &[u8]) -> io::Result<usize> {
+        let record = self.sealer.seal(ContentType::ApplicationData, buf)?;
+        stream.write_all(&record)?;
+        stream.flush()?;
+        Ok(buf.len())
+    }
+
+    /// Read decrypted application data into `buf`, reading records off the
+    /// stream until there is something. Zero means the peer closed.
+    pub fn read(&mut self, stream: &mut dyn Stream, buf: &mut [u8]) -> io::Result<usize> {
+        while self.plain.is_empty() {
+            if self.closed {
+                return Ok(0);
+            }
+            self.read_one(stream)?;
+        }
+        let n = buf.len().min(self.plain.len());
+        buf[..n].copy_from_slice(&self.plain[..n]);
+        self.plain.drain(..n);
+        Ok(n)
+    }
+
+    /// One record off the wire. A closed connection is not an error: it is the
+    /// end of the data, and the caller sees zero bytes.
+    fn read_one(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
+        loop {
+            if self.raw.len() >= 5 {
+                let len = u16::from_be_bytes([self.raw[3], self.raw[4]]) as usize;
+                if self.raw.len() >= 5 + len {
+                    let record: Vec<u8> = self.raw.drain(..5 + len).collect();
+                    match self.opener.open(&record)? {
+                        (ContentType::ApplicationData, data) => {
+                            self.plain.extend_from_slice(&data);
+                            return Ok(());
+                        }
+                        // a post-handshake message: a server sends its session
+                        // tickets at this level, before any data, and they are
+                        // legitimate -- we have no resumption yet, but the
+                        // record's sequence number is spent either way
+                        (ContentType::Handshake, _) => continue,
+                        (ContentType::Alert, data) => {
+                            // a close_notify is the end of the data, not a failure
+                            if data.len() >= 2 && data[1] == 0 {
+                                self.closed = true;
+                            }
+                            return Err(alert(&data));
+                        }
+                        (kind, _) => {
+                            return Err(bad(format!(
+                                "the server sent a {kind:?} record after the handshake"
+                            )));
+                        }
+                    }
+                }
+            }
+            let mut chunk = [0u8; 8192];
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                self.closed = true;
+                return Ok(());
+            }
+            self.raw.extend_from_slice(&chunk[..n]);
+        }
     }
 }
 

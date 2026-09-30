@@ -229,6 +229,22 @@ impl KeySchedule {
         )
     }
 
+    /// The server's application secret, which is the one secret that also
+    /// covers the client's Finished: the client's comes from the transcript
+    /// through the server's Finished, the server's from the transcript through
+    /// ours.
+    pub fn server_application_traffic_after_client_finished(
+        &self,
+        transcript_hash: &[u8],
+    ) -> Vec<u8> {
+        derive_secret(
+            self.hash,
+            &self.master_secret,
+            b"s ap traffic",
+            transcript_hash,
+        )
+    }
+
     pub fn server_application_traffic(&self) -> Vec<u8> {
         derive_secret(
             self.hash,

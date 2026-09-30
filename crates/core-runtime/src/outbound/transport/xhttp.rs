@@ -947,11 +947,19 @@ impl XhttpConfig {
                     format!("{scheme}://{authority}{path}?{}={pad}", m.x_key),
                 )),
             }
-        } else {
-            // Legacy Xray: padding as ?x_padding= inside a Referer header.
+        } else if !pad.is_empty() {
+            // Legacy Xray: padding as ?x_padding= inside a Referer header. The
+            // filler is a literal '0' rather than the configured method's
+            // characters, because the server validates the *length* and the byte
+            // is free -- and the reference is explicit that this exact default is
+            // the one that has been live-verified against Xray. A zero length
+            // sends no header at all, which is also what the reference does.
             extra_headers.push((
                 "referer".to_string(),
-                format!("{scheme}://{authority}{path}?x_padding={pad}"),
+                format!(
+                    "{scheme}://{authority}{path}?x_padding={}",
+                    "0".repeat(pad.len())
+                ),
             ));
         }
 
@@ -972,10 +980,18 @@ impl XhttpConfig {
         for (name, value) in extra_headers {
             builder = builder.header(name.as_str(), value);
         }
-        // stream-one/stream-up set a gRPC content type by default (reference
-        // `applyGRPCHeader`) — reverse proxies key response streaming on it.
+        // A streamed body (stream-one, stream-up) announces itself as gRPC by
+        // default — reference `applyGRPCHeader` — and reverse proxies key
+        // response streaming on that. A packet-up upload is not a stream: the
+        // reference sends a plain `application/octet-stream` there, which is what
+        // its HTTP client puts on a body it is given, so that is what goes on the
+        // wire. Announcing gRPC on a per-packet upload is a claim nobody made.
         if has_body && !self.no_grpc_header {
-            builder = builder.header("content-type", "application/grpc");
+            let content_type = match self.mode {
+                Mode::PacketUp => "application/octet-stream",
+                _ => "application/grpc",
+            };
+            builder = builder.header("content-type", content_type);
         }
         builder
             .body(())
@@ -1179,7 +1195,33 @@ mod tests {
         );
         let pad = referer.to_str().unwrap().rsplit('=').next().unwrap();
         assert_eq!(pad.len(), 50);
-        assert!(pad.bytes().all(|b| b == b'X'));
+        // the legacy default fills with '0', not the obfs method's characters: the
+        // server validates the length, and '0' is the byte the reference's
+        // live-verified default uses
+        assert!(pad.bytes().all(|b| b == b'0'));
+    }
+
+    /// A packet-up upload is a packet, not a stream: the reference sends
+    /// `application/octet-stream` there and reserves the gRPC content type for
+    /// the streamed modes, and a production node refused ours until it did.
+    #[test]
+    fn a_packet_up_upload_is_octet_stream_and_a_stream_is_grpc() {
+        let packet = cfg(json!({"mode": "packet-up"}));
+        let req = packet
+            .build_request("https", "srv:443", "POST", Some("SID"), Some("0"), true)
+            .unwrap();
+        assert_eq!(
+            req.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        let stream = cfg(json!({"mode": "stream-one"}));
+        let req = stream
+            .build_request("https", "srv:443", "POST", None, None, true)
+            .unwrap();
+        assert_eq!(
+            req.headers().get("content-type").unwrap(),
+            "application/grpc"
+        );
     }
 
     #[test]

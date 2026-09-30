@@ -116,11 +116,68 @@ mod tests {
         assert!(certificate_signature(&wrong).is_err());
     }
 
-    /// The leaf here is RSA, so there is no Ed25519 key in it -- which is the
+    /// The two shapes an Ed25519 SubjectPublicKeyInfo comes in, and the second is
+    /// the one that matters: RFC 8410 says the algorithm's parameters are absent,
+    /// and Go's `x509` -- which is what a REALITY server's certificate is built by
+    /// -- leaves them out. Requiring the NULL that RFC 5758 stacks add means
+    /// finding no key in a perfectly good one, and then falling through to a chain
+    /// check on a certificate nobody signed.
+    #[test]
+    fn an_ed25519_key_is_found_with_or_without_the_algorithms_null() {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("entropy");
+        // BIT STRING: tag, length, the unused-bit count, the key
+        let mut bits = vec![0x03, 0x21, 0x00];
+        bits.extend_from_slice(&key);
+
+        // SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }
+        let without_null = [
+            vec![0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70],
+            bits.clone(),
+        ]
+        .concat();
+        assert_eq!(
+            ed25519_public_key(&without_null),
+            Some(key),
+            "the shape Go emits"
+        );
+
+        // the same, with the NULL the other half of the world adds
+        let with_null = [
+            vec![
+                0x30, 0x2c, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00,
+            ],
+            bits,
+        ]
+        .concat();
+        assert_eq!(
+            ed25519_public_key(&with_null),
+            Some(key),
+            "the RFC 5758 shape"
+        );
+    }
+
+    /// And a key of another algorithm is not an Ed25519 key, however it is spelled.
+    #[test]
+    fn another_algorithm_is_not_an_ed25519_key() {
+        // P-256: OID 1.2.840.10045.2.1 with a 65-byte uncompressed point
+        let spki = [
+            vec![
+                0x30, 0x4a, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+                0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+            ],
+            vec![0x03, 0x42, 0x00],
+            vec![4u8; 65],
+        ]
+        .concat();
+        assert!(ed25519_public_key(&spki).is_none());
+    }
+
+    /// The leaf here is not Ed25519, so there is no key in it -- which is the
     /// point: a REALITY check on a certificate of the wrong type has to fall
     /// through to the ordinary one rather than trust it.
     #[test]
-    fn an_rsa_certificate_has_no_ed25519_key() {
+    fn a_certificate_of_another_algorithm_has_no_ed25519_key() {
         let cert = rustls::pki_types::CertificateDer::from(fixture_der());
         let spki = webpki::EndEntityCert::try_from(&cert)
             .expect("the certificate parses")
@@ -238,18 +295,32 @@ fn hmac_sha512(key: &[u8], message: &[u8]) -> Vec<u8> {
 /// The 32-byte Ed25519 key inside a SubjectPublicKeyInfo, or `None` for any
 /// other algorithm -- a REALITY leaf is Ed25519, and anything else is somebody
 /// else's certificate.
+///
+/// The algorithm's parameters are optional and the two halves of the world
+/// disagree: RFC 8410 says they should be *absent*, and Go's `x509` -- which is
+/// what a REALITY server's certificate comes from -- leaves them out. Requiring
+/// the NULL that RFC 5758 stacks add means silently finding no key, and then
+/// falling through to a chain check on a certificate nobody signed.
 fn ed25519_public_key(spki: &[u8]) -> Option<[u8; 32]> {
-    // OID 1.3.101.112 in bytes, then a NULL, then the key in a BIT STRING whose
-    // first content byte counts the unused bits
+    // OID 1.3.101.112 in bytes, then the key in a BIT STRING whose first content
+    // byte counts the unused bits
     const ED25519: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
     let at = spki
         .windows(ED25519.len())
         .position(|window| window == ED25519)?;
-    let mut reader = Der::new(&spki[at + ED25519.len()..]);
-    reader.take(0x05).ok()?; // the algorithm's NULL
-    let mut bits = Der::new(reader.take(0x03).ok()?);
-    bits.take(0x00).ok()?; // no unused bits
-    bits.take_remaining().try_into().ok()
+    let mut after = &spki[at + ED25519.len()..];
+    if after.first() == Some(&0x05) {
+        let mut null = Der::new(after);
+        null.take(0x05).ok()?;
+        after = null.take_remaining();
+    }
+    let mut reader = Der::new(after);
+    let content = reader.take(0x03).ok()?;
+    // The first content byte of a BIT STRING counts the unused bits, and a key
+    // leaves none of them. It is a content byte, not a length, so it is skipped
+    // as one -- reading it as a length is how this returned None for every
+    // certificate, including the good ones.
+    content.strip_prefix(&[0x00])?.try_into().ok()
 }
 
 /// The signature a certificate carries: the third element of the outer

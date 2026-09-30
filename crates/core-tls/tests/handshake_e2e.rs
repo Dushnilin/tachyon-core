@@ -428,7 +428,16 @@ async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
         .iter()
         .find(|(group, _)| *group == X25519MLKEM768)
         .expect("the hybrid share");
-    let offered: [u8; 32] = hybrid[1184..].try_into().expect("32 bytes");
+    // the server scans the shares and takes the first plain X25519, not the
+    // hybrid's half, so that is the key the exchange has to be run with
+    let offered: [u8; 32] = shares
+        .iter()
+        .find(|(group, _)| *group == core_tls::keyshare::X25519)
+        .expect("the plain share")
+        .1
+        .try_into()
+        .expect("32 bytes");
+    assert_ne!(&hybrid[1184..], &offered[..], "a browser offers two keys");
 
     // the server's half of the exchange, computed here
     let shared = server_secret.diffie_hellman(&offered.into());

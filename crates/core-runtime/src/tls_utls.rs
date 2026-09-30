@@ -108,6 +108,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
+        // A writer that reports writing a 22-byte tag has not written is lying
+        // about its input, and every caller that respects the contract -- tokio's
+        // `write_all` above all -- slices its buffer by the number it is given.
+        // An empty write is nothing to seal: reporting zero for it is the honest
+        // answer, and it keeps a caller from sealing an empty record.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let taken = buf.len();
         loop {
             let Some((record, written)) = me.out.as_mut() else {
                 // one record per call: a caller with more writes again, and the
@@ -123,9 +132,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
                 Poll::Ready(Ok(n)) => {
                     *written += n;
                     if *written == record.len() {
-                        let sent = record.len();
                         me.out = None;
-                        return Poll::Ready(Ok(sent));
+                        return Poll::Ready(Ok(taken));
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

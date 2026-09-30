@@ -217,6 +217,13 @@ impl<'a> Handshake<'a> {
             let secret = self.shares.reality_secret(reality.public_key)?;
             let key = crate::reality::auth_key(&secret, &random);
             crate::reality::seal_hello(&mut record, &key)?;
+            // What the server will echo is the ciphertext, not the version, time
+            // and short id underneath it, so this is the one place the session id
+            // can be read back from: keeping the plaintext here would make the
+            // ServerHello check below compare two different things.
+            self.session_id = record
+                [crate::reality::SESSION_ID_OFFSET..crate::reality::SESSION_ID_OFFSET + 32]
+                .to_vec();
             self.auth_key = Some(key);
             self.config.verifier.set_reality_auth_key(&key);
         }

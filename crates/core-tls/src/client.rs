@@ -441,71 +441,91 @@ impl Connection {
         })
     }
 
-    /// Write `buf` as one record. A caller with more than a record's worth of
-    /// data writes it in pieces; the sequence number moves with each.
+    /// Wrap `data` into one record, ready for the transport to send. A caller
+    /// with more than a record's worth writes it in pieces; the sequence number
+    /// moves with each.
+    pub fn write_record(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        self.sealer.seal(ContentType::ApplicationData, data)
+    }
+
+    /// Decrypt whatever whole records `raw` holds and return their application
+    /// data. A partial record stays in `raw` for next time, and a post-handshake
+    /// message is skipped rather than returned: a server sends its session
+    /// tickets at this level, before any data.
+    ///
+    /// This is the whole interface an async stream needs: bytes in, bytes out,
+    /// no blocking and no stream of its own. The blocking [`Self::read`] below
+    /// is this plus a socket.
+    pub fn read_record_from(&mut self, raw: &mut Vec<u8>) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            if raw.len() < 5 {
+                return Ok(out);
+            }
+            let len = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+            if raw.len() < 5 + len {
+                return Ok(out);
+            }
+            let record: Vec<u8> = raw.drain(..5 + len).collect();
+            match self.opener.open(&record)? {
+                (ContentType::ApplicationData, data) => {
+                    out.extend_from_slice(&data);
+                    return Ok(out);
+                }
+                (ContentType::Handshake, _) => continue,
+                (ContentType::Alert, data) => {
+                    // close_notify is the end of the data, not a failure
+                    if data.len() >= 2 && data[1] == 0 {
+                        self.closed = true;
+                    }
+                    return Err(alert(&data));
+                }
+                (kind, _) => {
+                    return Err(bad(format!(
+                        "the server sent a {kind:?} record after the handshake"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// True once the peer has closed or sent close_notify.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Write `buf` as one record, over a blocking transport.
     pub fn write(&mut self, stream: &mut dyn Stream, buf: &[u8]) -> io::Result<usize> {
-        let record = self.sealer.seal(ContentType::ApplicationData, buf)?;
+        let record = self.write_record(buf)?;
         stream.write_all(&record)?;
         stream.flush()?;
         Ok(buf.len())
     }
 
     /// Read decrypted application data into `buf`, reading records off the
-    /// stream until there is something. Zero means the peer closed.
+    /// transport until there is something. Zero means the peer closed.
     pub fn read(&mut self, stream: &mut dyn Stream, buf: &mut [u8]) -> io::Result<usize> {
         while self.plain.is_empty() {
             if self.closed {
                 return Ok(0);
             }
-            self.read_one(stream)?;
+            let mut chunk = [0u8; 8192];
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                self.closed = true;
+                break;
+            }
+            self.raw.extend_from_slice(&chunk[..n]);
+            // the buffer is ours, so it has to be lent and taken back
+            let mut raw = std::mem::take(&mut self.raw);
+            let data = self.read_record_from(&mut raw)?;
+            self.raw = raw;
+            self.plain.extend_from_slice(&data);
         }
         let n = buf.len().min(self.plain.len());
         buf[..n].copy_from_slice(&self.plain[..n]);
         self.plain.drain(..n);
         Ok(n)
-    }
-
-    /// One record off the wire. A closed connection is not an error: it is the
-    /// end of the data, and the caller sees zero bytes.
-    fn read_one(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
-        loop {
-            if self.raw.len() >= 5 {
-                let len = u16::from_be_bytes([self.raw[3], self.raw[4]]) as usize;
-                if self.raw.len() >= 5 + len {
-                    let record: Vec<u8> = self.raw.drain(..5 + len).collect();
-                    match self.opener.open(&record)? {
-                        (ContentType::ApplicationData, data) => {
-                            self.plain.extend_from_slice(&data);
-                            return Ok(());
-                        }
-                        // a post-handshake message: a server sends its session
-                        // tickets at this level, before any data, and they are
-                        // legitimate -- we have no resumption yet, but the
-                        // record's sequence number is spent either way
-                        (ContentType::Handshake, _) => continue,
-                        (ContentType::Alert, data) => {
-                            // a close_notify is the end of the data, not a failure
-                            if data.len() >= 2 && data[1] == 0 {
-                                self.closed = true;
-                            }
-                            return Err(alert(&data));
-                        }
-                        (kind, _) => {
-                            return Err(bad(format!(
-                                "the server sent a {kind:?} record after the handshake"
-                            )));
-                        }
-                    }
-                }
-            }
-            let mut chunk = [0u8; 8192];
-            let n = stream.read(&mut chunk)?;
-            if n == 0 {
-                self.closed = true;
-                return Ok(());
-            }
-            self.raw.extend_from_slice(&chunk[..n]);
-        }
     }
 }
 

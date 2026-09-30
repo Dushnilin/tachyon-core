@@ -14,7 +14,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use core_tls::client::{Config, Handshake};
+use core_tls::client::{self, Config, Handshake};
 use core_tls::fingerprints;
 use core_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use core_tls::rustls::{self, RootCertStore, ServerConfig};
@@ -247,4 +247,107 @@ fn the_server_may_pick_a_later_group_from_our_share() {
     shake(&verifier, "chrome", "localhost").expect("chrome");
     shake(&verifier, "firefox", "localhost").expect("firefox offers three groups");
     shake(&verifier, "safari", "localhost").expect("safari");
+}
+
+/// The handshake is only half of it: after it, application data has to flow
+/// through the same record layer, with the record sequence numbers carrying on
+/// from the handshake and the two directions on their own keys.
+#[test]
+fn application_data_flows_after_the_handshake() {
+    core_tls::install_default_provider();
+    let (certs, key) = fixture();
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .expect("a server config");
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let mut server = rustls::ServerConnection::new(Arc::new(config)).expect("a server connection");
+    let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
+    let template = fingerprints::by_name("chrome").expect("a chrome table");
+    let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+    let client_config = Config {
+        template: &template,
+        server_name: "localhost",
+        alpn: &alpn,
+        verifier: &verifier,
+    };
+    let mut client = Handshake::new(client_config).expect("a handshake");
+    let mut pipe = Pipe::default();
+
+    // the handshake, then take the application keys
+    client.start(&mut pipe).expect("client hello");
+    let mut step = 0;
+    for _ in 0..16 {
+        let from_client = std::mem::take(&mut pipe.outgoing);
+        server
+            .read_tls(&mut from_client.as_slice())
+            .expect("to server");
+        server.process_new_packets().expect("server processes");
+        let mut from_server = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut from_server).expect("from server");
+        }
+        pipe.incoming.extend_from_slice(&from_server);
+        let outcome = match step {
+            0 => client.read_server_hello(&mut pipe),
+            1 => client.read_flight(&mut pipe),
+            _ => client.send_finished(&mut pipe),
+        };
+        outcome.expect("a handshake step");
+        step += 1;
+        if step == 3 {
+            break;
+        }
+    }
+    let from_client = std::mem::take(&mut pipe.outgoing);
+    server
+        .read_tls(&mut from_client.as_slice())
+        .expect("finished to server");
+    server
+        .process_new_packets()
+        .expect("server takes the finished");
+    assert!(!server.is_handshaking(), "the server is done too");
+    let mut connection = client::Connection::new(&mut client).expect("application keys");
+
+    // our write reaches the server
+    connection
+        .write(&mut pipe, b"GET / HTTP/1.1\r\n\r\n")
+        .expect("write");
+    let to_server = std::mem::take(&mut pipe.outgoing);
+    server
+        .read_tls(&mut to_server.as_slice())
+        .expect("app data to server");
+    server
+        .process_new_packets()
+        .expect("server processes app data");
+    let mut plain = [0u8; 64];
+    let n = server.reader().read(&mut plain).expect("server reads");
+    assert_eq!(&plain[..n], b"GET / HTTP/1.1\r\n\r\n");
+
+    // and the server's write reaches us
+    server
+        .writer()
+        .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+        .expect("server writes");
+    let mut from_server = Vec::new();
+    while server.wants_write() {
+        server.write_tls(&mut from_server).expect("server seals");
+    }
+    pipe.incoming.extend_from_slice(&from_server);
+    let mut got = [0u8; 64];
+    let n = connection.read(&mut pipe, &mut got).expect("read");
+    assert_eq!(&got[..n], b"HTTP/1.1 204 No Content\r\n\r\n");
+
+    // a second record in the other direction keeps the sequence numbers apart
+    connection.write(&mut pipe, b"second").expect("write again");
+    let to_server = std::mem::take(&mut pipe.outgoing);
+    server
+        .read_tls(&mut to_server.as_slice())
+        .expect("second to server");
+    server.process_new_packets().expect("server processes");
+    let n = server
+        .reader()
+        .read(&mut plain)
+        .expect("server reads again");
+    assert_eq!(&plain[..n], b"second");
 }

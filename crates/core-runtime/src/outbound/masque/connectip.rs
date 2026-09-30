@@ -86,6 +86,25 @@ fn ip_version(b: &[u8]) -> u8 {
     b[0] >> 4
 }
 
+/// Fold the accumulated sum and take its one's complement.
+fn finish_checksum(mut sum: u32) -> u16 {
+    while sum >> 16 > 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// What goes *into* the field, as opposed to what a receiver computes.
+///
+/// RFC 1071 section 3: a computed zero is transmitted as all ones. Writing the
+/// zero instead reads as "no checksum" to anything parsing a UDP header, and is
+/// an invalid field in an IP header -- the exact bug the reference fixed in its
+/// TUN stack in 1.14.2-lx.11. The arithmetic above is untouched on purpose: a
+/// receiver still has to accept the zero, so only the two write sites map it.
+fn transmit_checksum(value: u16) -> u16 {
+    if value == 0 { 0xffff } else { value }
+}
+
 /// Recompute the IPv4 header checksum over `header` (the caller passes
 /// `header[:IHL*4]`, so options are covered). The checksum field itself
 /// (offset 10..12) is skipped. Mirrors Go `calculateIPv4Checksum`.
@@ -98,10 +117,7 @@ pub(crate) fn calculate_ipv4_checksum(header: &[u8]) -> u16 {
         }
         i += 2;
     }
-    while sum >> 16 > 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    transmit_checksum(finish_checksum(sum))
 }
 
 /// Ones-complement checksum (RFC 1071) over `buf`, big-endian word order,
@@ -116,10 +132,7 @@ fn ones_complement_checksum(buf: &[u8]) -> u16 {
     if i < buf.len() {
         sum += u32::from(buf[i]) << 8;
     }
-    while sum >> 16 > 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    finish_checksum(sum)
 }
 
 /// Decrement TTL (v4) or hop limit (v6) in place and refresh the IPv4 header
@@ -207,7 +220,7 @@ pub(crate) fn compose_icmp_too_large(orig: &[u8], mtu: u16) -> Result<Vec<u8>, E
             icmp.extend_from_slice(&[3, 4, 0, 0]);
             icmp.extend_from_slice(&mtu.to_be_bytes());
             icmp.extend_from_slice(&orig[..quote_len]);
-            let csum = ones_complement_checksum(&icmp);
+            let csum = transmit_checksum(ones_complement_checksum(&icmp));
             icmp[2..4].copy_from_slice(&csum.to_be_bytes());
 
             let mut header = [0u8; IPV4_HEADER_LEN];
@@ -246,7 +259,7 @@ pub(crate) fn compose_icmp_too_large(orig: &[u8], mtu: u16) -> Result<Vec<u8>, E
             let mut psh_msg = Vec::with_capacity(40 + icmp.len());
             psh_msg.extend_from_slice(&psh);
             psh_msg.extend_from_slice(&icmp);
-            let csum = ones_complement_checksum(&psh_msg);
+            let csum = transmit_checksum(ones_complement_checksum(&psh_msg));
             icmp[2..4].copy_from_slice(&csum.to_be_bytes());
 
             let mut header = [0u8; IPV6_HEADER_LEN];
@@ -586,6 +599,43 @@ mod tests {
 
     fn v4(a: [u8; 4]) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(a))
+    }
+
+    /// A computed checksum of zero is transmitted as all ones: zero in the field
+    /// reads as "no checksum" in a UDP header and is invalid in an IP header.
+    /// The verification arithmetic is untouched -- a receiver still has to
+    /// accept the zero, so only the write sites map it.
+    #[test]
+    fn a_zero_checksum_is_written_as_all_ones() {
+        assert_eq!(transmit_checksum(0), 0xffff);
+        assert_eq!(transmit_checksum(0xffff), 0xffff);
+        assert_eq!(transmit_checksum(0x1234), 0x1234);
+        assert_eq!(
+            finish_checksum(0xffff),
+            0,
+            "the raw complement is still zero"
+        );
+        assert_eq!(finish_checksum(0xfffe), 0x0001);
+        // a real header still gets a real checksum
+        // and the ordinary case is untouched: a real header still gets a real
+        // checksum, and writing it back in makes the whole header sum to zero
+        let mut header = [
+            0x45, 0x00, 0x00, 0x3c, 0x7f, 0x00, 0x00, 0x01, 0x40, 0x11, 0, 0, 0x7f, 0x00, 0x00,
+            0x01, 0, 0, 0, 0,
+        ];
+        let sum = calculate_ipv4_checksum(&header);
+        assert_ne!(sum, 0);
+        header[10..12].copy_from_slice(&sum.to_be_bytes());
+        let mut total: u32 = 0;
+        let mut i = 0;
+        while i + 1 < header.len() {
+            total += u32::from(u16::from_be_bytes([header[i], header[i + 1]]));
+            i += 2;
+        }
+        while total >> 16 > 0 {
+            total = (total & 0xffff) + (total >> 16);
+        }
+        assert_eq!(total, 0xffff, "a valid header sums to all ones");
     }
 
     fn v6(a: [u8; 16]) -> IpAddr {

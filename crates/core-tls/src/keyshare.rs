@@ -195,6 +195,36 @@ impl Shares {
         Ok(body)
     }
 
+    /// The REALITY shared secret with a server's X25519 key: the X25519 half of
+    /// the exchange, not the ML-KEM one. A REALITY server proves itself with an
+    /// ed25519 key that has nothing to do with ML-KEM, so the classical half is
+    /// the one both sides have to agree on, and it is the tail of the hybrid
+    /// share -- or the plain share when a fingerprint offers no hybrid.
+    pub fn reality_secret(&self, server_key: &[u8; 32]) -> io::Result<[u8; 32]> {
+        let peer = x25519_dalek::PublicKey::from(*server_key);
+        let secret = match &self.hybrid {
+            Some(hybrid) => {
+                let shared = hybrid.x.diffie_hellman(&peer);
+                if !shared.was_contributory() {
+                    return Err(err("the REALITY server key is a low-order point"));
+                }
+                shared.to_bytes()
+            }
+            None => {
+                let x25519 = self
+                    .x25519
+                    .as_ref()
+                    .ok_or_else(|| err("no X25519 key was offered"))?;
+                let shared = x25519.diffie_hellman(&peer);
+                if !shared.was_contributory() {
+                    return Err(err("the REALITY server key is a low-order point"));
+                }
+                shared.to_bytes()
+            }
+        };
+        Ok(secret)
+    }
+
     /// The public share we wrote for `group`, if we offered it.
     pub fn public(&self, group: u16) -> Option<&[u8]> {
         self.entries

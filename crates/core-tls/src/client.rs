@@ -92,11 +92,14 @@ impl<'a> Handshake<'a> {
                 _ => None,
             })
             .ok_or_else(|| bad("the fingerprint offers no key share"))?;
-        let offered = config
-            .template
-            .cipher_suites
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        // the suite list is a run of 16-bit ids, and it is the fingerprint's
+        // own bytes: a trailing odd byte is ignored rather than guessed at
+        let suites = &config.template.cipher_suites;
+        let offered: Vec<u16> = suites
+            .iter()
+            .step_by(2)
+            .zip(suites.iter().skip(1))
+            .map(|(high, low)| u16::from_be_bytes([*high, *low]))
             .collect();
         Ok(Handshake {
             shares: Shares::for_body(&key_share)?,

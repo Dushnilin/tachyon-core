@@ -50,6 +50,102 @@ use rustls::{CipherSuite, SupportedCipherSuite, Tls13CipherSuite};
 #[cfg(feature = "tls12")]
 use rustls::SignatureScheme;
 
+use ::aead::{Aead, KeyInit};
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
+/// The key length the TLS 1.3 record AEAD of `suite` needs, or `None` for a
+/// suite that is not ours to run.
+///
+/// The suite table already names the algorithm for every suite; this exposes it
+/// to a stack that runs its own record layer (we do, for the uTLS
+/// fingerprint) without making that stack repeat the table, so a new suite
+/// cannot be half-added.
+pub fn tls13_key_len(suite: CipherSuite) -> Option<usize> {
+    match suite {
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => Some(16),
+        CipherSuite::TLS13_AES_256_GCM_SHA384 | CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => {
+            Some(32)
+        }
+        _ => None,
+    }
+}
+
+fn seal_with<A: Aead + KeyInit>(
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Option<Vec<u8>> {
+    let alg = <A as KeyInit>::new_from_slice(key).ok()?;
+    let payload = ::aead::Payload {
+        msg: plaintext,
+        aad,
+    };
+    alg.encrypt(nonce.into(), payload).ok()
+}
+
+fn open_with<A: Aead + KeyInit>(
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Option<Vec<u8>> {
+    let alg = <A as KeyInit>::new_from_slice(key).ok()?;
+    let payload = ::aead::Payload {
+        msg: ciphertext,
+        aad,
+    };
+    alg.decrypt(nonce.into(), payload).ok()
+}
+
+/// One TLS 1.3 record sealed: `ciphertext || tag`, or `None` when the suite is
+/// not one of ours or the key is the wrong length.
+pub fn tls13_seal(
+    suite: CipherSuite,
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Option<Vec<u8>> {
+    match suite {
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => {
+            seal_with::<aes_gcm::Aes128Gcm>(key, nonce, aad, plaintext)
+        }
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => {
+            seal_with::<aes_gcm::Aes256Gcm>(key, nonce, aad, plaintext)
+        }
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => {
+            seal_with::<chacha20poly1305::ChaCha20Poly1305>(key, nonce, aad, plaintext)
+        }
+        _ => None,
+    }
+}
+
+/// The plaintext of one sealed record, or `None` when the tag does not verify --
+/// which is the only thing a client can conclude from a record it cannot open.
+pub fn tls13_open(
+    suite: CipherSuite,
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Option<Vec<u8>> {
+    match suite {
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => {
+            open_with::<aes_gcm::Aes128Gcm>(key, nonce, aad, ciphertext)
+        }
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => {
+            open_with::<aes_gcm::Aes256Gcm>(key, nonce, aad, ciphertext)
+        }
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => {
+            open_with::<chacha20poly1305::ChaCha20Poly1305>(key, nonce, aad, ciphertext)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct Provider;
 

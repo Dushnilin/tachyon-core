@@ -8,6 +8,7 @@ pub mod fingerprints;
 pub mod hello;
 pub mod keyshare;
 pub mod quic;
+pub mod record;
 pub mod tls13;
 
 pub use rustls;

@@ -475,6 +475,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-webpki",
  "sha2",
+ "tokio",
  "webpki-roots 0.26.11",
  "x25519-dalek",
 ]

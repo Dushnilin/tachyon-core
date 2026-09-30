@@ -1,18 +1,19 @@
 //! The client half of a TLS 1.3 handshake (RFC 8446 §4.1), over any transport.
 //!
 //! The state machine is the one a client needs with no session resumption and no
-//! HelloRetryRequest, written against a `Read + Write` stream so the same code
-//! runs over a socket, over a tunnel, or over a socket pair in a test.
+//! HelloRetryRequest, written against any async stream, so the same code runs
+//! over a socket, over a tunnel, or over a pair of buffers in a test.
 //!
 //! Every message joins the transcript as it is *processed*, never as it arrives:
 //! the transcript hash is what CertificateVerify and Finished are computed
 //! over, and hashing one message too early or too late leaves nothing in the
 //! bytes to say why the server's signature does not verify.
 
-use std::io::{self, Read, Write};
+use std::io;
 
 use rustls::CipherSuite;
 use rustls::pki_types::{CertificateDer, ServerName};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::hello::{self, Ext, Template};
 use crate::keyshare::Shares;
@@ -25,9 +26,12 @@ use crate::record::{self, ContentType, Opener, Sealer, VERSION_1_3};
 use crate::tls13::{Hash, KeySchedule};
 use crate::verify::CertVerifier;
 
-/// Anything a handshake can be run over.
-pub trait Stream: Read + Write {}
-impl<T: Read + Write> Stream for T {}
+/// Anything a handshake can be run over: the caller's own socket, tunnel or
+/// buffer. It is async because everything this crate is called from is -- a
+/// blocking handshake here would mean blocking a runtime worker to do it, and a
+/// blocking call inside a `poll` is worse.
+pub trait Stream: AsyncRead + AsyncWrite + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Unpin> Stream for T {}
 
 fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -151,15 +155,15 @@ impl<'a> Handshake<'a> {
     }
 
     /// Run the whole handshake.
-    pub fn run(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
-        self.start(stream)?;
-        self.read_server_hello(stream)?;
-        self.read_flight(stream)?;
-        self.send_finished(stream)
+    pub async fn run(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
+        self.start(stream).await?;
+        self.read_server_hello(stream).await?;
+        self.read_flight(stream).await?;
+        self.send_finished(stream).await
     }
 
     /// Write the ClientHello.
-    pub fn start(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
+    pub async fn start(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
         let mut random = [0u8; 32];
         entropy(&mut random)?;
         entropy(&mut self.session_id)?;
@@ -172,14 +176,14 @@ impl<'a> Handshake<'a> {
             Some(&self.shares),
         )?;
         self.transcript.extend_from_slice(&record[5..]);
-        stream.write_all(&record)?;
-        stream.flush()
+        stream.write_all(&record).await?;
+        stream.flush().await
     }
 
     /// Read the server's hello and derive the handshake keys, refusing anything
     /// that is not an answer to the hello we actually sent.
-    pub fn read_server_hello(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
-        let raw = read_record(stream)?;
+    pub async fn read_server_hello(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
+        let raw = read_record(stream).await?;
         if raw[0] != ContentType::Handshake as u8 {
             return Err(bad("the first record from the server is not a handshake"));
         }
@@ -238,7 +242,7 @@ impl<'a> Handshake<'a> {
 
     /// The next handshake message, reassembled across records and decrypted as
     /// the encryption level allows.
-    fn next_message(&mut self, stream: &mut dyn Stream) -> io::Result<(u8, Vec<u8>)> {
+    async fn next_message(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<(u8, Vec<u8>)> {
         loop {
             if self.pending.len() >= 4 {
                 let len = ((self.pending[1] as usize) << 16)
@@ -251,7 +255,7 @@ impl<'a> Handshake<'a> {
                     return Ok((kind, body));
                 }
             }
-            let raw = read_record(stream)?;
+            let raw = read_record(stream).await?;
             match ContentType::from_byte(raw[0])? {
                 // the compatibility record, which every server sends in the clear
                 // just before its flight and which a client is told to ignore
@@ -280,8 +284,8 @@ impl<'a> Handshake<'a> {
 
     /// The server's flight: EncryptedExtensions, Certificate, maybe a
     /// CertificateStatus, CertificateVerify, Finished.
-    pub fn read_flight(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
-        let (kind, body) = self.next_message(stream)?;
+    pub async fn read_flight(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
+        let (kind, body) = self.next_message(stream).await?;
         if kind != HANDSHAKE_ENCRYPTED_EXTENSIONS {
             return Err(bad(
                 "the server's flight did not start with EncryptedExtensions",
@@ -298,7 +302,7 @@ impl<'a> Handshake<'a> {
             .transpose()?;
         self.record_message(kind, &body);
 
-        let (kind, body) = self.next_message(stream)?;
+        let (kind, body) = self.next_message(stream).await?;
         if kind != HANDSHAKE_CERTIFICATE {
             return Err(bad("the server sent no certificate"));
         }
@@ -321,10 +325,10 @@ impl<'a> Handshake<'a> {
         self.record_message(kind, &body);
 
         // a server that asked for OCSP staples may answer with the status first
-        let (mut kind, mut body) = self.next_message(stream)?;
+        let (mut kind, mut body) = self.next_message(stream).await?;
         if kind == 0x16 {
             self.record_message(kind, &body);
-            (kind, body) = self.next_message(stream)?;
+            (kind, body) = self.next_message(stream).await?;
         }
         if kind != HANDSHAKE_CERTIFICATE_VERIFY {
             return Err(bad("the server signed nothing"));
@@ -339,7 +343,7 @@ impl<'a> Handshake<'a> {
         )?;
         self.record_message(kind, &body);
 
-        let (kind, body) = self.next_message(stream)?;
+        let (kind, body) = self.next_message(stream).await?;
         if kind != HANDSHAKE_FINISHED {
             return Err(bad("the server's flight ended without a Finished"));
         }
@@ -358,7 +362,7 @@ impl<'a> Handshake<'a> {
 
     /// Our own Finished, under the client handshake keys, after the
     /// compatibility ChangeCipherSpec every real client sends.
-    pub fn send_finished(&mut self, stream: &mut dyn Stream) -> io::Result<()> {
+    pub async fn send_finished(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
         // the client application secret is derived from the transcript through
         // the *server's* Finished, so it is taken before ours is added
         self.schedule.enter_application(&self.transcript_hash());
@@ -377,9 +381,9 @@ impl<'a> Handshake<'a> {
             .as_mut()
             .ok_or_else(|| bad("no handshake keys, so nothing to seal with"))?;
         let sealed = sealer.seal(ContentType::Handshake, &message)?;
-        stream.write_all(&ccs)?;
-        stream.write_all(&sealed)?;
-        stream.flush()?;
+        stream.write_all(&ccs).await?;
+        stream.write_all(&sealed).await?;
+        stream.flush().await?;
         // the server's application secret covers our Finished too
         self.record_message(HANDSHAKE_FINISHED, &verify);
         Ok(())
@@ -396,13 +400,14 @@ impl<'a> Handshake<'a> {
 ///
 /// The record sequence numbers carry on from the handshake, which is the one
 /// detail that makes this a continuation rather than a second connection.
+///
+/// The interface is bytes in and bytes out -- [`Connection::write_record`] seals
+/// one record, [`Connection::read_record_from`] takes whatever whole records a
+/// buffer holds -- so the caller's async stream is a buffer and two calls, and
+/// nothing here blocks or owns a socket.
 pub struct Connection {
     sealer: Sealer,
     opener: Opener,
-    /// decrypted records not yet handed to the caller
-    plain: Vec<u8>,
-    /// plaintext read from the socket, waiting to be decrypted
-    raw: Vec<u8>,
     closed: bool,
 }
 
@@ -435,8 +440,6 @@ impl Connection {
                 suite,
                 KeySchedule::traffic_keys(&server_secret, hash, key_len, 12),
             ),
-            plain: Vec::new(),
-            raw: Vec::new(),
             closed: false,
         })
     }
@@ -493,50 +496,16 @@ impl Connection {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
-
-    /// Write `buf` as one record, over a blocking transport.
-    pub fn write(&mut self, stream: &mut dyn Stream, buf: &[u8]) -> io::Result<usize> {
-        let record = self.write_record(buf)?;
-        stream.write_all(&record)?;
-        stream.flush()?;
-        Ok(buf.len())
-    }
-
-    /// Read decrypted application data into `buf`, reading records off the
-    /// transport until there is something. Zero means the peer closed.
-    pub fn read(&mut self, stream: &mut dyn Stream, buf: &mut [u8]) -> io::Result<usize> {
-        while self.plain.is_empty() {
-            if self.closed {
-                return Ok(0);
-            }
-            let mut chunk = [0u8; 8192];
-            let n = stream.read(&mut chunk)?;
-            if n == 0 {
-                self.closed = true;
-                break;
-            }
-            self.raw.extend_from_slice(&chunk[..n]);
-            // the buffer is ours, so it has to be lent and taken back
-            let mut raw = std::mem::take(&mut self.raw);
-            let data = self.read_record_from(&mut raw)?;
-            self.raw = raw;
-            self.plain.extend_from_slice(&data);
-        }
-        let n = buf.len().min(self.plain.len());
-        buf[..n].copy_from_slice(&self.plain[..n]);
-        self.plain.drain(..n);
-        Ok(n)
-    }
 }
 
-fn read_record(stream: &mut dyn Stream) -> io::Result<Vec<u8>> {
+async fn read_record(stream: &mut (dyn Stream + '_)) -> io::Result<Vec<u8>> {
     let mut header = [0u8; 5];
-    stream.read_exact(&mut header)?;
+    stream.read_exact(&mut header).await?;
     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
     let mut out = Vec::with_capacity(5 + len);
     out.extend_from_slice(&header);
     out.resize(5 + len, 0);
-    stream.read_exact(&mut out[5..])?;
+    stream.read_exact(&mut out[5..]).await?;
     Ok(out)
 }
 

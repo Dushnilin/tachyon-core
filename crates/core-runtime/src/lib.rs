@@ -10,6 +10,7 @@ pub mod ntp;
 pub mod outbound;
 pub mod route;
 pub mod tls_client;
+pub mod tls_utls;
 pub mod ws;
 mod zip;
 

@@ -23,6 +23,19 @@ fn adapt_for_test(root: &mut Value) {
     if let Some(log) = root.get_mut("log").and_then(Value::as_object_mut) {
         log.insert("level".into(), Value::String("error".into()));
     }
+    if !cfg!(target_os = "linux") {
+        // `routing_mark` is Linux-only and the reference refuses to start with
+        // it anywhere else, so the fixture loses it off Linux
+        for section in ["outbounds", "inbounds", "endpoints"] {
+            if let Some(entries) = root.get_mut(section).and_then(Value::as_array_mut) {
+                for entry in entries {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("routing_mark");
+                    }
+                }
+            }
+        }
+    }
     let inbounds = root
         .get_mut("inbounds")
         .and_then(Value::as_array_mut)

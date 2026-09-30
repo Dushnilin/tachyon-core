@@ -219,7 +219,7 @@ impl Outbound {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
         match ty {
-            "direct" => Ok(Outbound::Direct(Direct::build(obj))),
+            "direct" => Ok(Outbound::Direct(Direct::build(obj, at)?)),
             "block" => Ok(Outbound::Block(Block)),
             "socks" => Ok(Outbound::Socks(Socks::build(obj, at)?)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
@@ -598,11 +598,11 @@ impl Router {
             }
             let mut outbound = Outbound::build(obj, &format!("outbounds[{i}]"))?;
             if let Outbound::Direct(direct) = &mut outbound {
-                if direct.routing_mark.is_none() {
-                    direct.routing_mark = defaults.default_mark;
+                if direct.dial.routing_mark.is_none() {
+                    direct.dial.routing_mark = defaults.default_mark;
                 }
-                if direct.bind_interface.is_none() {
-                    direct.bind_interface = bind_iface.clone();
+                if direct.dial.bind_interface.is_none() {
+                    direct.dial.bind_interface = bind_iface.clone();
                 }
             }
             outbounds.push(outbound);
@@ -1169,18 +1169,32 @@ mod tests {
             "route defaults install the global ddr tag"
         );
 
-        // Explicit outbound fields win over route defaults.
+        // Explicit outbound fields win over route defaults. `routing_mark` is
+        // Linux-only, and off Linux the reference refuses it, so the mark can
+        // only be checked there; the interface option is portable.
         let router = Router::new(&json!({
-            "outbounds": [{"type": "direct", "tag": "d", "routing_mark": 99, "bind_interface": "eth0"}],
+            "outbounds": [{"type": "direct", "tag": "d", "bind_interface": "eth0"}],
             "route": {"final": "d", "default_interface": "lo", "default_mark": 7}
         }))
         .unwrap();
         match router.outbounds.first() {
             Some(Outbound::Direct(d)) => {
-                assert_eq!(d.routing_mark, Some(99));
-                assert_eq!(d.bind_interface.as_deref(), Some("eth0"));
+                assert_eq!(d.dial.bind_interface.as_deref(), Some("eth0"));
             }
             _ => panic!("expected direct outbound"),
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let router = Router::new(&json!({
+                "outbounds": [{"type": "direct", "tag": "d", "routing_mark": 99}],
+                "route": {"final": "d", "default_mark": 7}
+            }))
+            .unwrap();
+            match router.outbounds.first() {
+                Some(Outbound::Direct(d)) => assert_eq!(d.dial.routing_mark, Some(99)),
+                _ => panic!("expected direct outbound"),
+            }
         }
 
         // No route section clears a previously installed ddr tag.

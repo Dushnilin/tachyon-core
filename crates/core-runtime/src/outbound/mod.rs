@@ -1,5 +1,6 @@
 pub mod anytls;
 pub mod block;
+pub mod dial;
 pub mod direct;
 pub mod fptn;
 pub mod hysteria2;

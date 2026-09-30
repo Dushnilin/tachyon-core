@@ -88,6 +88,7 @@ pub struct Vless {
     vision: bool,
     /// how datagrams are framed on the stream, see `packet`
     packet_encoding: PacketEncoding,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl Vless {
@@ -116,6 +117,7 @@ impl Vless {
             tls,
             vision,
             packet_encoding,
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
@@ -142,7 +144,8 @@ impl Vless {
         header.push(0x00);
         header.push(command);
         header.extend_from_slice(&encode_vless_target(target)?);
-        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let tcp =
+            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         // a ws transport with early data carries the request in the upgrade head
         let (mut stream, consumed) = self
             .transport
@@ -245,6 +248,7 @@ pub struct Trojan {
     password_hash: String,
     transport: Transport,
     tls: Option<TlsOptions>,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl Trojan {
@@ -268,6 +272,7 @@ impl Trojan {
             password_hash,
             transport,
             tls,
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
@@ -294,7 +299,8 @@ impl Trojan {
         header.push(command);
         header.extend_from_slice(&encode_target(target)?);
         header.extend_from_slice(b"\r\n");
-        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let tcp =
+            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         let (mut stream, consumed) = self
             .transport
             .connect(tcp, Some(tls), &self.server, self.port, &header)

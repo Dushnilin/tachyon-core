@@ -46,6 +46,7 @@ pub struct Naive {
     quic: bool,
     quic_tunnel: crate::outbound::quic::QuicTunnelOptions,
     congestion: crate::outbound::quic::CongestionKind,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl Naive {
@@ -167,6 +168,7 @@ impl Naive {
                 crate::outbound::quic::QuicTunnelDefaults::tuic(),
             )?,
             congestion,
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
@@ -254,7 +256,7 @@ impl Naive {
     async fn tunnel_h2(&self, authority: &str) -> io::Result<AnyStream> {
         let tcp = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            crate::dns::connect_tcp(&self.server, self.port),
+            crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial),
         )
         .await
         .map_err(|_| io::Error::other("naive: connect timeout"))??;

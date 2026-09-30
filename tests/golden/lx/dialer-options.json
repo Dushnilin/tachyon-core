@@ -1,0 +1,20 @@
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "p",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "bind_interface": "eth0",
+      "inet4_bind_address": "192.168.1.5",
+      "reuse_addr": true,
+      "tcp_keep_alive": "30s",
+      "tcp_keep_alive_interval": "10s",
+      "udp_fragment": true,
+      "tcp_fast_open": true,
+      "connect_timeout": "5s"
+    }
+  ],
+  "route": { "final": "p" }
+}

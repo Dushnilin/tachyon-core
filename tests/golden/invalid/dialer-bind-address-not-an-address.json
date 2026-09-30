@@ -1,0 +1,10 @@
+{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "d",
+      "inet4_bind_address": "nonsense"
+    }
+  ],
+  "route": { "final": "d" }
+}

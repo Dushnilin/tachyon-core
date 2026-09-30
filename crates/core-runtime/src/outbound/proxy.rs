@@ -65,6 +65,7 @@ pub struct Socks {
     port: u16,
     version: u8,
     credentials: Option<(String, String)>,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl Socks {
@@ -81,11 +82,13 @@ impl Socks {
             port,
             version,
             credentials: credentials(obj),
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let stream = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let stream =
+            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         if self.version == 4 {
             let mut stream = stream;
             self.connect_v4(&mut stream, target).await?;
@@ -193,7 +196,8 @@ impl Socks {
         if self.version == 4 {
             return Err(io::Error::other("socks4 has no udp support"));
         }
-        let mut control = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let mut control =
+            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         self.handshake_v5(&mut control).await?;
         // 0.0.0.0:0 asks the server for its default relay
         control
@@ -325,6 +329,7 @@ pub struct HttpOut {
     port: u16,
     credentials: Option<(String, String)>,
     tls: Option<Arc<crate::tls_client::TlsOptions>>,
+    dial: crate::outbound::dial::DialOptions,
 }
 
 impl HttpOut {
@@ -336,11 +341,13 @@ impl HttpOut {
             port,
             credentials: credentials(obj),
             tls: tls.map(Arc::new),
+            dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let tcp = crate::dns::connect_tcp(self.server.as_str(), self.port).await?;
+        let tcp =
+            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         let mut stream: AnyStream = match &self.tls {
             Some(tls) => Box::new(tls.connect_stream(tcp, &[]).await?),
             None => Box::new(tcp),

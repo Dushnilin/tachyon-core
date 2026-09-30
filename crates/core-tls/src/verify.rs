@@ -185,6 +185,32 @@ mod tests {
         assert!(ed25519_public_key(&spki).is_none());
     }
 
+    /// The verdict is what a caller has to report, because a REALITY server that
+    /// does not recognise us hands us the site it hides behind and the handshake
+    /// still succeeds. So: unknown before the check, and a reason after it.
+    #[test]
+    fn the_verdict_says_why_a_certificate_was_not_taken_on_reality_terms() {
+        let der = fixture_der();
+        let leaf = rustls::pki_types::CertificateDer::from(der);
+        let name = ServerName::try_from("example.com").expect("a name");
+        let verifier = RealityVerifier::new(Box::new(AcceptsAnything));
+        assert_eq!(verifier.verdict(), "not checked yet");
+
+        // no auth key yet: the key exchange has not run, so this cannot be REALITY
+        verifier
+            .verify_chain(&leaf, &[], &name)
+            .expect("the fallback accepts anything");
+        assert_eq!(verifier.verdict(), "the key exchange produced no auth key");
+
+        // with one, the certificate here is ECDSA, so there is no Ed25519 key to
+        // check against -- which is exactly the "not the node we named" case
+        verifier.set_reality_auth_key(&[9u8; 32]);
+        verifier
+            .verify_chain(&leaf, &[], &name)
+            .expect("the fallback accepts anything");
+        assert_eq!(verifier.verdict(), "the certificate carries no Ed25519 key");
+    }
+
     /// The rule itself, on the two byte strings it reads: the leaf's Ed25519 key
     /// HMAC'd under the auth key has to equal the leaf's own signature.
     #[test]
@@ -219,17 +245,37 @@ fn algorithm_for(scheme: u16) -> Option<&'static dyn SignatureVerificationAlgori
 /// key, equals the leaf's own signature. Anything else falls through to the
 /// ordinary chain check, so a certificate that does happen to chain still
 /// works.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RealityVerifier {
-    fallback: Box<dyn CertVerifier>,
-    auth_key: std::sync::Mutex<Option<[u8; 32]>>,
+    fallback: std::sync::Arc<dyn CertVerifier>,
+    auth_key: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    verdict: std::sync::Arc<std::sync::Mutex<&'static str>>,
 }
 
 impl RealityVerifier {
     pub fn new(fallback: Box<dyn CertVerifier>) -> Self {
         RealityVerifier {
-            fallback,
-            auth_key: std::sync::Mutex::new(None),
+            fallback: std::sync::Arc::from(fallback),
+            auth_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            verdict: std::sync::Arc::new(std::sync::Mutex::new("not checked yet")),
+        }
+    }
+
+    /// What the last certificate check concluded, in one line.
+    ///
+    /// A REALITY server that does not recognise its client does not fail: it
+    /// hands the connection to the site it hides behind, and the client ends up
+    /// talking TLS to that site with a perfectly valid certificate for it. Nothing
+    /// about that looks wrong from here, which is why this exists -- a caller can
+    /// put one line in a log instead of leaving the user with a tunnel that
+    /// quietly goes somewhere else.
+    pub fn verdict(&self) -> &'static str {
+        self.verdict.lock().map(|v| *v).unwrap_or("unreadable")
+    }
+
+    fn set_verdict(&self, what: &'static str) {
+        if let Ok(mut slot) = self.verdict.lock() {
+            *slot = what;
         }
     }
 }
@@ -254,18 +300,24 @@ impl CertVerifier for RealityVerifier {
                     .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?
                     .subject_public_key_info();
                 let Some(public) = ed25519_public_key(&der) else {
+                    self.set_verdict("the certificate carries no Ed25519 key");
                     return self.fallback.verify_chain(leaf, chain, server_name);
                 };
                 let signature = certificate_signature(leaf)
                     .map_err(|e| bad(format!("the leaf signature: {e}")))?;
                 if hmac_sha512(&key, &public) == signature {
+                    self.set_verdict("the borrowed certificate checks out");
                     Ok(())
                 } else {
                     // not the server we named: let the ordinary answer stand
+                    self.set_verdict("the borrowed certificate is not signed under our auth key");
                     self.fallback.verify_chain(leaf, chain, server_name)
                 }
             }
-            None => self.fallback.verify_chain(leaf, chain, server_name),
+            None => {
+                self.set_verdict("the key exchange produced no auth key");
+                self.fallback.verify_chain(leaf, chain, server_name)
+            }
         }
     }
 

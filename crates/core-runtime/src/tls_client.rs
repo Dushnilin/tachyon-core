@@ -392,10 +392,18 @@ impl TlsOptions {
             public_key: &r.public_key,
             short_id: &r.short_id,
         });
-        let verifier: Box<dyn core_tls::verify::CertVerifier> = match reality {
-            Some(_) => Box::new(core_tls::verify::RealityVerifier::new(plain)),
-            None => plain,
-        };
+        // Kept as a concrete type so the verdict can be reported: a REALITY server
+        // that does not recognise its client answers with the site it hides
+        // behind, and the handshake then *succeeds* against a certificate that
+        // has nothing to do with the node. Without this line that failure is
+        // invisible, and the tunnel simply goes somewhere else.
+        let (verifier, reality_verifier): (Box<dyn core_tls::verify::CertVerifier>, _) =
+            if reality.is_some() {
+                let v = core_tls::verify::RealityVerifier::new(plain);
+                (Box::new(v.clone()), Some(v))
+            } else {
+                (plain, None)
+            };
         let config = core_tls::client::Config {
             template: &fingerprint.template,
             server_name: if self.disable_sni {
@@ -409,10 +417,18 @@ impl TlsOptions {
         };
         let mut handshake = core_tls::client::Handshake::new(config)?;
         let mut stream = stream;
-        handshake
+        let result = handshake
             .run(&mut stream)
             .await
-            .map_err(|e| io::Error::other(format!("{} handshake: {e}", fingerprint.name)))?;
+            .map_err(|e| io::Error::other(format!("{} handshake: {e}", fingerprint.name)));
+        if let Some(v) = reality_verifier.as_ref() {
+            crate::logging::debug(format_args!(
+                "REALITY {}: {}",
+                self.server_name,
+                v.verdict()
+            ));
+        }
+        result?;
         let connection = core_tls::client::Connection::new(&mut handshake)?;
         Ok(Box::new(crate::tls_utls::FingerprintStream::new(
             stream, connection,

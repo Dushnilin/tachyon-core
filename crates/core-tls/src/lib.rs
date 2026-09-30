@@ -7,6 +7,7 @@
 pub mod fingerprints;
 pub mod hello;
 pub mod quic;
+pub mod tls13;
 
 pub use rustls;
 

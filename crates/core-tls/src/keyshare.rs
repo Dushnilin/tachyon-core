@@ -23,7 +23,7 @@ use std::io;
 use ml_kem::kem::{Decapsulate, DecapsulationKey, EncapsulationKey};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 
 pub const X25519MLKEM768: u16 = 0x11ec;
 pub const X25519: u16 = 0x001d;
@@ -43,14 +43,28 @@ pub fn is_grease(value: u16) -> bool {
     (value & 0x0f) == 0x0a && (value >> 8) as u8 == (value & 0xff) as u8
 }
 
-/// A GREASE value the way BoringSSL picks one: a random byte repeated, with the
-/// low nibble set. A failure to read entropy would leave every handshake with
-/// the same GREASE, which is legal, so it is not worth failing a connection.
-pub fn random_grease() -> u16 {
-    let mut byte = [0u8; 1];
-    let _ = getrandom::fill(&mut byte);
-    let v = (byte[0] & 0x0f) as u16;
-    (v << 8 | v) & 0xf0f0 | 0x0a0a
+/// A fresh GREASE value the way BoringSSL picks one: a random byte repeated,
+/// with the low nibble set.
+///
+/// `used` collects the values already written into this hello, because Chrome
+/// sends *two* GREASE extensions and a repeated id is a duplicate extension,
+/// which every server rejects. A failure to read entropy would leave every
+/// handshake with the same GREASE, which is legal, so it is not worth failing a
+/// connection over; the 16 reserved values cannot all be taken by one hello, so
+/// neither can the retries run out.
+pub fn unique_grease(used: &mut Vec<u16>) -> u16 {
+    for _ in 0..16 {
+        let mut byte = [0u8; 1];
+        let _ = RngCore::try_fill_bytes(&mut OsRng, &mut byte);
+        // the byte's *high* nibble, repeated, with the low one set to 0xa
+        let v = (byte[0] & 0xf0) as u16;
+        let value = (v << 8 | v) | 0x0a0a;
+        if !used.contains(&value) {
+            used.push(value);
+            return value;
+        }
+    }
+    0x0a0a
 }
 
 /// The `(group, key_exchange)` entries of a `key_share` extension body.
@@ -147,13 +161,18 @@ impl Shares {
 
     /// The `key_share` body to write: the template's group list in the
     /// template's order, with our data in place of the captured data. A GREASE
-    /// group keeps its captured data (a byte of noise) and gets a fresh
-    /// reserved id, as BoringSSL does.
-    pub fn body(&self, template: &[u8]) -> io::Result<Vec<u8>> {
+    /// group keeps its captured data (a byte of noise) and gets a fresh reserved
+    /// id, as BoringSSL does. `grease_used` carries the values the rest of the
+    /// hello already spent, so two GREASE ids cannot collide.
+    pub fn body(&self, template: &[u8], grease_used: &mut Vec<u16>) -> io::Result<Vec<u8>> {
         let mut list = Vec::new();
         for (group, data) in entries(template)? {
             let grease = is_grease(group);
-            let id = if grease { random_grease() } else { group };
+            let id = if grease {
+                unique_grease(grease_used)
+            } else {
+                group
+            };
             let share: &[u8] = if grease {
                 data
             } else {
@@ -267,7 +286,7 @@ mod tests {
     fn the_built_body_keeps_the_template_shape() {
         let template = chrome_template();
         let shares = Shares::for_body(&template).expect("shares");
-        let body = shares.body(&template).expect("body");
+        let body = shares.body(&template, &mut Vec::new()).expect("body");
 
         // the same length, the same groups in the same order
         assert_eq!(body.len(), template.len());
@@ -291,7 +310,7 @@ mod tests {
         // the standard library instead of the browser.
         let template = chrome_template();
         let shares = Shares::for_body(&template).expect("shares");
-        let body = shares.body(&template).expect("body");
+        let body = shares.body(&template, &mut Vec::new()).expect("body");
         let entries = entries(&body).unwrap();
         let hybrid_x = &entries[1].1[MLKEM768_EK_LEN..];
         let plain_x = entries[2].1;
@@ -338,10 +357,25 @@ mod tests {
         assert!(err.to_string().contains("0x0018"), "{err}");
     }
 
+    /// Chrome sends two GREASE extensions, and a repeated id is a duplicate
+    /// extension that every server rejects -- so the draws have to differ.
+    #[test]
+    fn grease_values_never_repeat_within_one_hello() {
+        for _ in 0..64 {
+            let mut used = Vec::new();
+            let first = unique_grease(&mut used);
+            let second = unique_grease(&mut used);
+            let third = unique_grease(&mut used);
+            assert_ne!(first, second);
+            assert_ne!(second, third);
+            assert_ne!(first, third);
+        }
+    }
+
     #[test]
     fn grease_values_are_the_reserved_shape() {
         for _ in 0..64 {
-            let value = random_grease();
+            let value = unique_grease(&mut Vec::new());
             assert!(is_grease(value), "{value:#06x} is not GREASE");
         }
         for value in [0x0a0a, 0xfafa, 0x1a1a, 0x0a0b, 0x0a00, 0x001d] {

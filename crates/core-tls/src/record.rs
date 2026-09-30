@@ -167,7 +167,10 @@ impl Opener {
             return Err(err("short record header"));
         }
         if record[0] != ContentType::ApplicationData as u8 {
-            return Err(err("a sealed record is always application_data outside"));
+            return Err(err(format!(
+                "a sealed record is always application_data outside, got {:#04x}",
+                record[0]
+            )));
         }
         let aad = &record[..5];
         let nonce = self.keys.nonce(self.seq);

@@ -75,6 +75,12 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// A vector of `n` bytes with an 8-bit length prefix.
+    pub fn vec8(&mut self) -> io::Result<&'a [u8]> {
+        let n = self.u8()? as usize;
+        self.take(n)
+    }
+
     /// A vector of `n` bytes with a 16-bit length prefix.
     pub fn vec16(&mut self) -> io::Result<&'a [u8]> {
         let n = self.u16()? as usize;
@@ -135,6 +141,13 @@ pub fn messages(mut input: &[u8]) -> io::Result<Vec<(u8, Vec<u8>)>> {
         out.push((message.kind, message.body.to_vec()));
     }
     Ok(out)
+}
+
+/// The protocol out of an ALPN extension body: a 16-bit list length and then
+/// the entries. In TLS 1.3 a server's list holds exactly one, the one it chose.
+pub fn alpn_protocol(body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut list = Reader::new(body).sub16()?;
+    Ok(list.vec8()?.to_vec())
 }
 
 /// §4.1.3. The cipher suite and the key share are the two fields the client has
@@ -203,11 +216,14 @@ impl ServerHello {
     }
 }
 
-/// §4.3.1. Only ALPN matters to a client, and a server must not echo SNI.
+/// §4.3.1. Only ALPN matters to a client, and a server may acknowledge the SNI
+/// with an *empty* `server_name` extension (RFC 6066 §3) but must not echo the
+/// name -- so the flag is "the server sent a name back", not "the server
+/// mentioned the extension".
 #[derive(Debug, Clone, Default)]
 pub struct EncryptedExtensions {
     pub alpn: Option<Vec<u8>>,
-    pub server_name: bool,
+    pub server_name_echo: bool,
 }
 
 impl EncryptedExtensions {
@@ -220,7 +236,7 @@ impl EncryptedExtensions {
             let body = extensions.vec16()?;
             match id {
                 0x0010 => out.alpn = Some(body.to_vec()),
-                0x0000 => out.server_name = true,
+                0x0000 => out.server_name_echo = !body.is_empty(),
                 _ => {}
             }
         }
@@ -238,7 +254,7 @@ pub struct Certificate {
 impl Certificate {
     pub fn parse(body: &[u8]) -> io::Result<Self> {
         let mut r = Reader::new(body);
-        let context = r.vec16()?;
+        let context = r.vec8()?;
         if !context.is_empty() {
             return Err(err("a server certificate must have no request context"));
         }
@@ -426,7 +442,7 @@ mod tests {
             list.extend_from_slice(der);
             list.extend_from_slice(&0u16.to_be_bytes());
         }
-        let mut body = vec![0, 0]; // no request context
+        let mut body = vec![0]; // no request context, one byte of length
         body.push((list.len() >> 16) as u8);
         body.push((list.len() >> 8) as u8);
         body.push(list.len() as u8);
@@ -440,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_certificate_with_a_request_context_is_not_a_server_certificate() {
-        let body = [1, 0, 0, 0, 0];
+        let body = [1, 0, 0, 0];
         assert!(Certificate::parse(&body).is_err());
     }
 

@@ -117,6 +117,13 @@ pub fn expand_label(
 }
 
 /// `Derive-Secret(Secret, Label, Transcript-Hash)`.
+/// `HKDF(salt, ikm)` then `HKDF-Expand(info, length)`: RFC 5869 in full, for
+/// the one key that is not part of the TLS schedule (REALITY's auth key, which
+/// is derived outside it).
+pub fn hkdf(hash: Hash, salt: &[u8], ikm: &[u8], info: &[u8], length: usize) -> Vec<u8> {
+    hash.expand(&hash.extract(salt, ikm), info, length)
+}
+
 pub fn derive_secret(hash: Hash, secret: &[u8], label: &[u8], transcript: &[u8]) -> Vec<u8> {
     expand_label(hash, secret, label, transcript, hash.output_len())
 }

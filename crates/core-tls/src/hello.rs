@@ -8,6 +8,8 @@ fn err(msg: &str) -> io::Error {
 pub enum Ext {
     Static(u16, Vec<u8>),
     Sni,
+    /// The protocol list the caller configured, in the fingerprint's own order.
+    Alpn,
     KeyShare(Vec<u8>),
 }
 
@@ -154,6 +156,7 @@ pub fn build(
     random: &[u8; 32],
     session_id: &[u8],
     sni: &str,
+    alpn: &[&[u8]],
     key_share_override: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     let mut hs = Vec::new();
@@ -174,6 +177,7 @@ pub fn build(
         let (id, body): (u16, Vec<u8>) = match e {
             Ext::Static(id, body) => (*id, body.clone()),
             Ext::Sni => (0x0000, build_sni(sni)?),
+            Ext::Alpn => (0x0010, build_alpn(alpn)?),
             Ext::KeyShare(raw) => (
                 0x0033,
                 match key_share_override {
@@ -212,6 +216,26 @@ fn build_sni(name: &str) -> io::Result<Vec<u8>> {
     b.push(0x00);
     b.extend_from_slice(&(n.len() as u16).to_be_bytes());
     b.extend_from_slice(n);
+    Ok(b)
+}
+
+/// The ALPN extension body: a 16-bit list length and then the protocols, in
+/// the order the caller configured. The extension's own length is the framing
+/// the builder writes around this.
+fn build_alpn(alpn: &[&[u8]]) -> io::Result<Vec<u8>> {
+    let total: usize = alpn.iter().map(|p| p.len() + 1).sum();
+    if total > u16::MAX as usize {
+        return Err(err("alpn list too long"));
+    }
+    let mut b = Vec::with_capacity(2 + total);
+    b.extend_from_slice(&(total as u16).to_be_bytes());
+    for protocol in alpn {
+        if protocol.len() > u8::MAX as usize || protocol.is_empty() {
+            return Err(err("alpn protocol must be 1..=255 bytes"));
+        }
+        b.push(protocol.len() as u8);
+        b.extend_from_slice(protocol);
+    }
     Ok(b)
 }
 

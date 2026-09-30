@@ -411,7 +411,7 @@ fn client_hello(sni: &str) -> Vec<u8> {
         compression: vec![0x00],
         extensions: vec![core_tls::hello::Ext::Sni],
     };
-    core_tls::hello::build(&template, &[0x11; 32], &[], sni, None).expect("client hello")
+    core_tls::hello::build(&template, &[0x11; 32], &[], sni, &[], None).expect("client hello")
 }
 
 #[tokio::test]

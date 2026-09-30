@@ -187,7 +187,7 @@ fn decoy_hello(profile: RealityProfile, sni: &str) -> io::Result<Vec<u8>> {
     crate::outbound::shadowsocks::crypto::random_bytes(&mut random)
         .map_err(|_| io::Error::other("fptn reality: system random unavailable"))?;
     let session_id = fptn_decoy_session_id(unix_now());
-    hello::build(&parsed.template, &random, &session_id, sni, None)
+    hello::build(&parsed.template, &random, &session_id, sni, &[], None)
 }
 
 /// Full fake handshake on a fresh TCP stream: decoy hello → drain the fake

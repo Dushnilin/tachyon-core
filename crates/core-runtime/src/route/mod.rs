@@ -416,7 +416,6 @@ fn parse_rule_set_payload(
 const ROUTE_UNIMPL_FIELDS: &[&str] = &[
     "geoip",
     "geosite",
-    "find_process",
     "override_android_vpn",
     "default_network_strategy",
     "default_network_type",
@@ -520,6 +519,9 @@ pub struct Router {
     rules: Vec<Rule>,
     defaults: RouteDefaults,
     rule_sets: Option<rule_set::RuleSetRegistry>,
+    /// `route.find_process`, or any rule that names a process: the `/proc`
+    /// walk per connection is only worth it when something will read it.
+    find_process: bool,
     probe_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -703,14 +705,13 @@ impl Router {
             })
             .unwrap_or_default();
         // `route.find_process`, or any rule that names a process: either way
-        // the searcher is armed, the walk itself is per connection
-        process::set_wanted(
-            root.get("route")
-                .and_then(|route| route.get("find_process"))
-                .and_then(Value::as_bool)
-                == Some(true)
-                || rules.iter().any(Rule::needs_process),
-        );
+        // the searcher runs, once per connection
+        let find_process = root
+            .get("route")
+            .and_then(|route| route.get("find_process"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            || rules.iter().any(Rule::needs_process);
         if defaults.find_neighbor
             || rules.iter().any(Rule::needs_neighbor)
             || neighbor_domain_configured(&root)
@@ -726,6 +727,7 @@ impl Router {
             rules,
             defaults,
             rule_sets: Some(registry),
+            find_process,
             probe_tasks: std::sync::Mutex::new(Vec::new()),
         });
         for outbound in &router.outbounds {
@@ -849,7 +851,7 @@ impl Router {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        prepare(ctx);
+        prepare(ctx, self.find_process);
         for (i, rule) in self.rules.iter().enumerate() {
             if !rule.matches(ctx) {
                 continue;
@@ -914,7 +916,7 @@ pub enum SelectError {
 }
 
 /// FakeIP reverse mapping + ip_version before the rule walk.
-fn prepare(ctx: &mut ConnContext) {
+fn prepare(ctx: &mut ConnContext, want_process: bool) {
     if let Target::Ip(addr) = ctx.destination
         && let Some(dns) = dns::current()
         && let Some(domain) = dns.fakeip_domain(addr.ip())
@@ -948,7 +950,7 @@ fn prepare(ctx: &mut ConnContext) {
         Target::Ip(addr) => Some(*addr),
         Target::Domain(..) => None,
     };
-    if let Some(info) = process::find_owner(ctx.network, ctx.source, destination) {
+    if want_process && let Some(info) = process::find_owner(ctx.network, ctx.source, destination) {
         logging::info(format_args!(
             "found process path: {}{}",
             info.path,
@@ -1102,6 +1104,46 @@ mod tests {
         RouteDefaults::parse(Some(&json!({"default_domain_resolver": ["x"]})))
             .expect_err("array form must fail");
         RouteDefaults::parse(Some(&json!({"auto_detect_interface": "yes"}))).ok();
+    }
+
+    /// The whole path, not just the lookup: a live socket, `prepare`, and a
+    /// rule that names this very process. Linux-only because the searcher is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rule_can_route_by_the_process_that_opened_the_socket() {
+        // the rule names whatever this test binary is called
+        let own = std::fs::read_link("/proc/self/exe").expect("own exe");
+        let name = own
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let router = Router::new(&json!({
+            "outbounds": [{"type": "direct", "tag": "d"}],
+            "route": {
+                "find_process": true,
+                "rules": [{"process_name": name, "outbound": "d"}],
+                "final": "d"
+            }
+        }))
+        .expect("router");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        let mut ctx = ConnContext::new(
+            "in",
+            client.local_addr().expect("source"),
+            Target::Ip(server.local_addr().expect("server")),
+            "tcp",
+        );
+        prepare(&mut ctx, true);
+        let owner = ctx.process.as_ref().expect("prepare found the owner");
+        assert_eq!(owner.path, own.to_string_lossy(), "this very test binary");
+        assert!(router.rules[0].matches(&ctx), "and the rule matches it");
+        drop((client, server));
     }
 
     #[test]

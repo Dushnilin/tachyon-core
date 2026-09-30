@@ -13,8 +13,14 @@ core-crypto = { path = "../core-crypto" }
 quinn-proto = { version = "0.11.18", default-features = false }
 bytes.workspace = true
 aes-gcm.workspace = true
+getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+# the key shares: the hybrid, its X25519 half, and the p256 point Firefox offers
+ml-kem.workspace = true
+x25519-dalek.workspace = true
+rand_core = { version = "0.6.4", default-features = false, features = ["getrandom"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdh"] }
 sha2.workspace = true
 
 [dev-dependencies]

@@ -119,3 +119,42 @@ defeats the static-musl goal) and pure-Rust Hello builders.
   the small hello as configured (measured: 517 bytes for `ios`/`edge`/`qq`
   against 1789 for `chrome`, both with and without `reality`), so our captures
   and tables serve the REALITY path unchanged and no substitution is made.
+
+## The key share we put our own keys into (F2, 2026-09-30)
+
+`core-tls/src/keyshare.rs`. The table supplies the *group list*; the share data
+is generated per handshake, because a captured key cannot complete an exchange.
+The layout was measured from the captures and read out of
+`refraction-networking/utls` `key_schedule.go`:
+
+| | group | bytes | contents |
+|---|---|---|---|
+| client share | `0x11ec` X25519MLKEM768 | 1216 | ML-KEM-768 **encapsulation key** (1184) ‖ X25519 (32) |
+| server share | `0x11ec` | 1120 | ML-KEM-768 **ciphertext** (1088) ‖ X25519 (32) |
+| shared secret | `0x11ec` | 64 | ML-KEM secret ‖ X25519 secret, in that order |
+
+The 1216 was the number to get right: it is not the 1120 the draft's arithmetic
+suggests, because the client sends the 1184-byte *encapsulation key*, not the
+1088-byte ciphertext, and a server that assumed otherwise would reject every
+hello. A test encapsulates against the very key the client offered and checks
+the secret comes out as `ML-KEM ‖ X25519`, so a swapped pair of halves fails
+there.
+
+Two details that are fingerprints in their own right:
+
+- Chrome and Firefox offer a **second, plain X25519 share** next to the hybrid,
+  and it is a *different* key from the hybrid's X25519 half — utls generates a
+  separate one "in line with Chrome" (`keySharePrivateKeys.mlkemEcdhe`). We do
+  the same; a client that reuses one key for both is not a browser.
+- Firefox also offers a `secp256r1` share (a 65-byte uncompressed point), so we
+  generate one too (`p256`, pure Rust) rather than offer a key we hold no
+  private half of. A group we cannot answer is an error at build time, never a
+  silent fallback.
+
+**GREASE is now drawn per handshake**, both for extension ids and for the
+GREASE key share group, as BoringSSL does. A constant GREASE value across
+connections is a signature in itself, and it is the one byte range where the
+reference already differs from itself. The cost is that no hello can be
+byte-identical to a capture any more: the rebuild tests are structural, exactly
+like the table test above.
+

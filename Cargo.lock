@@ -464,13 +464,18 @@ dependencies = [
  "aes-gcm",
  "bytes",
  "core-crypto",
+ "getrandom 0.3.4",
  "hkdf",
  "hmac",
+ "ml-kem",
+ "p256",
  "quinn-proto",
+ "rand_core 0.6.4",
  "rustls",
  "rustls-pemfile",
  "sha2",
  "webpki-roots 0.26.11",
+ "x25519-dalek",
 ]
 
 [[package]]

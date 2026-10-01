@@ -599,6 +599,17 @@ impl PostWriter {
 
         let seq = self.seq;
         self.seq += 1;
+        // One line per packet-up POST: which sequence number went out and how much
+        // of the caller's stream it carried. XHTTP turns every write into a packet,
+        // so this is the only place that can say whether what left matches what was
+        // handed in -- and a server that reads one buffer and parses the request out
+        // of it is very sensitive to a head arriving twice.
+        crate::logging::debug(format_args!(
+            "xhttp POST seq={seq} session={} bytes={} placement={:?}",
+            self.session_id,
+            chunk.len(),
+            self.cfg.meta.uplink_data
+        ));
         let payload = match self.cfg.meta.uplink_data {
             UplinkPlacement::Body => Some(Bytes::copy_from_slice(chunk)),
             UplinkPlacement::Header | UplinkPlacement::Cookie => None,

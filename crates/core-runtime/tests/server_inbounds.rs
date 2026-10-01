@@ -436,29 +436,32 @@ async fn trojan_server_refuses_an_unknown_command() {
     drop(instance);
 }
 
-/// A vmess server measured against our own client: two boxes in one process,
-/// the second one a SOCKS front door to a vmess outbound aimed at the first.
-/// The handshake, the answer header and both framed directions are the
-/// production code on both sides.
-async fn vmess_through_our_own_client(
-    server_uuid: &str,
-    client_uuid: &str,
+/// A server inbound measured against our own client: two boxes in one process,
+/// the second one a SOCKS front door to an outbound aimed at the first. The
+/// handshake and both framed directions are the production code on both sides.
+async fn through_our_own_client(
+    server_inbound: Value,
+    client_outbound: Value,
     payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
     let echo = spawn_echo().await;
+    let tag = server_inbound["tag"]
+        .as_str()
+        .expect("the server inbound needs a tag")
+        .to_string();
     let server = core_runtime::start(&cfg(
-        json!({
-            "type": "vmess",
-            "tag": "vmess-in",
-            "listen": "127.0.0.1",
-            "listen_port": free_port(),
-            "users": [{"name": "carol", "uuid": server_uuid}]
-        }),
+        server_inbound,
         json!([{"type": "direct", "tag": "direct"}]),
     ))
     .await
-    .expect("start vmess server");
-    let server_addr = inbound_addr(&server, "vmess-in");
+    .expect("start server");
+    let server_addr = inbound_addr(&server, &tag);
+    let mut outbound = client_outbound
+        .as_object()
+        .expect("the client outbound must be an object")
+        .clone();
+    outbound.insert("server".into(), json!("127.0.0.1"));
+    outbound.insert("server_port".into(), json!(server_addr.port()));
     let client = core_runtime::start(&json!({
         "log": {"level": "error"},
         "inbounds": [{
@@ -467,17 +470,11 @@ async fn vmess_through_our_own_client(
             "listen": "127.0.0.1",
             "listen_port": free_port()
         }],
-        "outbounds": [{
-            "type": "vmess",
-            "tag": "vmess-out",
-            "server": "127.0.0.1",
-            "server_port": server_addr.port(),
-            "uuid": client_uuid
-        }],
-        "route": {"final": "vmess-out"}
+        "outbounds": [Value::Object(outbound)],
+        "route": {"final": "out"}
     }))
     .await
-    .expect("start vmess client");
+    .expect("start client");
     let socks = inbound_addr(&client, "mixed-in");
 
     let mut stream = tokio::net::TcpStream::connect(socks).await?;
@@ -521,6 +518,20 @@ async fn vmess_through_our_own_client(
     Ok(got)
 }
 
+fn vmess_server(uuid: &str) -> Value {
+    json!({
+        "type": "vmess",
+        "tag": "vmess-in",
+        "listen": "127.0.0.1",
+        "listen_port": free_port(),
+        "users": [{"name": "carol", "uuid": uuid}]
+    })
+}
+
+fn vmess_client(uuid: &str) -> Value {
+    json!({"type": "vmess", "tag": "out", "uuid": uuid})
+}
+
 fn io_shutdown(err: std::io::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, err.to_string())
 }
@@ -528,9 +539,10 @@ fn io_shutdown(err: std::io::Error) -> std::io::Error {
 #[tokio::test]
 async fn vmess_server_carries_our_own_client_traffic() {
     let _guard = test_guard().await;
-    let got = vmess_through_our_own_client(
-        "b831381d-6324-4d53-ad4f-8cda48b30811",
-        "b831381d-6324-4d53-ad4f-8cda48b30811",
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let got = through_our_own_client(
+        vmess_server(uuid),
+        vmess_client(uuid),
         b"through-the-vmess-server",
     )
     .await
@@ -545,9 +557,9 @@ async fn vmess_server_refuses_an_unknown_uuid() {
     // socks front door flushes its success reply even when the dial fails, so
     // the handshake alone proves nothing. The auth id arithmetic itself is
     // covered by the unit tests in `inbound::vmess`.
-    let got = vmess_through_our_own_client(
-        "b831381d-6324-4d53-ad4f-8cda48b30811",
-        "00000000-0000-4000-8000-000000000000",
+    let got = through_our_own_client(
+        vmess_server("b831381d-6324-4d53-ad4f-8cda48b30811"),
+        vmess_client("00000000-0000-4000-8000-000000000000"),
         b"nope",
     )
     .await
@@ -575,4 +587,103 @@ async fn a_vmess_inbound_needs_users() {
     .expect("no users should not start");
     let chain = format!("{err:#}");
     assert!(chain.contains("missing users"), "{chain}");
+}
+
+fn ss_server(method: &str, password: &str) -> Value {
+    json!({
+        "type": "shadowsocks",
+        "tag": "ss-in",
+        "listen": "127.0.0.1",
+        "listen_port": free_port(),
+        "method": method,
+        "password": password
+    })
+}
+
+fn ss_client(method: &str, password: &str) -> Value {
+    json!({"type": "shadowsocks", "tag": "out", "method": method, "password": password})
+}
+
+/// Both AEAD families, each measured against our own client: the 2022 one with
+/// its sealed head and the legacy one with a bare address in the first chunk.
+/// The 2022 methods take a pre-shared key, so their password is base64.
+#[tokio::test]
+async fn shadowsocks_server_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    for (method, password) in [
+        ("2022-blake3-aes-128-gcm", "QUFBQUFBQUFBQUFBQUFBQQ=="),
+        (
+            "2022-blake3-chacha20-poly1305",
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=",
+        ),
+        ("aes-128-gcm", "hunter2"),
+        ("chacha20-ietf-poly1305", "hunter2"),
+    ] {
+        let got = through_our_own_client(
+            ss_server(method, password),
+            ss_client(method, password),
+            b"through-the-shadowsocks-server",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{method}: {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "through-the-shadowsocks-server",
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shadowsocks_server_refuses_a_wrong_password() {
+    let _guard = test_guard().await;
+    for (method, right, wrong) in [
+        (
+            "2022-blake3-aes-128-gcm",
+            "QUFBQUFBQUFBQUFBQUFBQQ==",
+            "QkJCQkJCQkJCQkJCQkJCQg==",
+        ),
+        ("aes-128-gcm", "hunter2", "wrong"),
+    ] {
+        let got =
+            through_our_own_client(ss_server(method, right), ss_client(method, wrong), b"nope")
+                .await
+                .unwrap_or_default();
+        assert!(got.is_empty(), "{method}: {got:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_shadowsocks_2022_server_wants_a_key_of_its_own_length() {
+    let _guard = test_guard().await;
+    let err = core_runtime::start(&cfg(
+        ss_server("2022-blake3-aes-128-gcm", "c2hvcnQ="),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .err()
+    .expect("a five-byte 2022 key should not start");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("must be 16 bytes"), "{chain}");
+}
+
+#[tokio::test]
+async fn a_shadowsocks_inbound_refuses_the_multi_user_shape() {
+    let _guard = test_guard().await;
+    let err = core_runtime::start(&cfg(
+        json!({
+            "type": "shadowsocks",
+            "tag": "ss-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "method": "2022-blake3-aes-128-gcm",
+            "users": [{"name": "dave", "password": "QUFBQUFBQUFBQUFBQUFBQQ=="}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .err()
+    .expect("a multi-user shadowsocks server should not start");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("multi-user"), "{chain}");
 }

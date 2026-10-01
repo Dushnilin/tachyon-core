@@ -330,8 +330,9 @@ impl Trojan {
         header.extend_from_slice(self.password_hash.as_bytes());
         header.extend_from_slice(b"\r\n");
         header.push(command);
-        // trojan numbers a domain 2 and keeps 4 for IPv6
-        header.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x02)?);
+        // trojan uses `M.SocksaddrSerializer`, so the family bytes are the
+        // SOCKS ones: 1 = IPv4, 4 = IPv6, 3 = domain
+        header.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x03)?);
         header.extend_from_slice(b"\r\n");
         let tcp =
             crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;

@@ -435,3 +435,144 @@ async fn trojan_server_refuses_an_unknown_command() {
     assert!(buf.is_empty(), "nothing may come back: {buf:?}");
     drop(instance);
 }
+
+/// A vmess server measured against our own client: two boxes in one process,
+/// the second one a SOCKS front door to a vmess outbound aimed at the first.
+/// The handshake, the answer header and both framed directions are the
+/// production code on both sides.
+async fn vmess_through_our_own_client(
+    server_uuid: &str,
+    client_uuid: &str,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let echo = spawn_echo().await;
+    let server = core_runtime::start(&cfg(
+        json!({
+            "type": "vmess",
+            "tag": "vmess-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "users": [{"name": "carol", "uuid": server_uuid}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start vmess server");
+    let server_addr = inbound_addr(&server, "vmess-in");
+    let client = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port()
+        }],
+        "outbounds": [{
+            "type": "vmess",
+            "tag": "vmess-out",
+            "server": "127.0.0.1",
+            "server_port": server_addr.port(),
+            "uuid": client_uuid
+        }],
+        "route": {"final": "vmess-out"}
+    }))
+    .await
+    .expect("start vmess client");
+    let socks = inbound_addr(&client, "mixed-in");
+
+    let mut stream = tokio::net::TcpStream::connect(socks).await?;
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    assert_eq!(greeting, [0x05, 0x00], "socks greeting");
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&[127, 0, 0, 1]);
+    request.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&request).await?;
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.map_err(io_shutdown)?;
+    let mut bnd = [0u8; 6];
+    stream.read_exact(&mut bnd).await.map_err(io_shutdown)?;
+    if reply[1] != 0x00 {
+        return Err(io_shutdown(std::io::Error::other(format!(
+            "socks connect refused: {reply:?}"
+        ))));
+    }
+    stream.write_all(payload).await?;
+    // the echo comes back through the server's own framing, so it arrives in
+    // whatever pieces the socket hands over
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut buf = [0u8; 4096];
+    while got.len() < payload.len() && std::time::Instant::now() < deadline {
+        let Ok(read) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
+                .await
+        else {
+            continue;
+        };
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    drop(client);
+    drop(server);
+    Ok(got)
+}
+
+fn io_shutdown(err: std::io::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, err.to_string())
+}
+
+#[tokio::test]
+async fn vmess_server_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let got = vmess_through_our_own_client(
+        "b831381d-6324-4d53-ad4f-8cda48b30811",
+        "b831381d-6324-4d53-ad4f-8cda48b30811",
+        b"through-the-vmess-server",
+    )
+    .await
+    .expect("vmess round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-the-vmess-server");
+}
+
+#[tokio::test]
+async fn vmess_server_refuses_an_unknown_uuid() {
+    let _guard = test_guard().await;
+    // No payload may come back. That is all a client can observe here: our own
+    // socks front door flushes its success reply even when the dial fails, so
+    // the handshake alone proves nothing. The auth id arithmetic itself is
+    // covered by the unit tests in `inbound::vmess`.
+    let got = vmess_through_our_own_client(
+        "b831381d-6324-4d53-ad4f-8cda48b30811",
+        "00000000-0000-4000-8000-000000000000",
+        b"nope",
+    )
+    .await
+    .unwrap_or_default();
+    assert!(
+        got.is_empty(),
+        "a refused connection must not carry the payload: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_vmess_inbound_needs_users() {
+    let _guard = test_guard().await;
+    let err = core_runtime::start(&cfg(
+        json!({
+            "type": "vmess",
+            "tag": "vmess-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port()
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .err()
+    .expect("no users should not start");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("missing users"), "{chain}");
+}

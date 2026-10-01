@@ -251,6 +251,14 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
+            "vmess" => {
+                let inbound = inbound::vmess::Vmess::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: vmess"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
             other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
         }
     }

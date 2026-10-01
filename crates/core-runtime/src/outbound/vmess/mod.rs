@@ -3,9 +3,9 @@
 //! global padding, and authenticated length. Legacy CFB headers, transports,
 //! and UDP packet commands are not implemented yet.
 
-mod framing;
+pub(crate) mod framing;
 pub(crate) mod kdf;
-mod wire;
+pub(crate) mod wire;
 
 use std::io;
 use std::pin::Pin;

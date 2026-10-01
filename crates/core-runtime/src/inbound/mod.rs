@@ -19,6 +19,7 @@ pub mod proxy;
 pub mod redirect;
 pub mod tproxy;
 pub(crate) mod udp;
+pub mod vmess;
 
 /// Object-safe stream for dial results (TCP, TLS, future transports).
 pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -65,24 +66,42 @@ enum LazyReply {
 /// moment the dial returns), and defensively on the first read/write as well
 /// (reference `LazyConn`) for a path that establishes the upstream silently.
 pub struct ClientConn {
-    inner: TcpStream,
+    inner: AnyStream,
     reply: LazyReply,
+    /// the socket's address, kept here because a boxed stream has none to ask:
+    /// `direct` needs it to work out its destination, and only ever holds a
+    /// real socket there
+    local: Option<SocketAddr>,
 }
 
 impl ClientConn {
     /// SOCKS path: success `reply` bytes flush on first payload I/O.
     pub fn socks(inner: TcpStream, reply: Vec<u8>) -> Self {
+        let local = inner.local_addr().ok();
         Self {
-            inner,
+            inner: Box::new(inner),
             reply: LazyReply::Pending(reply),
+            local,
         }
     }
 
     /// HTTP CONNECT path: the 200 response is written by the caller.
     pub fn http(inner: TcpStream) -> Self {
+        let local = inner.local_addr().ok();
+        Self {
+            inner: Box::new(inner),
+            reply: LazyReply::None,
+            local,
+        }
+    }
+
+    /// A stream that carries a protocol frame of its own -- what the server
+    /// inbounds hand over once they have unwrapped the request.
+    pub fn framed(inner: AnyStream, local: SocketAddr) -> Self {
         Self {
             inner,
             reply: LazyReply::None,
+            local: Some(local),
         }
     }
 
@@ -123,7 +142,8 @@ impl ClientConn {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        self.local
+            .ok_or_else(|| io::Error::other("this stream has no socket address"))
     }
 
     fn poll_flush_reply(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -495,7 +515,17 @@ pub(crate) async fn drive_transparent(
     tag: &str,
     router: &Arc<Router>,
 ) -> io::Result<()> {
-    let mut client = ClientConn::http(stream);
+    drive_framed(ClientConn::http(stream), peer, destination, tag, router).await
+}
+
+/// The same routing decision for a stream that already carries its own frame.
+pub(crate) async fn drive_framed(
+    mut client: ClientConn,
+    peer: SocketAddr,
+    destination: Target,
+    tag: &str,
+    router: &Arc<Router>,
+) -> io::Result<()> {
     let mut ctx = ConnContext::new(tag, peer, destination, "tcp");
     let decision = match router.route(&mut client, &mut ctx).await {
         Ok(decision) => decision,

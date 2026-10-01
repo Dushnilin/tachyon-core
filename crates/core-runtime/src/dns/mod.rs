@@ -7,6 +7,7 @@
 mod cache;
 pub mod codec;
 pub mod group;
+pub mod mdns;
 mod rules;
 pub mod transport;
 
@@ -30,6 +31,9 @@ const DEFAULT_OPTIMISTIC_TIMEOUT: Duration = Duration::from_secs(3 * 24 * 3600);
 const REVERSE_CAPACITY: usize = 1024;
 /// Address resolution probes both families unless the strategy says otherwise.
 const RESOLVE_TIMEOUT_GUARD: Duration = Duration::from_secs(10);
+/// The reference's `mdnsTimeout`: an mDNS answer is either already on the LAN
+/// or it is not coming.
+const MDNS_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -448,6 +452,12 @@ impl DnsService {
                 return self.answer(&target, &raw, info.id);
             }
             Kind::Local => {
+                if mdns::is_local_domain(&info.name)
+                    && let Some(mdns_result) = self.local_zone_mdns(query).await
+                {
+                    let raw = mdns_result?;
+                    return self.answer(&target, &raw, info.id);
+                }
                 let addrs = match self.neighbor_lookup(&target, &info.name) {
                     Some(addresses) => addresses,
                     None => system_lookup(&info.name).await,
@@ -605,6 +615,10 @@ impl DnsService {
         cfg: &ServerConfig,
         query: &[u8],
     ) -> std::io::Result<Vec<u8>> {
+        if cfg.kind == Kind::Mdns {
+            // no address to resolve: the query goes to the multicast group
+            return self.mdns_exchange(cfg, query).await;
+        }
         let addr = self.resolve_server_addr(cfg, 0).await?;
         // reference `prepareExchangeMessage`: `client_subnet` rides along on
         // every query we send upstream
@@ -614,6 +628,36 @@ impl DnsService {
         };
         let raw = transport::exchange(cfg, addr, &query, &self.dialer()).await?;
         Ok(raw)
+    }
+
+    /// The mDNS lookup behind a `mdns` server. The reference waits one second
+    /// unless the caller gave it a longer deadline, so a plain `timeout` is the
+    /// ceiling here too.
+    async fn mdns_exchange(&self, cfg: &ServerConfig, query: &[u8]) -> std::io::Result<Vec<u8>> {
+        let ifaces = mdns::interfaces(&cfg.mdns_interfaces)?;
+        mdns::exchange(query, &ifaces, cfg.timeout.min(MDNS_TIMEOUT)).await
+    }
+
+    /// The mDNS lookup behind a `local` server, which the reference gives to the
+    /// LAN for every name in an mDNS zone (`local.ExchangeAsync`): the `mdns`
+    /// transport when one is configured, the multicast group otherwise.
+    async fn local_zone_mdns(&self, query: &[u8]) -> Option<std::io::Result<Vec<u8>>> {
+        let cfg = self
+            .servers
+            .values()
+            .find(|cfg| cfg.kind == Kind::Mdns)
+            .cloned();
+        let (interfaces, timeout) = match &cfg {
+            Some(cfg) => (cfg.mdns_interfaces.clone(), cfg.timeout),
+            None => (Vec::new(), transport::DEFAULT_DNS_TIMEOUT),
+        };
+        Some(
+            async move {
+                let ifaces = mdns::interfaces(&interfaces)?;
+                mdns::exchange(query, &ifaces, timeout.min(MDNS_TIMEOUT)).await
+            }
+            .await,
+        )
     }
 
     /// Resolve the transport's own address (domain servers via
@@ -711,6 +755,11 @@ impl DnsService {
         }
         if cfg.kind == Kind::Local {
             let (query_msg, info) = codec::parse_query(query)?;
+            if mdns::is_local_domain(&info.name)
+                && let Some(mdns_result) = self.local_zone_mdns(query).await
+            {
+                return mdns_result;
+            }
             let addrs = match self.neighbor_lookup(cfg, &info.name) {
                 Some(addresses) => addresses,
                 None => system_lookup(&info.name).await,
@@ -1031,6 +1080,38 @@ mod tests {
         assert_eq!(svc.strategy, Strategy::PreferIPv4);
         assert_eq!(svc.rules.len(), 1);
         assert!(svc.fakeip_stores().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn a_local_server_hands_mdns_zones_to_the_lan() {
+        // the mdns server names an interface that does not exist, so the query
+        // fails with the mDNS error instead of quietly falling through to the
+        // system resolver -- which is how we know the hand-off happened
+        let root = serde_json::json!({
+            "dns": {
+                "servers": [
+                    {"type": "mdns", "tag": "m", "interface": "no-such-interface"},
+                    {"type": "local", "tag": "l"}
+                ],
+                "final": "l",
+                "disable_cache": true
+            }
+        });
+        let svc = Arc::new(DnsService::build(&root).unwrap().expect("service"));
+        let meta = QueryMeta {
+            inbound: Some("dns-in".into()),
+            source: None,
+            network: Some("udp".into()),
+        };
+        let query = codec::build_query(1, "printer.local", RecordType::A).expect("query");
+        let err = svc
+            .exchange(&meta, &query, true)
+            .await
+            .expect_err("no interface, no mDNS answer");
+        assert!(
+            err.to_string().contains("missing usable mDNS interfaces"),
+            "{err}"
+        );
     }
 
     #[test]

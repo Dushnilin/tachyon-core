@@ -18,7 +18,7 @@ use crate::outbound::transport::h2io::{H2Io, H2Stream};
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
 
-const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -35,6 +35,8 @@ pub enum Kind {
     Local,
     /// the hosts file(s) plus inline `predefined` entries
     Hosts,
+    /// mDNS: one multicast query per interface, answers merged
+    Mdns,
     /// lx `group`: several member servers behind one tag
     Group,
 }
@@ -63,6 +65,8 @@ pub struct ServerConfig {
     /// `type: local` with `neighbor_domain`: the suffixes a `<host><suffix>`
     /// name is answered from the neighbour tables under.
     pub neighbor_domain: Vec<String>,
+    /// `type: mdns`: the interfaces to query, empty for all of them
+    pub mdns_interfaces: Vec<String>,
 }
 
 /// The `hosts` server's sources: the files it reads and the inline entries,
@@ -394,6 +398,7 @@ impl ServerConfig {
             "fakeip" => Kind::Fakeip,
             "local" => Kind::Local,
             "hosts" => Kind::Hosts,
+            "mdns" => Kind::Mdns,
             "group" => Kind::Group,
             other => anyhow::bail!("{at}: dns server type {other:?} not implemented yet"),
         };
@@ -449,7 +454,7 @@ impl ServerConfig {
                 Kind::Udp | Kind::Tcp | Kind::Tls => 53,
                 Kind::Https | Kind::H3 => 443,
                 Kind::Quic => 853,
-                Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Group => 0,
+                Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Mdns | Kind::Group => 0,
             });
         // dns tls/https/quic/h3 servers implicitly use TLS: the reference
         // forces `enabled` on when the key is absent, and builds a client with
@@ -508,9 +513,12 @@ impl ServerConfig {
         } else {
             (None, None)
         };
-        // fakeip, local, hosts and group never dial a server, so they need no
+        // fakeip, local, hosts, mdns and group never dial a server, so they need no
         // address
-        let needs_server = !matches!(kind, Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Group);
+        let needs_server = !matches!(
+            kind,
+            Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Mdns | Kind::Group
+        );
         if needs_server && server.is_empty() {
             anyhow::bail!("{at}: missing server");
         }
@@ -601,6 +609,16 @@ impl ServerConfig {
                 .collect(),
             Some(_) => anyhow::bail!("{at}.neighbor_domain: must be a string or a list"),
         };
+        let mdns_interfaces = match map.get("interface") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(entry)) => vec![entry.clone()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(_) => anyhow::bail!("{at}.interface: must be a string or a list"),
+        };
         Ok(Self {
             tag,
             kind,
@@ -618,6 +636,7 @@ impl ServerConfig {
             hosts,
             group,
             neighbor_domain,
+            mdns_interfaces,
         })
     }
 
@@ -700,6 +719,8 @@ pub async fn exchange(
 ) -> io::Result<Vec<u8>> {
     let fut = async {
         match cfg.kind {
+            // mdns has no server address: the router runs it before it gets here
+            Kind::Mdns => Err(io::Error::other("dns: mdns server has no address")),
             Kind::Udp => exchange_udp(dialer, cfg, addr, query).await,
             Kind::Tcp => {
                 let stream = dialer.tcp(cfg, addr).await?;
@@ -1122,6 +1143,27 @@ mod tests {
         assert_eq!(store.lookup_address("c.example", false), Some(b));
         assert!(store.contains(a));
         assert!(!store.contains("198.17.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_mdns_server_needs_no_address_and_takes_an_interface_list() {
+        let cfg = ServerConfig::build(
+            &serde_json::json!({"type": "mdns", "tag": "m", "interface": "eth0"}),
+            "dns.servers[0]",
+        )
+        .expect("mdns server");
+        assert_eq!(cfg.kind, Kind::Mdns);
+        assert_eq!(cfg.mdns_interfaces, vec!["eth0".to_string()]);
+        let list = ServerConfig::build(
+            &serde_json::json!({"type": "mdns", "tag": "m", "interface": ["eth0", "eth1"]}),
+            "dns.servers[0]",
+        )
+        .expect("mdns server with a list");
+        assert_eq!(list.mdns_interfaces.len(), 2);
+        // and no interface at all means every one of them
+        let all = ServerConfig::build(&serde_json::json!({"type": "mdns"}), "dns.servers[0]")
+            .expect("mdns server with no interface");
+        assert!(all.mdns_interfaces.is_empty());
     }
 
     #[test]

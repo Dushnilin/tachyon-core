@@ -16,19 +16,19 @@ static MODE: RwLock<&'static str> = RwLock::new(RULE);
 static STORE: OnceLock<Mutex<Option<SharedCacheFile>>> = OnceLock::new();
 
 /// The runtime hands the cache handle over so a mode change can be persisted,
-/// the way the reference keeps `bucketMode`.
+/// the way the reference keeps `bucketMode`, and the mode that was in the cache
+/// becomes the mode we start in.
 pub fn attach_store(store: Option<SharedCacheFile>) {
-    *STORE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("clash mode store") = store;
-    if let Some(store) = &STORE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("store")
-        .as_ref()
-        && let Ok(guard) = store.lock()
-        && let Some(mode) = guard.get(crate::cache_file::BUCKET_MODE, b"mode")
+    let slot = STORE.get_or_init(|| Mutex::new(None));
+    *slot.lock().expect("clash mode store") = store;
+    let guard = slot.lock().expect("store");
+    let Some(store) = guard.as_ref() else {
+        return;
+    };
+    let Ok(cache) = store.lock() else {
+        return;
+    };
+    if let Some(mode) = cache.get(crate::cache_file::BUCKET_MODE, b"mode")
         && let Ok(mode) = String::from_utf8(mode)
     {
         set(mode.trim());

@@ -50,6 +50,8 @@ const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 const SETTINGS_H3_DATAGRAM_00: u64 = 0x276;
 
 const INITIAL_MTU: u16 = 1242;
+/// Memory quinn keeps for its datagram queue, not a read buffer, so it is a
+/// round 64 KiB rather than the 65_535-byte datagram maximum.
 const DATAGRAM_BUFFER: usize = 65_536;
 const STREAM_WINDOW: u64 = 8 << 20;
 const CONNECTION_WINDOW: u64 = 16 << 20;

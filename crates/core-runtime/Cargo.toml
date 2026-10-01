@@ -40,6 +40,7 @@ h2.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 hickory-proto.workspace = true
+if-addrs.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 http.workspace = true

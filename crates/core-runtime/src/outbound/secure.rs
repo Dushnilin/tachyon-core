@@ -9,33 +9,6 @@ use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
 
-fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    match target {
-        Target::Ip(addr) => match addr.ip() {
-            std::net::IpAddr::V4(v4) => {
-                out.push(0x01);
-                out.extend_from_slice(&v4.octets());
-            }
-            std::net::IpAddr::V6(v6) => {
-                out.push(0x04);
-                out.extend_from_slice(&v6.octets());
-            }
-        },
-        Target::Domain(host, _) => {
-            out.push(0x02);
-            let raw = host.as_bytes();
-            if raw.len() > 255 {
-                return Err(io::Error::other("domain too long"));
-            }
-            out.push(raw.len() as u8);
-            out.extend_from_slice(raw);
-        }
-    }
-    out.extend_from_slice(&target.port().to_be_bytes());
-    Ok(out)
-}
-
 /// vless address block: port first, then ATYP (1=v4, 2=domain, 3=v6) + addr.
 fn encode_vless_target(target: &Target) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -64,6 +37,10 @@ fn encode_vless_target(target: &Target) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// vless wants a canonical UUID and nothing else, which is not what vmess and
+/// tuic want: those fall back to a UUIDv5 of the raw string
+/// (`vmess::kdf::parse_uuid`). Two functions on purpose -- sharing one would
+/// either hand vless a UUID nobody configured, or refuse vmess names.
 fn parse_uuid(raw: &str) -> io::Result<[u8; 16]> {
     let hex: String = raw.chars().filter(|c| *c != '-').collect();
     if hex.len() != 16 * 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -353,7 +330,8 @@ impl Trojan {
         header.extend_from_slice(self.password_hash.as_bytes());
         header.extend_from_slice(b"\r\n");
         header.push(command);
-        header.extend_from_slice(&encode_target(target)?);
+        // trojan numbers a domain 2 and keeps 4 for IPv6
+        header.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x02)?);
         header.extend_from_slice(b"\r\n");
         let tcp =
             crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;

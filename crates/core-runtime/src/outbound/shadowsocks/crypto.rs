@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use std::io;
 
 use aes_gcm::aead::AeadInPlace;
@@ -176,43 +177,12 @@ pub fn master_key(method: Method, password: &str) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Standard base64 with padding, as the reference decodes it: a length that is
+/// not a multiple of four and anything outside the alphabet are errors.
 pub(crate) fn decode_base64_std(input: &str) -> io::Result<Vec<u8>> {
-    if !input.len().is_multiple_of(4) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "base64 length"));
-    }
-    let mut unpadded = input.as_bytes();
-    while unpadded.last() == Some(&b'=') {
-        unpadded = &unpadded[..unpadded.len() - 1];
-    }
-    if input.len() - unpadded.len() > 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "base64 padding"));
-    }
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    let mut out = Vec::with_capacity(unpadded.len() * 3 / 4);
-    for &byte in unpadded {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "base64 alphabet",
-                ));
-            }
-        };
-        acc = (acc << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Ok(out)
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {

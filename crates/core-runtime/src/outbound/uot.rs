@@ -20,6 +20,8 @@ pub(crate) const UOT_LEGACY_MAGIC: &str = "sp.udp-over-tcp.arpa";
 /// uot v2, the version the reference defaults to.
 pub(crate) const UOT_DEFAULT_VERSION: u8 = 2;
 
+/// One UDP payload at its largest: an IPv4 datagram carries 65_535 bytes and a
+/// uot header byte comes out of that, so this is the most a read can return.
 const DATAGRAM_BUF: usize = 65_535;
 
 /// `uot.WriteRequest`: `[is_connect][addr type][addr][port]`.
@@ -66,6 +68,10 @@ pub(crate) fn spawn_bridge(stream: AnyStream, peer: UdpSocket) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let peer_send = Arc::new(peer);
     let peer_recv = Arc::clone(&peer_send);
+    // One buffer per direction: both tasks read at the same time, so one shared
+    // buffer would mean a lock on the data path. That is 128 KiB per relay, which
+    // is what it costs to never truncate a datagram -- ponytail: fine while the
+    // number of concurrent UDP relays is small, pool the buffers if it is not.
     tokio::spawn(async move {
         let mut buf = vec![0u8; DATAGRAM_BUF];
         loop {

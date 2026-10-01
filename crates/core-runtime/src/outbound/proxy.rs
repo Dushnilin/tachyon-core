@@ -32,7 +32,10 @@ fn credentials(obj: &serde_json::Map<String, Value>) -> Option<(String, String)>
     Some((username.to_string(), password.to_string()))
 }
 
-pub(crate) fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
+/// SOCKS-shaped address block: ATYP, address, then the port. SOCKS, anytls
+/// and shadowsocks number a domain 3 and an IPv6 address 4; trojan numbers a
+/// domain 2 and keeps 4 for IPv6, which is the only difference between them.
+pub(crate) fn encode_target_with(target: &Target, domain_atyp: u8) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     match target {
         Target::Ip(addr) => match addr.ip() {
@@ -46,7 +49,7 @@ pub(crate) fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
             }
         },
         Target::Domain(host, _) => {
-            out.push(0x03);
+            out.push(domain_atyp);
             let raw = host.as_bytes();
             if raw.len() > 255 {
                 return Err(io::Error::other("domain too long"));
@@ -57,6 +60,11 @@ pub(crate) fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
     }
     out.extend_from_slice(&target.port().to_be_bytes());
     Ok(out)
+}
+
+/// The SOCKS numbering: a domain is 3.
+pub(crate) fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
+    encode_target_with(target, 0x03)
 }
 
 /// socks outbound; `version` is 4 or 5 (5 by default), as in the reference.

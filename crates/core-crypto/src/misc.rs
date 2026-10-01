@@ -1,3 +1,9 @@
+/// Join slice constants into one array constant. `concat!` only takes literals
+/// and no stable way to build `[T; A.len() + B.len()]` from two slices exists
+/// yet (the `generic_const_exprs` gap), so this does it with a loop in a const
+/// block. Three users, all cipher-suite tables.
+/// ponytail: temporary scaffold -- drop it for `concat!` once const slice
+/// concatenation is stable, or for a build script if it is not on the way.
 #[macro_export]
 macro_rules! const_concat_slices {
     ($ty:ty, $a:expr, $b:expr $(,)*) => {{

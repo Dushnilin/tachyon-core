@@ -8,6 +8,7 @@
 //! - field allowlists for protocols other than hysteria2/tuic;
 //! - PEM/x509 content parsing of server certificates (presence only).
 
+use base64::Engine as _;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -9967,41 +9968,10 @@ fn valid_uuid(uuid: &str) -> bool {
 }
 
 /// Standard base64 with padding (Go `base64.StdEncoding`).
+/// Standard base64 with padding; anything the alphabet does not cover, or a
+/// length that is not a multiple of four, is not a key.
 fn decode_base64_std(input: &str) -> Option<Vec<u8>> {
-    if !input.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut unpadded = input.as_bytes();
-    while unpadded.last() == Some(&b'=') {
-        unpadded = &unpadded[..unpadded.len() - 1];
-    }
-    if input.len() - unpadded.len() > 2 {
-        return None;
-    }
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    let mut out = Vec::with_capacity(unpadded.len() * 3 / 4);
-    for &byte in unpadded {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    if acc != 0 {
-        return None;
-    }
-    Some(out)
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
 /// Raw base64url without padding (Go `base64.RawURLEncoding`).

@@ -3,6 +3,7 @@
 
 use std::net::IpAddr;
 
+use base64::Engine as _;
 use hickory_proto::rr::RecordType;
 use regex::Regex;
 use serde_json::Value;
@@ -415,32 +416,16 @@ fn build_predefined(
     })
 }
 
-/// Standard base64 with padding, as the reference decoder expects.
+/// Standard base64 with padding, as the reference decoder expects. Wrapped
+/// lines are tolerated because base64 URLs arrive that way.
 pub fn base64_decode(raw: &str) -> anyhow::Result<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut lookup = [255u8; 256];
-    for (index, byte) in TABLE.iter().enumerate() {
-        lookup[*byte as usize] = index as u8;
-    }
-    let mut out = Vec::with_capacity(raw.len() / 4 * 3);
-    let mut buffer = 0u32;
-    let mut bits = 0u32;
-    for byte in raw.bytes() {
-        if byte == b'=' || byte == b'\n' || byte == b'\r' {
-            continue;
-        }
-        let value = lookup[byte as usize];
-        if value == 255 {
-            anyhow::bail!("illegal base64 data at input byte {byte}");
-        }
-        buffer = (buffer << 6) | value as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Ok(out)
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '=' | '\n' | '\r'))
+        .collect();
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(cleaned)
+        .map_err(|e| anyhow::anyhow!("illegal base64 data: {e}"))
 }
 
 fn domain_suffix_match(name: &str, suffix: &str) -> bool {

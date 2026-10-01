@@ -62,7 +62,7 @@ impl Shadowsocks {
         let mut out = Vec::with_capacity(salt.len() + 256);
         out.extend_from_slice(&salt);
         let mut writer_counter = 0u64;
-        let mut addr = encode_target(target)?;
+        let mut addr = crate::outbound::proxy::encode_target(target)?;
         if is_2022 {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -123,33 +123,6 @@ impl Shadowsocks {
         };
         Ok((reader, writer))
     }
-}
-
-fn encode_target(target: &Target) -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    match target {
-        Target::Ip(addr) => match addr.ip() {
-            std::net::IpAddr::V4(v4) => {
-                out.push(0x01);
-                out.extend_from_slice(&v4.octets());
-            }
-            std::net::IpAddr::V6(v6) => {
-                out.push(0x04);
-                out.extend_from_slice(&v6.octets());
-            }
-        },
-        Target::Domain(host, _) => {
-            out.push(0x03);
-            let raw = host.as_bytes();
-            if raw.len() > 255 {
-                return Err(io::Error::other("domain too long"));
-            }
-            out.push(raw.len() as u8);
-            out.extend_from_slice(raw);
-        }
-    }
-    out.extend_from_slice(&target.port().to_be_bytes());
-    Ok(out)
 }
 
 pub struct SsWriter<W> {

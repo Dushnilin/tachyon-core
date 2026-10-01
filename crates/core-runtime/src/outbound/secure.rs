@@ -54,6 +54,9 @@ fn parse_uuid(raw: &str) -> io::Result<[u8; 16]> {
     Ok(uuid)
 }
 
+/// The only flow the reference accepts (`vless.NewClient`).
+const FLOW: &str = "xtls-rprx-vision";
+
 /// vless outbound (TCP command, with the `xtls-rprx-vision` flow).
 pub struct Vless {
     server: String,
@@ -115,12 +118,7 @@ impl Vless {
     }
 
     async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
-        let mut header = Vec::with_capacity(24 + 8);
-        header.push(0x00);
-        header.extend_from_slice(&self.uuid);
-        header.push(0x00);
-        header.push(command);
-        header.extend_from_slice(&encode_vless_target(target)?);
+        let header = request_head(&self.uuid, command, target, self.vision)?;
         let tcp =
             crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         // a ws transport with early data carries the request in the upgrade head
@@ -154,6 +152,31 @@ impl Vless {
             Ok(framed)
         }
     }
+}
+
+/// `[version][uuid][addonsLen][addons][command][addr][port]`, reference
+/// `WriteRequest`. The flow travels in the addons as protobuf field 1, and a
+/// server with `flow` on the user refuses a request without it.
+fn request_head(
+    uuid: &[u8; 16],
+    command: u8,
+    target: &Target,
+    vision: bool,
+) -> io::Result<Vec<u8>> {
+    let mut addons = Vec::new();
+    if vision {
+        addons.push(0x0a); // field 1, wire type 2
+        addons.push(FLOW.len() as u8); // 17 bytes, so a one-byte uvarint
+        addons.extend_from_slice(FLOW.as_bytes());
+    }
+    let mut header = Vec::with_capacity(24 + addons.len());
+    header.push(0x00);
+    header.extend_from_slice(uuid);
+    header.push(addons.len() as u8);
+    header.extend_from_slice(&addons);
+    header.push(command);
+    header.extend_from_slice(&encode_vless_target(target)?);
+    Ok(header)
 }
 
 /// vless response ([version][addonsLen][addons]) is sent lazily by servers on

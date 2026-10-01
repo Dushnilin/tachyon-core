@@ -8,6 +8,26 @@ use tokio::io::AsyncReadExt;
 
 use super::Vless;
 
+/// The flow has to be *announced*: a server with `flow` on the user answers a
+/// request without it with `flow mismatch: expected xtls-rprx-vision, but got
+/// none`, which is what the reference did to us until the addon went out.
+#[test]
+fn the_flow_travels_in_the_request_addons() {
+    use crate::inbound::Target;
+    let uuid = [0x11u8; 16];
+    let target = Target::Ip("127.0.0.1:443".parse().expect("addr"));
+
+    let plain = super::request_head(&uuid, 0x01, &target, false).expect("plain head");
+    assert_eq!(plain[17], 0, "a plain request carries no addons");
+    assert_eq!(plain.len(), 17 + 1 + 1 + 7);
+
+    let vision = super::request_head(&uuid, 0x01, &target, true).expect("vision head");
+    assert_eq!(vision[17], 18, "1 tag + 1 length + 16 bytes of flow");
+    assert_eq!(&vision[18..36], b"\x0a\x10xtls-rprx-vision");
+    assert_eq!(vision[36], 0x01, "the command follows the addons");
+    assert_eq!(vision.len(), 36 + 1 + 7);
+}
+
 /// trojan's destination block is `M.SocksaddrSerializer`, whose family bytes
 /// are 1 = IPv4, 4 = IPv6 and 3 = FQDN (sing's `common/metadata/family.go`).
 /// A domain written as 2 is what every trojan server on the wire rejects, and
@@ -78,7 +98,7 @@ async fn serve(listener: tokio::net::TcpListener) -> Vec<u8> {
     seen
 }
 
-/// `[0x00][uuid][0x00 addons_len][command][port:u16][addr_type][len][addr]`
+/// `[0x00][uuid][addons][command][port:u16][addr_type][len][addr]`
 fn request_head_with(command: u8) -> Vec<u8> {
     let mut head = vec![0x00];
     head.extend_from_slice(&UUID);
@@ -91,6 +111,20 @@ fn request_head_with(command: u8) -> Vec<u8> {
 
 fn request_head() -> Vec<u8> {
     request_head_with(1)
+}
+
+/// The same head with the flow addon in it, which is what a Vision outbound
+/// sends: `[0x00][uuid][18 addons][command]...`
+fn vision_request_head() -> Vec<u8> {
+    let mut head = vec![0x00];
+    head.extend_from_slice(&UUID);
+    head.extend_from_slice(&[18, 0x0a, 16]);
+    head.extend_from_slice(b"xtls-rprx-vision");
+    head.push(0x01);
+    head.extend_from_slice(&(80u16).to_be_bytes());
+    head.extend_from_slice(&[0x02, 11]);
+    head.extend_from_slice(b"example.com");
+    head
 }
 
 #[tokio::test]
@@ -136,12 +170,8 @@ async fn vision_frames_the_payload_behind_the_uuid() {
     drop(stream);
 
     let seen = server.await.expect("join");
-    let head = request_head();
-    assert_eq!(
-        &seen[..head.len()],
-        &head[..],
-        "the request head is untouched"
-    );
+    let head = vision_request_head();
+    assert_eq!(&seen[..head.len()], &head[..], "the request head");
 
     // the payload arrives as [uuid][command][content_len][pad_len][content][pad]
     let payload = b"GET / HTTP/1.1\r\n\r\n";

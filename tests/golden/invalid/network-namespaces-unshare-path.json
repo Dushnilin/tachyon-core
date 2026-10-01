@@ -1,0 +1,14 @@
+{
+  "log": { "level": "info" },
+  "network_namespaces": [
+    {
+      "type": "unshare",
+      "tag": "fresh",
+      "path": "/run/netns/sing"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": { "final": "direct" }
+}

@@ -27,6 +27,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "services",
     "experimental",
     "http_clients",
+    "network_namespaces",
 ];
 
 const KNOWN_LOG_FIELDS: &[&str] = &["disabled", "level", "timestamp", "output", "time"];
@@ -4071,6 +4072,64 @@ fn validate_tuic_in_decode(
 }
 
 /// Validate a parsed configuration document against reference `check` rules.
+/// `network_namespaces`: a list of `{"type": "", "tag": "", "path": ""}` or
+/// `{"type": "unshare", "tag": "", "pid_file": ""}`, the reference's
+/// discriminated union on `type`.
+fn validate_network_namespaces(value: &Value) -> Result<(), String> {
+    let list = value
+        .as_array()
+        .ok_or_else(|| "network_namespaces: must be a list".to_string())?;
+    for (index, entry) in list.iter().enumerate() {
+        let at = format!("network_namespaces[{index}]");
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("{at}: must be an object"))?;
+        let tag = obj
+            .get("tag")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{at}: missing tag"))?;
+        if tag.is_empty() {
+            return Err(format!("{at}: missing tag"));
+        }
+        match obj.get("type").and_then(Value::as_str).unwrap_or("") {
+            "" | "default" => {
+                let path = obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{at}: missing path"))?;
+                if path.is_empty() {
+                    return Err(format!("{at}: missing path"));
+                }
+                // the reference decodes `default` with only its own fields, so a
+                // foreign one is an unknown field rather than a semantic check
+                if obj.contains_key("pid_file") {
+                    return Err(format!("{at}.pid_file: json: unknown field \"pid_file\""));
+                }
+            }
+            "unshare" => {
+                if obj.contains_key("path") {
+                    return Err(format!("{at}.path: json: unknown field \"path\""));
+                }
+                if let Some(pid_file) = obj.get("pid_file")
+                    && !pid_file.is_null()
+                    && pid_file.as_str().is_none_or(str::is_empty)
+                {
+                    return Err(format!("{at}.pid_file: must be a non-empty string"));
+                }
+            }
+            other => {
+                return Err(format!("{at}: unknown network namespace type: {other}"));
+            }
+        }
+    }
+    // after the decode, which is where Go puts it: `NewManager` refuses a
+    // populated list off Linux (`common/netns/manager_stub.go`)
+    if !list.is_empty() && !cfg!(target_os = "linux") {
+        return Err("network namespaces are only supported on Linux".to_string());
+    }
+    Ok(())
+}
+
 pub fn validate(root: &Value) -> Result<(), String> {
     let root = root
         .as_object()
@@ -4093,6 +4152,9 @@ pub fn validate(root: &Value) -> Result<(), String> {
 
     if let Some(clients) = root.get("http_clients") {
         validate_http_clients(clients)?;
+    }
+    if let Some(namespaces) = root.get("network_namespaces") {
+        validate_network_namespaces(namespaces)?;
     }
     if let Some(log) = root.get("log") {
         validate_log(log)?;
@@ -10004,6 +10066,86 @@ fn decode_base64_url_raw(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// The `network_namespaces` section: a discriminated union on `type` with
+    /// `tag` required, the path only for `default` and the pid file only for
+    /// `unshare` -- reference `option.NetworkNamespace`.
+    /// One entry of the section, as the JSON an operator would write.
+    fn netns_err(entry: &str) -> String {
+        let entry: Value = serde_json::from_str(entry).expect("test json");
+        validate(&json!({
+            "outbounds": [{"type": "direct", "tag": "d"}],
+            "network_namespaces": [entry],
+        }))
+        .expect_err("should be rejected")
+    }
+
+    #[test]
+    fn network_namespaces_is_refused_off_linux() {
+        // common/netns/manager_stub.go: an empty list is fine everywhere, a
+        // populated one is a Linux-only feature
+        assert!(
+            validate(&json!({
+                "outbounds": [{"type": "direct", "tag": "d"}],
+                "network_namespaces": [],
+            }))
+            .is_ok()
+        );
+        let result = validate(&json!({
+            "outbounds": [{"type": "direct", "tag": "d"}],
+            "network_namespaces": [{"tag": "v", "path": "/run/netns/a"}],
+        }));
+        if cfg!(target_os = "linux") {
+            assert!(result.is_ok(), "{:?}", result.err());
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                "network namespaces are only supported on Linux"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn network_namespaces_accepts_both_types() {
+        for section in [
+            json!({"type": "default", "tag": "vpn", "path": "/run/netns/sing"}),
+            json!({"tag": "vpn", "path": "sing"}),
+            json!({"type": "unshare", "tag": "fresh"}),
+            json!({"type": "unshare", "tag": "fresh", "pid_file": "/tmp/pid"}),
+        ] {
+            let result = validate(&json!({
+                "outbounds": [{"type": "direct", "tag": "d"}],
+                "network_namespaces": [section.clone()],
+            }));
+            assert!(result.is_ok(), "{section} should pass: {:?}", result.err());
+        }
+    }
+
+    #[test]
+    fn network_namespaces_wants_a_list_of_tagged_objects() {
+        let err = validate(&json!({"outbounds": [], "network_namespaces": {}}))
+            .expect_err("an object, not a list");
+        assert!(err.contains("network_namespaces: must be a list"), "{err}");
+        assert!(netns_err("null").contains("must be an object"));
+        assert!(netns_err(r#"{"path": "/run/netns/a"}"#).contains("missing tag"));
+        assert!(netns_err(r#"{"tag": ""}"#).contains("missing tag"));
+        // the two types carry different fields, and the reference refuses the
+        // one that does not belong
+        assert!(netns_err(r#"{"tag": "v"}"#).contains("missing path"));
+        assert!(
+            netns_err(r#"{"tag": "v", "path": "/run/netns/a", "pid_file": "/tmp/p"}"#)
+                .contains(r#"pid_file: json: unknown field "pid_file""#)
+        );
+        assert!(
+            netns_err(r#"{"type": "unshare", "tag": "v", "path": "/run/netns/a"}"#)
+                .contains(r#"path: json: unknown field "path""#)
+        );
+        assert!(
+            netns_err(r#"{"type": "nope", "tag": "v"}"#)
+                .contains("unknown network namespace type: nope")
+        );
+    }
+
     use super::*;
     use serde_json::json;
     use std::fs;

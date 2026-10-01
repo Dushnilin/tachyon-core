@@ -6,8 +6,12 @@ pub mod dns;
 pub mod http_client;
 pub mod inbound;
 pub mod logging;
+#[cfg(target_os = "linux")]
+pub mod netns;
 pub mod ntp;
 pub mod outbound;
+#[cfg(unix)]
+pub mod protect;
 pub mod route;
 pub mod tls_client;
 pub mod tls_utls;
@@ -39,14 +43,18 @@ pub struct BoxInstance {
 /// Everything else in `DIALER_OUT_FIELDS` is honoured by
 /// `outbound::dial::DialOptions`, which is the single place a socket is built.
 const UNHONORED_DIALER_FIELDS: &[&str] = &[
-    "domain_strategy",
-    "fallback_delay",
     "fallback_network_type",
-    "netns",
     "network_strategy",
     "network_type",
-    "protect_path",
+    // a Linux socket option and a Linux-only dial, applied by `outbound/dial.rs`
+    // there and nowhere else
+    #[cfg(not(target_os = "linux"))]
+    "netns",
+    #[cfg(not(target_os = "linux"))]
     "tcp_multi_path",
+    // `protect_path` is a unix socket protocol, and a no-op off unix
+    #[cfg(not(unix))]
+    "protect_path",
 ];
 
 /// One warning per entry per field, so a shared option is not repeated.
@@ -134,6 +142,15 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     }
     if disabled {
         logging::set_disabled();
+    }
+
+    // network_namespaces: every namespace has to be enterable before the first
+    // dial asks for one, which is where the reference starts them too
+    #[cfg(target_os = "linux")]
+    if let Some(namespaces) = root.get("network_namespaces") {
+        for line in netns::setup(&netns_from_config(namespaces)?)? {
+            logging::info(format_args!("{line}"));
+        }
     }
 
     // experimental.cache_file: the bbolt store for rule-sets, fakeip and DNS
@@ -259,6 +276,41 @@ async fn wait_for_signal() {
     }
 }
 
+/// The `network_namespaces` section as the manager wants it.
+#[cfg(target_os = "linux")]
+fn netns_from_config(value: &Value) -> anyhow::Result<Vec<netns::Namespace>> {
+    let list = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("network_namespaces: must be a list"))?;
+    list.iter()
+        .map(|entry| {
+            let kind = match entry.get("type").and_then(Value::as_str).unwrap_or("") {
+                "" | "default" => netns::Kind::Default,
+                "unshare" => netns::Kind::Unshare,
+                other => anyhow::bail!("network namespace: unknown type: {other}"),
+            };
+            Ok(netns::Namespace {
+                kind,
+                tag: entry
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                path: entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                pid_file: entry
+                    .get("pid_file")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,13 +328,21 @@ mod tests {
                 {"type": "mixed", "tag": "in", "tcp_multi_path": true}
             ]
         });
+        // `domain_strategy` and `fallback_delay` are applied everywhere;
+        // `netns` and `tcp_multi_path` only on Linux, and the interface group
+        // is not applied at all, which is what the reference does off Android
+        let expected: Vec<(&str, usize, &str)> = if cfg!(target_os = "linux") {
+            vec![("outbounds", 0, "network_strategy")]
+        } else {
+            vec![
+                ("outbounds", 0, "network_strategy"),
+                ("outbounds", 0, "netns"),
+                ("inbounds", 0, "tcp_multi_path"),
+            ]
+        };
         assert_eq!(
             unhonored_options(&config),
-            vec![
-                ("outbounds", 0, "netns"),
-                ("outbounds", 0, "network_strategy"),
-                ("inbounds", 0, "tcp_multi_path"),
-            ],
+            expected,
             "the honored options stay quiet and a null is not an option"
         );
     }

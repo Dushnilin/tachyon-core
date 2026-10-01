@@ -192,6 +192,15 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args),
         "api" => cmd_api(&args),
         "rule-set" => rule_set::cmd_rule_set(&args),
+        // the process that holds an `unshare` network namespace open; it does
+        // nothing until its stdin closes
+        #[cfg(target_os = "linux")]
+        "netns-holder" => {
+            core_runtime::netns::hold();
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        "netns-holder" => Err("netns-holder is only supported on Linux".to_string()),
         "help" | "-h" | "--help" => {
             print!("{}", usage());
             Ok(())

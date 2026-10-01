@@ -45,7 +45,7 @@ pub enum Strategy {
 }
 
 impl Strategy {
-    fn parse(raw: &str) -> anyhow::Result<Self> {
+    pub(crate) fn parse(raw: &str) -> anyhow::Result<Self> {
         match raw {
             "" => Ok(Self::AsIs),
             "prefer_ipv4" => Ok(Self::PreferIPv4),
@@ -798,6 +798,17 @@ impl DnsService {
         server_tag: &str,
         host: &str,
     ) -> std::io::Result<Vec<IpAddr>> {
+        self.resolve_via_with(server_tag, host, None).await
+    }
+
+    /// The same through one server, with the strategy the caller wants instead of
+    /// the service default (`domain_strategy` on a dialer).
+    pub async fn resolve_via_with(
+        self: &Arc<Self>,
+        server_tag: &str,
+        host: &str,
+        strategy: Option<Strategy>,
+    ) -> std::io::Result<Vec<IpAddr>> {
         if let Some(ip) = transport::is_ip_literal(host) {
             return Ok(vec![ip]);
         }
@@ -811,17 +822,28 @@ impl DnsService {
             )));
         }
         let addrs = self.lookup_via(cfg, host, 0).await?;
-        Ok(order_addresses(addrs, self.strategy))
+        Ok(order_addresses(addrs, strategy.unwrap_or(self.strategy)))
     }
 
     /// Resolve a hostname to addresses through the dns section
     /// (system-mode fallback lives in [`connect_tcp`]).
     pub async fn resolve(self: &Arc<Self>, host: &str) -> std::io::Result<Vec<IpAddr>> {
+        self.resolve_with(host, None).await
+    }
+
+    /// The same with the strategy the caller wants, which is the service default
+    /// when it has none: `domain_strategy` on a dialer asks for exactly this.
+    pub async fn resolve_with(
+        self: &Arc<Self>,
+        host: &str,
+        strategy: Option<Strategy>,
+    ) -> std::io::Result<Vec<IpAddr>> {
+        let strategy = strategy.unwrap_or(self.strategy);
         let fut = async {
             if let Some(ip) = transport::is_ip_literal(host) {
                 return Ok(vec![ip]);
             }
-            let qtypes = self.strategy.query_types();
+            let qtypes = strategy.query_types();
             let mut handles = Vec::with_capacity(qtypes.len());
             for qtype in qtypes {
                 let host = host.to_string();
@@ -849,7 +871,7 @@ impl DnsService {
                     format!("dns: no addresses for {host:?}"),
                 ));
             }
-            Ok(order_addresses(collected, self.strategy))
+            Ok(order_addresses(collected, strategy))
         };
         tokio::time::timeout(RESOLVE_TIMEOUT_GUARD, fut)
             .await
@@ -983,7 +1005,7 @@ fn mask_host_bits(addr: IpAddr, bits: u8) -> IpAddr {
     }
 }
 
-fn order_addresses(mut addrs: Vec<IpAddr>, strategy: Strategy) -> Vec<IpAddr> {
+pub(crate) fn order_addresses(mut addrs: Vec<IpAddr>, strategy: Strategy) -> Vec<IpAddr> {
     match strategy {
         Strategy::PreferIPv6 | Strategy::IPv6Only => {
             addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });

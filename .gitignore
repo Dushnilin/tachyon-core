@@ -6,3 +6,5 @@ Cargo.lock.orig
 /dist
 /tmp-tests
 .DS_Store
+# local agent notes, same as in G:\tachyon
+AGENTS.md

@@ -15,6 +15,7 @@ use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
 pub mod direct;
 pub mod mixed;
+pub mod proxy;
 pub mod redirect;
 pub mod tproxy;
 pub(crate) mod udp;

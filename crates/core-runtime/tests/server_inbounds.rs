@@ -256,3 +256,182 @@ async fn a_vless_inbound_refuses_an_empty_user_list() {
     let chain = format!("{err:#}");
     assert!(chain.contains("must not be empty"), "{chain}");
 }
+
+/// A trojan client speaking the raw protocol: `[56-byte SHA224 hex][CRLF]
+/// [command][atyp][addr][port][CRLF]`, the same bytes our outbound writes and
+/// the reference's server reads.
+async fn trojan_request(
+    server: SocketAddr,
+    password: &str,
+    target: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use sha2::Digest as _;
+    use tokio::net::TcpStream;
+
+    let mut stream = TcpStream::connect(server).await?;
+    let hash: String = sha2::Sha224::digest(password.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut head = Vec::new();
+    head.extend_from_slice(hash.as_bytes());
+    head.extend_from_slice(b"\r\n");
+    head.push(0x01);
+    match target.ip() {
+        std::net::IpAddr::V4(v4) => {
+            head.push(0x01);
+            head.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            head.push(0x04);
+            head.extend_from_slice(&v6.octets());
+        }
+    }
+    head.extend_from_slice(&target.port().to_be_bytes());
+    head.extend_from_slice(b"\r\n");
+    head.extend_from_slice(payload);
+    stream.write_all(&head).await?;
+    // trojan has no answer head: what comes back is the target's own payload
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while answer.len() < payload.len() && std::time::Instant::now() < deadline {
+        let Ok(read) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
+                .await
+        else {
+            continue;
+        };
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => answer.extend_from_slice(&buf[..n]),
+        }
+    }
+    Ok(answer)
+}
+
+#[tokio::test]
+async fn trojan_server_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let password = "hunter2";
+    let instance = core_runtime::start(&cfg(
+        json!({
+            "type": "trojan",
+            "tag": "trojan-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "users": [{"name": "bob", "password": password}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start box");
+    let server = inbound_addr(&instance, "trojan-in");
+
+    let got = trojan_request(server, password, echo, b"through-the-trojan-server")
+        .await
+        .expect("trojan request");
+    // trojan writes no answer head, so this is exactly the echo
+    assert_eq!(String::from_utf8_lossy(&got), "through-the-trojan-server");
+    drop(instance);
+}
+
+#[tokio::test]
+async fn trojan_server_refuses_a_wrong_password() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let instance = core_runtime::start(&cfg(
+        json!({
+            "type": "trojan",
+            "tag": "trojan-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "users": [{"name": "bob", "password": "hunter2"}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start box");
+    let server = inbound_addr(&instance, "trojan-in");
+
+    let got = trojan_request(server, "wrong", echo, b"nope")
+        .await
+        .unwrap_or_default();
+    assert!(
+        got.is_empty(),
+        "a refused connection must not carry the payload: {got:?}"
+    );
+    drop(instance);
+}
+
+#[tokio::test]
+async fn trojan_server_refuses_two_users_with_one_password() {
+    let _guard = test_guard().await;
+    let err = core_runtime::start(&cfg(
+        json!({
+            "type": "trojan",
+            "tag": "trojan-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "users": [
+                {"name": "bob", "password": "same"},
+                {"name": "eve", "password": "same"}
+            ]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .err()
+    .expect("two users with one password should not start");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("password used by"), "{chain}");
+}
+
+#[tokio::test]
+async fn trojan_server_refuses_an_unknown_command() {
+    let _guard = test_guard().await;
+    use tokio::io::AsyncWriteExt as _;
+    let instance = core_runtime::start(&cfg(
+        json!({
+            "type": "trojan",
+            "tag": "trojan-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "users": [{"name": "bob", "password": "hunter2"}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start box");
+    let server = inbound_addr(&instance, "trojan-in");
+
+    let mut stream = tokio::net::TcpStream::connect(server)
+        .await
+        .expect("connect");
+    let hash: String = {
+        use sha2::Digest as _;
+        sha2::Sha224::digest(b"hunter2")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let mut head = Vec::from(hash.as_bytes());
+    head.extend_from_slice(b"\r\n");
+    head.push(0x7e); // not tcp, not udp, not mux
+    head.extend_from_slice(&[0x01, 127, 0, 0, 1, 0x00, 0x50]);
+    head.extend_from_slice(b"\r\n");
+    stream.write_all(&head).await.expect("write");
+    // the server closes without routing anything; a reset on the way out is the
+    // same answer as a clean close, and what matters is that no payload came
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut buf),
+    )
+    .await
+    .expect("the server closes an unknown command");
+    assert!(buf.is_empty(), "nothing may come back: {buf:?}");
+    drop(instance);
+}

@@ -21,6 +21,8 @@ use crate::route::Router;
 /// Request command bytes (`vmess.CommandTCP` and friends).
 pub(crate) const COMMAND_TCP: u8 = 0x01;
 pub(crate) const COMMAND_UDP: u8 = 0x02;
+/// trojan numbers its mux command 0x7f (`transport/trojan/protocol.go`).
+pub(crate) const COMMAND_MUX: u8 = 0x7f;
 
 /// The answer head the server puts in front of the first payload: version and
 /// addons length, both zero (`serverConn.Write`).
@@ -178,6 +180,166 @@ async fn handle_vless(
     // route below fails, and then a close is what it sees either way.
     stream.write_all(&RESPONSE_HEAD).await?;
     drive_transparent(stream, peer, destination, &tag, &router).await
+}
+
+/// trojan server inbound: the request is
+/// `[56-byte SHA224 hex][CRLF][command][atyp][addr][port][CRLF]`, which is
+/// `trojan.Service.NewConnection` byte for byte -- 56 bytes of key, the CRLF
+/// skipped, the command, `M.SocksaddrSerializer` for the destination, then the
+/// trailing CRLF. There is no answer head at all.
+pub struct Trojan {
+    listener: TcpListener,
+    tag: String,
+    router: Arc<Router>,
+    /// SHA224 hex of each password, keyed by those bytes
+    keys: HashMap<[u8; KEY_LENGTH], String>,
+}
+
+/// `KeyLength`: SHA224 in hex is 56 bytes.
+const KEY_LENGTH: usize = 56;
+
+impl Trojan {
+    pub async fn bind(obj: &Value, router: Arc<Router>) -> anyhow::Result<Self> {
+        let object = obj
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("inbound: must be an object"))?;
+        let tag = object
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or("trojan")
+            .to_string();
+        let at = format!("inbound[{tag}]");
+        let list = object
+            .get("users")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("{at}: missing users"))?;
+        if list.is_empty() {
+            anyhow::bail!("{at}: users is required and must not be empty");
+        }
+        let mut keys: HashMap<[u8; KEY_LENGTH], String> = HashMap::new();
+        for (index, entry) in list.iter().enumerate() {
+            let password = entry
+                .get("password")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("{at}.users[{index}]: missing password"))?;
+            // `UpdateUsers` refuses a password another user already has
+            let hash = password_hash(password);
+            let mut key = [0u8; KEY_LENGTH];
+            key.copy_from_slice(hash.as_bytes());
+            if let Some(name) = keys.insert(
+                key,
+                entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ) {
+                anyhow::bail!("{at}: password used by {name} (users[{index}])");
+            }
+        }
+        let listen = parse_listen(object, &at)?;
+        let listener = TcpListener::bind(listen)
+            .await
+            .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
+        Ok(Self {
+            listener,
+            tag,
+            router,
+            keys,
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub async fn serve(self) {
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, peer)) => {
+                    let keys = self.keys.clone();
+                    let tag = self.tag.clone();
+                    let router = Arc::clone(&self.router);
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_trojan(stream, peer, keys, tag, router).await {
+                            logging::debug(format_args!("trojan {peer}: {err}"));
+                        }
+                    });
+                }
+                Err(err) => {
+                    logging::debug(format_args!("trojan accept: {err}"));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// SHA224 of the password, hex, lowercase -- what the trojan protocol sends.
+/// The client side builds the same string in `outbound::secure::Trojan::build`.
+pub(crate) fn password_hash(password: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha224::digest(password.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+async fn handle_trojan(
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    keys: HashMap<[u8; KEY_LENGTH], String>,
+    tag: String,
+    router: Arc<Router>,
+) -> io::Result<()> {
+    let (name, command, destination) = read_trojan_request(&mut stream, &keys).await?;
+    if command != COMMAND_TCP {
+        return Err(io::Error::other(format!(
+            "command {command} is not implemented by this server"
+        )));
+    }
+    logging::info(format_args!(
+        "trojan [{name}] inbound connection to {destination}"
+    ));
+    drive_transparent(stream, peer, destination, &tag, &router).await
+}
+
+async fn read_trojan_request(
+    stream: &mut tokio::net::TcpStream,
+    keys: &HashMap<[u8; KEY_LENGTH], String>,
+) -> io::Result<(String, u8, Target)> {
+    let mut key = [0u8; KEY_LENGTH];
+    // the reference reads exactly KeyLength bytes and calls a short one a bad
+    // request, so a truncated head must not reach the lookup
+    match stream.read_exact(&mut key).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::other("bad request size"));
+        }
+        Err(err) => return Err(err),
+    }
+    let name = keys
+        .get(&key)
+        .ok_or_else(|| io::Error::other("bad request"))?
+        .clone();
+    skip_crlf(stream).await?;
+    let mut command = [0u8; 1];
+    stream.read_exact(&mut command).await?;
+    if !matches!(command[0], COMMAND_TCP | COMMAND_UDP | COMMAND_MUX) {
+        return Err(io::Error::other(format!("unknown command {}", command[0])));
+    }
+    let destination = read_target(stream).await?;
+    skip_crlf(stream).await?;
+    Ok((name, command[0], destination))
+}
+
+async fn skip_crlf(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
+    let mut crlf = [0u8; 2];
+    stream.read_exact(&mut crlf).await?;
+    if crlf != *b"\r\n" {
+        return Err(io::Error::other("skip crlf"));
+    }
+    Ok(())
 }
 
 /// `[version][uuid][addonsLen][addons][command][addr][port]`, and the addons

@@ -7,6 +7,36 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use super::Vless;
+
+/// trojan's destination block is `M.SocksaddrSerializer`, whose family bytes
+/// are 1 = IPv4, 4 = IPv6 and 3 = FQDN (sing's `common/metadata/family.go`).
+/// A domain written as 2 is what every trojan server on the wire rejects, and
+/// this pins the byte so it cannot come back.
+#[test]
+fn trojan_writes_the_socksaddr_family_bytes() {
+    use crate::inbound::Target;
+    let domain = Target::Domain("example.com".to_string(), 443);
+    let block = crate::outbound::proxy::encode_target_with(&domain, 0x03).expect("encode domain");
+    assert_eq!(
+        block,
+        [
+            0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01, 0xbb
+        ],
+        "domain, then port 443"
+    );
+    // and the IPv4 and IPv6 bytes are the ones the serializer uses
+    let v4 = Target::Ip("1.2.3.4:80".parse().expect("addr"));
+    assert_eq!(
+        crate::outbound::proxy::encode_target_with(&v4, 0x03).expect("encode v4"),
+        [0x01, 1, 2, 3, 4, 0x00, 0x50]
+    );
+    let v6 = Target::Ip("[2001:db8::1]:80".parse().expect("addr"));
+    let encoded = crate::outbound::proxy::encode_target_with(&v6, 0x03).expect("encode v6");
+    assert_eq!(encoded[0], 0x04, "IPv6 keeps 4, not 3");
+    assert_eq!(encoded.len(), 1 + 16 + 2);
+    assert_eq!(&encoded[17..], &[0x00, 0x50]);
+}
+
 use crate::inbound::Target;
 
 /// b831381d-6324-4d53-ad4f-8cda48b30811

@@ -94,10 +94,22 @@ jobs:
             build-std: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # `rustup target add` refuses a tier-3 target outright -- there are no
+      # prebuilt artifacts to add, and it says so and exits non-zero -- so the two
+      # MIPS entries must not be asked to install their target. They get nightly
+      # plus rust-src and let `-Z build-std` compile the standard library.
+      - name: Toolchain (prebuilt std)
+        if: ${{ !matrix.build-std }}
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.build-std && 'nightly' || 'stable' }}
+          toolchain: stable
           targets: ${{ matrix.target }}
+      - name: Toolchain (std from source)
+        if: ${{ matrix.build-std }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
       # the toolchains are static musl: link with the bundled rust-lld and the
       # self-contained CRT objects instead of a host gcc that is not there
       - name: Link musl with rust-lld

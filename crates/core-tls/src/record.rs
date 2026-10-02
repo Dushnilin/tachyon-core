@@ -115,6 +115,13 @@ impl Sealer {
     }
 
     pub fn seal(&mut self, kind: ContentType, payload: &[u8]) -> io::Result<Vec<u8>> {
+        // Checked here rather than left to the arithmetic below: the length in
+        // the header is a u16, so an oversized payload wraps round to a short
+        // one and the peer reads a truncated record out of the middle of a long
+        // ciphertext -- which arrives as a tag that does not verify.
+        if payload.len() > MAX_FRAGMENT {
+            return Err(err("plaintext over the record length limit"));
+        }
         // the inner plaintext: the content, its type, then zero padding
         let mut inner = Vec::with_capacity(payload.len() + 1);
         inner.extend_from_slice(payload);
@@ -209,6 +216,24 @@ mod tests {
         CipherSuite::TLS13_AES_256_GCM_SHA384,
         CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
     ];
+
+    /// A payload over 2^14 cannot go into one record, and the length field
+    /// cannot hold it either -- so it has to be refused rather than wrapped
+    /// round into a header that says something else entirely.
+    #[test]
+    fn an_oversized_payload_is_refused_rather_than_truncated() {
+        let suite = CipherSuite::TLS13_AES_128_GCM_SHA256;
+        let mut sealer = Sealer::new(suite, keys(suite));
+        assert!(
+            sealer
+                .seal(ContentType::ApplicationData, &vec![0u8; MAX_FRAGMENT])
+                .is_ok()
+        );
+        let err = sealer
+            .seal(ContentType::ApplicationData, &vec![0u8; MAX_FRAGMENT + 1])
+            .expect_err("a record over 2^14 was sealed");
+        assert!(err.to_string().contains("length limit"), "{err}");
+    }
 
     fn keys(suite: CipherSuite) -> TrafficKeys {
         let hash = match suite {

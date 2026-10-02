@@ -610,3 +610,146 @@ async fn a_shadowsocks_inbound_refuses_the_multi_user_shape() {
     let chain = format!("{err:#}");
     assert!(chain.contains("multi-user"), "{chain}");
 }
+
+/// The test certificate, by path. `CARGO_MANIFEST_DIR` rather than a relative
+/// one: the runtime reads these files itself, and the working directory of a
+/// test binary is not something to rely on.
+fn cert_file(name: &str) -> String {
+    format!(
+        "{}/../../tests/golden/certs/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// `tls` on a server inbound, the way a user writes it: the two files and
+/// nothing else.
+fn server_tls() -> Value {
+    json!({
+        "enabled": true,
+        "certificate_path": cert_file("localhost.crt"),
+        "key_path": cert_file("localhost.key"),
+    })
+}
+
+/// The client side of the same handshake. No fingerprint is configured, so this
+/// is rustls' client -- which is the point: the server half shares no code with
+/// it, so a payload that comes back is a handshake that happened on the wire.
+fn client_tls() -> Value {
+    json!({"enabled": true, "server_name": "localhost", "insecure": true})
+}
+
+#[tokio::test]
+async fn vless_server_over_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["tls"] = server_tls();
+    let mut client = vless_client(uuid, "");
+    client["tls"] = client_tls();
+    let got = through_our_own_client(server, client, b"through-tls")
+        .await
+        .expect("vless over tls round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-tls");
+}
+
+#[tokio::test]
+async fn trojan_server_over_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let mut server = json!({
+        "type": "trojan",
+        "tag": "trojan-in",
+        "listen": "127.0.0.1",
+        "listen_port": free_port(),
+        "users": [{"name": "bob", "password": "hunter2"}]
+    });
+    server["tls"] = server_tls();
+    let mut client = json!({"type": "trojan", "tag": "out", "password": "hunter2"});
+    client["tls"] = client_tls();
+    let got = through_our_own_client(server, client, b"through-tls")
+        .await
+        .expect("trojan over tls round trip");
+    // trojan writes no answer head, so this is exactly the echo
+    assert_eq!(String::from_utf8_lossy(&got), "through-tls");
+}
+
+#[tokio::test]
+async fn vmess_server_over_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vmess_server(uuid);
+    server["tls"] = server_tls();
+    let mut client = vmess_client(uuid);
+    client["tls"] = client_tls();
+    let got = through_our_own_client(server, client, b"through-tls")
+        .await
+        .expect("vmess over tls round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-tls");
+}
+
+#[tokio::test]
+async fn shadowsocks_server_over_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let mut server = ss_server("aes-128-gcm", "hunter2");
+    server["tls"] = server_tls();
+    let mut client = ss_client("aes-128-gcm", "hunter2");
+    client["tls"] = client_tls();
+    let got = through_our_own_client(server, client, b"through-tls")
+        .await
+        .expect("shadowsocks over tls round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-tls");
+}
+
+/// A plaintext client against a TLS server gets nothing back. Without this the
+/// first three tests could pass for the wrong reason -- a server that answered
+/// every connection regardless of what was on it would satisfy them too.
+#[tokio::test]
+async fn a_vless_server_over_tls_answers_a_plaintext_client_with_nothing() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["tls"] = server_tls();
+    let got = through_our_own_client(server, vless_client(uuid, ""), b"nope")
+        .await
+        .unwrap_or_default();
+    assert!(
+        got.is_empty(),
+        "a plaintext client must not be served: {got:?}"
+    );
+}
+
+/// `enabled: false` is a block that is off, not a broken one -- the server comes
+/// up in the clear, and a client with no `tls` is served.
+#[tokio::test]
+async fn a_disabled_inbound_tls_block_starts_in_the_clear() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["tls"] = json!({"enabled": false});
+    let got = through_our_own_client(server, vless_client(uuid, ""), b"in-the-clear")
+        .await
+        .expect("a disabled tls block is not tls");
+    assert_eq!(String::from_utf8_lossy(&got), "in-the-clear");
+}
+
+/// What the reference answers `insecure` without a certificate with is a
+/// throwaway key pair it builds itself. We cannot sign one yet, so the server
+/// says so by name instead of coming up with nothing to answer with.
+#[tokio::test]
+async fn an_inbound_tls_without_a_certificate_does_not_start() {
+    let _guard = test_guard().await;
+    for tls in [
+        json!({"enabled": true}),
+        json!({"enabled": true, "insecure": true}),
+        json!({"enabled": true, "acme": {"domain": "example.com"}}),
+        json!({"enabled": true, "certificate_path": cert_file("absent.crt")}),
+    ] {
+        let mut server = vless_server("b831381d-6324-4d53-ad4f-8cda48b30811", "");
+        server["tls"] = tls.clone();
+        let err = core_runtime::start(&cfg(server, json!([{"type": "direct", "tag": "direct"}])))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{tls} should not start"));
+        let chain = format!("{err:#}");
+        assert!(chain.contains("tls:"), "{tls}: {chain}");
+    }
+}

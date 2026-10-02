@@ -11,10 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
-use crate::inbound::{Target, drive_transparent, parse_listen};
+use super::tls::ServerTls;
+use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::route::Router;
 
@@ -85,6 +86,7 @@ pub struct Vless {
     tag: String,
     router: Arc<Router>,
     users: HashMap<[u8; 16], User>,
+    tls: Option<Arc<ServerTls>>,
 }
 
 impl Vless {
@@ -102,6 +104,7 @@ impl Vless {
             .into_iter()
             .map(|user| (user.uuid, user))
             .collect::<HashMap<_, _>>();
+        let tls = ServerTls::from_inbound(obj, &at)?;
         let listen = parse_listen(object, &at)?;
         let listener = TcpListener::bind(listen)
             .await
@@ -111,6 +114,7 @@ impl Vless {
             tag,
             router,
             users,
+            tls,
         })
     }
 
@@ -125,8 +129,22 @@ impl Vless {
                     let users = self.users.clone();
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
+                    let tls = self.tls.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_vless(stream, peer, users, tag, router).await {
+                        // The socket's own address is read here because a TLS
+                        // stream is handed over where the socket was, and
+                        // nothing downstream can ask it again.
+                        let local = stream.local_addr().unwrap_or(peer);
+                        let result = match tls {
+                            Some(tls) => match tls.accept(stream).await {
+                                Ok(stream) => {
+                                    handle_vless(stream, peer, local, users, tag, router).await
+                                }
+                                Err(err) => Err(err),
+                            },
+                            None => handle_vless(stream, peer, local, users, tag, router).await,
+                        };
+                        if let Err(err) = result {
                             logging::debug(format_args!("vless {peer}: {err}"));
                         }
                     });
@@ -141,13 +159,17 @@ impl Vless {
 }
 
 /// One connection: read the request, check the user, route it.
-async fn handle_vless(
-    mut stream: tokio::net::TcpStream,
+async fn handle_vless<S>(
+    mut stream: S,
     peer: SocketAddr,
+    local: SocketAddr,
     users: HashMap<[u8; 16], User>,
     tag: String,
     router: Arc<Router>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (user, command, destination, flow) = read_request(&mut stream, &users).await?;
     if flow != user.flow {
         return Err(io::Error::other(format!(
@@ -179,7 +201,15 @@ async fn handle_vless(
     // in the socket buffer, which a client cannot tell apart -- except when the
     // route below fails, and then a close is what it sees either way.
     stream.write_all(&RESPONSE_HEAD).await?;
-    drive_transparent(stream, peer, destination, &tag, &router).await
+    let framed: AnyStream = Box::new(stream);
+    drive_framed(
+        ClientConn::framed(framed, local),
+        peer,
+        destination,
+        &tag,
+        &router,
+    )
+    .await
 }
 
 /// trojan server inbound: the request is
@@ -193,6 +223,7 @@ pub struct Trojan {
     router: Arc<Router>,
     /// SHA224 hex of each password, keyed by those bytes
     keys: HashMap<[u8; KEY_LENGTH], String>,
+    tls: Option<Arc<ServerTls>>,
 }
 
 /// `KeyLength`: SHA224 in hex is 56 bytes.
@@ -246,6 +277,7 @@ impl Trojan {
             tag,
             router,
             keys,
+            tls: ServerTls::from_inbound(obj, &at)?,
         })
     }
 
@@ -260,8 +292,19 @@ impl Trojan {
                     let keys = self.keys.clone();
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
+                    let tls = self.tls.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_trojan(stream, peer, keys, tag, router).await {
+                        let local = stream.local_addr().unwrap_or(peer);
+                        let result = match tls {
+                            Some(tls) => match tls.accept(stream).await {
+                                Ok(stream) => {
+                                    handle_trojan(stream, peer, local, keys, tag, router).await
+                                }
+                                Err(err) => Err(err),
+                            },
+                            None => handle_trojan(stream, peer, local, keys, tag, router).await,
+                        };
+                        if let Err(err) = result {
                             logging::debug(format_args!("trojan {peer}: {err}"));
                         }
                     });
@@ -285,13 +328,17 @@ pub(crate) fn password_hash(password: &str) -> String {
         .collect()
 }
 
-async fn handle_trojan(
-    mut stream: tokio::net::TcpStream,
+async fn handle_trojan<S>(
+    mut stream: S,
     peer: SocketAddr,
+    local: SocketAddr,
     keys: HashMap<[u8; KEY_LENGTH], String>,
     tag: String,
     router: Arc<Router>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (name, command, destination) = read_trojan_request(&mut stream, &keys).await?;
     if command != COMMAND_TCP {
         return Err(io::Error::other(format!(
@@ -301,13 +348,24 @@ async fn handle_trojan(
     logging::info(format_args!(
         "trojan [{name}] inbound connection to {destination}"
     ));
-    drive_transparent(stream, peer, destination, &tag, &router).await
+    let framed: AnyStream = Box::new(stream);
+    drive_framed(
+        ClientConn::framed(framed, local),
+        peer,
+        destination,
+        &tag,
+        &router,
+    )
+    .await
 }
 
-async fn read_trojan_request(
-    stream: &mut tokio::net::TcpStream,
+async fn read_trojan_request<S>(
+    stream: &mut S,
     keys: &HashMap<[u8; KEY_LENGTH], String>,
-) -> io::Result<(String, u8, Target)> {
+) -> io::Result<(String, u8, Target)>
+where
+    S: AsyncRead + Unpin,
+{
     let mut key = [0u8; KEY_LENGTH];
     // the reference reads exactly KeyLength bytes and calls a short one a bad
     // request, so a truncated head must not reach the lookup
@@ -333,7 +391,10 @@ async fn read_trojan_request(
     Ok((name, command[0], destination))
 }
 
-async fn skip_crlf(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
+async fn skip_crlf<S>(stream: &mut S) -> io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     let mut crlf = [0u8; 2];
     stream.read_exact(&mut crlf).await?;
     if crlf != *b"\r\n" {
@@ -344,10 +405,13 @@ async fn skip_crlf(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
 
 /// `[version][uuid][addonsLen][addons][command][addr][port]`, and the addons
 /// block that carries the flow (`readAddons`: `(1<<3)|2` then a uvarint length).
-async fn read_request(
-    stream: &mut tokio::net::TcpStream,
+async fn read_request<S>(
+    stream: &mut S,
     users: &HashMap<[u8; 16], User>,
-) -> io::Result<(User, u8, Target, String)> {
+) -> io::Result<(User, u8, Target, String)>
+where
+    S: AsyncRead + Unpin,
+{
     let mut version = [0u8; 1];
     stream.read_exact(&mut version).await?;
     if version[0] != 0 {
@@ -418,7 +482,10 @@ fn read_uvarint(bytes: &[u8]) -> io::Result<(u64, usize)> {
 
 /// The address block in the socks shape, `[atyp][addr][port]`, which is what
 /// trojan's `M.SocksaddrSerializer` writes.
-async fn read_target(stream: &mut tokio::net::TcpStream) -> io::Result<Target> {
+async fn read_target<S>(stream: &mut S) -> io::Result<Target>
+where
+    S: AsyncRead + Unpin,
+{
     let mut atyp = [0u8; 1];
     stream.read_exact(&mut atyp).await?;
     let addr = read_addr(stream, atyp[0]).await?;
@@ -431,7 +498,10 @@ async fn read_target(stream: &mut tokio::net::TcpStream) -> io::Result<Target> {
 /// the other is invisible until a third party's client arrives -- which is how
 /// this one shipped: our own client failed against our own server, and the test
 /// was green because its hand-written client repeated the mistake.
-async fn read_vless_target(stream: &mut tokio::net::TcpStream) -> io::Result<Target> {
+async fn read_vless_target<S>(stream: &mut S) -> io::Result<Target>
+where
+    S: AsyncRead + Unpin,
+{
     let port = read_port(stream).await?;
     let mut atyp = [0u8; 1];
     stream.read_exact(&mut atyp).await?;
@@ -455,7 +525,10 @@ impl Addr {
     }
 }
 
-async fn read_addr(stream: &mut tokio::net::TcpStream, atyp: u8) -> io::Result<Addr> {
+async fn read_addr<S>(stream: &mut S, atyp: u8) -> io::Result<Addr>
+where
+    S: AsyncRead + Unpin,
+{
     match atyp {
         0x01 => {
             let mut octets = [0u8; 4];
@@ -478,7 +551,10 @@ async fn read_addr(stream: &mut tokio::net::TcpStream, atyp: u8) -> io::Result<A
     }
 }
 
-async fn read_port(stream: &mut tokio::net::TcpStream) -> io::Result<u16> {
+async fn read_port<S>(stream: &mut S) -> io::Result<u16>
+where
+    S: AsyncRead + Unpin,
+{
     let mut port = [0u8; 2];
     stream.read_exact(&mut port).await?;
     Ok(u16::from_be_bytes(port))

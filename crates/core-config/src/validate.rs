@@ -417,7 +417,7 @@ const TLS_REQUIRED_OUTBOUNDS: &[&str] = &[
 
 const TLS_REQUIRED_INBOUNDS: &[&str] = &["hysteria2", "tuic", "hysteria"];
 
-const SERVER_TLS_INBOUNDS: &[&str] = &["mixed", "http", "trojan"];
+const SERVER_TLS_INBOUNDS: &[&str] = &["mixed", "http", "trojan", "vless", "vmess", "shadowsocks"];
 
 const TUN_LEGACY_FIELDS: &[&str] = &[
     "inet4_address",
@@ -762,6 +762,7 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
             "destinations",
             "multiplex",
             "managed",
+            "tls",
         ],
     ),
     (
@@ -880,6 +881,13 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
     ),
     (
         "vless",
+        "tls",
+        "InboundTLSOptionsContainer.tls",
+        "option.InboundTLSOptions",
+        true,
+    ),
+    (
+        "shadowsocks",
         "tls",
         "InboundTLSOptionsContainer.tls",
         "option.InboundTLSOptions",
@@ -6758,7 +6766,9 @@ fn validate_plain_out_decode(
     let (protocol, go_base, has_tls, has_quic): (&[&str], &str, bool, bool) = match ty {
         "socks" => (SOCKS_OUT_FIELDS, "SOCKSOutboundOptions", false, false),
         "http" => (HTTP_OUT_FIELDS, "HTTPOutboundOptions", true, false),
-        "shadowsocks" => (SS_OUT_FIELDS, "ShadowsocksOutboundOptions", false, false),
+        // `ShadowsocksOutboundOptions` embeds `OutboundTLSOptionsContainer`, so a
+        // shadowsocks server behind TLS is a shape the reference builds
+        "shadowsocks" => (SS_OUT_FIELDS, "ShadowsocksOutboundOptions", true, false),
         "shadowtls" => (
             SHADOWTLS_OUT_FIELDS,
             "ShadowTLSOutboundOptions",
@@ -12429,6 +12439,56 @@ mod tests {
             .unwrap_err(),
             "initialize inbound[0] hysteria2[0]: create inline certificate provider: endpoint not found: ts"
         );
+    }
+
+    /// The same validation the QUIC server inbounds get has to run for the proxy
+    /// ones too: a `tls` block on a vless inbound that `check` does not look at
+    /// is a block the runtime may refuse with words the reference never says.
+    #[test]
+    fn server_tls_is_validated_on_every_inbound_that_accepts_it() {
+        let certificate = cert_fixture("localhost.crt");
+        let key = cert_fixture("localhost.key");
+        for ty in ["vless", "vmess", "trojan", "shadowsocks", "mixed"] {
+            // shadowsocks reads its own fields before the tls block, so it
+            // needs the two that make it a shadowsocks server at all
+            let extra = if ty == "shadowsocks" {
+                r#""method":"aes-128-gcm","password":"hunter2","#
+            } else {
+                ""
+            };
+            let inbound = |tls: &str| {
+                lx_json(&format!(
+                    r#"{{"inbounds":[{{"type":"{ty}",{extra}"tls":{tls}}}]}}"#
+                ))
+            };
+            let missing = format!("initialize inbound[0] {ty}[0]: missing certificate");
+            assert_eq!(
+                validate(&inbound(r#"{"enabled":true}"#)).unwrap_err(),
+                missing,
+                "{ty}"
+            );
+            assert_eq!(
+                validate(&inbound(&format!(
+                    r#"{{"enabled":true,"certificate_path":"{certificate}"}}"#
+                )))
+                .unwrap_err(),
+                format!("initialize inbound[0] {ty}[0]: missing key"),
+                "{ty}"
+            );
+            assert!(
+                validate(&inbound(&format!(
+                    r#"{{"enabled":true,"certificate_path":"{certificate}","key_path":"{key}"}}"#
+                )))
+                .is_ok(),
+                "{ty}"
+            );
+            // a tls block that is not an object is a decode error, not a block
+            // that happens to be off
+            assert!(
+                validate(&inbound(r#""yes""#)).is_err(),
+                "{ty} took a tls block that is not an object"
+            );
+        }
     }
 
     #[test]

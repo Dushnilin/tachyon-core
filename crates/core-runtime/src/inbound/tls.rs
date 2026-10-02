@@ -1,0 +1,396 @@
+//! TLS for the server inbounds: our own handshake, our own record layer.
+//!
+//! The client half is `tls_utls::FingerprintStream`; this is the same shape over
+//! the keys the server side derived, so a vless or trojan inbound with a `tls`
+//! block costs one handshake at accept time and nothing after that.
+
+use std::collections::VecDeque;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use core_tls::record::{ContentType, Opener, Sealer};
+use core_tls::server::{Config, Handshake};
+
+/// A chunk big enough to hold a whole record, so the ordinary case is one read
+/// from the socket. A compile-time assertion, not a test: a runtime check of a
+/// constant is a comment.
+const CHUNK: usize = {
+    assert!(core_tls::record::MAX_FRAGMENT + 512 <= 18 * 1024);
+    18 * 1024
+};
+
+/// How long a client has to finish its half of the handshake. It runs inside the
+/// accept task, so an endless one is a task that never ends and a socket that
+/// never becomes readable again.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `close_notify`: warning(1) plus description 0.
+const CLOSE_NOTIFY: [u8; 2] = [1, 0];
+
+/// What `tls` on an inbound gives us: the chain, the key and the protocols.
+pub struct ServerTls {
+    chain: Vec<Vec<u8>>,
+    key: Arc<dyn core_tls::rustls::sign::SigningKey>,
+    alpn: Vec<Vec<u8>>,
+}
+
+impl ServerTls {
+    /// Parse the `tls` block of a server inbound; `None` when it is absent or
+    /// says `enabled: false`. The gate lives here rather than in the caller so
+    /// that a disabled block is never mistaken for a broken one.
+    pub fn from_inbound(obj: &Value, at: &str) -> anyhow::Result<Option<Arc<Self>>> {
+        let Some(tls) = obj.get("tls").filter(|tls| !tls.is_null()) else {
+            return Ok(None);
+        };
+        if tls
+            .as_object()
+            .and_then(|tls| tls.get("enabled"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(Self::from_config(tls, at)?)))
+    }
+
+    /// Read the block the way the reference's `common/tls.NewSTDServer` does:
+    /// the certificate and the key, from the files or inline, and nothing else
+    /// invented.
+    pub fn from_config(tls: &Value, at: &str) -> anyhow::Result<Self> {
+        let object = tls
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{at}: tls: must be a JSON object"))?;
+        if let Some(provider) = object.get("certificate_provider") {
+            let ty = provider
+                .as_object()
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            anyhow::bail!(
+                "{at}: tls: certificate_provider {ty:?} is not supported by this \
+                 server yet (check accepts it, start does not)"
+            );
+        }
+        if object.get("acme").is_some_and(|acme| !acme.is_null()) {
+            anyhow::bail!("{at}: tls: acme is not supported by this server yet");
+        }
+        if object
+            .get("insecure")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && !has_material(object, "certificate", "certificate_path")
+        {
+            // `check` lets this through: the reference answers it with a
+            // throwaway key pair it builds out of the ClientHello. We have no
+            // way to sign a certificate yet, and a server with no certificate
+            // would have nothing to answer with, so it is refused by name.
+            anyhow::bail!(
+                "{at}: tls: insecure without a certificate needs an ephemeral \
+                 key pair, which this server cannot generate"
+            );
+        }
+
+        let certificate = match object.get("certificate_path").and_then(Value::as_str) {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{at}: tls: read certificate: {e}"))?,
+            None => listable(object, "certificate")
+                .ok_or_else(|| anyhow::anyhow!("{at}: tls: missing certificate"))?,
+        };
+        let key_pem = match object.get("key_path").and_then(Value::as_str) {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{at}: tls: read key: {e}"))?,
+            None => {
+                listable(object, "key").ok_or_else(|| anyhow::anyhow!("{at}: tls: missing key"))?
+            }
+        };
+
+        let mut chain = Vec::new();
+        for cert in rustls_pemfile::certs(&mut certificate.as_bytes()) {
+            let der = cert.map_err(|e| anyhow::anyhow!("{at}: tls: certificate: {e}"))?;
+            chain.push(der.to_vec());
+        }
+        if chain.is_empty() {
+            anyhow::bail!("{at}: tls: the certificate holds no certificate");
+        }
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{at}: tls: key: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("{at}: tls: the key file holds no key"))?;
+        let signing = core_crypto::sign::any_supported_type(&key)
+            .map_err(|e| anyhow::anyhow!("{at}: tls: parse x509 key pair: {e}"))?;
+
+        // `alpn` is a Listable[string]: one name or a list of them
+        let alpn = match object.get("alpn") {
+            None => Vec::new(),
+            Some(Value::String(one)) => vec![one.as_bytes().to_vec()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| name.as_bytes().to_vec())
+                .collect(),
+            Some(_) => anyhow::bail!("{at}: tls: alpn: must be a string or a list"),
+        };
+        Ok(ServerTls {
+            chain,
+            key: signing,
+            alpn,
+        })
+    }
+
+    /// Run the handshake over `stream` and hand back a stream that carries
+    /// application data.
+    pub async fn accept<S>(&self, mut stream: S) -> io::Result<TlsStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut handshake = Handshake::new(Config {
+            chain: self.chain.clone(),
+            key: Arc::clone(&self.key),
+            alpn: self.alpn.clone(),
+        })?;
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run(&mut stream)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tls handshake timed out",
+                ));
+            }
+        }
+        let (sealer, opener) = handshake
+            .application
+            .take()
+            .ok_or_else(|| io::Error::other("the handshake left no application keys"))?;
+        Ok(TlsStream {
+            inner: stream,
+            sealer,
+            opener,
+            raw: Vec::new(),
+            pending: Vec::new(),
+            pending_at: 0,
+            out: VecDeque::new(),
+            taken: 0,
+            eof: false,
+            closed: false,
+        })
+    }
+}
+
+/// A `Listable[string]`: one PEM block or a list of them, which the reference
+/// joins with newlines before it hands the text to the parser. `None` for an
+/// absent or empty value -- an empty `certificate` is no certificate, the same
+/// way an empty path is no path.
+fn listable(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    let joined = match object.get(key)? {
+        Value::String(one) => one.clone(),
+        Value::Array(list) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<&str>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// Does the block name a certificate by either of the two ways it can?
+fn has_material(object: &serde_json::Map<String, Value>, inline: &str, path: &str) -> bool {
+    listable(object, inline).is_some()
+        || object
+            .get(path)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+}
+
+/// A stream carrying application data through our own TLS 1.3 record layer.
+pub struct TlsStream<S> {
+    inner: S,
+    sealer: Sealer,
+    opener: Opener,
+    /// transport bytes that do not make a whole record yet
+    raw: Vec<u8>,
+    /// plaintext of a record bigger than the reader's buffer, and how much of it
+    /// has been handed over
+    pending: Vec<u8>,
+    pending_at: usize,
+    /// sealed records waiting to go out, in order, with how much of each one
+    /// has been written
+    out: VecDeque<(Vec<u8>, usize)>,
+    /// how many bytes of the caller's buffer this call has already sealed, and
+    /// therefore owes back once they are on the wire
+    taken: usize,
+    eof: bool,
+    /// close_notify is due to go out once, at shutdown
+    closed: bool,
+}
+
+impl<S> TlsStream<S> {
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// Push whatever is left of the queued records into the transport, oldest
+    /// first: the sequence number is the record's position, so they cannot be
+    /// reordered or interleaved.
+    fn drain_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let Self { inner, out, .. } = self;
+        while let Some((record, written)) = out.front_mut() {
+            // An empty slice reads as `Ok(0)`, which is the one thing a socket
+            // does answer with without having written anything -- so the loop
+            // has to stop on the length itself, not on what the write returns.
+            if *written >= record.len() {
+                out.pop_front();
+                continue;
+            }
+            match Pin::new(&mut *inner).poll_write(cx, &record[*written..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "the transport took no bytes of a sealed record",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => *written += n,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        loop {
+            if me.pending_at < me.pending.len() {
+                let take = (me.pending.len() - me.pending_at).min(buf.remaining());
+                buf.put_slice(&me.pending[me.pending_at..me.pending_at + take]);
+                me.pending_at += take;
+                if me.pending_at == me.pending.len() {
+                    me.pending.clear();
+                    me.pending_at = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if me.eof {
+                return Poll::Ready(Ok(()));
+            }
+            // Whatever we already hold comes first and only then the socket: a
+            // socket hands us half a record all the time, so asking it only when
+            // the buffer was short spins over the same bytes forever.
+            if me.raw.len() >= 5 {
+                let len = u16::from_be_bytes([me.raw[3], me.raw[4]]) as usize;
+                if me.raw.len() >= 5 + len {
+                    let record: Vec<u8> = me.raw.drain(..5 + len).collect();
+                    let (kind, plain) = me.opener.open(&record)?;
+                    match kind {
+                        ContentType::ApplicationData if !plain.is_empty() => {
+                            me.pending = plain;
+                            me.pending_at = 0;
+                        }
+                        // an alert ends the stream, close_notify or not: the
+                        // reference has nothing left to say either way
+                        ContentType::Alert => me.eof = true,
+                        // a post-handshake message we do not keep, which is what
+                        // the reference does with NewSessionTicket as well
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
+            let mut chunk = [0u8; CHUNK];
+            let mut read = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) => {
+                    let filled = read.filled();
+                    if filled.is_empty() {
+                        me.eof = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                    me.raw.extend_from_slice(filled);
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        // Nothing to seal is nothing written: reporting zero keeps a caller from
+        // sealing an empty record.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // A record holds 2^14 bytes of plaintext and no more (RFC 8446 §5.1), so
+        // a caller with a megabyte in hand gets a short write and comes back for
+        // the rest. That is what `AsyncWrite` allows, and it is the only honest
+        // answer: sealing the whole buffer anyway puts a length in the header
+        // that does not describe it.
+        if me.taken == 0 {
+            let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
+            match me.sealer.seal(ContentType::ApplicationData, &buf[..take]) {
+                Ok(record) => {
+                    me.out.push_back((record, 0));
+                    me.taken = take;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+        match me.drain_out(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+        // only now are the promised bytes actually on the transport
+        Poll::Ready(Ok(std::mem::take(&mut me.taken)))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        // poll_write only reports ready once the whole record is out, so there is
+        // never a part-written record to flush around
+        Pin::new(&mut me.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        // A close_notify is what tells the client the tunnel ended cleanly
+        // instead of the transport dying under it. rustls treats its absence as
+        // a truncation and complains.
+        if !me.closed {
+            me.closed = true;
+            if let Ok(record) = me.sealer.seal(ContentType::Alert, &CLOSE_NOTIFY) {
+                me.out.push_back((record, 0));
+            }
+            match me.drain_out(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
+}

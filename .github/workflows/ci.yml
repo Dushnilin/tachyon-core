@@ -5,8 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to the same PR makes the previous run obsolete; don't queue behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  SB_REF_VERSION: v1.14.2-lx.11
 
 jobs:
   test:
@@ -42,6 +51,29 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --test exit_gate -- --nocapture
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --test inbounds -- --nocapture
+
+  differential:
+    name: check vs sing-box-lx
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # run.sh refuses to start without a binary, so this build is not optional.
+      - name: Build tachyon-core
+        run: cargo build --workspace
+      - name: Fetch reference sing-box-lx
+        run: |
+          curl -fsSL -o ref.tar.gz \
+            "https://github.com/Leadaxe/sing-box-lx/releases/download/${SB_REF_VERSION}/sing-box-${SB_REF_VERSION#v}-linux-amd64.tar.gz"
+          mkdir -p "$HOME/ref" && tar -xzf ref.tar.gz -C "$HOME/ref"
+          REF_BIN="$(find "$HOME/ref" -type f -name sing-box | head -1)"
+          chmod +x "$REF_BIN"
+          echo "SING_BOX_REF=$REF_BIN" >> "$GITHUB_ENV"
+          "$REF_BIN" version
+      - name: Run differential harness
+        env:
+          STRICT: "1"
+        run: bash tests/differential/run.sh
 
   cross:
     name: Cross build (musl)

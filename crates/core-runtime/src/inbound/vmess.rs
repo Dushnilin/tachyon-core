@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpListener;
 
+use super::tls::ServerTls;
 use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_CHUNK};
@@ -87,6 +88,7 @@ pub struct Vmess {
     router: Arc<Router>,
     users: Arc<Vec<User>>,
     replay: Arc<Replay>,
+    tls: Option<Arc<ServerTls>>,
 }
 
 impl Vmess {
@@ -140,6 +142,7 @@ impl Vmess {
             router,
             users: Arc::new(users),
             replay: Arc::new(Replay::default()),
+            tls: ServerTls::from_inbound(obj, &at)?,
         })
     }
 
@@ -155,8 +158,19 @@ impl Vmess {
                     let replay = Arc::clone(&self.replay);
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
+                    let tls = self.tls.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle(stream, peer, users, replay, tag, router).await {
+                        let local = stream.local_addr().unwrap_or(peer);
+                        let result = match tls {
+                            Some(tls) => match tls.accept(stream).await {
+                                Ok(stream) => {
+                                    handle(stream, peer, local, users, replay, tag, router).await
+                                }
+                                Err(err) => Err(err),
+                            },
+                            None => handle(stream, peer, local, users, replay, tag, router).await,
+                        };
+                        if let Err(err) = result {
                             logging::debug(format_args!("vmess {peer}: {err}"));
                         }
                     });
@@ -182,14 +196,18 @@ struct Request {
     destination: Target,
 }
 
-async fn handle(
-    mut stream: tokio::net::TcpStream,
+async fn handle<S>(
+    mut stream: S,
     peer: SocketAddr,
+    local: SocketAddr,
     users: Arc<Vec<User>>,
     replay: Arc<Replay>,
     tag: String,
     router: Arc<Router>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let request = read_request(&mut stream, &users, &replay).await?;
     if request.command != COMMAND_TCP {
         return Err(io::Error::other(format!(
@@ -223,7 +241,6 @@ async fn handle(
     let global_padding = request.option & OPT_GLOBAL_PADDING != 0;
     let chunk_masking = request.option & OPT_CHUNK_MASKING != 0;
     let authenticated_length = request.option & OPT_AUTHENTICATED_LENGTH != 0;
-    let local = stream.local_addr().unwrap_or(peer);
     let framed: AnyStream = Box::new(ServerStream {
         inner: Box::new(stream),
         // what the client writes is keyed with the request keys on both sides
@@ -266,11 +283,10 @@ async fn handle(
 }
 
 /// authID || GCM(length, AAD=authID) || connNonce(8) || GCM(header, AAD=authID).
-async fn read_request(
-    stream: &mut tokio::net::TcpStream,
-    users: &[User],
-    replay: &Replay,
-) -> io::Result<Request> {
+async fn read_request<S>(stream: &mut S, users: &[User], replay: &Replay) -> io::Result<Request>
+where
+    S: AsyncRead + Unpin,
+{
     let mut auth_id = [0u8; 16];
     stream.read_exact(&mut auth_id).await?;
     let (user, decoded, timestamp) = find_user(users, &auth_id)?;

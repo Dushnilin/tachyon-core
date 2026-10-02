@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::crypto::{Cipher, Method, derive_subkey, master_key, random_bytes};
-use crate::inbound::{AnyRead, AnyWrite, Target};
+use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {
@@ -14,6 +14,7 @@ pub struct Shadowsocks {
     method: Method,
     master_key: Arc<Vec<u8>>,
     dial: crate::outbound::dial::DialOptions,
+    tls: Option<crate::tls_client::TlsOptions>,
 }
 
 impl Shadowsocks {
@@ -39,12 +40,17 @@ impl Shadowsocks {
             .ok_or_else(|| anyhow::anyhow!("{at}: missing password"))?;
         let key =
             master_key(method, password).map_err(|e| anyhow::anyhow!("{at}: bad password: {e}"))?;
+        // TLS wraps the whole shadowsocks session, salt and head included, the
+        // way the reference dials it: `tls` is a container on the outbound and
+        // not a separate transport.
+        let tls = crate::tls_client::TlsOptions::from_outbound(obj, &server, at)?;
         Ok(Self {
             server,
             port,
             method,
             master_key: Arc::new(key),
             dial: crate::outbound::dial::DialOptions::parse(obj)?,
+            tls,
         })
     }
 
@@ -52,8 +58,11 @@ impl Shadowsocks {
         &self,
         target: &Target,
     ) -> io::Result<(SsReader<AnyRead>, SsWriter<AnyWrite>)> {
-        let mut stream =
-            crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial).await?;
+        let tcp = crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial).await?;
+        let mut stream: AnyStream = match &self.tls {
+            Some(tls) => tls.wrap_with_defaults(tcp, &[]).await?,
+            None => Box::new(tcp),
+        };
         let mut salt = vec![0u8; self.method.salt_len()];
         random_bytes(&mut salt)?;
         let subkey = derive_subkey(self.method, &self.master_key, &salt);
@@ -95,7 +104,7 @@ impl Shadowsocks {
         }
         stream.write_all(&out).await?;
 
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = tokio::io::split(stream);
         let mut writer = SsWriter {
             inner: Box::new(write_half) as AnyWrite,
             cipher: Cipher::new(self.method, &subkey),

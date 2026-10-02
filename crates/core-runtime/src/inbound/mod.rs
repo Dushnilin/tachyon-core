@@ -18,6 +18,7 @@ pub mod mixed;
 pub mod proxy;
 pub mod redirect;
 pub mod shadowsocks;
+pub mod tls;
 pub mod tproxy;
 pub(crate) mod udp;
 pub mod vmess;

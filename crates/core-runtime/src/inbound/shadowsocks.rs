@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 
+use super::tls::ServerTls;
 use crate::inbound::{
     AnyRead, AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen,
 };
@@ -38,6 +39,7 @@ pub struct Shadowsocks {
     router: Arc<Router>,
     method: Method,
     master_key: Arc<Vec<u8>>,
+    tls: Option<Arc<ServerTls>>,
 }
 
 impl Shadowsocks {
@@ -89,6 +91,7 @@ impl Shadowsocks {
             router,
             method,
             master_key: Arc::new(key),
+            tls: ServerTls::from_inbound(obj, &at)?,
         })
     }
 
@@ -104,11 +107,23 @@ impl Shadowsocks {
                     let master_key = Arc::clone(&self.master_key);
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
+                    let tls = self.tls.clone();
                     tokio::spawn(async move {
-                        if let Err(err) =
-                            handle(stream, peer, method, master_key, tag, router).await
-                        {
-                            eprintln!("SS-SERVER-ERR {peer}: {err}");
+                        let local = stream.local_addr().unwrap_or(peer);
+                        let result = match tls {
+                            Some(tls) => match tls.accept(stream).await {
+                                Ok(stream) => {
+                                    handle(stream, peer, local, method, master_key, tag, router)
+                                        .await
+                                }
+                                Err(err) => Err(err),
+                            },
+                            None => {
+                                handle(stream, peer, local, method, master_key, tag, router).await
+                            }
+                        };
+                        if let Err(err) = result {
+                            logging::debug(format_args!("shadowsocks {peer}: {err}"));
                         }
                     });
                 }
@@ -130,14 +145,18 @@ struct Head {
     counter: u64,
 }
 
-async fn handle(
-    mut stream: tokio::net::TcpStream,
+async fn handle<S>(
+    mut stream: S,
     peer: SocketAddr,
+    local: SocketAddr,
     method: Method,
     master_key: Arc<Vec<u8>>,
     tag: String,
     router: Arc<Router>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut salt = vec![0u8; method.salt_len()];
     stream.read_exact(&mut salt).await?;
     let mut cipher = Cipher::new(method, &derive_subkey(method, &master_key, &salt));
@@ -148,7 +167,6 @@ async fn handle(
         read_legacy_head(&mut stream, &mut cipher, &mut counter).await?
     };
 
-    let local = stream.local_addr().unwrap_or(peer);
     let (read_half, write_half) = tokio::io::split(stream);
     let framed: AnyStream = Box::new(ServerStream {
         read: ChunkReader {
@@ -193,11 +211,14 @@ async fn handle(
 /// behind them. Neither block carries a length prefix: the 2022 client seals
 /// them straight off the session key (`shadowio.Writer.Encrypt`), and only what
 /// follows them is chunked.
-async fn read_2022_head(
-    stream: &mut tokio::net::TcpStream,
+async fn read_2022_head<S>(
+    stream: &mut S,
     cipher: &mut Cipher,
     counter: &mut u64,
-) -> io::Result<Head> {
+) -> io::Result<Head>
+where
+    S: AsyncRead + Unpin,
+{
     let fixed = read_sealed(stream, cipher, counter, 11).await?;
     if fixed.first() != Some(&0) {
         return Err(io::Error::other("bad header type"));
@@ -229,11 +250,14 @@ async fn read_2022_head(
 }
 
 /// The legacy head is the bare address; the client puts it in the first chunk.
-async fn read_legacy_head(
-    stream: &mut tokio::net::TcpStream,
+async fn read_legacy_head<S>(
+    stream: &mut S,
     cipher: &mut Cipher,
     counter: &mut u64,
-) -> io::Result<Head> {
+) -> io::Result<Head>
+where
+    S: AsyncRead + Unpin,
+{
     let first = read_chunk(stream, cipher, counter).await?;
     let (destination, at) = decode_target(&first)?;
     Ok(Head {
@@ -297,11 +321,14 @@ fn now_secs() -> i64 {
 
 /// One chunk: a sealed length followed by a sealed payload, the counters
 /// running 0, 1, 2, ... over the two halves.
-async fn read_chunk(
-    stream: &mut tokio::net::TcpStream,
+async fn read_chunk<S>(
+    stream: &mut S,
     cipher: &mut Cipher,
     counter: &mut u64,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut sealed = vec![0u8; 2 + AEAD_TAG];
     stream.read_exact(&mut sealed).await?;
     cipher.open(*counter, &mut sealed)?;
@@ -314,12 +341,15 @@ async fn read_chunk(
 }
 
 /// A block sealed straight off the session key, with no length in front of it.
-async fn read_sealed(
-    stream: &mut tokio::net::TcpStream,
+async fn read_sealed<S>(
+    stream: &mut S,
     cipher: &mut Cipher,
     counter: &mut u64,
     len: usize,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut payload = vec![0u8; len + AEAD_TAG];
     stream.read_exact(&mut payload).await?;
     cipher.open(*counter, &mut payload)?;

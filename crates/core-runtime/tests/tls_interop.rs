@@ -128,6 +128,8 @@ async fn assert_outbound(
     let users = match inbound_type {
         "vless" => json!([{"uuid": VLESS_UUID}]),
         "trojan" => json!([{"password": "trojan-secret"}]),
+        "anytls" => json!([{"password": "anytls-secret"}]),
+        "naive" => json!([{"username": "naive-user", "password": "naive-secret"}]),
         other => panic!("unsupported inbound type {other}"),
     };
     let _server = start_ref(
@@ -176,6 +178,52 @@ async fn interop_vless_tls() {
             "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
             "uuid": VLESS_UUID,
             "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
+        })
+    })
+    .await;
+}
+
+/// Both were on the roadmap as full parity with nothing but `check` behind
+/// them -- which is exactly how the vless Vision flow went unnoticed until the
+/// reference was actually run. These run the reference as the server.
+#[tokio::test]
+async fn interop_anytls_tls() {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    assert_outbound(&ref_bin.to_string_lossy(), "anytls", "anytls+tls", |port| {
+        json!({
+            "type": "anytls", "tag": "up", "server": "127.0.0.1", "server_port": port,
+            "password": "anytls-secret",
+            "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
+        })
+    })
+    .await;
+}
+
+/// Known gap: the reference's naive inbound now accepts, authenticates and
+/// routes our tunnel (`inbound connection from ... / to ...`), and bytes do
+/// cross in both directions, but the payload never reaches the caller. The
+/// reference's own naive client cannot serve as the control on this machine --
+/// its Chromium TLS stack rejects the test certificate with "cert validity too
+/// long", the cert being valid for ten years.
+#[tokio::test]
+#[ignore = "naive: the tunnel opens but the payload does not come back"]
+async fn interop_naive_tls() {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    // the reference refuses `insecure` on a naive outbound (and so do we), so
+    // the test certificate is trusted as a CA instead
+    assert_outbound(&ref_bin.to_string_lossy(), "naive", "naive+tls", |port| {
+        json!({
+            "type": "naive", "tag": "up", "server": "127.0.0.1", "server_port": port,
+            "username": "naive-user", "password": "naive-secret",
+            "tls": {
+                "enabled": true,
+                "server_name": "localhost",
+                "certificate_path": format!("{}/../../tests/golden/certs/localhost.crt", env!("CARGO_MANIFEST_DIR"))
+            }
         })
     })
     .await;

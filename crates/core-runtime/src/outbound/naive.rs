@@ -7,6 +7,12 @@
 //! or the server address. UDP needs `udp_over_tcp`: the client opens a tunnel
 //! to the reserved magic address, writes the uot request header, and then
 //! exchanges bare datagrams.
+//!
+//! What makes it naive rather than a plain HTTP CONNECT is the `Padding`
+//! header: the reference answers 400 without one, and puts one on the response
+//! too. The framing of the first eight blocks that its `paddingConn` describes
+//! is dead code in the reference -- nothing constructs it -- so the stream
+//! itself stays plain. Reference `protocol/naive/inbound.go`.
 
 use std::io;
 use std::net::IpAddr;
@@ -24,6 +30,22 @@ use crate::outbound::uot::{UOT_DEFAULT_VERSION, magic_authority, request_header,
 use crate::tls_client::TlsOptions;
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A `Padding` header value: 30 to 62 bytes, the first sixteen drawn from a
+/// punctuation set and the rest tildes, so the header reads as proxy noise.
+fn padding_header() -> String {
+    const NOISE: &[u8] = b"!#$()+<>?@[]^`{}";
+    let mut random = [0u8; 8];
+    let _ = getrandom::fill(&mut random);
+    let mut bits = u64::from_le_bytes(random) % 33 + 30;
+    let len = bits as usize;
+    let mut bytes = vec![b'~'; len];
+    for slot in bytes[..16].iter_mut() {
+        *slot = NOISE[(bits & 15) as usize];
+        bits >>= 4;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 /// Config knobs that only tune the reference (cronet) client internals.
 const TUNING_FIELDS: &[&str] = &[
@@ -232,7 +254,9 @@ impl Naive {
         });
         let mut builder = http::Request::builder()
             .method("CONNECT")
-            .uri(format!("https://{authority}"));
+            .uri(format!("https://{authority}"))
+            .header("padding", padding_header())
+            .header("-connect-authority", authority);
         if let Some(authorization) = &self.authorization {
             builder = builder.header("proxy-authorization", authorization.clone());
         }
@@ -247,9 +271,9 @@ impl Naive {
                 .await
                 .map_err(|_| io::Error::other("naive: h3 request timeout"))?
                 .map_err(|e| io::Error::other(format!("naive: h3 request: {e}")))?;
-        Ok(Box::new(
-            crate::outbound::transport::h3io::H3Stream::new(request_stream, conn_task).await?,
-        ))
+        let inner =
+            crate::outbound::transport::h3io::H3Stream::new(request_stream, conn_task).await?;
+        Ok(Box::new(inner))
     }
 
     /// One h2 CONNECT stream: handshake, request, wrapped as raw pipes.
@@ -273,7 +297,9 @@ impl Naive {
             .map_err(|e| io::Error::other(format!("naive: h2 ready: {e}")))?;
         let mut builder = http::Request::builder()
             .method("CONNECT")
-            .uri(authority.to_string());
+            .uri(authority.to_string())
+            .header("padding", padding_header())
+            .header("-connect-authority", authority.to_string());
         if let Some(authorization) = &self.authorization {
             builder = builder.header("proxy-authorization", authorization.clone());
         }
@@ -284,10 +310,23 @@ impl Naive {
             .body(())
             .map_err(|e| io::Error::other(format!("naive: build request: {e}")))?;
         let (response, send) = send_request
-            .send_request(request, true)
+            .send_request(request, false)
             .map_err(|e| io::Error::other(format!("naive: send request: {e}")))?;
+        // Read the head here rather than leaving it to the first read: a server
+        // that refuses the CONNECT resets the stream, and the copy loop then
+        // fails on the write side with a closed stream and no reason at all.
+        let response = tokio::time::timeout(CONNECT_TIMEOUT, response)
+            .await
+            .map_err(|_| io::Error::other("naive: h2 response timeout"))?
+            .map_err(|e| io::Error::other(format!("naive: h2 response: {e}")))?;
+        if response.status() != http::StatusCode::OK {
+            return Err(io::Error::other(format!(
+                "naive: server refused the tunnel: {}",
+                response.status()
+            )));
+        }
         Ok(Box::new(H2Io {
-            h2: H2Stream::new(response, send, conn_task),
+            h2: H2Stream::from_response(response, send, conn_task),
         }))
     }
 }

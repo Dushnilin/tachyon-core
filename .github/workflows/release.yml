@@ -70,16 +70,29 @@ jobs:
             build-std: true
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
+      # `rustup target add` refuses a tier-3 target outright -- there are no
+      # prebuilt artifacts to add, and it says so and exits non-zero -- so the two
+      # MIPS entries must not be asked to install their target. They get nightly
+      # plus rust-src and let `-Z build-std` compile the standard library.
+      - name: Toolchain (prebuilt std)
+        if: ${{ !matrix.build-std }}
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.build-std && 'nightly' || 'stable' }}
+          toolchain: stable
           targets: ${{ matrix.target }}
+      - name: Toolchain (std from source)
+        if: ${{ matrix.build-std }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
       - name: Link musl with rust-lld
         run: echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
       - name: Build
         run: |
           if [ -n "${{ matrix.build-std }}" ]; then
+            # `panic_abort` is already the release profile's setting, so the
+            # unwinding tables have nowhere to live and would only cost size.
             cargo build --workspace --release --target ${{ matrix.target }} \
               -Z build-std=std,panic_abort
           else
@@ -89,13 +102,14 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/tachyon-core"
           size=$(stat -c%s "$bin")
-          echo "size=$size bytes"
+          echo "${{ matrix.name }}: $size bytes, budget $SIZE_BUDGET"
           test "$size" -le "$SIZE_BUDGET"
-      - name: Version
-        id: version
+      - name: The binary is for this architecture
+        # Not `tachyon-core version`: these are foreign-architecture binaries and
+        # the runner cannot exec them. Read the header instead, which is the check
+        # that would actually catch a stale target directory.
         run: |
-          echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
-          "target/${{ matrix.target }}/release/tachyon-core" version
+          file "target/${{ matrix.target }}/release/tachyon-core"
       - name: Pack
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
@@ -129,11 +143,26 @@ jobs:
           cat ./*.sha256 > SHA256SUMS
           rm -f ./*.sha256
           cat SHA256SUMS
+      - name: The notes for this version, not the whole file
+        # `body_path: CHANGELOG.md` would publish every version ever written as
+        # the notes for this one, and the next release would still read as 0.0.1.
+        run: |
+          ver="${{ inputs.tag || github.ref_name }}"
+          ver="${ver#v}"
+          awk -v want="## $ver" '
+            /^## / { inside = ($0 == want) }
+            inside
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '^## ' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $ver"
+            exit 1
+          fi
+          cat notes.md
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: notes.md
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS

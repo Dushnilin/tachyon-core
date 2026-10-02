@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use crate::dns::QueryMeta;
-use crate::inbound::Target;
+use crate::inbound::{AnyWrite, Target};
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router};
 
@@ -54,26 +55,63 @@ fn now_ms() -> u64 {
     epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// How a reply datagram is framed before it goes back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DatagramFrame {
+    /// the bare payload: direct and tproxy inbounds answer a socket
+    Raw,
+    /// a SOCKS5 UDP relay header in front of it (mixed inbound)
+    Socks,
+    /// `[len:u16][payload]`, which is what `vmess.Service`'s `serverPacketConn`
+    /// reads and writes for the UDP command
+    LengthPrefixed,
+}
+
+impl DatagramFrame {
+    fn apply(self, dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        match self {
+            DatagramFrame::Raw => payload.to_vec(),
+            DatagramFrame::Socks => socks_udp_datagram(dest, payload),
+            DatagramFrame::LengthPrefixed => {
+                let mut out = Vec::with_capacity(2 + payload.len());
+                out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                out.extend_from_slice(payload);
+                out
+            }
+        }
+    }
+}
+
+/// Where a reply datagram goes: back out of a socket the client is reading
+/// from, or down a stream it is reading a length-prefixed sequence off.
+#[derive(Clone)]
+pub(crate) enum Reply {
+    Socket(Arc<UdpSocket>),
+    Stream(Arc<tokio::sync::Mutex<AnyWrite>>),
+}
+
+impl Reply {
+    async fn send(&self, framed: Vec<u8>, source: SocketAddr) -> std::io::Result<()> {
+        match self {
+            Reply::Socket(socket) => socket.send_to(&framed, source).await.map(|_| ()),
+            Reply::Stream(writer) => {
+                let mut writer = writer.lock().await;
+                writer.write_all(&framed).await
+            }
+        }
+    }
+}
+
 pub(crate) struct UdpHub {
     router: Arc<Router>,
     flows: Mutex<HashMap<FlowKey, Arc<Flow>>>,
     timeout: Duration,
-    /// Wrap responses in a SOCKS5 UDP relay header (mixed inbound);
-    /// direct/tproxy inbounds reply with the raw payload.
-    socks: bool,
+    /// how replies are framed before they go back
+    frame: DatagramFrame,
 }
 
 impl UdpHub {
-    pub fn new(router: Arc<Router>, timeout: Duration) -> Arc<Self> {
-        Self::with_wrap(router, timeout, false)
-    }
-
-    /// Hub for a SOCKS5 UDP ASSOCIATE relay (response header re-added).
-    pub fn new_socks(router: Arc<Router>, timeout: Duration) -> Arc<Self> {
-        Self::with_wrap(router, timeout, true)
-    }
-
-    fn with_wrap(router: Arc<Router>, timeout: Duration, socks: bool) -> Arc<Self> {
+    pub fn new(router: Arc<Router>, timeout: Duration, frame: DatagramFrame) -> Arc<Self> {
         let hub = Arc::new(Self {
             router,
             flows: Mutex::new(HashMap::new()),
@@ -82,7 +120,7 @@ impl UdpHub {
             } else {
                 timeout
             },
-            socks,
+            frame,
         });
         let sweeper = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -100,10 +138,11 @@ impl UdpHub {
         flows.retain(|_, flow| flow.idle() < timeout);
     }
 
-    /// Handle one datagram received on `listen` from `source` toward `dest`.
+    /// Handle one datagram received from `source` toward `dest`, and answer it
+    /// through `reply`.
     pub async fn handle(
         self: &Arc<Self>,
-        listen: &Arc<UdpSocket>,
+        reply: Reply,
         source: SocketAddr,
         dest: SocketAddr,
         payload: &[u8],
@@ -117,7 +156,7 @@ impl UdpHub {
                 Arc::clone(flow)
             } else {
                 drop(map);
-                let flow = self.open_flow(listen, source, dest, tag).await?;
+                let flow = self.open_flow(reply.clone(), source, dest, tag).await?;
                 flow.touch();
                 let mut map = self.flows.lock().await;
                 // Another packet may have won the race — keep the first.
@@ -130,7 +169,7 @@ impl UdpHub {
             }
         };
         match &flow.kind {
-            FlowKind::Dns => self.hijack_one(listen, source, dest, payload, tag).await,
+            FlowKind::Dns => self.hijack_one(reply, source, dest, payload, tag).await,
             FlowKind::Outbound { sock } => {
                 sock.send(payload).await?;
                 Ok(())
@@ -140,7 +179,7 @@ impl UdpHub {
 
     async fn open_flow(
         self: &Arc<Self>,
-        listen: &Arc<UdpSocket>,
+        reply: Reply,
         source: SocketAddr,
         dest: SocketAddr,
         tag: &str,
@@ -161,13 +200,13 @@ impl UdpHub {
                 let sock = Arc::new(sock);
                 spawn_reverse(
                     Arc::clone(&sock),
-                    Arc::clone(listen),
+                    reply,
+                    self.frame,
                     source,
                     tag,
                     self.timeout,
                     Arc::clone(self),
                     (source, dest),
-                    self.socks,
                 );
                 Flow {
                     kind: FlowKind::Outbound { sock },
@@ -180,7 +219,7 @@ impl UdpHub {
 
     async fn hijack_one(
         &self,
-        listen: &Arc<UdpSocket>,
+        reply: Reply,
         source: SocketAddr,
         dest: SocketAddr,
         payload: &[u8],
@@ -198,17 +237,65 @@ impl UdpHub {
             "udp hijack-dns {tag} {source} -> {dest}: {}B reply",
             resp.len()
         ));
-        let resp = if self.socks {
-            socks_udp_datagram(dest, &resp)
-        } else {
-            resp
-        };
-        listen.send_to(&resp, source).await?;
+        reply.send(self.frame.apply(dest, &resp), source).await?;
         Ok(())
     }
 
     async fn remove_flow(&self, key: FlowKey) {
         self.flows.lock().await.remove(&key);
+    }
+}
+
+/// The UDP command of a proxy-protocol server inbound: `[len:u16][payload]` in
+/// both directions over the connection the client already opened, with every
+/// datagram going to the destination its request head named.
+///
+/// `vmess.Service`'s `serverPacketConn` byte for byte -- a length, the payload,
+/// and no address in either direction, because the head carried it. The
+/// reference's vless and trojan inbounds wrap this the same way, and their
+/// inbounds listen on TCP only: there is no second socket to bind.
+pub(crate) async fn relay_stream_datagrams<S>(
+    mut reader: S,
+    writer: Arc<tokio::sync::Mutex<AnyWrite>>,
+    source: SocketAddr,
+    dest: SocketAddr,
+    tag: &str,
+    router: &Arc<Router>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    let hub = UdpHub::new(
+        Arc::clone(router),
+        Duration::ZERO,
+        DatagramFrame::LengthPrefixed,
+    );
+    let reply = Reply::Stream(writer);
+    let mut len = [0u8; 2];
+    loop {
+        if let Err(err) = reader.read_exact(&mut len).await {
+            // a client that closes between datagrams has simply finished; only
+            // a half-read length is a protocol error
+            return match err.kind() {
+                std::io::ErrorKind::UnexpectedEof if len == [0, 0] => Ok(()),
+                _ => Err(err),
+            };
+        }
+        let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
+        reader.read_exact(&mut payload).await?;
+        hub.handle(reply.clone(), source, dest, &payload, tag)
+            .await?;
+    }
+}
+
+/// The destination a UDP command's head has to name: an address, because the
+/// datagrams that follow carry none.
+pub(crate) fn udp_destination(destination: &Target) -> std::io::Result<SocketAddr> {
+    match destination {
+        Target::Ip(addr) => Ok(*addr),
+        Target::Domain(host, _) => Err(std::io::Error::other(format!(
+            "the udp command names the destination in its head, and {host:?} is not an address"
+        ))),
     }
 }
 
@@ -234,13 +321,13 @@ fn socks_udp_datagram(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 fn spawn_reverse(
     outbound: Arc<UdpSocket>,
-    listen: Arc<UdpSocket>,
+    reply: Reply,
+    frame: DatagramFrame,
     source: SocketAddr,
     tag: &str,
     idle: Duration,
     hub: Arc<UdpHub>,
     key: FlowKey,
-    socks: bool,
 ) {
     let tag = tag.to_string();
     tokio::spawn(async move {
@@ -248,13 +335,8 @@ fn spawn_reverse(
         loop {
             match tokio::time::timeout(idle, outbound.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    let dest = key.1;
-                    let packet = if socks {
-                        socks_udp_datagram(dest, &buf[..n])
-                    } else {
-                        buf[..n].to_vec()
-                    };
-                    if let Err(err) = listen.send_to(&packet, source).await {
+                    let packet = frame.apply(key.1, &buf[..n]);
+                    if let Err(err) = reply.send(packet, source).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
                         hub.remove_flow(key).await;
                         return;
@@ -273,4 +355,62 @@ fn spawn_reverse(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The datagrams of a UDP command carry no address, so the head has to name
+    /// one. A name cannot be sent to, and a session that accepted one would
+    /// answer nothing for as long as the client waited -- so it is refused with
+    /// the name in the message instead.
+    #[test]
+    fn a_udp_command_destination_has_to_be_an_address() {
+        assert_eq!(
+            udp_destination(&Target::Ip("10.0.0.1:53".parse().expect("addr"))).expect("ip"),
+            "10.0.0.1:53".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(
+            udp_destination(&Target::Ip("[::1]:5353".parse().expect("addr"))).expect("v6"),
+            "[::1]:5353".parse::<SocketAddr>().expect("addr")
+        );
+        let err = udp_destination(&Target::Domain("dns.example.com".into(), 53))
+            .expect_err("a name was accepted");
+        assert!(err.to_string().contains("dns.example.com"), "{err}");
+    }
+
+    /// The framing is the reference's `serverPacketConn`: a length and the
+    /// payload, with the address nowhere in it.
+    #[test]
+    fn length_prefixed_frames_carry_no_address() {
+        let dest = "10.0.0.1:53".parse::<SocketAddr>().expect("addr");
+        assert_eq!(
+            DatagramFrame::LengthPrefixed.apply(dest, b"hello"),
+            b"\x00\x05hello".to_vec()
+        );
+        assert_eq!(DatagramFrame::Raw.apply(dest, b"hello"), b"hello".to_vec());
+        let socks = DatagramFrame::Socks.apply(dest, b"hello");
+        assert_eq!(&socks[..3], &[0, 0, 0]);
+        assert_eq!(&socks[3..], b"\x01\x0a\x00\x00\x01\x00\x35hello");
+    }
+
+    /// A datagram the length describes has to arrive whole and nothing else:
+    /// the relay reads exactly that many bytes, so a frame that is one byte
+    /// short would eat the next frame's length.
+    #[test]
+    fn a_length_prefix_covers_its_whole_payload() {
+        let dest = "10.0.0.1:53".parse::<SocketAddr>().expect("addr");
+        for len in [1usize, 2, 255, 1400, 65_535] {
+            let payload = vec![(len % 251) as u8; len];
+            let framed = DatagramFrame::LengthPrefixed.apply(dest, &payload);
+            assert_eq!(framed.len(), len + 2, "{len}");
+            assert_eq!(
+                u16::from_be_bytes([framed[0], framed[1]]) as usize,
+                len,
+                "{len}"
+            );
+            assert_eq!(&framed[2..], &payload[..], "{len}");
+        }
+    }
 }

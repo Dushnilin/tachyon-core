@@ -15,7 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
 use super::tls::ServerTls;
-use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
+use super::udp::{relay_stream_datagrams, udp_destination};
+use crate::inbound::{AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::route::Router;
 
@@ -24,6 +25,13 @@ pub(crate) const COMMAND_TCP: u8 = 0x01;
 pub(crate) const COMMAND_UDP: u8 = 0x02;
 /// trojan numbers its mux command 0x7f (`transport/trojan/protocol.go`).
 pub(crate) const COMMAND_MUX: u8 = 0x7f;
+
+/// trojan's UDP command is 2 in sing's `protocol.go` and 3 in Xray's
+/// `protocol.RequestCommand`, and both spellings are in the field -- sing-box
+/// reads 2, Xray writes 3, and our own client writes what Xray writes. A server
+/// that picked one number would refuse half of them, so both are read as the
+/// same command and the mux value stays 0x7f, which neither of them uses.
+pub(crate) const COMMAND_UDP_ALT: u8 = 0x03;
 
 /// The answer head the server puts in front of the first payload: version and
 /// addons length, both zero (`serverConn.Write`).
@@ -187,6 +195,24 @@ where
             "xtls-rprx-vision flow does not support UDP",
         ));
     }
+    if command == COMMAND_UDP {
+        let dest = udp_destination(&destination)?;
+        // The answer head goes out in front of the first datagram, not in
+        // front of a payload that may never come: `serverPacketConn` writes it
+        // on the first `WriteTo`, and a client waiting for it before its first
+        // read would otherwise wait forever.
+        stream.write_all(&RESPONSE_HEAD).await?;
+        let (reader, writer) = tokio::io::split(stream);
+        return relay_stream_datagrams(
+            reader,
+            Arc::new(tokio::sync::Mutex::new(Box::new(writer) as AnyWrite)),
+            peer,
+            dest,
+            &tag,
+            &router,
+        )
+        .await;
+    }
     if command != COMMAND_TCP {
         return Err(io::Error::other(format!(
             "command {command} is not implemented by this server"
@@ -340,6 +366,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (name, command, destination) = read_trojan_request(&mut stream, &keys).await?;
+    if matches!(command, COMMAND_UDP | COMMAND_UDP_ALT) {
+        let dest = udp_destination(&destination)?;
+        let (reader, writer) = tokio::io::split(stream);
+        return relay_stream_datagrams(
+            reader,
+            Arc::new(tokio::sync::Mutex::new(Box::new(writer) as AnyWrite)),
+            peer,
+            dest,
+            &tag,
+            &router,
+        )
+        .await;
+    }
     if command != COMMAND_TCP {
         return Err(io::Error::other(format!(
             "command {command} is not implemented by this server"
@@ -383,7 +422,10 @@ where
     skip_crlf(stream).await?;
     let mut command = [0u8; 1];
     stream.read_exact(&mut command).await?;
-    if !matches!(command[0], COMMAND_TCP | COMMAND_UDP | COMMAND_MUX) {
+    if !matches!(
+        command[0],
+        COMMAND_TCP | COMMAND_UDP | COMMAND_UDP_ALT | COMMAND_MUX
+    ) {
         return Err(io::Error::other(format!("unknown command {}", command[0])));
     }
     let destination = read_target(stream).await?;

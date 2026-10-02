@@ -14,11 +14,11 @@ use std::task::{Context, Poll, ready};
 
 use cfb_mode::cipher::KeyIvInit;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::mux;
-use crate::outbound::packet::{CMD_TCP, PacketEncoding, ResponseHeaderStream, spawn_packet_bridge};
+use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::transport::Transport;
@@ -204,7 +204,15 @@ impl Vmess {
             .connect(tcp, self.tls.as_ref(), &self.server, self.port, &first)
             .await?;
         stream.write_all(&first[consumed..]).await?;
-        let stream: AnyStream = Box::new(ResponseHeaderStream::new(stream));
+        // The packet path has no codec, so the server answers with the bare
+        // `[version][addonsLen]` pair rather than the sealed response header.
+        // It has to be swallowed here: the relay reads the raw stream, and a
+        // header left in it would be taken for the length of the first
+        // datagram. Both bytes are zero, which is the answer and not a refusal
+        // -- a refused request gets no answer at all, only a closed connection.
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await?;
+        let stream: AnyStream = Box::new(stream);
         spawn_packet_bridge(stream, peer, mode, target.clone());
         Ok(local)
     }

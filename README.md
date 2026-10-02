@@ -223,7 +223,7 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release
 | **F9** | **MIPS Spike** | Таргеты `mipsel`/`mips` softfloat musl через `-Zbuild-std`, qemu-user CI | Запланировано |
 | **F10** | **Интеграция в Tachyon** | Вариант `rs` в Tachyon: автоинсталлятор, переключение ядра в LuCI в 1 клик | Запланировано |
 
-Полные технические спецификации и журнал разработки доступны в [ROADMAP.md](ROADMAP.md).
+Журнал разработки ведётся локально и в репозиторий не попадает.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />

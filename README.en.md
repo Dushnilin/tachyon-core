@@ -204,7 +204,7 @@ The resulting stripped static binary is ~3.5 MiB.
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
 
-## 🗺️ Development Roadmap
+## 🗺️ What works today
 
 Phased implementation validated by automated differential tests against `sing-box-lx`:
 
@@ -222,7 +222,7 @@ Phased implementation validated by automated differential tests against `sing-bo
 | **F9** | **MIPS Spike** | `mipsel`/`mips` softfloat musl via `-Zbuild-std`, qemu-user CI | Planned |
 | **F10** | **Tachyon Integration** | `rs` variant in Tachyon: auto-installer, 1-click LuCI switching | Planned |
 
-See [ROADMAP.md](ROADMAP.md) for detailed task tracking.
+Task tracking is kept out of the repository, so nothing here promises a date.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />

@@ -1,5 +1,13 @@
 # Compatibility matrix
 
+> **This table has not been kept up to date.** It was written while the work was
+> still in F0–F2 and most of the rows below say `planned` for things that are
+> done and measured: the whole client stack, the DNS server types, `rule_set`,
+> `clash_api`, `cache_file`, the mux and transport layers. Treat `ROADMAP.md` as
+> the source of truth for what works today; this file is a snapshot of the
+> schema policy, not of the implementation. Fixing it properly means walking
+> every field of every option against the code, which is its own piece of work.
+
 Goal: **full schema compatibility** with sing-box (Leadaxe/sing-box-lx feature set).
 Policy: the reference `check` decodes strictly — unknown fields anywhere are
 rejected. `tachyon-core check` mirrors this at the top level and inside `log`,
@@ -24,12 +32,12 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 
 | Command | Surface used by Tachyon | Status |
 |---|---|---|
-| `version` | `generator.uc` regex `sing-box version ([^\s]+)` | scaffold |
+| `version` | `generator.uc` regex `sing-box version ([^\s]+)` | done |
 | `check -c` | `watchdog.uc`, installer preflight | done (schema + semantic validation) |
-| `run` | service runtime | planned |
+| `run` | service runtime | done (Tokio async runtime) |
 | `format`, `upgrade` | config maintenance | planned |
 | `generate uuid\|rand\|reality-keypair\|wg-keypair\|tls-keypair` | `server/service.uc`, `warp_generator.uc` | planned |
-| `rule-set compile\|decompile\|upgrade` | `updates.uc` | planned |
+| `rule-set compile\|decompile\|upgrade` | `updates.uc` | `compile`/`decompile` done (`upgrade` planned) |
 | `api`, `dns` | diagnostics | planned |
 | `lxd` | lx daemon | planned |
 

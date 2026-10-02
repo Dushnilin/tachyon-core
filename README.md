@@ -159,11 +159,11 @@ tachyon-core run -c /etc/sing-box/config.json
 | `check -c <path>` | Предстартовая проверка конфига в `watchdog.uc` | **Готово** (полная валидация схемы) |
 | `version` | Определение версии в `generator.uc` | **Готово** (upstream regex совместимость) |
 | `run -c <path>` | Запуск рабочего процесса службы | **Готово** (Tokio async runtime) |
-| `rule-set compile\|decompile` | Компиляция бинарных правил `.srs` | В разработке (Фаза F3) |
-| `generate reality-keypair` | Генерация ключей REALITY | В разработке (Фаза F1) |
-| `generate wg-keypair` | Генерация ключей WireGuard / AmneziaWG | В разработке (Фаза F1) |
+| `rule-set compile\|decompile` | Бинарные правила `.srs` для `updates.uc` | **Готово** (SRS v5, оба направления) |
+| `generate reality-keypair` | Генерация ключей REALITY | Не реализовано |
+| `generate wg-keypair` | Генерация ключей WireGuard / AmneziaWG | Не реализовано |
 
-Подробное отслеживание поддержки каждого поля JSON-схемы доступно в документе [COMPAT.md](COMPAT.md).
+Подробное отслеживание поддержки каждого поля JSON-схемы доступно в документе [COMPAT.md](COMPAT.md) — он устарел и не является источником правды: текущее состояние держит `ROADMAP.md`.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
@@ -213,14 +213,14 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release
 |:---:|---|---|:---:|
 | **F0** | **Фундамент** | Прохождение дифференциальных тестов `check` и `version` по всему корпусу тестов | **Завершено** |
 | **F1** | **Data Plane v1** | Inbounds: tproxy, redirect, mixed, direct. Outbounds: socks, http, shadowsocks, vless, trojan, vmess. Smart DNS + FakeIP + LRU. Роутер и сниффер. | **Завершено** |
-| **F2** | **Тяжёлые протоколы** | Hysteria2 (quinn), TUIC, WireGuard + AmneziaWG 2.0/3.x, VLESS ML-KEM-768, XHTTP, uTLS/REALITY | **В разработке** (hy2/tuic/wg/awg/mlkem — готовы) |
-| **F3** | **Правила SRS и обновления** | Бинарная совместимость с `.srs` правилами, автоматическое скачивание списков | Запланировано |
-| **F4** | **Экспериментальный стек** | Clash API (Yacd UI, Secret), `cache.db` (bbolt r/w совместимость) | Запланировано |
-| **F5** | **Серверная часть** | Серверные инбаунды для всех поддерживаемых протоколов | Запланировано |
+| **F2** | **Тяжёлые протоколы** | Hysteria2 (quinn), TUIC, WireGuard + AmneziaWG 2.0/3.x, VLESS ML-KEM-768, XHTTP, uTLS/REALITY | **Завершено** |
+| **F3** | **Правила SRS и обновления** | Бинарная совместимость с `.srs` правилами, автоматическое скачивание списков | **Завершено** |
+| **F4** | **Экспериментальный стек** | Clash API (Yacd UI, Secret), `cache.db` (bbolt r/w совместимость) | **Завершено** |
+| **F5** | **Серверная часть** | Серверные инбаунды для всех поддерживаемых протоколов | **В разработке**: vless, trojan, vmess, shadowsocks — с TLS и UDP-командой |
 | **F6** | **TUN подсистема** | Режим `stack: system` (kernel TUN) и userspace стек на `smoltcp` | Запланировано |
 | **F7** | **lx daemon и метрики** | Совместимость с демоном `lxd`, телеметрия и управление конфигурацией | Запланировано |
 | **F8** | **libbox / Android** | UniFFI/JNI биндинги для мобильных клиентов | Запланировано |
-| **F9** | **MIPS Spike** | Таргеты `mipsel`/`mips` softfloat musl через `-Zbuild-std`, qemu-user CI | Запланировано |
+| **F9** | **MIPS Spike** | Таргеты `mipsel`/`mips` softfloat musl через `-Zbuild-std`, qemu-user CI | **В разработке**: сборка в CI есть, проверки под qemu нет |
 | **F10** | **Интеграция в Tachyon** | Вариант `rs` в Tachyon: автоинсталлятор, переключение ядра в LuCI в 1 клик | Запланировано |
 
 Журнал разработки ведётся локально и в репозиторий не попадает.

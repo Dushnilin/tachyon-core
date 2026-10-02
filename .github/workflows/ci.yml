@@ -81,21 +81,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+          - target: armv7-unknown-linux-musleabihf
+          - target: arm-unknown-linux-musleabi
+          - target: riscv64gc-unknown-linux-musl
+          # tier-3, no prebuilt std: the standard library is built from source
+          - target: mipsel-unknown-linux-musl
+            build-std: true
+          - target: mips-unknown-linux-musl
+            build-std: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.build-std && 'nightly' || 'stable' }}
           targets: ${{ matrix.target }}
       # the toolchains are static musl: link with the bundled rust-lld and the
       # self-contained CRT objects instead of a host gcc that is not there
       - name: Link musl with rust-lld
         run: |
           echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
-      - run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.build-std }}" ]; then
+            cargo build --workspace --release --target ${{ matrix.target }} \
+              -Z build-std=std,panic_abort
+          else
+            cargo build --workspace --release --target ${{ matrix.target }}
+          fi
       - name: Size budget (<= 12 MiB)
         run: |
           size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")

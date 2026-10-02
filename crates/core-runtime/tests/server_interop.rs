@@ -51,6 +51,20 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// The reference needs a moment before its door answers, and how long that is
+/// depends on the machine: on Windows it is up in time, in a container it is
+/// not, and a test that assumes otherwise fails for a reason that has nothing
+/// to do with the code under it.
+async fn wait_listening(port: u16) -> bool {
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 struct RefClient(Child);
 
 impl Drop for RefClient {
@@ -143,6 +157,10 @@ async fn assert_server_serves(
     .unwrap_or_else(|e| panic!("{label}: start our server: {e:#}"));
 
     let (_client, front) = start_ref(ref_bin, make_client(listen_port));
+    assert!(
+        wait_listening(front.port()).await,
+        "{label}: the reference did not start"
+    );
     let result =
         tokio::time::timeout(Duration::from_secs(15), socks_roundtrip(front, echo, label)).await;
     instance.shutdown();

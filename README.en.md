@@ -4,7 +4,7 @@
 
 [![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
 [![Rust](https://img.shields.io/badge/Rust-1.89+-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Binary Size](https://img.shields.io/badge/Binary-3.5_MiB_(musl)-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core)
+[![Binary Size](https://img.shields.io/badge/Binary-5.4_MiB_(musl)-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core)
 [![RAM RSS](https://img.shields.io/badge/RAM_RSS-2.4_MiB-10B981?style=for-the-badge&logo=speedtest)](https://github.com/Dushnilin/tachyon-core)
 [![sing-box Compatibility](https://img.shields.io/badge/sing--box-100%25_JSON_Compat-C084FC?style=for-the-badge&logo=json)](COMPAT.md)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x_%7C_SNAPSHOT-10B981?style=for-the-badge&logo=openwrt)](https://openwrt.org/)
@@ -25,7 +25,7 @@
 Engineered specifically for **OpenWrt** routers and embedded network appliances (including devices with small flash and RAM budgets across MIPS, ARMv7, AArch64, and x86_64 architectures).
 
 **tachyon-core** consumes the **exact same JSON configuration file** (`/etc/sing-box/config.json`), exposes the **exact same CLI surface** (`check -c`, `version`, `run`), while eliminating the overhead of the Go runtime:
-* 📉 **19× Smaller Binary**: Static musl binary weighs **3.5 MiB** vs **67.6–75.9 MiB** for sing-box-lx.
+* 📉 **12× Smaller Binary**: Static musl binary weighs **5.4 MiB** vs **67.6–75.9 MiB** for sing-box-lx.
 * 🧠 **94% Lower Memory (RAM)**: **2.4 MiB idle RSS** vs **42.7 MiB** for Go sing-box.
 * ⚡ **Zero-GC (Zero Garbage Collector Pauses)**: Deterministic RAII lifecycle, eliminating tail latency jitter in VoIP, gaming, and 4K streaming.
 * 🔒 **Pure Rust No-C Cryptography**: Independent of `ring` and BoringSSL/CGO, compiling cleanly for 32-bit softfloat MIPS without toolchain failures.
@@ -53,9 +53,9 @@ Most contemporary proxy cores (sing-box, sing-box-lx, Xray) are written in **Go*
 * **In Go (sing-box)**: Go pre-allocates runtime memory pools (`mheap`), goroutine stacks, and scheduler metadata. Even when completely idle, sing-box-lx consumes **~43 MiB RSS**. Under load with 10,000 active connections, memory can swell past 100 MiB, triggering the **Linux OOM-Killer** on routers with 128 MB or 256 MB RAM.
 * **In Rust (tachyon-core)**: Baseline idle memory is just **2.4 MiB RSS** (**17.8× less RAM**). The router retains free memory for kernel networking, conntrack tables, Wi-Fi drivers, and LuCI.
 
-### 3. Binary Size and Flash Storage: 3.5 MiB vs 68–76 MiB
+### 3. Binary Size and Flash Storage: 5.4 MiB vs 68–76 MiB
 * **In Go (sing-box)**: The Go runtime, reflection tables, and dependencies inflate the sing-box-lx binary to **67.6 – 75.9 MiB**.
-* **In Rust (tachyon-core)**: Compiled with `opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, and symbol stripping, the static musl binary is just **3.5 MiB (aarch64) / 3.6 MiB (armv7) / 4.1 MiB (x86_64)**.
+* **In Rust (tachyon-core)**: Compiled with `opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, and symbol stripping, the static musl binary is just **5.4 MiB (aarch64) / 5.6 MiB (armv7) / 6.8 MiB (x86_64)**.
 > 💡 Most home routers have 16 MB, 32 MB, or 128 MB flash storage. A 68 MB binary cannot be installed without external USB storage or extroot partitions. **tachyon-core fits directly into internal `/usr/bin/` flash.**
 
 ### 4. Robust MIPS & Soft-Float Support Without CGO
@@ -83,10 +83,10 @@ Measured on real static musl builds under OpenWrt across target architectures:
 
 | Metric / Architecture | tachyon-core (Rust) | sing-box-lx 1.14.2-lx.2 (Go) | Advantage |
 |---|:---:|:---:|:---:|
-| **Binary Size (aarch64)** | **3.5 MiB** | 67.6 MiB | **19.3× smaller (-94.8%)** |
-| **Binary Size (armv7)** | **3.6 MiB** | 68.2 MiB | **18.9× smaller (-94.7%)** |
-| **Binary Size (x86_64)** | **4.1 MiB** | 75.9 MiB | **18.5× smaller (-94.6%)** |
-| **Binary Size (MIPS)** | **≤ 4.5 MiB** (budget) | ~78.0+ MiB | **Fits 16 MB Flash** |
+| **Binary Size (aarch64)** | **5.37 MiB** | 67.6 MiB | **12.6× smaller (-92.1%)** |
+| **Binary Size (armv7)** | **5.57 MiB** | 68.2 MiB | **12.2× smaller (-91.8%)** |
+| **Binary Size (x86_64)** | **6.85 MiB** | 75.9 MiB | **11.1× smaller (-91.0%)** |
+| **Binary Size (MIPS)** | not measured yet | ~78.0+ MiB | built and size-checked in CI |
 | **Idle Memory (RSS)** | **2.4 MiB** | 42.7 MiB | **17.8× less RAM (-94.4%)** |
 | **Load Memory (10k conns)** | **~14.8 MiB** | ~98.4 MiB | **6.6× less RAM** |
 | **Garbage Collector Pauses** | **0.00 ms (Zero-GC)** | 2 – 15 ms (STW) | **Zero tail latency jitter** |
@@ -198,7 +198,7 @@ cargo zigbuild --target armv7-unknown-linux-musleabihf --release
 cargo zigbuild --target x86_64-unknown-linux-musl --release
 ```
 
-The resulting stripped static binary is ~3.5 MiB.
+The resulting stripped static binary is ~5.4 MiB.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />

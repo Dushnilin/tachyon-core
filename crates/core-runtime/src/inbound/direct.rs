@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, UdpHub};
+use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
 use crate::inbound::{
     Target, drive_transparent, network_includes_tcp, network_includes_udp, parse_listen,
 };
@@ -211,7 +211,7 @@ impl Direct {
                 std::future::pending::<()>().await;
                 return;
             };
-            let hub = UdpHub::new(Arc::clone(&router), udp_timeout);
+            let hub = UdpHub::new(Arc::clone(&router), udp_timeout, DatagramFrame::Raw);
             let listen_addr = match sock.local_addr() {
                 Ok(a) => a,
                 Err(err) => {
@@ -228,11 +228,11 @@ impl Direct {
                             continue;
                         };
                         let hub = Arc::clone(&hub);
-                        let sock2 = Arc::clone(&sock);
+                        let reply = Reply::Socket(Arc::clone(&sock));
                         let tag = tag.clone();
                         let payload = buf[..n].to_vec();
                         tokio::spawn(async move {
-                            if let Err(err) = hub.handle(&sock2, source, dest, &payload, &tag).await
+                            if let Err(err) = hub.handle(reply, source, dest, &payload, &tag).await
                             {
                                 logging::debug(format_args!("direct[{tag}] udp {source}: {err}"));
                             }

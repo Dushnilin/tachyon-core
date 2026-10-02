@@ -17,7 +17,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tokio::net::TcpListener;
 
 use super::tls::ServerTls;
-use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
+use super::udp::{relay_stream_datagrams, udp_destination};
+use crate::inbound::{AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_CHUNK};
 use crate::outbound::vmess::kdf::{cmd_key, crc32_ieee, kdf, kdf16, parse_uuid};
@@ -35,6 +36,12 @@ const SALT_RESP_KEY: &[u8] = b"AEAD Resp Header Key";
 const SALT_RESP_IV: &[u8] = b"AEAD Resp Header IV";
 
 const COMMAND_TCP: u8 = 1;
+const COMMAND_UDP: u8 = 2;
+
+/// `[version][addonsLen]`, what the UDP command answers with instead of the
+/// sealed response header: the packet path has no codec, so there is nothing
+/// to key a header with.
+const PACKET_RESPONSE_HEAD: [u8; 2] = [0x00, 0x00];
 const OPT_CHUNK_STREAM: u8 = 0x01;
 const OPT_CHUNK_MASKING: u8 = 0x04;
 const OPT_GLOBAL_PADDING: u8 = 0x08;
@@ -209,7 +216,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request = read_request(&mut stream, &users, &replay).await?;
-    if request.command != COMMAND_TCP {
+    if request.command != COMMAND_TCP && request.command != COMMAND_UDP {
         return Err(io::Error::other(format!(
             "command {} is not implemented by this server",
             request.command
@@ -236,12 +243,41 @@ where
         request.response_header,
         request.option,
     );
+
+    if request.command == COMMAND_UDP {
+        // vmess datagrams ride the raw stream, not the body codec: `[len:u16]`
+        // in front of each one delimits itself, so the codec that carries a TCP
+        // stream has nothing to do here. What the client reads first is the bare
+        // `[version][addonsLen]` pair rather than the sealed header above --
+        // `serverPacketConn` writes those two bytes and nothing else, because
+        // there is no codec here to key them with.
+        let dest = udp_destination(&request.destination)?;
+        logging::info(format_args!(
+            "vmess [{}] inbound packet connection to {dest}",
+            request.user.name
+        ));
+        stream.write_all(&PACKET_RESPONSE_HEAD).await?;
+        let (reader, writer) = tokio::io::split(stream);
+        return relay_stream_datagrams(
+            reader,
+            Arc::new(tokio::sync::Mutex::new(Box::new(writer) as AnyWrite)),
+            peer,
+            dest,
+            &tag,
+            &router,
+        )
+        .await;
+    }
+
+    // The client reads it before anything else, so it goes out now; the
+    // reference defers it to the first write, which only a client that speaks
+    // first can tell apart.
     stream.write_all(&answer).await?;
 
     let global_padding = request.option & OPT_GLOBAL_PADDING != 0;
     let chunk_masking = request.option & OPT_CHUNK_MASKING != 0;
     let authenticated_length = request.option & OPT_AUTHENTICATED_LENGTH != 0;
-    let framed: AnyStream = Box::new(ServerStream {
+    let server: ServerStream = ServerStream {
         inner: Box::new(stream),
         // what the client writes is keyed with the request keys on both sides
         read: FrameAssembler::new(
@@ -267,7 +303,8 @@ where
             flushing: None,
             consumed: 0,
         },
-    });
+    };
+    let framed: AnyStream = Box::new(server);
     logging::info(format_args!(
         "vmess [{}] inbound connection to {}",
         request.user.name, request.destination

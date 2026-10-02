@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::clash_state;
-use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, UdpHub};
+use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
 use crate::inbound::{
     ClientConn, Target, clash_meta, network_includes_udp, pump_conn_tracked, require_u16,
     socks_failure_reply, socks_success_reply,
@@ -57,8 +57,13 @@ impl Mixed {
         logging::info(format_args!(
             "inbound mixed[{tag}] listening at {ip}:{port}"
         ));
-        let udp = network_includes_udp(obj)
-            .then(|| UdpHub::new_socks(Arc::clone(&router), DEFAULT_UDP_TIMEOUT));
+        let udp = network_includes_udp(obj).then(|| {
+            UdpHub::new(
+                Arc::clone(&router),
+                DEFAULT_UDP_TIMEOUT,
+                DatagramFrame::Socks,
+            )
+        });
         Ok(Self {
             listener,
             tag: tag.to_string(),
@@ -327,7 +332,13 @@ async fn socks_udp_associate(
                     Ok((n, source)) => match parse_socks_udp_datagram(&buf[..n]).await {
                         Some((dest, offset)) => {
                             if let Err(err) = hub
-                                .handle(&relay, source, dest, &buf[offset..n], &tag)
+                                .handle(
+                                    Reply::Socket(Arc::clone(&relay)),
+                                    source,
+                                    dest,
+                                    &buf[offset..n],
+                                    &tag,
+                                )
                                 .await
                             {
                                 logging::debug(format_args!(

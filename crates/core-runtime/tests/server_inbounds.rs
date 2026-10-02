@@ -1,11 +1,11 @@
 //! Server inbounds (F5), end to end: our own client against our own server over
 //! a real socket. No fixture stands in for either side.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 
 async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
@@ -37,6 +37,243 @@ async fn spawn_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+/// A UDP echo, so a datagram that comes back came back through the server
+/// inbound rather than out of a buffer somewhere in the test.
+async fn spawn_udp_echo() -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
+    let addr = sock.local_addr().expect("udp echo addr");
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            if sock.send_to(&buf[..n], from).await.is_err() {
+                return;
+            }
+        }
+    });
+    addr
+}
+
+/// SOCKS5 UDP ASSOCIATE against the client's mixed inbound, and the socket to
+/// send from plus the address to send to -- which is the relay the reply named
+/// and not the destination inside the datagram. The control connection has to
+/// stay open for the relay to live, so it goes to a task of its own.
+async fn socks_udp_associate(socks: SocketAddr) -> (UdpSocket, SocketAddr) {
+    let mut stream = TcpStream::connect(socks).await.expect("connect");
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("greeting");
+    let mut greeting = [0u8; 2];
+    stream
+        .read_exact(&mut greeting)
+        .await
+        .expect("greeting back");
+    assert_eq!(greeting, [0x05, 0x00], "socks greeting");
+    // UDP ASSOCIATE still carries an address: 0.0.0.0:0 asks the server to
+    // pick one, which is what every client sends.
+    stream
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("associate");
+    let mut reply = [0u8; 10];
+    stream
+        .read_exact(&mut reply)
+        .await
+        .expect("associate reply");
+    assert_eq!(reply[1], 0x00, "associate refused: {reply:?}");
+    let relay = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(&reply[4..8]).expect("bnd addr"),
+        )),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    );
+    tokio::spawn(async move {
+        // hold the control connection open: the relay dies with it
+        let mut sink = tokio::io::sink();
+        let mut stream = stream;
+        let _ = tokio::io::copy(&mut stream, &mut sink).await;
+    });
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client udp");
+    (socket, relay)
+}
+
+/// A SOCKS5 UDP datagram header plus the payload.
+fn socks_udp_request(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0, 0, 0, 0x01];
+    match dest.ip() {
+        IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+        IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
+    }
+    out.extend_from_slice(&dest.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The same, aimed at a name instead of an address.
+#[allow(dead_code)]
+fn socks_udp_name_request(host: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0, 0, 0, 0x03, host.len() as u8];
+    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// What is left of a SOCKS5 UDP datagram once the header is off. The length is
+/// checked rather than trusted: a server that framed the payload wrongly shows
+/// up here as a short or long read instead of as nothing at all.
+fn socks_udp_payload(datagram: &[u8]) -> Vec<u8> {
+    assert!(datagram.len() > 4, "a socks udp reply with no address");
+    let atyp = datagram[3];
+    let at = match atyp {
+        0x01 => 4 + 4 + 2,
+        0x04 => 4 + 16 + 2,
+        0x03 => {
+            let len = *datagram.get(4).expect("domain length") as usize;
+            4 + 1 + len + 2
+        }
+        other => panic!("a socks udp reply with address type {other:#04x}"),
+    };
+    datagram
+        .get(at..)
+        .expect("a socks udp reply shorter than its header")
+        .to_vec()
+}
+
+/// One datagram through a server inbound's UDP command: our client opens a SOCKS
+/// UDP relay into it, and the echo behind the server answers. The client is told
+/// to use the length-prefixed packet encoding, which is the one that puts
+/// `[len:u16][payload]` on the wire -- the framing `vmess.Service`'s
+/// `serverPacketConn` speaks.
+async fn udp_round_trip(
+    server_inbound: Value,
+    client_outbound: Value,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let echo = spawn_udp_echo().await;
+    let tag = server_inbound["tag"]
+        .as_str()
+        .expect("the server inbound needs a tag")
+        .to_string();
+    let server = core_runtime::start(&cfg(
+        server_inbound,
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start server");
+    let server_addr = inbound_addr(&server, &tag);
+    let mut outbound = client_outbound
+        .as_object()
+        .expect("the client outbound must be an object")
+        .clone();
+    outbound.insert("server".into(), json!("127.0.0.1"));
+    outbound.insert("server_port".into(), json!(server_addr.port()));
+    outbound.insert("packet_encoding".into(), json!(""));
+    let client = core_runtime::start(&json!({
+        "log": {"level": "debug"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port()
+        }],
+        "outbounds": [Value::Object(outbound)],
+        "route": {"final": "out"}
+    }))
+    .await
+    .expect("start client");
+
+    let (socket, relay) = socks_udp_associate(inbound_addr(&client, "mixed-in")).await;
+    // The relay, not the echo: sent to the echo the datagram comes straight
+    // back from it and reads exactly like a round trip through the server.
+    socket
+        .send_to(&socks_udp_request(echo, payload), relay)
+        .await?;
+    let mut buf = vec![0u8; 65535];
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while got.len() < payload.len() && std::time::Instant::now() < deadline {
+        let Ok(read) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), socket.recv(&mut buf))
+                .await
+        else {
+            continue;
+        };
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&socks_udp_payload(&buf[..n])),
+        }
+    }
+    drop(client);
+    drop(server);
+    Ok(got)
+}
+
+/// The UDP command on the three server inbounds that speak it: one datagram out
+/// to a real echo and back, through the production code on both sides.
+#[tokio::test]
+async fn a_vless_server_carries_a_udp_datagram() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let got = udp_round_trip(
+        vless_server(uuid, ""),
+        vless_client(uuid, ""),
+        b"a datagram",
+    )
+    .await
+    .expect("vless udp round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "a datagram");
+}
+
+#[tokio::test]
+async fn a_trojan_server_carries_a_udp_datagram() {
+    let _guard = test_guard().await;
+    // trojan is TLS-only in both directions, so the client's refusal to dial a
+    // cleartext server is part of what makes this a real round trip.
+    let mut server = json!({
+        "type": "trojan",
+        "tag": "trojan-in",
+        "listen": "127.0.0.1",
+        "listen_port": free_port(),
+        "users": [{"name": "bob", "password": "hunter2"}]
+    });
+    server["tls"] = server_tls();
+    let mut client = json!({"type": "trojan", "tag": "out", "password": "hunter2"});
+    client["tls"] = client_tls();
+    let got = udp_round_trip(server, client, b"a datagram")
+        .await
+        .expect("trojan udp round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "a datagram");
+}
+
+#[tokio::test]
+async fn a_vmess_server_carries_a_udp_datagram() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let got = udp_round_trip(vmess_server(uuid), vmess_client(uuid), b"a datagram")
+        .await
+        .expect("vmess udp round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "a datagram");
+}
+
+/// A datagram larger than a DNS reply, so the length prefix is exercised on a
+/// value that is not a round dozen.
+#[tokio::test]
+async fn a_large_datagram_survives_the_length_prefix() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let payload: Vec<u8> = (0..1400u32).map(|i| (i % 251) as u8).collect();
+    let got = udp_round_trip(vless_server(uuid, ""), vless_client(uuid, ""), &payload)
+        .await
+        .expect("vless udp round trip");
+    assert_eq!(got, payload);
 }
 
 fn inbound_addr(instance: &core_runtime::BoxInstance, tag: &str) -> SocketAddr {

@@ -8,3 +8,8 @@ Cargo.lock.orig
 .DS_Store
 # local agent notes, same as in G:\tachyon
 AGENTS.md
+
+# local-only notes, never pushed
+ROADMAP.md
+ROADMAP.ru.md
+TELEGRAM.md

@@ -159,9 +159,9 @@ tachyon-core run -c /etc/sing-box/config.json
 | `check -c <path>` | Pre-flight configuration validation in `watchdog.uc` | **Done** (full schema validation) |
 | `version` | Upstream version detection in `generator.uc` | **Done** (upstream regex compatible) |
 | `run -c <path>` | Production runtime service | **Done** (Tokio async runtime) |
-| `rule-set compile\|decompile` | SRS binary rule set compilation | Planned (Phase F3) |
-| `generate reality-keypair` | REALITY key generation | Planned (Phase F1) |
-| `generate wg-keypair` | WireGuard / AmneziaWG key generation | Planned (Phase F1) |
+| `rule-set compile\|decompile` | `.srs` rule sets from `updates.uc` | **Done** (binary SRS v5, both directions) |
+| `generate reality-keypair` | REALITY key generation | Planned |
+| `generate wg-keypair` | WireGuard / AmneziaWG key generation | Planned |
 
 Detailed field-by-field schema support is tracked in [COMPAT.md](COMPAT.md).
 
@@ -212,15 +212,18 @@ Phased implementation validated by automated differential tests against `sing-bo
 |:---:|---|---|:---:|
 | **F0** | **Foundation** | Workspace, CI, schema model, golden differential tests | **Done** |
 | **F1** | **Data Plane v1** | Inbounds (tproxy, redirect, mixed, direct), outbounds, Smart DNS, router | **Done** |
-| **F2** | **Heavy Protocols** | Hysteria2, TUIC, WireGuard + AmneziaWG 2.0/3.x, VLESS ML-KEM-768, XHTTP, uTLS/REALITY | **In Progress** (hy2/tuic/wg/awg/mlkem green) |
-| **F3** | **SRS Rules & Updates** | Binary `.srs` compatibility, remote list updates | Planned |
-| **F4** | **Experimental Stack** | Clash API (Yacd UI, Secret), `cache.db` (bbolt r/w) | Planned |
-| **F5** | **Server Half** | Server inbounds across all protocols | Planned |
+| **F2** | **Heavy Protocols** | Hysteria2, TUIC, WireGuard + AmneziaWG 2.0/3.x, VLESS ML-KEM-768, XHTTP, uTLS/REALITY | **Done** |
+| **F3** | **SRS Rules & Updates** | Binary `.srs` compatibility, remote list updates | **Done** |
+| **F4** | **Experimental Stack** | Clash API (Yacd UI, Secret), `cache.db` (bbolt r/w) | **Done** |
+| **F5** | **Server Half** | Server inbounds across all protocols | **In progress**: vless, trojan, vmess and shadowsocks, with TLS and the UDP command |
 | **F6** | **TUN Subsystem** | `stack: system` (kernel TUN) and smoltcp userspace stack | Planned |
 | **F7** | **lx daemon & Observability** | `lxd` daemon compatibility, telemetry, config rollback | Planned |
 | **F8** | **libbox / Android** | UniFFI/JNI bindings for mobile apps | Planned |
-| **F9** | **MIPS Spike** | `mipsel`/`mips` softfloat musl via `-Zbuild-std`, qemu-user CI | Planned |
+| **F9** | **MIPS Spike** | `mipsel`/`mips` softfloat musl via `-Zbuild-std`, qemu-user CI | **In progress**: CI builds them, nothing runs under qemu yet |
 | **F10** | **Tachyon Integration** | `rs` variant in Tachyon: auto-installer, 1-click LuCI switching | Planned |
+
+The current state of the tree lives in `ROADMAP.md`. `COMPAT.md` predates most of
+the work and is not a record of what runs today.
 
 Task tracking is kept out of the repository, so nothing here promises a date.
 

@@ -1,0 +1,140 @@
+name: Release
+
+# A tag is the only thing that produces a release, and the tag has to be the
+# workspace version: `Cargo.toml` is the one place the version lives, so a tag
+# that disagrees with it is a release whose binary lies about what it is.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag to build (must match Cargo.toml)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The 12 MiB budget the CI cross job enforces, in bytes. A release that is
+  # bigger than the gate would be a release nobody could install on a router.
+  SIZE_BUDGET: 12582912
+
+jobs:
+  check-version:
+    name: tag matches the workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the version the binaries will report
+        id: version
+        run: |
+          in_cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "cargo=$in_cargo tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$in_cargo" != "${tag#v}" ]; then
+            echo "::error::Cargo.toml says $in_cargo, the release is tagged $tag"
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The OpenWrt targets, by the name its own package feed uses. Every
+          # one is a static musl build: an OpenWrt box has no matching glibc,
+          # and the binary has to land in /usr/bin on flash.
+          - name: x86_64
+            target: x86_64-unknown-linux-musl
+          - name: aarch64
+            target: aarch64-unknown-linux-musl
+          - name: armv7
+            target: armv7-unknown-linux-musleabihf
+          - name: armv6
+            target: arm-unknown-linux-musleabi
+          - name: riscv64
+            target: riscv64gc-unknown-linux-musl
+          # mipsel and mips have no prebuilt std: they are tier-3 and need the
+          # standard library built from source, which is what `build-std` is for
+          # and why these two want nightly.
+          - name: mipsel
+            target: mipsel-unknown-linux-musl
+            build-std: true
+          - name: mips
+            target: mips-unknown-linux-musl
+            build-std: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.build-std && 'nightly' || 'stable' }}
+          targets: ${{ matrix.target }}
+      - name: Link musl with rust-lld
+        run: echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.build-std }}" ]; then
+            cargo build --workspace --release --target ${{ matrix.target }} \
+              -Z build-std=std,panic_abort
+          else
+            cargo build --workspace --release --target ${{ matrix.target }}
+          fi
+      - name: Size budget
+        run: |
+          bin="target/${{ matrix.target }}/release/tachyon-core"
+          size=$(stat -c%s "$bin")
+          echo "size=$size bytes"
+          test "$size" -le "$SIZE_BUDGET"
+      - name: Version
+        id: version
+        run: |
+          echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+          "target/${{ matrix.target }}/release/tachyon-core" version
+      - name: Pack
+        run: |
+          ver="${{ inputs.tag || github.ref_name }}"
+          name="tachyon-core-${{ matrix.name }}-${ver}"
+          cp "target/${{ matrix.target }}/release/tachyon-core" "./${name}"
+          sha256sum "./${name}" > "./${name}.sha256"
+          tar -czf "${name}.tar.gz" "./${name}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            tachyon-core-${{ matrix.name }}-*.tar.gz
+            tachyon-core-${{ matrix.name }}-*.sha256
+          if-no-files-found: error
+
+  release:
+    name: attach to the release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: One checksum file for everything
+        run: |
+          cd artifacts
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          cat SHA256SUMS
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body_path: CHANGELOG.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true

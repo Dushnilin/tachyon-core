@@ -71,7 +71,7 @@ while True:
 PY
 
 cat > "$WORK/probe.py" <<'PY'
-import socket, struct, sys
+import os, socket, struct, sys
 proxy, port, payload = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].encode()
 # PROBE_REPEAT turns the payload into a bigger one, which is how a double upload
 # shows up: sixteen bytes fit in a single packet and a duplicated write is easy to
@@ -98,6 +98,14 @@ try:
         data += chunk
 except socket.timeout:
     pass
+# PROBE_HEX prints the answer as hex. When the far end gets more than we sent,
+# the only way to tell a duplicated body from a vless head from padding is to look
+# at the bytes, and the escaped form above is unreadable past the first NUL.
+if os.environ.get("PROBE_HEX") == "1":
+    print("SENT %d bytes, GOT %d bytes" % (len(payload), len(data)))
+    print("SENT " + payload.hex())
+    print("GOT  " + data.hex())
+    sys.exit(0 if data == b"echo:" + payload else 1)
 # The verdict is a single word and the bytes come back escaped: a Windows console
 # is cp1251 and the echo's bytes are not encodable there, so a stand that has to
 # report a failure cannot print them raw.

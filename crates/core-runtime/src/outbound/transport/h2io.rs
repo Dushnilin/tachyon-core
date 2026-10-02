@@ -10,6 +10,7 @@ use std::task::{Context, Poll, ready};
 use bytes::{Buf, Bytes, BytesMut};
 use h2::RecvStream;
 use h2::client::ResponseFuture;
+use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
@@ -41,6 +42,29 @@ impl H2Stream {
     /// A stream that borrows a connection task owned by a session pool.
     pub(crate) fn shared(response: ResponseFuture, send: h2::SendStream<Bytes>) -> Self {
         Self::build(response, send, None)
+    }
+
+    /// The same, for a caller that has already read the head -- naive does, so
+    /// that a refused CONNECT is reported as itself rather than as a stream that
+    /// happens to be closed. The body is left live even if the head came with an
+    /// end-of-stream flag: a CONNECT response that says so is the server's
+    /// mistake, and treating it as EOF would drop a tunnel that is still open.
+    pub(crate) fn from_response(
+        response: Response<RecvStream>,
+        send: h2::SendStream<Bytes>,
+        conn_task: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            send: Some(send),
+            response: None,
+            recv: Some(response.into_body()),
+            pending: BytesMut::new(),
+            out: Vec::new(),
+            out_pos: 0,
+            report: 0,
+            eof: false,
+            conn_task: Some(conn_task),
+        }
     }
 
     fn build(

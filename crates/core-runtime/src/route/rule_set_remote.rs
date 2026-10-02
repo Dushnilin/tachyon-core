@@ -579,9 +579,9 @@ mod tests {
         }
         let set = registry.sets[0].lock().await;
         assert_eq!(set.set.rule_count(), 1, "recovered in the background");
-        assert_eq!(
-            set.set.snapshot()[0]["domain_suffix"][0],
-            "recovered.example"
+        assert!(
+            set.set.index().has_suffix("recovered.example"),
+            "the recovered set compiled its suffix"
         );
         drop(set);
         server.abort();
@@ -599,8 +599,10 @@ mod tests {
         set.spec.initial_path = Some(path);
         set.start(&router, None).await.expect("start");
         assert_eq!(set.set.rule_count(), 1);
-        let rules = set.set.snapshot();
-        assert_eq!(rules[0]["domain_suffix"][0], "local.example");
+        assert!(
+            set.set.index().has_suffix("local.example"),
+            "the initial path compiled its suffix"
+        );
         let _ = std::fs::remove_file(std::env::temp_dir().join("tachyon-remote-rule-set-test.srs"));
     }
 }

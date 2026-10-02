@@ -5,6 +5,7 @@ pub mod neighbor;
 pub mod process;
 pub mod rule;
 pub mod rule_set;
+pub mod rule_set_index;
 pub mod rule_set_remote;
 pub mod sniff;
 

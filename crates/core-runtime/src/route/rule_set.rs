@@ -11,23 +11,40 @@ use std::sync::RwLock;
 
 use serde_json::Value;
 
+use super::rule_set_index::{Fallbacks, RuleSetIndex};
 use crate::inbound::Target;
 use crate::route::ConnContext;
 
-/// A loaded rule set: its tags and the rules it holds. The rule list sits
-/// behind a lock so a remote update is visible to the rules that already hold
-/// an `Arc` to this set (reference `RemoteRuleSet.access` + callbacks).
+/// A loaded rule set: its tags and the compiled form of the rules it holds.
+/// The body sits behind a lock so a remote update is visible to the rules that
+/// already hold an `Arc` to this set (reference `RemoteRuleSet.access` +
+/// callbacks).
 #[derive(Debug)]
 pub struct RuleSet {
     tags: Vec<String>,
-    rules: RwLock<Vec<Value>>,
+    body: RwLock<RuleSetBody>,
+}
+
+/// What a set holds once compiled. `count` is the number of rules as loaded,
+/// not the number of pools, so `rule_count` still answers what it always did.
+#[derive(Debug, Default)]
+struct RuleSetBody {
+    index: RuleSetIndex,
+    fallbacks: Fallbacks,
+    count: usize,
 }
 
 impl RuleSet {
     pub fn new(tags: Vec<String>, rules: Vec<Value>) -> Self {
+        let count = rules.len();
+        let (index, fallbacks) = RuleSetIndex::compile(&rules);
         Self {
             tags,
-            rules: RwLock::new(rules),
+            body: RwLock::new(RuleSetBody {
+                index,
+                fallbacks,
+                count,
+            }),
         }
     }
 
@@ -41,37 +58,90 @@ impl RuleSet {
         self.tags.iter().any(|known| known == tag)
     }
 
-    /// `adapter.RuleSet.Match`: any headless rule of the set matches.
+    /// `adapter.RuleSet.Match`: any headless rule of the set matches. The simple
+    /// rules answer from the compiled pools; `logical` and `invert` rules still
+    /// go through `match_rule`.
     pub fn matches(&self, ctx: &ConnContext) -> bool {
-        match self.rules.read() {
-            Ok(rules) => rules.iter().any(|rule| match_rule(rule, ctx)),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .iter()
-                .any(|rule| match_rule(rule, ctx)),
-        }
+        self.with(|body| body.index.matches(ctx) || body.fallbacks.matches(ctx))
     }
 
     pub fn rule_count(&self) -> usize {
-        self.rules
-            .read()
-            .map(|rules| rules.len())
-            .unwrap_or_default()
+        self.with(|body| body.count)
     }
 
     /// `RemoteRuleSet.loadBytes`: swap the rule list in one step.
+    ///
+    /// The new rules are compiled *before* the lock is taken. Compiling a geo
+    /// list is not free, and a write lock held across it would stall every
+    /// matching connection behind an HTTP update.
     pub fn replace_rules(&self, rules: Vec<Value>) {
-        match self.rules.write() {
-            Ok(mut current) => *current = rules,
-            Err(poisoned) => *poisoned.into_inner() = rules,
+        let count = rules.len();
+        let (index, fallbacks) = RuleSetIndex::compile(&rules);
+        let body = RuleSetBody {
+            index,
+            fallbacks,
+            count,
+        };
+        match self.body.write() {
+            Ok(mut current) => *current = body,
+            Err(poisoned) => *poisoned.into_inner() = body,
         }
     }
 
-    pub fn snapshot(&self) -> Vec<Value> {
-        match self.rules.read() {
-            Ok(rules) => rules.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+    fn with<T>(&self, read: impl FnOnce(&RuleSetBody) -> T) -> T {
+        match self.body.read() {
+            Ok(body) => read(&body),
+            Err(poisoned) => read(&poisoned.into_inner()),
         }
+    }
+
+    /// The compiled pools, for the CLI's `rule-set match` and for tests.
+    pub fn index(&self) -> RuleSetIndexClone {
+        self.with(|body| RuleSetIndexClone {
+            index: body.index.clone(),
+        })
+    }
+
+    /// How many rules had to keep the old interpreter (`logical` or `invert`).
+    pub fn fallback_count(&self) -> usize {
+        self.with(|body| body.fallbacks.len())
+    }
+}
+
+/// A cheap handle for callers outside the lock: the index is immutable once
+/// built, and cloning it costs one atomic bump per pool rather than a lock.
+#[derive(Clone, Debug)]
+pub struct RuleSetIndexClone {
+    index: RuleSetIndex,
+}
+
+impl RuleSetIndexClone {
+    pub fn domain_count(&self) -> usize {
+        self.index.domain_count()
+    }
+
+    pub fn has_domain(&self, domain: &str) -> bool {
+        self.index.has_domain(domain)
+    }
+
+    pub fn has_suffix(&self, suffix: &str) -> bool {
+        self.index.has_suffix(suffix)
+    }
+
+    pub fn has_keyword(&self, host: &str) -> bool {
+        self.index.has_keyword(host)
+    }
+
+    pub fn has_prefix(&self, address: std::net::IpAddr, bits: u32) -> bool {
+        self.index.has_prefix(address, bits)
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
     }
 }
 
@@ -200,7 +270,8 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
 }
 
 /// `badoption.Listable[uint16]`: the SRS container stores numbers.
-fn ports(value: Option<&Value>) -> Vec<u16> {
+/// Shared with the compiled index, which folds these lists once at load.
+pub(crate) fn ports(value: Option<&Value>) -> Vec<u16> {
     match value {
         Some(Value::Number(number)) => number
             .as_u64()
@@ -216,8 +287,9 @@ fn ports(value: Option<&Value>) -> Vec<u16> {
     }
 }
 
-/// `badoption.Listable[string]`.
-fn list(value: Option<&Value>) -> Vec<String> {
+/// `badoption.Listable[string]`. Shared with the compiled index, which folds
+/// these lists once at load instead of rebuilding them per lookup.
+pub(crate) fn list(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::String(text)) => vec![text.clone()],
         Some(Value::Array(items)) => items
@@ -237,18 +309,18 @@ fn prefix_contains(prefix: &str, address: std::net::IpAddr) -> bool {
     };
     match (base, address) {
         (std::net::IpAddr::V4(base), std::net::IpAddr::V4(address)) => {
-            let mask = if bits >= 32 {
-                u32::MAX
-            } else {
-                u32::MAX << (32 - bits)
+            let mask = match bits {
+                0 => 0,
+                n if n >= 32 => u32::MAX,
+                n => u32::MAX << (32 - n),
             };
             u32::from(base) & mask == u32::from(address) & mask
         }
         (std::net::IpAddr::V6(base), std::net::IpAddr::V6(address)) => {
-            let mask = if bits >= 128 {
-                u128::MAX
-            } else {
-                u128::MAX << (128 - bits)
+            let mask = match bits {
+                0 => 0,
+                n if n >= 128 => u128::MAX,
+                n => u128::MAX << (128 - n),
             };
             u128::from(base) & mask == u128::from(address) & mask
         }

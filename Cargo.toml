@@ -51,6 +51,10 @@ if-addrs = "0.15"
 md-5 = "0.10"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "log"] }
 regex = "1"
+# Already in the tree through `regex`, so linking it directly costs no extra
+# binary size: `rule_keyword` matching is substring search, which is exactly what
+# an Aho-Corasick automaton is for.
+aho-corasick = "1"
 rustls-pemfile = "2"
 sha1 = "0.10"
 sha2 = "0.10"

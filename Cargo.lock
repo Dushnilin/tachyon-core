@@ -405,6 +405,7 @@ version = "0.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
+ "aho-corasick",
  "anyhow",
  "argon2",
  "aria",

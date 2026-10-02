@@ -9,10 +9,11 @@
 //! exchanges bare datagrams.
 //!
 //! What makes it naive rather than a plain HTTP CONNECT is the `Padding`
-//! header: the reference answers 400 without one, and puts one on the response
-//! too. The framing of the first eight blocks that its `paddingConn` describes
-//! is dead code in the reference -- nothing constructs it -- so the stream
-//! itself stays plain. Reference `protocol/naive/inbound.go`.
+//! header -- the reference answers 400 without one, and puts one on the response
+//! too -- and the framing of the first eight blocks in each direction:
+//! `[len:u16 BE][pad:u8][data][pad zero bytes]`. The reference's `naiveH2Conn`
+//! embeds `paddingConn` and reads through `readWithPadding`, so the frames are
+//! real on the wire even though nothing ever writes `paddingConn{...}`.
 
 use std::io;
 use std::net::IpAddr;
@@ -31,6 +32,9 @@ use crate::tls_client::TlsOptions;
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Blocks in each direction that carry the naive framing (`paddingCount`).
+const PADDING_COUNT: usize = 8;
+
 /// A `Padding` header value: 30 to 62 bytes, the first sixteen drawn from a
 /// punctuation set and the rest tildes, so the header reads as proxy noise.
 fn padding_header() -> String {
@@ -45,6 +49,220 @@ fn padding_header() -> String {
         bits >>= 4;
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What the read side still owes the peer: a header, the data it announced,
+/// the padding behind it, or nothing at all once the eight blocks are past.
+#[derive(Clone, Copy)]
+enum ReadStep {
+    Header,
+    /// the block's data has arrived; only its padding is left
+    Data {
+        pad: usize,
+    },
+    Padding,
+    Raw,
+}
+
+/// The eight blocks are past: read on, or frame no more writes.
+fn next_step(blocks: usize) -> ReadStep {
+    if blocks >= PADDING_COUNT {
+        ReadStep::Raw
+    } else {
+        ReadStep::Header
+    }
+}
+
+/// The naive framing around a tunnel, both directions: the first eight writes
+/// and the first eight blocks read carry `[len:u16][pad:u8]` in front of the
+/// data and `pad` zero bytes behind it. The reference splits what it sends at
+/// 65535 bytes first (`writeChunked`), which changes nothing here -- a block is
+/// whatever its header announces.
+struct Padded<S> {
+    inner: S,
+    // write side
+    write_blocks: usize,
+    flushing: Option<(Vec<u8>, usize)>,
+    consumed: usize,
+    // read side
+    read_blocks: usize,
+    step: ReadStep,
+    staging: Vec<u8>,
+    staging_filled: usize,
+    staging_want: usize,
+    payload: Vec<u8>,
+    pos: usize,
+}
+
+impl<S> Padded<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            write_blocks: 0,
+            flushing: None,
+            consumed: 0,
+            read_blocks: 0,
+            step: ReadStep::Header,
+            staging: Vec::new(),
+            staging_filled: 0,
+            staging_want: 3,
+            payload: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+/// Fill `staging` to `want` bytes across as many `Pending`s as it takes.
+fn poll_fill<S: tokio::io::AsyncRead + Unpin>(
+    inner: &mut S,
+    cx: &mut std::task::Context<'_>,
+    staging: &mut Vec<u8>,
+    filled: &mut usize,
+    want: usize,
+) -> std::task::Poll<std::io::Result<()>> {
+    if *filled == 0 {
+        staging.clear();
+        staging.resize(want.max(1), 0);
+    }
+    while *filled < want {
+        let mut read_buf = tokio::io::ReadBuf::new(&mut staging[*filled..]);
+        match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let n = read_buf.filled().len();
+                if n == 0 {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "naive: stream closed inside the padding",
+                    )));
+                }
+                *filled += n;
+            }
+            std::task::Poll::Ready(Err(err)) => return std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        }
+    }
+    std::task::Poll::Ready(Ok(()))
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Padded<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        loop {
+            if this.pos < this.payload.len() {
+                let n = out.remaining().min(this.payload.len() - this.pos);
+                out.put_slice(&this.payload[this.pos..this.pos + n]);
+                this.pos += n;
+                return std::task::Poll::Ready(Ok(()));
+            }
+            this.payload.clear();
+            this.pos = 0;
+            if let ReadStep::Raw = this.step {
+                std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, out))?;
+                return std::task::Poll::Ready(Ok(()));
+            }
+            // one piece of a block at a time, and only once all of it has
+            // arrived: a half-read header would step the framing over bytes
+            // still in flight
+            std::task::ready!(poll_fill(
+                &mut this.inner,
+                cx,
+                &mut this.staging,
+                &mut this.staging_filled,
+                this.staging_want,
+            ))?;
+            let block = std::mem::take(&mut this.staging);
+            this.staging_filled = 0;
+            this.read_blocks += 1;
+            match this.step {
+                ReadStep::Header => {
+                    let len = usize::from(u16::from_be_bytes([block[0], block[1]]));
+                    let pad = usize::from(block[2]);
+                    this.step = ReadStep::Data { pad };
+                    this.staging_want = len;
+                }
+                ReadStep::Data { pad } => {
+                    this.payload = block;
+                    if pad == 0 {
+                        // nothing to swallow: the next thing is a header, or the
+                        // stream is done with the framing
+                        this.step = next_step(this.read_blocks);
+                        this.staging_want = 3;
+                    } else {
+                        this.step = ReadStep::Padding;
+                        this.staging_want = pad;
+                    }
+                }
+                ReadStep::Padding => {
+                    this.step = next_step(this.read_blocks);
+                    this.staging_want = 3;
+                }
+                ReadStep::Raw => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Padded<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        loop {
+            if let Some((frame, off)) = &mut this.flushing {
+                while *off < frame.len() {
+                    let n = std::task::ready!(
+                        std::pin::Pin::new(&mut this.inner).poll_write(cx, &frame[*off..],)
+                    )?;
+                    if n == 0 {
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "naive: padded write stalled",
+                        )));
+                    }
+                    *off += n;
+                }
+                this.flushing = None;
+                return std::task::Poll::Ready(Ok(this.consumed));
+            }
+            if buf.is_empty() {
+                return std::task::Poll::Ready(Ok(0));
+            }
+            if this.write_blocks >= PADDING_COUNT {
+                return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+            }
+            let mut random = [0u8; 1];
+            let _ = getrandom::fill(&mut random);
+            let pad = usize::from(random[0]);
+            let mut frame = Vec::with_capacity(3 + buf.len() + pad);
+            frame.extend_from_slice(&(buf.len() as u16).to_be_bytes());
+            frame.push(pad as u8);
+            frame.extend_from_slice(buf);
+            frame.resize(frame.len() + pad, 0);
+            this.write_blocks += 1;
+            this.flushing = Some((frame, 0));
+            this.consumed = buf.len();
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 /// Config knobs that only tune the reference (cronet) client internals.
@@ -273,7 +491,7 @@ impl Naive {
                 .map_err(|e| io::Error::other(format!("naive: h3 request: {e}")))?;
         let inner =
             crate::outbound::transport::h3io::H3Stream::new(request_stream, conn_task).await?;
-        Ok(Box::new(inner))
+        Ok(Box::new(Padded::new(inner)))
     }
 
     /// One h2 CONNECT stream: handshake, request, wrapped as raw pipes.
@@ -325,9 +543,9 @@ impl Naive {
                 response.status()
             )));
         }
-        Ok(Box::new(H2Io {
+        Ok(Box::new(Padded::new(H2Io {
             h2: H2Stream::from_response(response, send, conn_task),
-        }))
+        })))
     }
 }
 

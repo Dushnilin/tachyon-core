@@ -122,23 +122,39 @@ impl Vless {
         let tcp =
             crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         // a ws transport with early data carries the request in the upgrade head
-        let (stream, consumed) = self
+        let (mut stream, consumed) = self
             .transport
             .connect(tcp, self.tls.as_ref(), &self.server, self.port, &header)
             .await?;
-        // The request head goes out *with the first payload*, not before it
-        // (reference `DialEarlyConn` -> `WriteRequest(conn, request, b)` on the
-        // first write). Written on its own it is a separate write, and a transport
-        // that turns writes into packets -- XHTTP packet-up, where each write is
-        // its own sequenced POST -- then delivers the head as a packet of its own
-        // with nothing in it. A server that decides where the request ends from
-        // the first packet gets that wrong, and the symptom is not an error: the
-        // far end receives the request head as tunnel payload.
+        // The request head goes out on its own, ahead of any payload.
+        //
+        // This used to be glued to the caller's first write, because a transport
+        // that turns writes into packets -- XHTTP packet-up, one sequenced POST per
+        // write -- would otherwise deliver the head as a packet with nothing in it.
+        // That reasoning was wrong, and the cost was a corrupted tunnel on Xray
+        // 26.9: a POST carrying the head *and* the first payload is read back twice,
+        // so the far end receives the payload two times. Xray 25.9 tolerates it,
+        // which is exactly why it looked healthy for as long as it did.
+        //
+        // Measured against a real Xray with the stand in tests/spikes/xhttp, one
+        // 13-byte payload and a 26-byte head:
+        //
+        // | client | Xray 25.9 | Xray 26.9 |
+        // |---|---|---|
+        // | sing-box-lx 1.14.2-lx.11 | `firstLen = 26`, passes | `firstLen = 26`, passes |
+        // | glued head + payload | `firstLen = 39`, passes | `firstLen = 156`, fails |
+        //
+        // The reference splits them and reads `firstLen` back equal to the head on
+        // both versions, so splitting is the shape both accept. Over a plain TCP or
+        // TLS stream the bytes on the wire are identical either way -- only the POST
+        // framing changes -- and the server parses the head out of the byte stream
+        // rather than deciding where the request ends from the first packet.
+        if !header[consumed..].is_empty() {
+            stream.write_all(&header[consumed..]).await?;
+            stream.flush().await?;
+        }
         let framed: AnyStream = Box::new(VlessStream {
             inner: stream,
-            request: header[consumed..].to_vec(),
-            first: Vec::new(),
-            owed: 0,
             header_pending: true,
             need: 2,
             buf: Vec::new(),
@@ -183,12 +199,6 @@ fn request_head(
 /// the first upstream write, so it is consumed transparently on first read.
 pub struct VlessStream {
     inner: AnyStream,
-    /// the part of the request head a transport has not already carried
-    request: Vec<u8>,
-    /// the caller's first payload, not yet all of it on the wire
-    first: Vec<u8>,
-    /// how much of that payload is owed an answer once it is out
-    owed: usize,
     header_pending: bool,
     need: usize,
     buf: Vec<u8>,
@@ -235,51 +245,15 @@ impl tokio::io::AsyncRead for VlessStream {
 
 impl tokio::io::AsyncWrite for VlessStream {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        let this = &mut *self;
-        if this.first.is_empty() && this.request.is_empty() {
-            // nothing of ours is queued: the caller's buffer goes straight through
-            return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
-        }
-        if this.first.is_empty() {
-            if buf.is_empty() {
-                // nothing to attach the head to yet, and a head on its own is
-                // exactly what this is about not doing
-                return std::task::Poll::Ready(Ok(0));
-            }
-            this.first = buf.to_vec();
-            this.owed = buf.len();
-        }
-        // The head and the first payload are written as one frame, which the
-        // transport is free to take in pieces -- and over a transport that turns
-        // writes into packets, every poll would be another packet, so the frame is
-        // buffered here instead of being rebuilt per poll. What is still owed to
-        // the caller stays in `first`, and nothing is reported until all of it has
-        // gone out: reporting a short count and then dropping the rest is how a
-        // request head ends up in the middle of a tunnel.
-        let mut frame = std::mem::take(&mut this.request);
-        let head_len = frame.len();
-        frame.extend_from_slice(&this.first);
-        match std::pin::Pin::new(&mut this.inner).poll_write(cx, &frame) {
-            std::task::Poll::Ready(Ok(n)) => {
-                let from_head = n.min(head_len);
-                let from_payload = n.saturating_sub(from_head);
-                this.request = frame[from_head..head_len].to_vec();
-                this.first = frame[head_len + from_payload..].to_vec();
-                if !this.request.is_empty() || !this.first.is_empty() {
-                    return std::task::Poll::Pending;
-                }
-                let done = std::mem::take(&mut this.owed);
-                std::task::Poll::Ready(Ok(done))
-            }
-            other => {
-                // nothing was taken, so the queue is still exactly what it was
-                other
-            }
-        }
+        // The request head has already gone out, on its own write, so there is
+        // nothing left to queue here and a plain passthrough is right: buffering
+        // the caller's first write to pair it with the head is what this type used
+        // to do, and it is what doubled the packet on Xray 26.9.
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
     fn poll_flush(

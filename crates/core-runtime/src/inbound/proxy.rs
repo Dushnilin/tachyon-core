@@ -369,7 +369,7 @@ async fn read_request(
         .get(&uuid)
         .ok_or_else(|| io::Error::other(format!("unknown UUID: {}", hex(&uuid))))?
         .clone();
-    let destination = read_target(stream).await?;
+    let destination = read_vless_target(stream).await?;
     Ok((user, command[0], destination, flow))
 }
 
@@ -416,33 +416,63 @@ fn read_uvarint(bytes: &[u8]) -> io::Result<(u64, usize)> {
     Err(io::Error::other("varint is truncated"))
 }
 
-/// The address block, the same one our client writes: `[atyp][addr][port]`.
+/// The address block in the socks shape, `[atyp][addr][port]`, which is what
+/// trojan's `M.SocksaddrSerializer` writes.
 async fn read_target(stream: &mut tokio::net::TcpStream) -> io::Result<Target> {
     let mut atyp = [0u8; 1];
     stream.read_exact(&mut atyp).await?;
-    match atyp[0] {
-        0x01 => {
-            let mut addr = [0u8; 4];
-            stream.read_exact(&mut addr).await?;
-            let port = read_port(stream).await?;
-            Ok(Target::Ip(SocketAddr::from((addr, port))))
+    let addr = read_addr(stream, atyp[0]).await?;
+    Ok(addr.with_port(read_port(stream).await?))
+}
+
+/// The vless destination block is `[port][atyp][addr]`: `vmess.AddressSerializer`
+/// is the port-first serializer, and both the reference's vless client and ours
+/// write it that way. It is not the socks shape, and a server that reads one as
+/// the other is invisible until a third party's client arrives -- which is how
+/// this one shipped: our own client failed against our own server, and the test
+/// was green because its hand-written client repeated the mistake.
+async fn read_vless_target(stream: &mut tokio::net::TcpStream) -> io::Result<Target> {
+    let port = read_port(stream).await?;
+    let mut atyp = [0u8; 1];
+    stream.read_exact(&mut atyp).await?;
+    let addr = read_addr(stream, atyp[0]).await?;
+    Ok(addr.with_port(port))
+}
+
+enum Addr {
+    V4([u8; 4]),
+    V6([u8; 16]),
+    Domain(String),
+}
+
+impl Addr {
+    fn with_port(self, port: u16) -> Target {
+        match self {
+            Addr::V4(octets) => Target::Ip(SocketAddr::from((octets, port))),
+            Addr::V6(octets) => Target::Ip(SocketAddr::from((octets, port))),
+            Addr::Domain(host) => Target::Domain(host, port),
         }
-        0x03 => {
+    }
+}
+
+async fn read_addr(stream: &mut tokio::net::TcpStream, atyp: u8) -> io::Result<Addr> {
+    match atyp {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await?;
+            Ok(Addr::V4(octets))
+        }
+        0x02 => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await?;
             let mut host = vec![0u8; len[0] as usize];
             stream.read_exact(&mut host).await?;
-            let port = read_port(stream).await?;
-            Ok(Target::Domain(
-                String::from_utf8_lossy(&host).to_string(),
-                port,
-            ))
+            Ok(Addr::Domain(String::from_utf8_lossy(&host).into_owned()))
         }
-        0x04 => {
-            let mut addr = [0u8; 16];
-            stream.read_exact(&mut addr).await?;
-            let port = read_port(stream).await?;
-            Ok(Target::Ip(SocketAddr::from((addr, port))))
+        0x03 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await?;
+            Ok(Addr::V6(octets))
         }
         other => Err(io::Error::other(format!("unknown address type: {other}"))),
     }

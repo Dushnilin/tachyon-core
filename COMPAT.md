@@ -62,7 +62,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `masque` / `warp` | planned | lx |
 | `anytls`, `snell`, `mieru`, `sudoku`, `openvpn`, `tailscale` | planned | extended/lx |
 | `chain` | planned | lx multi-hop |
-| `fptn` (tachyon extension) | runtime live-verified | `fptn:`/`fptnb:` token outbound: parse + check-time expansion into per-server outbounds + urltest group (`tests/golden/ext/`); runtime tested against a real subscription (login → TlsObfuscator2 TLS → ws → smoltcp CONNECT-IP, HTTP round-trip; `obfuscation` field, default `tls` — deliberate divergence from the official client's plain-SNI default, see ROADMAP); clash_api exposure planned — the reference rejects `type: fptn` as unknown, so this type has no differential parity |
+| `fptn` (tachyon extension) | runtime live-verified | `fptn:`/`fptnb:` token outbound: parse + check-time expansion into per-server outbounds + urltest group (`tests/golden/ext/`); runtime tested against a real subscription (login → TlsObfuscator2 TLS → ws → smoltcp CONNECT-IP, HTTP round-trip; `obfuscation` field, default `tls` — deliberate divergence from the official client's plain-SNI default, see the local notes); clash_api exposure planned — the reference rejects `type: fptn` as unknown, so this type has no differential parity |
 
 ## Inbound types
 

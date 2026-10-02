@@ -201,14 +201,10 @@ async fn interop_anytls_tls() {
     .await;
 }
 
-/// Known gap: the reference's naive inbound now accepts, authenticates and
-/// routes our tunnel (`inbound connection from ... / to ...`), and bytes do
-/// cross in both directions, but the payload never reaches the caller. The
-/// reference's own naive client cannot serve as the control on this machine --
-/// its Chromium TLS stack rejects the test certificate with "cert validity too
-/// long", the cert being valid for ten years.
+/// Naive is two things on top of an HTTP/2 CONNECT: the `Padding` header the
+/// reference answers 400 without, and the eight-block framing its `naiveH2Conn`
+/// embeds. Both are here, and the reference's own naive inbound is the judge.
 #[tokio::test]
-#[ignore = "naive: the tunnel opens but the payload does not come back"]
 async fn interop_naive_tls() {
     let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
         return;

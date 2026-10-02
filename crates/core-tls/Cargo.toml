@@ -31,3 +31,5 @@ webpki-roots = "0.26"
 rustls-pemfile = "2"
 bytes.workspace = true
 aes-gcm.workspace = true
+# the server is judged by rustls' client, which needs its async wrapper
+tokio-rustls.workspace = true

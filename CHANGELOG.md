@@ -33,17 +33,27 @@ end, plus the server half of the four TCP proxy protocols.
 
 ### Measurements
 
-Taken on 2026-09-25 with a `cargo zigbuild` musl static release build:
+Taken on 2026-10-02 with the same toolchain the release workflow uses:
+`cargo build --release` against a musl target, `RUSTFLAGS="-C linker=rust-lld
+-C link-self-contained=yes"`, release profile (`opt-level = "z"`, LTO,
+`codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`).
 
 | | tachyon-core | sing-box-lx 1.14.2-lx.2 | |
 |---|:---:|:---:|---|
-| binary, aarch64 | **3.5 MiB** | 67.6 MiB | 19.3× smaller |
-| binary, armv7 | **3.6 MiB** | 68.2 MiB | 18.9× smaller |
-| binary, x86_64 | **4.1 MiB** | 75.9 MiB | 18.5× smaller |
+| binary, aarch64 | **5.37 MiB** | 67.6 MiB | 12.6× smaller |
+| binary, armv7 | **5.57 MiB** | 68.2 MiB | 12.2× smaller |
+| binary, x86_64 | **6.85 MiB** | 75.9 MiB | 11.1× smaller |
 | idle RSS, mixed + direct | **2.4 MiB** | 42.7 MiB | 17.8× less |
 
+The earlier figures in this repository -- 3.5 MiB for aarch64, 19× smaller --
+came from a `cargo zigbuild` run, which is not what builds the released binary,
+so they were not numbers the release could reproduce. Zig is not in the release
+image; `rust-lld` is. The honest numbers are the ones above, and the tree grew
+into them: a full TLS 1.3 *server* stack and the server UDP path are new since
+that measurement.
+
 CI keeps a hard ceiling of 12 MiB on every architecture it builds, mipsel and
-mips included.
+mips included, which the largest of the above clears by 43%.
 
 ### Platforms
 

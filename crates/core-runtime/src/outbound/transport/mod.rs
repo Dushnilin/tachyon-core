@@ -9,7 +9,6 @@ mod http;
 pub(crate) mod xhttp;
 pub(crate) mod xmux;
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -473,258 +472,172 @@ async fn httpupgrade_handshake(
 
 /// RFC 6455 websocket carrying the protocol bytes as binary messages; frames
 /// are concatenated into a byte stream in each direction.
+///
+/// Reading keeps a read-ahead buffer: the socket (usually a TLS stream) is read
+/// in big gulps, frame headers are parsed out of the buffer, and the payload is
+/// unmasked where it lies and copied once, to the caller. Writing builds a
+/// frame in one reusable buffer and masks it word by word.
 pub(crate) struct WsStream {
     inner: AnyStream,
-    state: WsRead,
-    buffer: Vec<u8>,
-    pos: usize,
+    /// bytes off the wire not consumed yet: `rbuf[rpos..]`
+    rbuf: Vec<u8>,
+    rpos: usize,
+    /// payload of the data frame being handed out that is still to come, its
+    /// masking key and how far into the payload the key has rotated
+    left: usize,
+    mask: Option<[u8; 4]>,
+    mask_at: usize,
     eof: bool,
     /// Payload of a ping awaiting a pong reply.
     pong: Option<Vec<u8>>,
-    /// Queued frames not yet flushed (control pongs, close frame).
-    outbox: VecDeque<Vec<u8>>,
-    /// Frame currently being flushed (bytes, offset).
-    flushing: Option<(Vec<u8>, usize)>,
+    /// Whole frames waiting to go out (data, pongs, close), and how much of
+    /// them is written. Frames are only ever appended whole.
+    wbuf: Vec<u8>,
+    wpos: usize,
     /// Caller bytes consumed by the data frame currently flushing.
     consumed: Option<usize>,
     close_sent: bool,
 }
 
-enum WsRead {
-    /// Collecting the 2-byte frame header.
-    Header { buf: Vec<u8> },
-    /// Collecting the 2/8-byte extended length.
-    ExtLen {
-        b0: u8,
-        masked: bool,
-        wide: usize,
-        buf: Vec<u8>,
-    },
-    /// Collecting the 4-byte masking key (never sent by our peers, but the
-    /// parser tolerates it).
-    Mask {
-        opcode: u8,
-        len: usize,
-        buf: Vec<u8>,
-    },
-    /// Collecting the payload.
-    Payload {
-        opcode: u8,
-        len: usize,
-        mask: Option<[u8; 4]>,
-        buf: Vec<u8>,
-    },
+/// What one read asks the socket for at least.
+const WS_READ: usize = 32 * 1024;
+
+/// A frame header parsed out of the buffer.
+struct FrameHead {
+    opcode: u8,
+    len: usize,
+    mask: Option<[u8; 4]>,
+    /// header bytes in the buffer
+    size: usize,
+}
+
+fn parse_head(bytes: &[u8]) -> io::Result<Option<FrameHead>> {
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    let opcode = bytes[0] & 0x0F;
+    let masked = bytes[1] & 0x80 != 0;
+    let small = usize::from(bytes[1] & 0x7F);
+    let ext = match small {
+        126 => 2,
+        127 => 8,
+        _ => 0,
+    };
+    let size = 2 + ext + if masked { 4 } else { 0 };
+    if bytes.len() < size {
+        return Ok(None);
+    }
+    let len = match ext {
+        2 => usize::from(u16::from_be_bytes([bytes[2], bytes[3]])),
+        8 => usize::try_from(u64::from_be_bytes(
+            bytes[2..10].try_into().expect("8 bytes"),
+        ))
+        .map_err(|_| io::Error::other("ws: frame too large"))?,
+        _ => small,
+    };
+    let mask = masked.then(|| bytes[2 + ext..2 + ext + 4].try_into().expect("4 bytes"));
+    Ok(Some(FrameHead {
+        opcode,
+        len,
+        mask,
+        size,
+    }))
+}
+
+/// XOR `buf` with the masking key, `at` bytes into the payload. Eight bytes at
+/// a time: a byte loop with a modulo is what made masking the hot spot.
+fn xor_mask(buf: &mut [u8], mut mask: [u8; 4], at: usize) {
+    mask.rotate_left(at % 4);
+    let word = u32::from_ne_bytes(mask);
+    let wide = u64::from(word) | (u64::from(word) << 32);
+    let (words, rest) = buf.as_chunks_mut::<8>();
+    for word in words {
+        *word = (u64::from_ne_bytes(*word) ^ wide).to_ne_bytes();
+    }
+    for (i, byte) in rest.iter_mut().enumerate() {
+        *byte ^= mask[i % 4];
+    }
 }
 
 impl WsStream {
     fn new(inner: AnyStream) -> Self {
         Self {
             inner,
-            state: WsRead::Header { buf: Vec::new() },
-            buffer: Vec::new(),
-            pos: 0,
+            rbuf: Vec::new(),
+            rpos: 0,
+            left: 0,
+            mask: None,
+            mask_at: 0,
             eof: false,
             pong: None,
-            outbox: VecDeque::new(),
-            flushing: None,
+            wbuf: Vec::new(),
+            wpos: 0,
             consumed: None,
             close_sent: false,
         }
     }
 
-    /// Drive the frame parser until a data frame is buffered, the stream
-    /// ends, or the socket pends.
-    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            match std::mem::replace(&mut self.state, WsRead::Header { buf: Vec::new() }) {
-                WsRead::Header { mut buf } => match poll_fill(&mut self.inner, cx, &mut buf, 2) {
-                    Poll::Ready(Ok(true)) => {
-                        let opcode = buf[0] & 0x0F;
-                        let masked = buf[1] & 0x80 != 0;
-                        let small = usize::from(buf[1] & 0x7F);
-                        self.state = match small {
-                            126 => WsRead::ExtLen {
-                                b0: buf[0],
-                                masked,
-                                wide: 2,
-                                buf: Vec::new(),
-                            },
-                            127 => WsRead::ExtLen {
-                                b0: buf[0],
-                                masked,
-                                wide: 8,
-                                buf: Vec::new(),
-                            },
-                            _ if masked => WsRead::Mask {
-                                opcode,
-                                len: small,
-                                buf: Vec::new(),
-                            },
-                            _ => WsRead::Payload {
-                                opcode,
-                                len: small,
-                                mask: None,
-                                buf: Vec::new(),
-                            },
-                        };
-                    }
-                    Poll::Ready(Ok(false)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "ws: connection closed mid-frame",
-                        )));
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => {
-                        self.state = WsRead::Header { buf };
-                        return Poll::Pending;
-                    }
-                },
-                WsRead::ExtLen {
-                    b0,
-                    masked,
-                    wide,
-                    mut buf,
-                } => match poll_fill(&mut self.inner, cx, &mut buf, wide) {
-                    Poll::Ready(Ok(true)) => {
-                        let opcode = b0 & 0x0F;
-                        let len = if wide == 2 {
-                            usize::from(u16::from_be_bytes(buf[..2].try_into().expect("2 bytes")))
-                        } else {
-                            usize::try_from(u64::from_be_bytes(
-                                buf[..8].try_into().expect("8 bytes"),
-                            ))
-                            .map_err(|_| io::Error::other("ws: frame too large"))?
-                        };
-                        self.state = if masked {
-                            WsRead::Mask {
-                                opcode,
-                                len,
-                                buf: Vec::new(),
-                            }
-                        } else {
-                            WsRead::Payload {
-                                opcode,
-                                len,
-                                mask: None,
-                                buf: Vec::new(),
-                            }
-                        };
-                    }
-                    Poll::Ready(Ok(false)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "ws: connection closed mid-frame",
-                        )));
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => {
-                        self.state = WsRead::ExtLen {
-                            b0,
-                            masked,
-                            wide,
-                            buf,
-                        };
-                        return Poll::Pending;
-                    }
-                },
-                WsRead::Mask {
-                    opcode,
-                    len,
-                    mut buf,
-                } => match poll_fill(&mut self.inner, cx, &mut buf, 4) {
-                    Poll::Ready(Ok(true)) => {
-                        self.state = WsRead::Payload {
-                            opcode,
-                            len,
-                            mask: Some(buf[..4].try_into().expect("4 bytes")),
-                            buf: Vec::new(),
-                        };
-                    }
-                    Poll::Ready(Ok(false)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "ws: connection closed mid-frame",
-                        )));
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => {
-                        self.state = WsRead::Mask { opcode, len, buf };
-                        return Poll::Pending;
-                    }
-                },
-                WsRead::Payload {
-                    opcode,
-                    len,
-                    mut mask,
-                    mut buf,
-                } => {
-                    match poll_fill(&mut self.inner, cx, &mut buf, len) {
-                        Poll::Ready(Ok(true)) => {}
-                        Poll::Ready(Ok(false)) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "ws: connection closed mid-frame",
-                            )));
-                        }
-                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                        Poll::Pending => {
-                            self.state = WsRead::Payload {
-                                opcode,
-                                len,
-                                mask,
-                                buf,
-                            };
-                            return Poll::Pending;
-                        }
-                    }
-                    if let Some(mask) = mask.take() {
-                        for (i, byte) in buf.iter_mut().enumerate() {
-                            *byte ^= mask[i % 4];
-                        }
-                    }
-                    match opcode {
-                        OP_CLOSE => {
-                            self.eof = true;
-                            return Poll::Ready(Ok(()));
-                        }
-                        OP_PING => {
-                            self.pong = Some(std::mem::take(&mut buf));
-                        }
-                        OP_PONG => {}
-                        _ => {
-                            self.buffer = buf;
-                            self.pos = 0;
-                            return Poll::Ready(Ok(()));
-                        }
-                    }
-                    self.state = WsRead::Header { buf: Vec::new() };
-                }
-            }
+    /// Read more of the wire into the buffer; `false` on a clean end.
+    fn poll_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        // what was consumed can go: nothing points into the buffer between reads
+        if self.rpos == self.rbuf.len() {
+            self.rbuf.clear();
+            self.rpos = 0;
+        } else if self.rpos > 0 {
+            self.rbuf.drain(..self.rpos);
+            self.rpos = 0;
         }
+        self.rbuf.reserve(WS_READ);
+        let have = self.rbuf.len();
+        let mut read = ReadBuf::uninit(self.rbuf.spare_capacity_mut());
+        ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
+        let got = read.filled().len();
+        if got == 0 {
+            return Poll::Ready(Ok(false));
+        }
+        // SAFETY: the reader initialised exactly `got` bytes of the spare
+        // capacity, starting at `have`.
+        unsafe { self.rbuf.set_len(have + got) };
+        Poll::Ready(Ok(true))
     }
 
+    /// Drain the queued frames into the socket.
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            if let Some((frame, off)) = &mut self.flushing {
-                while *off < frame.len() {
-                    let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &frame[*off..]))?;
-                    if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "ws: frame write stalled",
-                        )));
-                    }
-                    *off += n;
-                }
-                self.flushing = None;
-                continue;
+        while self.wpos < self.wbuf.len() {
+            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.wbuf[self.wpos..]))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "ws: frame write stalled",
+                )));
             }
-            match self.outbox.pop_front() {
-                Some(frame) => self.flushing = Some((frame, 0)),
-                None => return Poll::Ready(Ok(())),
-            }
+            self.wpos += n;
         }
+        self.wbuf.clear();
+        self.wpos = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Append one whole frame, masked, to the write queue.
+    fn push_frame(&mut self, opcode: u8, payload: &[u8]) {
+        let mut mask = [0u8; 4];
+        let _ = random_bytes(&mut mask);
+        let len = payload.len();
+        self.wbuf.reserve(14 + len);
+        self.wbuf.push(0x80 | opcode);
+        if len < 126 {
+            self.wbuf.push(0x80 | len as u8);
+        } else if len <= usize::from(u16::MAX) {
+            self.wbuf.push(0x80 | 126);
+            self.wbuf.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            self.wbuf.push(0x80 | 127);
+            self.wbuf.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        self.wbuf.extend_from_slice(&mask);
+        let from = self.wbuf.len();
+        self.wbuf.extend_from_slice(payload);
+        xor_mask(&mut self.wbuf[from..], mask, 0);
     }
 }
 
@@ -734,17 +647,67 @@ impl AsyncRead for WsStream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let me = &mut *self;
         loop {
-            if self.pos < self.buffer.len() {
-                let n = out.remaining().min(self.buffer.len() - self.pos);
-                out.put_slice(&self.buffer[self.pos..self.pos + n]);
-                self.pos += n;
+            if me.eof {
                 return Poll::Ready(Ok(()));
             }
-            if self.eof {
-                return Poll::Ready(Ok(()));
+            let avail = me.rbuf.len() - me.rpos;
+            if me.left > 0 {
+                if avail > 0 {
+                    let n = avail.min(me.left).min(out.remaining());
+                    let chunk = &mut me.rbuf[me.rpos..me.rpos + n];
+                    if let Some(mask) = me.mask {
+                        xor_mask(chunk, mask, me.mask_at);
+                        me.mask_at += n;
+                    }
+                    out.put_slice(chunk);
+                    me.rpos += n;
+                    me.left -= n;
+                    return Poll::Ready(Ok(()));
+                }
+            } else if let Some(head) = parse_head(&me.rbuf[me.rpos..])? {
+                let is_control = head.opcode >= 0x8;
+                if is_control {
+                    // a control payload is at most 125 bytes: take it whole
+                    if head.len > 125 {
+                        return Poll::Ready(Err(io::Error::other("ws: oversized control frame")));
+                    }
+                    if avail >= head.size + head.len {
+                        let start = me.rpos + head.size;
+                        let mut payload = me.rbuf[start..start + head.len].to_vec();
+                        if let Some(mask) = head.mask {
+                            xor_mask(&mut payload, mask, 0);
+                        }
+                        me.rpos = start + head.len;
+                        match head.opcode {
+                            OP_CLOSE => me.eof = true,
+                            OP_PING => me.pong = Some(payload),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                } else {
+                    me.rpos += head.size;
+                    me.left = head.len;
+                    me.mask = head.mask;
+                    me.mask_at = 0;
+                    continue;
+                }
             }
-            ready!(self.as_mut().poll_frame(cx))?;
+            match ready!(me.poll_more(cx))? {
+                true => {}
+                false if me.rbuf.len() == me.rpos && me.left == 0 => {
+                    me.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                false => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ws: connection closed mid-frame",
+                    )));
+                }
+            }
         }
     }
 }
@@ -755,24 +718,22 @@ impl AsyncWrite for WsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let me = &mut *self;
         loop {
-            ready!(self.as_mut().poll_drain(cx))?;
-            if self.flushing.is_some() || !self.outbox.is_empty() {
-                continue;
-            }
-            if let Some(consumed) = self.consumed.take() {
+            ready!(me.poll_drain(cx))?;
+            if let Some(consumed) = me.consumed.take() {
                 return Poll::Ready(Ok(consumed));
             }
-            if let Some(payload) = self.pong.take() {
-                self.outbox.push_back(build_masked(OP_PONG, &payload));
+            if let Some(payload) = me.pong.take() {
+                me.push_frame(OP_PONG, &payload);
                 continue;
             }
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
             let take = buf.len().min(65535);
-            self.outbox.push_back(build_masked(OP_BINARY, &buf[..take]));
-            self.consumed = Some(take);
+            me.push_frame(OP_BINARY, &buf[..take]);
+            me.consumed = Some(take);
         }
     }
 
@@ -783,66 +744,12 @@ impl AsyncWrite for WsStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.close_sent {
-            self.close_sent = true;
-            self.outbox.push_back(build_masked(OP_CLOSE, &[]));
+        let me = &mut *self;
+        if !me.close_sent {
+            me.close_sent = true;
+            me.push_frame(OP_CLOSE, &[]);
         }
-        ready!(self.as_mut().poll_drain(cx))?;
-        let inner = &mut self.as_mut().inner;
-        Pin::new(&mut **inner).poll_shutdown(cx)
+        ready!(me.poll_drain(cx))?;
+        Pin::new(&mut me.inner).poll_shutdown(cx)
     }
-}
-
-/// Client frames must be masked (RFC 6455 §5.3); a random key per frame.
-fn build_masked(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let mut mask = [0u8; 4];
-    let _ = random_bytes(&mut mask);
-    let mut frame = Vec::with_capacity(14 + payload.len());
-    frame.push(0x80 | opcode);
-    let flag = 0x80;
-    let len = payload.len();
-    if len < 126 {
-        frame.push(flag | len as u8);
-    } else if len <= u16::MAX as usize {
-        frame.push(flag | 126);
-        frame.extend_from_slice(&(len as u16).to_be_bytes());
-    } else {
-        frame.push(flag | 127);
-        frame.extend_from_slice(&(len as u64).to_be_bytes());
-    }
-    frame.extend_from_slice(&mask);
-    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
-    frame
-}
-
-/// Fill `buf` to `need` bytes; `Ok(false)` on clean EOF with an empty buffer.
-fn poll_fill(
-    inner: &mut AnyStream,
-    cx: &mut Context<'_>,
-    buf: &mut Vec<u8>,
-    need: usize,
-) -> Poll<io::Result<bool>> {
-    while buf.len() < need {
-        let missing = need - buf.len();
-        let mut scratch = vec![0u8; missing];
-        let mut read_buf = ReadBuf::new(&mut scratch);
-        match Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let n = read_buf.filled().len();
-                if n == 0 {
-                    if buf.is_empty() {
-                        return Poll::Ready(Ok(false));
-                    }
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "ws: stream closed mid-frame",
-                    )));
-                }
-                buf.extend_from_slice(&scratch[..n]);
-            }
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
-    }
-    Poll::Ready(Ok(true))
 }

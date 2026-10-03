@@ -355,6 +355,22 @@ async fn vless_server_checks_the_flow_against_the_user() {
     );
 }
 
+/// The server used to accept `xtls-rprx-vision` and then read the frames as
+/// payload, so the client's first bytes came back as garbage or an EOF.
+#[tokio::test]
+async fn vless_server_speaks_vision_to_our_own_client() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let got = through_our_own_client(
+        vless_server(uuid, "xtls-rprx-vision"),
+        vless_client(uuid, "xtls-rprx-vision"),
+        b"vision both ways",
+    )
+    .await
+    .expect("vision round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "vision both ways");
+}
+
 #[tokio::test]
 async fn a_vless_inbound_needs_users() {
     let _guard = test_guard().await;

@@ -228,7 +228,17 @@ where
     // in the socket buffer, which a client cannot tell apart -- except when the
     // route below fails, and then a close is what it sees either way.
     stream.write_all(&RESPONSE_HEAD).await?;
-    let framed: AnyStream = Box::new(stream);
+    // Vision frames the payload both ways; the framing is symmetric, so the
+    // client's own stream type does for the server too. It is not a bare
+    // socket, so the relay takes the buffered path.
+    let framed: AnyStream = if flow == "xtls-rprx-vision" {
+        Box::new(crate::outbound::vision::VisionStream::new(
+            Box::new(stream),
+            user.uuid,
+        ))
+    } else {
+        Box::new(stream)
+    };
     drive_framed(
         ClientConn::framed(framed, local),
         peer,

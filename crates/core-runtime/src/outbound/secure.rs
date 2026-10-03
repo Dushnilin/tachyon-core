@@ -211,6 +211,18 @@ pub struct VlessStream {
     buf: Vec<u8>,
 }
 
+impl VlessStream {
+    /// The bare socket underneath, while the response head has not been touched:
+    /// the relay can then eat the head itself and hand the rest to the kernel.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn raw_pending(&self) -> Option<&tokio::net::TcpStream> {
+        if !self.header_pending || !self.buf.is_empty() {
+            return None;
+        }
+        (&*self.inner as &dyn std::any::Any).downcast_ref::<tokio::net::TcpStream>()
+    }
+}
+
 impl tokio::io::AsyncRead for VlessStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,

@@ -2,6 +2,7 @@
 //! shared outbound dial tail: TCP → optional TLS → transport → protocol.
 
 mod grpc;
+pub(crate) mod h1io;
 pub(crate) mod h2io;
 pub(crate) mod h3io;
 mod http;
@@ -9,8 +10,10 @@ pub(crate) mod xhttp;
 pub(crate) mod xmux;
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use serde_json::Value;
@@ -215,10 +218,32 @@ impl Transport {
         Ok(Self { kind })
     }
 
+    /// The ALPN this transport asks for when the config sets none.
+    ///
+    /// XHTTP is HTTP/1.1 and nothing else: the reference refuses h2 there even
+    /// when the server offers it, on purpose (`transport/v2rayxhttp/http1.go`,
+    /// lx SPEC 104) — a non-nil empty `TLSNextProto` map turns HTTP/2 off for
+    /// the whole transport. Offering `h2` instead is what made Xray 26.9 hand
+    /// the far end our request head plus the payload twice.
+    fn default_alpn(&self, secure: bool) -> &'static [&'static [u8]] {
+        match &self.kind {
+            Kind::Grpc { .. } => &[b"h2"],
+            Kind::Xhttp(_) => &[b"http/1.1"],
+            Kind::Http { .. } if secure => &[b"h2"],
+            _ => &[],
+        }
+    }
+
     /// Dial the full outbound stream: TCP → optional TLS → transport.
     /// `early` is the first protocol write; a transport that can carry it in
     /// its handshake (ws early data) takes as much as it declared and reports
     /// the count so the caller writes only the rest.
+    ///
+    /// `dial` is here for the transports that need more than the one connection
+    /// they were handed. HTTP/1.1 does not multiplex, so XHTTP opens a second
+    /// connection per concurrent request — and ALPN, which decides what a
+    /// connection speaks, is chosen per connection, so it cannot be settled once
+    /// for the whole transport.
     pub(crate) async fn connect(
         &self,
         tcp: TcpStream,
@@ -226,13 +251,9 @@ impl Transport {
         server: &str,
         port: u16,
         early: &[u8],
+        dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<(AnyStream, usize)> {
-        // sing-box defaults ALPN to h2 for grpc/http when the user set none.
-        let default_alpn: &[&[u8]] = match &self.kind {
-            Kind::Grpc { .. } | Kind::Xhttp(_) => &[b"h2"],
-            Kind::Http { .. } if tls.is_some() => &[b"h2"],
-            _ => &[],
-        };
+        let default_alpn = self.default_alpn(tls.is_some());
         let stream: AnyStream = match tls {
             Some(tls) => tls.wrap_with_defaults(tcp, default_alpn).await?,
             None => Box::new(tcp),
@@ -283,12 +304,43 @@ impl Transport {
                 .await?,
                 0,
             ),
-            Kind::Xhttp(cfg) => (
-                xhttp::connect(stream, tls.is_some(), server, port, cfg).await?,
-                0,
-            ),
+            Kind::Xhttp(cfg) => {
+                let dialer = self.dialer(tls, server, port, dial);
+                (
+                    xhttp::connect(stream, tls.is_some(), server, port, cfg, dialer).await?,
+                    0,
+                )
+            }
         };
         Ok((stream, consumed))
+    }
+
+    /// A closure that opens one more connection to the same server with the same
+    /// TCP options, the same TLS and the same ALPN as the first one.
+    fn dialer(
+        &self,
+        tls: Option<&TlsOptions>,
+        server: &str,
+        port: u16,
+        dial: &crate::outbound::dial::DialOptions,
+    ) -> Arc<xhttp::Dialer> {
+        let server = server.to_string();
+        let dial = dial.clone();
+        let tls = tls.cloned();
+        let alpn = self.default_alpn(tls.is_some());
+        Arc::new(move || {
+            let server = server.clone();
+            let dial = dial.clone();
+            let tls = tls.clone();
+            Box::pin(async move {
+                let tcp = crate::outbound::dial::connect_tcp(&server, port, &dial).await?;
+                let stream: AnyStream = match tls {
+                    Some(tls) => tls.wrap_with_defaults(tcp, alpn).await?,
+                    None => Box::new(tcp),
+                };
+                Ok(stream)
+            }) as Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>>
+        })
     }
 }
 

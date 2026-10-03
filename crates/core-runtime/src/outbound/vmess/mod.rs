@@ -201,7 +201,14 @@ impl Vmess {
             crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         let (mut stream, consumed) = self
             .transport
-            .connect(tcp, self.tls.as_ref(), &self.server, self.port, &first)
+            .connect(
+                tcp,
+                self.tls.as_ref(),
+                &self.server,
+                self.port,
+                &first,
+                &self.dial,
+            )
             .await?;
         stream.write_all(&first[consumed..]).await?;
         // The packet path has no codec, so the server answers with the bare
@@ -256,7 +263,14 @@ impl Vmess {
         // a ws transport with early data carries the request in the upgrade head
         let (mut stream, consumed) = self
             .transport
-            .connect(tcp, self.tls.as_ref(), &self.server, self.port, &first)
+            .connect(
+                tcp,
+                self.tls.as_ref(),
+                &self.server,
+                self.port,
+                &first,
+                &self.dial,
+            )
             .await?;
         stream.write_all(&first[consumed..]).await?;
 

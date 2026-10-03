@@ -25,6 +25,12 @@ SHORT_ID="${SHORT_ID:-6ba85179e30d4fc3}"
 SNI="${SNI:-localhost}"
 UUID="${UUID:-00000000-0000-0000-0000-000000000001}"
 PLAIN="${PLAIN:-0}"
+# WIRE=1 puts a logging relay between our client and Xray and writes what each
+# connection carried, as hex, to <outdir>/wire.log. When the far end reads more
+# than we meant to send, this is the only place the bytes can be told apart from
+# what the client's own log claims it wrote.
+WIRE="${WIRE:-0}"
+WIRE_PORT="${WIRE_PORT:-19905}"
 
 # Windows names it python, everyone else python3, and this stand has to run in
 # both. Asking each candidate whether it actually runs matters: Windows ships a
@@ -132,7 +138,14 @@ else
     XMUX_CLIENT=""
 fi
 
-if [ "$PLAIN" = "1" ]; then
+if [ "$PLAIN" = "2" ]; then
+    # no TLS at all: the HTTP requests are readable on the wire (WIRE=1)
+    SECURITY=none
+    ROOT=""
+    CERTS=""
+    TLS_BLOCK="\"sockopt\": {}"
+    CLIENT_TLS="{\"enabled\": false}"
+elif [ "$PLAIN" = "1" ]; then
     SECURITY=tls
     ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
     # Xray is a Windows program on a Windows host and gets a POSIX path from a
@@ -193,7 +206,7 @@ JSON
 # the decoy site REALITY hides behind, when there is one: an ordinary TLS inbound
 # in the same Xray, so the stand stays one process and the fallback path has
 # something real to talk to
-if [ "$PLAIN" != "1" ]; then
+if [ "$PLAIN" = "0" ]; then
 cat > "$WORK/decoy.json" <<JSON
 {
   "log": {"loglevel": "warning"},
@@ -215,6 +228,8 @@ cat > "$WORK/decoy.json" <<JSON
 JSON
 fi
 
+if [ "$WIRE" = "1" ]; then CLIENT_PORT="$WIRE_PORT"; else CLIENT_PORT="$SERVER_PORT"; fi
+
 cat > "$WORK/client.json" <<JSON
 {
   "log": {"level": "debug", "timestamp": false},
@@ -223,7 +238,7 @@ cat > "$WORK/client.json" <<JSON
   }],
   "outbounds": [{
     "type": "vless", "tag": "out",
-    "server": "127.0.0.1", "server_port": $SERVER_PORT,
+    "server": "127.0.0.1", "server_port": $CLIENT_PORT,
     "uuid": "$UUID",
     "tls": $CLIENT_TLS,
     "transport": {"type": "xhttp", "path": "$PATH_X", "host": "$SNI", "mode": "packet-up"$XMUX_CLIENT}
@@ -241,7 +256,7 @@ fi
 "$PY" "$WORK/echo.py" "$ECHO_PORT" > "$OUT/echo.log" 2>&1 &
 ECHO=$!
 sleep 1
-if [ "$PLAIN" != "1" ]; then
+if [ "$PLAIN" = "0" ]; then
     "$XRAY" run -c "$WORK/decoy.json" > "$OUT/decoy.log" 2>&1 &
     DECOY=$!
 else
@@ -249,6 +264,47 @@ else
 fi
 "$XRAY" run -c "$WORK/server.json" > "$OUT/server.log" 2>&1 &
 SERVER=$!
+if [ "$WIRE" = "1" ]; then
+    cat > "$WORK/wire.py" <<'PY'
+import socket, sys, threading, itertools
+listen, target, log = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+lock = threading.Lock()
+ids = itertools.count(1)
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", listen))
+srv.listen(16)
+def note(cid, way, data):
+    with lock, open(log, "a") as f:
+        f.write("conn %d %s %d bytes: %s ... tail %s\n" % (cid, way, len(data), data[:400].hex(), data[-96:].hex()))
+def pump(cid, a, b, way):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            note(cid, way, d)
+            b.sendall(d)
+    except OSError:
+        pass
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+while True:
+    c, _ = srv.accept()
+    cid = next(ids)
+    s = socket.create_connection(("127.0.0.1", target))
+    threading.Thread(target=pump, args=(cid, c, s, "up"), daemon=True).start()
+    threading.Thread(target=pump, args=(cid, s, c, "down"), daemon=True).start()
+PY
+    : > "$OUT/wire.log"
+    "$PY" "$WORK/wire.py" "$WIRE_PORT" "$SERVER_PORT" "$OUT/wire.log" > /dev/null 2>&1 &
+    WIREPID=$!
+    sleep 1
+else
+    WIREPID=""
+fi
 "$OUR" run -c "$WORK/client.json" > "$OUT/client.log" 2>&1 &
 CLIENT=$!
 sleep 3
@@ -257,8 +313,8 @@ BODY=$("$PY" "$WORK/probe.py" "$SOCKS_PORT" "$ECHO_PORT" 'xhttp-through' \
     "${PROBE_REPEAT:-1}" 2>"$OUT/probe.log")
 STATUS=$?
 
-kill "$CLIENT" "$SERVER" "$ECHO" $DECOY 2>/dev/null
-wait "$CLIENT" "$SERVER" "$ECHO" $DECOY 2>/dev/null
+kill "$CLIENT" "$SERVER" "$ECHO" $DECOY $WIREPID 2>/dev/null
+wait "$CLIENT" "$SERVER" "$ECHO" $DECOY $WIREPID 2>/dev/null
 
 echo "probe exit: $STATUS"
 echo "body: $BODY"

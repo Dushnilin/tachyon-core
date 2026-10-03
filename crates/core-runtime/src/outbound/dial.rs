@@ -325,12 +325,15 @@ impl DialOptions {
             if self.tcp_multi_path {
                 match set_int(fd, libc::IPPROTO_TCP, TCP_MPTCP_ENABLED, 1) {
                     Ok(()) => {}
-                    // a kernel without MPTCP says so, and the reference ignores
-                    // that error: the dial goes on without multipath
+                    // a kernel without MPTCP says so (a locked-down one says
+                    // EPERM), and the reference ignores that error: the dial
+                    // goes on without multipath
                     Err(err)
                         if matches!(
                             err.raw_os_error(),
-                            Some(libc::ENOPROTOOPT) | Some(libc::EPROTONOSUPPORT)
+                            Some(libc::ENOPROTOOPT)
+                                | Some(libc::EPROTONOSUPPORT)
+                                | Some(libc::EPERM)
                         ) =>
                     {
                         crate::logging::debug(format_args!(
@@ -936,7 +939,7 @@ mod tests {
             assert!(
                 matches!(
                     err.raw_os_error(),
-                    Some(libc::ENOPROTOOPT) | Some(libc::EPROTONOSUPPORT)
+                    Some(libc::ENOPROTOOPT) | Some(libc::EPROTONOSUPPORT) | Some(libc::EPERM)
                 ),
                 "getsockopt: {err}"
             );

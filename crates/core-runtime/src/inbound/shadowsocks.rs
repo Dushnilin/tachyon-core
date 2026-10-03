@@ -103,6 +103,7 @@ impl Shadowsocks {
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     let method = self.method;
                     let master_key = Arc::clone(&self.master_key);
                     let tag = self.tag.clone();
@@ -168,17 +169,21 @@ where
     };
 
     let (read_half, write_half) = tokio::io::split(stream);
+    // whatever the head already decrypted is the first thing the reader hands
+    // out: it sits at the front of the read buffer as an unread payload
+    let prefix_len = head.prefix.len();
     let framed: AnyStream = Box::new(ServerStream {
         read: ChunkReader {
             inner: Box::new(read_half) as AnyRead,
             cipher,
             counter: head.counter,
-            pending: head.prefix,
+            rbuf: head.prefix,
+            rpos: prefix_len,
+            rend: prefix_len,
             pos: 0,
-            staging: Vec::new(),
-            staging_want: 2 + AEAD_TAG,
-            staging_filled: 0,
-            staging_length: true,
+            pend: prefix_len,
+            want: 2 + AEAD_TAG,
+            want_length: true,
         },
         write: ServerWriter {
             inner: Box::new(write_half) as AnyWrite,
@@ -189,6 +194,7 @@ where
             // which is what the reference does
             session: None,
             flushing: None,
+            spare: Vec::new(),
             consumed: 0,
         },
     });
@@ -359,20 +365,23 @@ where
 
 /// Seal one chunk onto `out`, the way `shadowaead.Writer.WriteChunk` does.
 fn write_chunk(cipher: &mut Cipher, counter: &mut u64, out: &mut Vec<u8>, data: &[u8]) {
-    let mut head = (data.len() as u16).to_be_bytes().to_vec();
-    cipher.seal(*counter, &mut head).expect("seal cannot fail");
+    let head = out.len();
+    out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    cipher
+        .seal_at(*counter, out, head)
+        .expect("seal cannot fail");
     *counter += 1;
-    out.extend_from_slice(&head);
     write_sealed(cipher, counter, out, data);
 }
 
 /// A block sealed straight off the session key, with no length in front of it:
-/// the 2022 head and the first payload on either side of it.
+/// the 2022 head and the first payload on either side of it. Sealed where it
+/// lands, so there is no copy to seal and another to append.
 fn write_sealed(cipher: &mut Cipher, counter: &mut u64, out: &mut Vec<u8>, data: &[u8]) {
-    let mut block = data.to_vec();
-    cipher.seal(*counter, &mut block).expect("seal cannot fail");
+    let at = out.len();
+    out.extend_from_slice(data);
+    cipher.seal_at(*counter, out, at).expect("seal cannot fail");
     *counter += 1;
-    out.extend_from_slice(&block);
 }
 
 /// The payload side: the request cipher carried on from where the head left
@@ -381,17 +390,27 @@ struct ChunkReader {
     inner: AnyRead,
     cipher: Cipher,
     counter: u64,
-    /// plaintext not yet handed out
-    pending: Vec<u8>,
+    /// Bytes off the wire that nothing has consumed yet: `rbuf[rpos..rend]`.
+    /// Reads take as much as fits, so several chunks come in per syscall and
+    /// each is opened where it sits.
+    rbuf: Vec<u8>,
+    rpos: usize,
+    rend: usize,
+    /// the plaintext being handed out: `rbuf[pos..pend]`
     pos: usize,
-    /// a sealed block on its way in, how long it has to be, and how much of it
-    /// has actually arrived
-    staging: Vec<u8>,
-    staging_want: usize,
-    staging_filled: usize,
-    /// whether the block being read is a length rather than a payload
-    staging_length: bool,
+    pend: usize,
+    /// the sealed block that has to be complete before it is opened, and
+    /// whether it is a length rather than a payload
+    want: usize,
+    want_length: bool,
 }
+
+/// Read buffer of a connection: two legacy chunks and the length blocks between
+/// them. It only grows to this when the first chunk is waited for.
+const READ_BUF: usize = 33 * 1024;
+/// Most plaintext one write turns into a frame: a couple of legacy chunks, one
+/// syscall.
+const WRITE_FRAME: usize = 32 * 1024;
 
 impl AsyncRead for ChunkReader {
     fn poll_read(
@@ -400,57 +419,69 @@ impl AsyncRead for ChunkReader {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
-        while this.pos >= this.pending.len() {
+        while this.pos >= this.pend {
             // a block is only opened once every byte of it has arrived: the
             // counter moves with it, and a half-read block must not be able to
             // step over the bytes still in flight
-            ready!(poll_read_exact(
+            ready!(poll_fill(
                 &mut this.inner,
                 cx,
-                &mut this.staging,
-                &mut this.staging_filled,
-                this.staging_want
+                &mut this.rbuf,
+                &mut this.rpos,
+                &mut this.rend,
+                this.want
             ))?;
-            let mut block = std::mem::take(&mut this.staging);
-            this.staging_filled = 0;
-            this.cipher.open(this.counter, &mut block)?;
+            let at = this.rpos;
+            this.cipher
+                .open_slice(this.counter, &mut this.rbuf[at..at + this.want])?;
             this.counter += 1;
-            if this.staging_length {
-                let len = usize::from(u16::from_be_bytes([block[0], block[1]]));
+            if this.want_length {
+                let len = usize::from(u16::from_be_bytes([this.rbuf[at], this.rbuf[at + 1]]));
                 if len == 0 {
                     return Poll::Ready(Err(io::Error::other("zero-length chunk")));
                 }
-                this.staging_length = false;
-                this.staging_want = len + AEAD_TAG;
+                this.rpos += this.want;
+                this.want_length = false;
+                this.want = len + AEAD_TAG;
                 continue;
             }
-            this.staging_length = true;
-            this.staging_want = 2 + AEAD_TAG;
-            this.pending = block;
-            this.pos = 0;
+            this.pos = at;
+            this.pend = at + this.want - AEAD_TAG;
+            this.rpos += this.want;
+            this.want_length = true;
+            this.want = 2 + AEAD_TAG;
         }
-        let n = out.remaining().min(this.pending.len() - this.pos);
-        out.put_slice(&this.pending[this.pos..this.pos + n]);
+        let n = out.remaining().min(this.pend - this.pos);
+        out.put_slice(&this.rbuf[this.pos..this.pos + n]);
         this.pos += n;
         Poll::Ready(Ok(()))
     }
 }
 
-/// Fill `staging` to `want` bytes across as many `Pending`s as it takes, and
-/// leave what has arrived in place for the next call.
-fn poll_read_exact(
+/// Make `rbuf[*rpos..*rend]` at least `want` bytes across as many `Pending`s as
+/// it takes. Only called with no payload left to hand out, so moving the unread
+/// bytes to the front disturbs nothing.
+fn poll_fill(
     inner: &mut AnyRead,
     cx: &mut Context<'_>,
-    staging: &mut Vec<u8>,
-    filled: &mut usize,
+    rbuf: &mut Vec<u8>,
+    rpos: &mut usize,
+    rend: &mut usize,
     want: usize,
 ) -> Poll<io::Result<()>> {
-    if *filled == 0 {
-        staging.clear();
-        staging.resize(want, 0);
+    if *rend - *rpos >= want {
+        return Poll::Ready(Ok(()));
     }
-    while *filled < want {
-        let mut read_buf = ReadBuf::new(&mut staging[*filled..]);
+    if *rpos > 0 {
+        rbuf.copy_within(*rpos..*rend, 0);
+        *rend -= *rpos;
+        *rpos = 0;
+    }
+    if rbuf.len() < want {
+        rbuf.resize(want.max(READ_BUF), 0);
+    }
+    while *rend < want {
+        let mut read_buf = ReadBuf::new(&mut rbuf[*rend..]);
         match std::pin::Pin::new(&mut **inner).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
@@ -460,7 +491,7 @@ fn poll_read_exact(
                         "stream closed mid-chunk",
                     )));
                 }
-                *filled += n;
+                *rend += n;
             }
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             Poll::Pending => return Poll::Pending,
@@ -514,6 +545,8 @@ struct ServerWriter {
     session: Option<(Cipher, u64)>,
     /// a frame being drained, and how much of the payload it covers
     flushing: Option<(Vec<u8>, usize)>,
+    /// the last drained frame's buffer, kept for the next one
+    spare: Vec<u8>,
     consumed: usize,
 }
 
@@ -570,24 +603,36 @@ impl AsyncWrite for ServerWriter {
                     }
                     *off += n;
                 }
-                this.flushing = None;
+                if let Some((frame, _)) = this.flushing.take() {
+                    this.spare = frame;
+                }
                 return Poll::Ready(Ok(this.consumed));
             }
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let take = buf.len().min(usize::from(this.method.max_chunk()));
-            let mut frame = Vec::with_capacity(take + 2 * AEAD_TAG + 2);
+            let mut frame = std::mem::take(&mut this.spare);
+            frame.clear();
+            let max_chunk = usize::from(this.method.max_chunk());
             match &mut this.session {
                 None => {
+                    // the salt and the 2022 head go with the first payload,
+                    // which stays one chunk
+                    let take = buf.len().min(max_chunk);
                     let (cipher, counter, bytes) = this.open(&buf[..take])?;
                     this.session = Some((cipher, counter));
                     frame = bytes;
+                    this.consumed = take;
                 }
-                Some((cipher, counter)) => write_chunk(cipher, counter, &mut frame, &buf[..take]),
+                Some((cipher, counter)) => {
+                    let take = buf.len().min(WRITE_FRAME.max(max_chunk));
+                    for segment in buf[..take].chunks(max_chunk) {
+                        write_chunk(cipher, counter, &mut frame, segment);
+                    }
+                    this.consumed = take;
+                }
             }
             this.flushing = Some((frame, 0));
-            this.consumed = take;
         }
     }
 

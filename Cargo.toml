@@ -64,9 +64,48 @@ x25519-dalek = { version = "2", default-features = false, features = ["static_se
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
 overflow-checks = false
+
+# The size-first profile above is the right call for the control plane, and the
+# wrong one for the loops that touch every byte of every packet: AEAD, GHASH,
+# ChaCha, the hashes, the stream ciphers. Those crates get speed instead; the
+# binary grows by a few hundred KiB, not by a multiple.
+[profile.release.package.aes]
+opt-level = 3
+[profile.release.package.aes-gcm]
+opt-level = 3
+[profile.release.package.ghash]
+opt-level = 3
+[profile.release.package.polyval]
+opt-level = 3
+[profile.release.package.chacha20]
+opt-level = 3
+[profile.release.package.chacha20poly1305]
+opt-level = 3
+[profile.release.package.poly1305]
+opt-level = 3
+[profile.release.package.ctr]
+opt-level = 3
+[profile.release.package.cipher]
+opt-level = 3
+[profile.release.package.universal-hash]
+opt-level = 3
+[profile.release.package.cfb-mode]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.sha1]
+opt-level = 3
+[profile.release.package.md-5]
+opt-level = 3
+[profile.release.package.hmac]
+opt-level = 3
+[profile.release.package.memchr]
+opt-level = 3

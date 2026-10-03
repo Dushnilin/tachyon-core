@@ -7,6 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::crypto::{Cipher, Method, derive_subkey, master_key, random_bytes};
 use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 
+/// Read buffer of a connection: two legacy chunks (`0x3FFF` + tag each) and the
+/// length blocks between them, so one `read` usually brings in whole chunks.
+/// It is only allocated when the first byte of the response is about to be read.
+const READ_BUF: usize = 33 * 1024;
+/// Largest write buffer a connection keeps between writes. The relay hands over
+/// 32 KiB at a time, which seals to a little more than that.
+const WRITE_BUF_KEEP: usize = 40 * 1024;
+
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {
     server: String,
@@ -121,8 +129,11 @@ impl Shadowsocks {
             master_key: Arc::clone(&self.master_key),
             cipher: None,
             counter: 0,
-            pending: Vec::new(),
+            rbuf: Vec::new(),
+            rpos: 0,
+            rend: 0,
             pos: 0,
+            pend: 0,
             request_salt: salt,
             state: if is_2022 {
                 ReaderState::ResponseSalt
@@ -143,23 +154,27 @@ pub struct SsWriter<W> {
 }
 
 impl<W: tokio::io::AsyncWrite + Unpin> SsWriter<W> {
+    /// Seal `plaintext` as one or more chunks into the reused buffer and send the
+    /// lot with a single write: no temporary vectors, one syscall per call
+    /// instead of one per 16 KiB.
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> io::Result<()> {
+        self.buf.clear();
         for segment in plaintext.chunks(usize::from(self.max_chunk)) {
-            self.buf.clear();
-
-            let mut len_part = Vec::with_capacity(2 + 16);
-            len_part.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-            self.cipher.seal(self.counter, &mut len_part)?;
+            let head = self.buf.len();
+            self.buf
+                .extend_from_slice(&(segment.len() as u16).to_be_bytes());
+            self.cipher.seal_at(self.counter, &mut self.buf, head)?;
             self.counter += 1;
-            self.buf.extend_from_slice(&len_part);
 
-            let mut payload_part = Vec::with_capacity(segment.len() + 16);
-            payload_part.extend_from_slice(segment);
-            self.cipher.seal(self.counter, &mut payload_part)?;
+            let body = self.buf.len();
+            self.buf.extend_from_slice(segment);
+            self.cipher.seal_at(self.counter, &mut self.buf, body)?;
             self.counter += 1;
-            self.buf.extend_from_slice(&payload_part);
-
-            self.inner.write_all(&self.buf).await?;
+        }
+        self.inner.write_all(&self.buf).await?;
+        // a one-off big write must not pin its buffer for the connection's life
+        if self.buf.capacity() > WRITE_BUF_KEEP {
+            self.buf = Vec::new();
         }
         Ok(())
     }
@@ -171,8 +186,13 @@ pub struct SsReader<R> {
     master_key: Arc<Vec<u8>>,
     cipher: Option<Cipher>,
     counter: u64,
-    pending: Vec<u8>,
+    /// Bytes off the wire that nothing has consumed yet: `rbuf[rpos..rend]`.
+    rbuf: Vec<u8>,
+    rpos: usize,
+    rend: usize,
+    /// The decrypted payload being handed out, in place: `rbuf[pos..pend]`.
     pos: usize,
+    pend: usize,
     request_salt: Vec<u8>,
     state: ReaderState,
 }
@@ -186,20 +206,30 @@ enum ReaderState {
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
-    async fn read_exact_len(&mut self, len: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
-        let mut filled = 0;
-        while filled < len {
-            let n = self.inner.read(&mut buf[filled..]).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "stream closed mid-chunk",
-                ));
-            }
-            filled += n;
+    /// Make `rbuf[rpos..rend]` at least `n` bytes long, reading as much as the
+    /// buffer has room for in each call so several chunks arrive per syscall.
+    /// Only called once the previous payload has been handed out whole, so
+    /// moving the unread bytes to the front disturbs nothing.
+    async fn need(&mut self, n: usize, eof: &'static str) -> io::Result<()> {
+        if self.rend - self.rpos >= n {
+            return Ok(());
         }
-        Ok(buf)
+        if self.rpos > 0 {
+            self.rbuf.copy_within(self.rpos..self.rend, 0);
+            self.rend -= self.rpos;
+            self.rpos = 0;
+        }
+        if self.rbuf.len() < n {
+            self.rbuf.resize(n.max(READ_BUF), 0);
+        }
+        while self.rend < n {
+            let got = self.inner.read(&mut self.rbuf[self.rend..]).await?;
+            if got == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, eof));
+            }
+            self.rend += got;
+        }
+        Ok(())
     }
 
     fn establish_response_cipher(&mut self, salt: &[u8]) {
@@ -208,26 +238,60 @@ impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
         self.counter = 0;
     }
 
-    fn open_chunk(&self, counter: u64, buf: &mut Vec<u8>) -> io::Result<()> {
+    /// Open the `len` bytes at `rpos` in place and step past them.
+    fn open_next(&mut self, len: usize) -> io::Result<()> {
+        let at = self.rpos;
         self.cipher
             .as_ref()
             .expect("cipher established")
-            .open(counter, buf)
+            .open_slice(self.counter, &mut self.rbuf[at..at + len])?;
+        self.counter += 1;
+        self.rpos += len;
+        Ok(())
     }
 
-    /// Fill `pending` with the next decrypted chunk payload.
+    /// One `[len][payload]` pair: the length block, then the payload it names.
+    async fn take_chunk(&mut self) -> io::Result<()> {
+        self.need(2 + 16, "stream closed mid-chunk").await?;
+        let head = self.rpos;
+        self.open_next(2 + 16)?;
+        let payload_len = usize::from(u16::from_be_bytes([self.rbuf[head], self.rbuf[head + 1]]));
+        self.take_payload(payload_len).await
+    }
+
+    async fn take_payload(&mut self, payload_len: usize) -> io::Result<()> {
+        if payload_len == 0 {
+            return Err(io::Error::other("zero-length chunk"));
+        }
+        self.need(payload_len + 16, "stream closed mid-chunk")
+            .await?;
+        self.pos = self.rpos;
+        self.pend = self.rpos + payload_len;
+        self.open_next(payload_len + 16)
+    }
+
+    async fn take_salt(&mut self) -> io::Result<Vec<u8>> {
+        let len = self.request_salt.len();
+        self.need(len, "stream closed mid-salt").await?;
+        let salt = self.rbuf[self.rpos..self.rpos + len].to_vec();
+        self.rpos += len;
+        Ok(salt)
+    }
+
+    /// Make the next decrypted chunk payload readable at `rbuf[pos..pend]`.
     async fn fill(&mut self) -> io::Result<()> {
         match self.state {
             ReaderState::ResponseSalt => {
                 self.state = ReaderState::Chunks;
-                let mut salt = vec![0u8; self.request_salt.len()];
-                self.read_exact_into(&mut salt).await?;
+                let salt = self.take_salt().await?;
                 self.establish_response_cipher(&salt);
                 let salt_len = salt.len();
                 let header_len = 11 + salt_len;
-                let mut chunk = self.read_exact_len(header_len + 16).await?;
-                self.open_chunk(self.counter, &mut chunk)?;
-                self.counter += 1;
+                self.need(header_len + 16, "stream closed mid-chunk")
+                    .await?;
+                let at = self.rpos;
+                self.open_next(header_len + 16)?;
+                let chunk = &self.rbuf[at..at + header_len];
                 if chunk[0] != 0x01 {
                     return Err(io::Error::other("bad response header type"));
                 }
@@ -238,74 +302,24 @@ impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
                     chunk[header_len - 2],
                     chunk[header_len - 1],
                 ]));
-                if payload_len == 0 {
-                    return Err(io::Error::other("zero-length chunk"));
-                }
-                let mut payload = self.read_exact_len(payload_len + 16).await?;
-                self.open_chunk(self.counter, &mut payload)?;
-                self.counter += 1;
-                self.pending = payload;
-                Ok(())
+                self.take_payload(payload_len).await
             }
             ReaderState::ChunksAfterSalt => {
                 self.state = ReaderState::Chunks;
-                let mut salt = vec![0u8; self.request_salt.len()];
-                self.read_exact_into(&mut salt).await?;
+                let salt = self.take_salt().await?;
                 self.establish_response_cipher(&salt);
-                let mut chunk = self.read_exact_len(2 + 16).await?;
-                self.open_chunk(self.counter, &mut chunk)?;
-                self.counter += 1;
-                let payload_len = usize::from(u16::from_be_bytes([chunk[0], chunk[1]]));
-                if payload_len == 0 {
-                    return Err(io::Error::other("zero-length chunk"));
-                }
-                let mut payload = self.read_exact_len(payload_len + 16).await?;
-                self.open_chunk(self.counter, &mut payload)?;
-                self.counter += 1;
-                self.pending = payload;
-                Ok(())
+                self.take_chunk().await
             }
-            ReaderState::Chunks => {
-                let mut chunk = self.read_exact_len(2 + 16).await?;
-                self.open_chunk(self.counter, &mut chunk)?;
-                self.counter += 1;
-                let payload_len = usize::from(u16::from_be_bytes([chunk[0], chunk[1]]));
-                if payload_len == 0 {
-                    return Err(io::Error::other("zero-length chunk"));
-                }
-                let mut payload = self.read_exact_len(payload_len + 16).await?;
-                self.open_chunk(self.counter, &mut payload)?;
-                self.counter += 1;
-                self.pending = payload;
-                Ok(())
-            }
+            ReaderState::Chunks => self.take_chunk().await,
         }
-    }
-
-    async fn read_exact_into(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            let n = self.inner.read(&mut buf[filled..]).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "stream closed mid-salt",
-                ));
-            }
-            filled += n;
-        }
-        Ok(())
     }
 
     pub async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pos == self.pending.len() {
-            self.pending.clear();
-            self.pos = 0;
+        if self.pos == self.pend {
             self.fill().await?;
         }
-        let avail = self.pending.len() - self.pos;
-        let n = out.len().min(avail);
-        out[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+        let n = out.len().min(self.pend - self.pos);
+        out[..n].copy_from_slice(&self.rbuf[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
     }

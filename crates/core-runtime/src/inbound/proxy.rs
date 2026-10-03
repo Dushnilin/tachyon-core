@@ -134,6 +134,7 @@ impl Vless {
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     let users = self.users.clone();
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
@@ -315,6 +316,7 @@ impl Trojan {
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     let keys = self.keys.clone();
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);

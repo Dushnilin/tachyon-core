@@ -12,11 +12,12 @@
 //! deferred: a connection with live streams stays up until the last one leaves.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use tokio::sync::Mutex;
+
+use crate::inbound::AnyStream;
 
 /// `max_concurrency` bounds the streams one connection may carry,
 /// `max_connections` the pool size; both zero mean unlimited. A zero
@@ -82,9 +83,8 @@ pub(crate) struct XmuxConfig {
     pub c_max_reuse_times: IntRange,
     pub h_max_request_times: IntRange,
     pub h_max_reusable_secs: IntRange,
-    /// `h_keep_alive_period`: negative disables the HTTP/2 keep-alive ping,
-    /// zero keeps the transport default. Reported at parse time, because the
-    /// h2 client we build has no read-idle-timeout to set.
+    /// `h_keep_alive_period`: Xray's HTTP/2 keep-alive ping. An HTTP/1.1
+    /// connection has no ping to send, so the value is parsed and reported.
     pub keep_alive_period: i64,
 }
 
@@ -153,40 +153,39 @@ impl XmuxConfig {
         };
         if config.keep_alive_period != 0 {
             crate::logging::warn(format_args!(
-                "{at}.h_keep_alive_period: the h2 client exposes no read-idle-timeout (ignored)"
+                "{at}.h_keep_alive_period: HTTP/1.1 has no keep-alive ping (ignored)"
             ));
         }
         Ok(config)
     }
 }
 
-/// One pooled connection: the h2 client handle plus its retirement counters.
+/// One pooled connection: a keep-alive HTTP/1.1 connection plus its retirement
+/// counters.
+///
+/// The connection is lent out one request at a time — that is what HTTP/1.1 is,
+/// so `max_concurrency` has nothing left to bound here and the pooled unit is
+/// the connection rather than a multiplexed stream on top of one.
 pub(crate) struct Client {
-    pub send: h2::client::SendRequest<Bytes>,
-    pub conn_task: tokio::task::JoinHandle<()>,
+    pub io: std::sync::Mutex<Option<AnyStream>>,
     open_usage: AtomicI32,
     left_usage: AtomicI32,
-    left_requests: std::sync::atomic::AtomicI64,
+    left_requests: AtomicI64,
     unreusable_at: Option<Instant>,
     closed: AtomicBool,
 }
 
 impl Client {
-    fn new(
-        send: h2::client::SendRequest<Bytes>,
-        conn_task: tokio::task::JoinHandle<()>,
-        cfg: &XmuxConfig,
-    ) -> Self {
+    fn new(io: AnyStream, cfg: &XmuxConfig) -> Self {
         let reuse = cfg.c_max_reuse_times.roll();
         let requests = cfg.h_max_request_times.roll();
         let secs = cfg.h_max_reusable_secs.roll();
         Self {
-            send,
-            conn_task,
+            io: std::sync::Mutex::new(Some(io)),
             open_usage: AtomicI32::new(0),
             // the first handout is the connection's own creation
             left_usage: AtomicI32::new(if reuse > 0 { reuse as i32 - 1 } else { -1 }),
-            left_requests: std::sync::atomic::AtomicI64::new(if requests > 0 {
+            left_requests: AtomicI64::new(if requests > 0 {
                 requests as i64
             } else {
                 i64::MAX
@@ -196,9 +195,26 @@ impl Client {
         }
     }
 
-    /// One HTTP request against `h_max_request_times`. A packet-up stream
-    /// issues one POST per write, and a connection that ignored those would
-    /// outlive the limit the server was told about.
+    /// Take the connection out for one request, or `None` when somebody else
+    /// has it. An HTTP/1.1 connection serves one request at a time, so this is
+    /// what keeps two uploads from interleaving on one socket.
+    pub(crate) fn take(&self) -> Option<AnyStream> {
+        self.io.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Put it back for the next request, unless it has been retired.
+    pub(crate) fn give(&self, io: AnyStream) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut slot) = self.io.lock() {
+            *slot = Some(io);
+        }
+    }
+
+    /// One HTTP request against `h_max_request_times`. A packet-up stream issues
+    /// one POST per write, and a connection that ignored those would outlive the
+    /// limit the server was told about.
     pub(crate) fn take_request(&self) {
         self.left_requests.fetch_sub(1, Ordering::SeqCst);
     }
@@ -252,11 +268,12 @@ impl Pool {
         })
     }
 
-    /// A pooled connection that can take another stream, or `None` so the
-    /// caller dials a fresh one.
+    /// A pooled connection that is free and not retired, or `None` so the caller
+    /// dials a fresh one.
     pub(crate) async fn acquire(self: &Arc<Self>) -> Option<Arc<Client>> {
         let mut guard = self.clients.lock().await;
-        // eviction is deferred: a retired connection with live streams stays up
+        // eviction is deferred: a retired connection with a request on it stays
+        // up until that request is over
         let mut evicted = Vec::new();
         guard.retain(|client| match client.evict_cause() {
             Some(_) => {
@@ -276,9 +293,10 @@ impl Pool {
         }
         let mut candidates: Vec<Arc<Client>> = Vec::with_capacity(guard.len());
         for client in guard.iter() {
-            if self.concurrency == 0
-                || client.open_usage.load(Ordering::SeqCst) < self.concurrency as i32
-            {
+            // `max_concurrency` counted streams on an HTTP/2 connection; over
+            // HTTP/1.1 the equivalent ceiling is one request, which `take()`
+            // already enforces. A value above one is therefore not a limit.
+            if self.concurrency <= 1 || client.open_usage.load(Ordering::SeqCst) == 0 {
                 candidates.push(Arc::clone(client));
             }
         }
@@ -292,12 +310,8 @@ impl Pool {
     }
 
     /// Adds a freshly dialled connection, created for the caller.
-    pub(crate) async fn insert(
-        self: &Arc<Self>,
-        send: h2::client::SendRequest<Bytes>,
-        conn_task: tokio::task::JoinHandle<()>,
-    ) -> Arc<Client> {
-        let client = Arc::new(Client::new(send, conn_task, &self.config));
+    pub(crate) async fn insert(self: &Arc<Self>, io: AnyStream) -> Arc<Client> {
+        let client = Arc::new(Client::new(io, &self.config));
         client.acquire();
         self.clients.lock().await.push(Arc::clone(&client));
         client
@@ -306,9 +320,9 @@ impl Pool {
     pub(crate) async fn release(&self, client: &Arc<Client>) {
         client.release();
         // a connection that fell out of the pool while it was still in use is
-        // torn down only now that its last stream left
-        if client.closed.load(Ordering::SeqCst) && client.open_usage.load(Ordering::SeqCst) <= 0 {
-            client.conn_task.abort();
+        // torn down only now that its last request is over
+        if client.closed.load(Ordering::SeqCst) {
+            let _ = client.take();
         }
     }
 }

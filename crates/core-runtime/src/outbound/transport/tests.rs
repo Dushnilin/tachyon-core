@@ -55,7 +55,14 @@ async fn connect_with(
         .await
         .expect("connect");
     let (stream, consumed) = ws_transport(max_early_data)
-        .connect(tcp, None, "example.com", port, early)
+        .connect(
+            tcp,
+            None,
+            "example.com",
+            port,
+            early,
+            &crate::outbound::dial::DialOptions::default(),
+        )
         .await
         .expect("handshake");
     drop(stream);
@@ -126,7 +133,14 @@ async fn a_configured_protocol_header_is_replaced() {
         .expect("connect");
     drop(
         transport
-            .connect(tcp, None, "example.com", port, b"payload")
+            .connect(
+                tcp,
+                None,
+                "example.com",
+                port,
+                b"payload",
+                &crate::outbound::dial::DialOptions::default(),
+            )
             .await
             .expect("handshake"),
     );

@@ -124,7 +124,14 @@ impl Vless {
         // a ws transport with early data carries the request in the upgrade head
         let (mut stream, consumed) = self
             .transport
-            .connect(tcp, self.tls.as_ref(), &self.server, self.port, &header)
+            .connect(
+                tcp,
+                self.tls.as_ref(),
+                &self.server,
+                self.port,
+                &header,
+                &self.dial,
+            )
             .await?;
         // The request head goes out on its own, ahead of any payload.
         //
@@ -335,7 +342,7 @@ impl Trojan {
             crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         let (mut stream, consumed) = self
             .transport
-            .connect(tcp, Some(tls), &self.server, self.port, &header)
+            .connect(tcp, Some(tls), &self.server, self.port, &header, &self.dial)
             .await?;
         stream.write_all(&header[consumed..]).await?;
         Ok(stream)

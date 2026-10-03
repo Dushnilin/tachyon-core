@@ -1,4 +1,4 @@
-//! XHTTP (Xray "splithttp") client transport — HTTP/2.
+//! XHTTP (Xray "splithttp") client transport — HTTP/1.1.
 //!
 //! Wire semantics ported from the reference client (sing-box-lx
 //! `transport/v2rayxhttp`, SPEC 002 / PARAM_MAP): a per-dial session id
@@ -12,9 +12,12 @@
 //! stream), auto (REALITY → stream-one, otherwise packet-up — REALITY is not
 //! implemented yet, so auto currently resolves to packet-up).
 //!
-//! HTTP/2 only: TLS dials offer `h2` (like grpc/http), cleartext dials use
-//! h2c prior knowledge (the reference speaks HTTP/1.1 cleartext — documented
-//! divergence, tracked in the roadmap).
+//! HTTP/1.1 and nothing else, because that is what the reference speaks. It
+//! refuses h2 on this transport even when the server offers it, on purpose, and
+//! the two connections the protocol wants — a `Connection: close` download GET
+//! and keep-alive pooled upload POSTs — are why the transport layer hands us a
+//! dialer: HTTP/1.1 does not multiplex, so a second request means a second
+//! connection, and ALPN is decided per connection.
 
 use std::future::Future;
 use std::io;
@@ -22,16 +25,22 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use bytes::{Bytes, BytesMut};
-use h2::SendStream;
-use h2::client::ResponseFuture;
 use serde_json::{Map, Value};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use super::h2io::{H2Io, H2Stream};
+use super::h1io;
 use crate::inbound::AnyStream;
 
-const H2_SKIP: &[&str] = &[
+/// Opens one more connection to the same server, with the same TCP options, the
+/// same TLS and the same ALPN as the first.
+pub(crate) type Dialer =
+    dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>> + Send + Sync;
+
+/// Hop-by-hop headers: connection-scoped in HTTP/2 and HTTP/1.1 alike, so none
+/// of them may be copied from the config onto the wire.
+const HOP_BY_HOP: &[&str] = &[
     "host",
     "connection",
     "keep-alive",
@@ -112,74 +121,6 @@ enum UplinkPlacement {
     Body,
     Header,
     Cookie,
-}
-
-/// The stream handed back to the caller: it releases its pooled connection when
-/// it is dropped, which is the only place a stream knows it is finished.
-struct Pooled {
-    inner: AnyStream,
-    pool: std::sync::Arc<super::xmux::Pool>,
-    client: std::sync::Arc<super::xmux::Client>,
-}
-
-impl Pooled {
-    fn wrap(
-        cfg: &XhttpConfig,
-        inner: AnyStream,
-        client: std::sync::Arc<super::xmux::Client>,
-    ) -> AnyStream {
-        Box::new(Self {
-            inner,
-            pool: std::sync::Arc::clone(&cfg.pool),
-            client,
-        })
-    }
-}
-
-impl Drop for Pooled {
-    fn drop(&mut self) {
-        // Drop cannot await, so the release is handed to the runtime; a
-        // connection whose task is already gone is aborted right here.
-        let pool = std::sync::Arc::clone(&self.pool);
-        let client = std::sync::Arc::clone(&self.client);
-        tokio::spawn(async move {
-            pool.release(&client).await;
-        });
-    }
-}
-
-impl tokio::io::AsyncRead for Pooled {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        out: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, out)
-    }
-}
-
-impl tokio::io::AsyncWrite for Pooled {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }
 
 /// Normalized placement/key/method selection (reference `metaConfig`).
@@ -331,10 +272,9 @@ pub(crate) struct XhttpConfig {
     padding: Range,
     no_grpc_header: bool,
     meta: Meta,
-    /// XHTTP connection reuse, shared by every dial of this transport
+    /// keep-alive connections shared by the upload POSTs of every dial of this
+    /// transport
     pool: std::sync::Arc<super::xmux::Pool>,
-    /// the pooled connection this stream runs on, filled in per dial
-    client: Option<std::sync::Arc<super::xmux::Client>>,
 }
 
 impl XhttpConfig {
@@ -385,15 +325,7 @@ impl XhttpConfig {
                 t.get("xmux"),
                 "v2ray-xhttp.xmux",
             )?),
-            client: None,
         })
-    }
-
-    /// A copy of the config bound to the pooled connection a stream runs on.
-    fn with_client(&self, client: std::sync::Arc<super::xmux::Client>) -> Self {
-        let mut copy = self.clone();
-        copy.client = Some(client);
-        copy
     }
 
     fn resolved_mode(&self, tls: bool) -> Mode {
@@ -409,8 +341,8 @@ impl XhttpConfig {
     }
 }
 
-/// One xhttp connection: a download source and an upload sink over a single
-/// h2 connection.
+/// One xhttp tunnel: a download source and an upload sink. Over HTTP/1.1 those
+/// are two connections, not two streams on one.
 pub(crate) struct XhttpConn {
     split: Box<SplitConn>,
 }
@@ -421,31 +353,8 @@ pub(crate) async fn connect(
     server: &str,
     port: u16,
     cfg: &XhttpConfig,
+    dialer: std::sync::Arc<Dialer>,
 ) -> io::Result<AnyStream> {
-    // a pooled connection is reused whenever one can take another stream; the
-    // connection task belongs to the pool entry, not to the stream
-    let (send_request, client) = match cfg.pool.acquire().await {
-        Some(client) => (client.send.clone(), client),
-        None => {
-            let (send_request, connection) = h2::client::handshake(stream)
-                .await
-                .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
-            let client = cfg
-                .pool
-                .insert(
-                    send_request.clone(),
-                    tokio::spawn(async move {
-                        let _ = connection.await;
-                    }),
-                )
-                .await;
-            (send_request, client)
-        }
-    };
-
-    // from here on the config carries this stream's connection, so every
-    // request it issues is accounted against the pool's limits
-    let cfg = &cfg.with_client(std::sync::Arc::clone(&client));
     let authority = cfg.host.clone().unwrap_or_else(|| {
         if server.contains(':') && !server.starts_with('[') {
             format!("[{server}]:{port}")
@@ -455,132 +364,148 @@ pub(crate) async fn connect(
     });
     let scheme = if secure { "https" } else { "http" };
     let mode = cfg.resolved_mode(secure);
+    let mut this = SplitConn::new(cfg);
+
+    // stream-one is one bidirectional request on one connection: the body goes
+    // up and the response comes back down it, so there is no separate download.
+    if mode == Mode::StreamOne {
+        let request = cfg.build_request(
+            scheme,
+            &authority,
+            &cfg.meta.uplink_method,
+            None,
+            None,
+            true,
+        )?;
+        let (io, resp) = h1io::Stream::start(stream, &request, &authority, true).await?;
+        let failure = Failure::default();
+        this.up = Up::Stream(Box::new(StreamUp {
+            io,
+            failure: failure.clone(),
+        }));
+        this.spawn_upload_download(resp, failure);
+        return Ok(Box::new(XhttpConn {
+            split: Box::new(this),
+        }));
+    }
+
+    // The download GET is a long request, so it takes a connection of its own
+    // with `Connection: close` — the reference says outright that a download GET
+    // never shares one. The connection the caller dialled is exactly that, so
+    // nothing extra is opened for it.
+    let mut io = stream;
+    let request = cfg.build_request(
+        scheme,
+        &authority,
+        "GET",
+        Some(&this.session_id),
+        None,
+        false,
+    )?;
+    let (head, pending) = h1io::send(&mut io, &request, &authority, b"", true)
+        .await
+        .map_err(|e| io::Error::other(format!("xhttp: download: {e}")))?;
+    h1io::expect_ok(&head, "download")?;
+    this.spawn_pump(h1io::Body::new(io, &head, pending));
 
     match mode {
-        Mode::StreamOne => {
-            let (response, send) = issue(
-                send_request,
-                cfg,
-                scheme,
-                &authority,
-                &cfg.meta.uplink_method,
-                None,
-                None,
-                true,
-            )
-            .await?;
-            let body: AnyStream = Box::new(H2Io {
-                h2: H2Stream::shared(response, send),
-            });
-            Ok(Pooled::wrap(cfg, body, client))
-        }
         Mode::StreamUp => {
-            let mut this = SplitConn::new(cfg, send_request.clone());
-            // Download: GET with the session id, no seq.
-            let (dl_resp, _) = issue(
-                send_request.clone(),
-                cfg,
-                scheme,
-                &authority,
-                "GET",
-                Some(&this.session_id),
-                None,
-                false,
-            )
-            .await?;
-            this.spawn_download(dl_resp);
-            // Upload: one streamed POST using the configured method.
-            let (_, send) = issue(
-                send_request,
-                cfg,
+            let request = cfg.build_request(
                 scheme,
                 &authority,
                 &cfg.meta.uplink_method,
                 Some(&this.session_id),
                 None,
                 true,
-            )
-            .await?;
-            this.up = Up::Stream(send);
-            let body: AnyStream = Box::new(XhttpConn {
-                split: Box::new(this),
-            });
-            Ok(Pooled::wrap(cfg, body, client))
+            )?;
+            let io = (dialer)().await?;
+            let (io, resp) = h1io::Stream::start(io, &request, &authority, false).await?;
+            let failure = Failure::default();
+            this.up = Up::Stream(Box::new(StreamUp {
+                io,
+                failure: failure.clone(),
+            }));
+            // the upload's own response carries nothing back: it only says
+            // whether the server took the request
+            this.spawn_upload_ack(resp, failure);
         }
+        // packet-up (and auto→packet-up)
         _ => {
-            // packet-up (and auto→packet-up)
-            let mut this = SplitConn::new(cfg, send_request);
-            let (dl_resp, _) = issue(
-                this.send_request(),
-                cfg,
-                scheme,
-                &authority,
-                "GET",
-                Some(&this.session_id),
-                None,
-                false,
-            )
-            .await?;
-            this.spawn_download(dl_resp);
             this.up = Up::Packets(Box::new(PacketsState {
                 writer: Some(PostWriter {
-                    send_request: this.send_request(),
                     cfg: cfg.clone(),
                     scheme: scheme.to_string(),
                     authority: authority.clone(),
                     session_id: this.session_id.clone(),
                     seq: 0,
                     last_post: None,
+                    dialer,
                 }),
                 in_flight: None,
             }));
-            let body: AnyStream = Box::new(XhttpConn {
-                split: Box::new(this),
-            });
-            Ok(Pooled::wrap(cfg, body, client))
         }
+    }
+    Ok(Box::new(XhttpConn {
+        split: Box::new(this),
+    }))
+}
+
+/// What an upload request's response said, once the task behind it has seen it.
+///
+/// The error lives behind a lock rather than in the write path because it
+/// arrives on somebody else's task: a refused upload POST shows up as the next
+/// `poll_write` failing, not as the write that was already in flight.
+#[derive(Clone, Default)]
+struct Failure(std::sync::Arc<std::sync::Mutex<Option<io::Error>>>);
+
+impl Failure {
+    fn set(&self, e: io::Error) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(e);
+        }
+    }
+
+    fn take(&self) -> Option<io::Error> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn issue(
-    send_request: h2::client::SendRequest<Bytes>,
-    cfg: &XhttpConfig,
-    scheme: &str,
-    authority: &str,
-    method: &str,
-    session: Option<&str>,
-    seq: Option<String>,
-    body: bool,
-) -> io::Result<(ResponseFuture, SendStream<Bytes>)> {
-    let mut ready = send_request
-        .ready()
-        .await
-        .map_err(|e| io::Error::other(format!("xhttp: h2 ready: {e}")))?;
-    // one HTTP request against the pool's h_max_request_times: a packet-up
-    // stream issues one POST per write, and a connection that ignored those
-    // would outlive the limit the server was told about
-    if let Some(client) = &cfg.client {
-        client.take_request();
-    }
-    let request = cfg.build_request(scheme, authority, method, session, seq.as_deref(), body)?;
-    let (response, send) = ready
-        .send_request(request, false)
-        .map_err(|e| io::Error::other(format!("xhttp: send request: {e}")))?;
-    Ok((response, send))
+/// One streamed upload POST: the request body goes up while a task reads the
+/// response.
+struct StreamUp {
+    io: h1io::Stream,
+    failure: Failure,
 }
 
 struct PostWriter {
-    send_request: h2::client::SendRequest<Bytes>,
     cfg: XhttpConfig,
     scheme: String,
     authority: String,
     session_id: String,
     seq: u64,
     last_post: Option<std::time::Instant>,
+    dialer: std::sync::Arc<Dialer>,
 }
 
 impl PostWriter {
+    /// A keep-alive connection for one upload POST, out of the pool when there
+    /// is a free one and dialled when there is not.
+    async fn connection(&self) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream)> {
+        if let Some(client) = self.cfg.pool.acquire().await
+            && let Some(io) = client.take()
+        {
+            return Ok((client, io));
+        }
+        let io = (self.dialer)().await?;
+        let client = self.cfg.pool.insert(io).await;
+        // `insert` parks the connection in the pool, and the pool is the only
+        // owner, so it comes back out through the same door
+        let io = client
+            .take()
+            .ok_or_else(|| io::Error::other("xhttp: pooled connection unavailable"))?;
+        Ok((client, io))
+    }
+
     /// Send one upload chunk as a single sequenced POST (reference
     /// `packetConn.sendPacket`).
     async fn send_packet(&mut self, chunk: &[u8]) -> io::Result<()> {
@@ -623,18 +548,27 @@ impl PostWriter {
             payload.is_some(),
         )?;
         // header/cookie payload: base64url chunks under <key>-<i> / <key>_<i>.
-        let chunk_size = self.cfg.meta.uplink_chunk.rand().max(1) as usize;
-        let b64 = base64_url(chunk);
+        // Only when the payload is not in the body: with `Body` placement the same
+        // bytes in a header as well reach the far end twice, and Xray 26.9 reads
+        // both (25.9 only reads the body, which is why this looked healthy).
         let mut pieces: Vec<&str> = Vec::new();
-        let bytes = b64.as_bytes();
-        let mut at = 0;
-        while at < bytes.len() {
-            let end = (at + chunk_size).min(bytes.len());
-            pieces.push(std::str::from_utf8(&bytes[at..end]).expect("base64 ascii"));
-            at = end;
-        }
-        if pieces.is_empty() {
-            pieces.push("");
+        let b64 = if payload.is_none() {
+            base64_url(chunk)
+        } else {
+            String::new()
+        };
+        if payload.is_none() {
+            let chunk_size = self.cfg.meta.uplink_chunk.rand().max(1) as usize;
+            let bytes = b64.as_bytes();
+            let mut at = 0;
+            while at < bytes.len() {
+                let end = (at + chunk_size).min(bytes.len());
+                pieces.push(std::str::from_utf8(&bytes[at..end]).expect("base64 ascii"));
+                at = end;
+            }
+            if pieces.is_empty() {
+                pieces.push("");
+            }
         }
         for (i, piece) in pieces.iter().enumerate() {
             let name = match self.cfg.meta.uplink_data {
@@ -660,32 +594,52 @@ impl PostWriter {
             }
         }
         let payload = payload.unwrap_or_default();
-        let send_request = self.send_request.clone();
-        let mut ready = send_request
-            .ready()
+
+        let (client, io) = self.connection().await?;
+        // one HTTP request against the pool's h_max_request_times: a packet-up
+        // stream issues one POST per write, and a connection that ignored those
+        // would outlive the limit the server was told about
+        client.take_request();
+        let mut body = match Self::post(io, &req, &self.authority, &payload).await {
+            Ok((head, body)) => {
+                if let Err(e) = h1io::expect_ok(&head, "upload") {
+                    self.cfg.pool.release(&client).await;
+                    return Err(e);
+                }
+                body
+            }
+            Err(e) => {
+                self.cfg.pool.release(&client).await;
+                return Err(e);
+            }
+        };
+        // Drain the (usually empty) response body, so the connection is whole
+        // again and can carry the next POST.
+        let drained = body.drain().await;
+        if drained.is_ok()
+            && let Some(io) = body.into_inner()
+        {
+            client.give(io);
+        }
+        self.cfg.pool.release(&client).await;
+        drained
+    }
+
+    /// One `Content-Length` POST plus its response head, over one connection.
+    /// The connection comes back inside the body, and only out of it once the
+    /// body has been drained.
+    async fn post(
+        io: AnyStream,
+        request: &http::Request<()>,
+        authority: &str,
+        payload: &[u8],
+    ) -> io::Result<(h1io::Head, h1io::Body)> {
+        let mut io = io;
+        let (head, pending) = h1io::send(&mut io, request, authority, payload, false)
             .await
-            .map_err(|e| io::Error::other(format!("xhttp: h2 ready: {e}")))?;
-        let (response, mut send) = ready
-            .send_request(req, false)
             .map_err(|e| io::Error::other(format!("xhttp: send packet: {e}")))?;
-        send.send_data(payload, true)
-            .map_err(|e| io::Error::other(format!("xhttp: packet body: {e}")))?;
-        let resp = response
-            .await
-            .map_err(|e| io::Error::other(format!("xhttp: upload: {e}")))?;
-        if resp.status().as_u16() != 200 {
-            return Err(io::Error::other(format!(
-                "v2ray-xhttp: unexpected upload status: {}",
-                resp.status()
-            )));
-        }
-        // Drain the (usually empty) response body.
-        let mut body = resp.into_body();
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|e| io::Error::other(format!("xhttp: upload body: {e}")))?;
-            let _ = body.flow_control().release_capacity(chunk.len());
-        }
-        Ok(())
+        let body = h1io::Body::new(io, &head, pending);
+        Ok((head, body))
     }
 }
 
@@ -695,7 +649,6 @@ struct SplitConn {
     dl_task: tokio::task::JoinHandle<()>,
     up: Up,
     session_id: String,
-    send_request: h2::client::SendRequest<Bytes>,
 }
 
 type InFlight = Option<Pin<Box<dyn Future<Output = io::Result<(PostWriter, usize)>> + Send>>>;
@@ -707,13 +660,13 @@ struct PacketsState {
 }
 
 enum Up {
-    Stream(SendStream<Bytes>),
+    Stream(Box<StreamUp>),
     Packets(Box<PacketsState>),
     None,
 }
 
 impl SplitConn {
-    fn new(cfg: &XhttpConfig, send_request: h2::client::SendRequest<Bytes>) -> Self {
+    fn new(cfg: &XhttpConfig) -> Self {
         let session_id = new_session_id(&cfg.meta);
         let (_, dl) = mpsc::channel(4);
         Self {
@@ -722,55 +675,81 @@ impl SplitConn {
             dl_task: tokio::spawn(async {}),
             up: Up::None,
             session_id,
-            send_request,
         }
     }
 
-    fn send_request(&self) -> h2::client::SendRequest<Bytes> {
-        self.send_request.clone()
+    /// Feed the download channel from a response body, until it ends or the
+    /// reader goes away.
+    fn spawn_pump(&mut self, body: h1io::Body) {
+        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+        self.dl = rx;
+        self.dl_task = tokio::spawn(pump(body, tx));
     }
 
-    fn spawn_download(&mut self, response: ResponseFuture) {
+    /// The upload request's response when it *is* the download stream, which is
+    /// what stream-one does: one request, body up and body down.
+    fn spawn_upload_download(
+        &mut self,
+        task: JoinHandle<io::Result<h1io::Body>>,
+        failure: Failure,
+    ) {
         let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
         self.dl = rx;
         self.dl_task = tokio::spawn(async move {
-            let resp = match response.await {
-                Ok(r) => r,
+            match task.await {
+                Ok(Ok(body)) => pump(body, tx).await,
+                Ok(Err(e)) => {
+                    failure.set(e);
+                    let _ = tx.send(Err(failure.take().expect("just set"))).await;
+                }
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(io::Error::other(format!("xhttp: download: {e}"))))
-                        .await;
+                    let e = io::Error::other(format!("xhttp: upload: {e}"));
+                    failure.set(io::Error::other(e.to_string()));
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        });
+    }
+
+    /// The upload request's response when nothing comes back through it, which
+    /// is stream-up: the download has a connection of its own, so this response
+    /// only says whether the server took the request. Drain it and keep a
+    /// failure for the next write.
+    fn spawn_upload_ack(&mut self, task: JoinHandle<io::Result<h1io::Body>>, failure: Failure) {
+        self.dl_task = tokio::spawn(async move {
+            let mut body = match task.await {
+                Ok(Ok(body)) => body,
+                Ok(Err(e)) => {
+                    failure.set(e);
+                    return;
+                }
+                Err(e) => {
+                    failure.set(io::Error::other(format!("xhttp: upload: {e}")));
                     return;
                 }
             };
-            if resp.status().as_u16() != 200 {
-                let _ = tx
-                    .send(Err(io::Error::other(format!(
-                        "v2ray-xhttp: unexpected download status: {}",
-                        resp.status()
-                    ))))
-                    .await;
+            if let Err(e) = body.drain().await {
+                failure.set(e);
+            }
+        });
+    }
+}
+
+/// Read a response body into the download channel. Channel close is EOF.
+async fn pump(mut body: h1io::Body, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match body.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
                 return;
             }
-            let mut body = resp.into_body();
-            while let Some(chunk) = body.data().await {
-                match chunk {
-                    Ok(chunk) => {
-                        let _ = body.flow_control().release_capacity(chunk.len());
-                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(io::Error::other(format!("xhttp: download: {e}"))))
-                            .await;
-                        return;
-                    }
-                }
-            }
-            // Channel close = EOF.
-        });
+        };
+        if tx.send(Ok(buf[..n].to_vec())).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -805,22 +784,13 @@ impl AsyncWrite for XhttpConn {
     ) -> Poll<io::Result<usize>> {
         let split = &mut *self.split;
         match &mut split.up {
-            Up::Stream(send) => {
-                if buf.is_empty() {
-                    return Poll::Ready(Ok(0));
+            Up::Stream(state) => {
+                // a refused upload POST is reported here, not on the write that
+                // was already in flight when the answer came back
+                if let Some(e) = state.failure.take() {
+                    return Poll::Ready(Err(e));
                 }
-                send.reserve_capacity(buf.len());
-                let cap = match ready!(send.poll_capacity(cx)) {
-                    Some(Ok(cap)) => cap,
-                    Some(Err(e)) => {
-                        return Poll::Ready(Err(io::Error::other(format!("xhttp: capacity: {e}"))));
-                    }
-                    None => return Poll::Ready(Err(io::Error::other("xhttp: stream closed"))),
-                };
-                let n = cap.min(buf.len());
-                send.send_data(Bytes::copy_from_slice(&buf[..n]), false)
-                    .map_err(|e| io::Error::other(format!("xhttp: send: {e}")))?;
-                Poll::Ready(Ok(n))
+                Pin::new(&mut state.io).poll_write(cx, buf)
             }
             Up::Packets(state) => {
                 // Split like the reference Write: sc_max_each_post_bytes
@@ -858,16 +828,20 @@ impl AsyncWrite for XhttpConn {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let split = &mut *self.split;
+        if let Up::Stream(state) = &mut split.up {
+            return Pin::new(&mut state.io).poll_flush(cx);
+        }
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let split = &mut *self.split;
-        if let Up::Stream(send) = &mut split.up
-            && let Err(e) = send.send_data(Bytes::new(), true)
-        {
-            return Poll::Ready(Err(io::Error::other(format!("xhttp: end stream: {e}"))));
+        if let Up::Stream(state) = &mut split.up {
+            // ends the chunked request body; a packet-up upload has nothing to
+            // close, its last POST already went out whole
+            ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
         }
         split.dl_task.abort();
         Poll::Ready(Ok(()))
@@ -983,7 +957,7 @@ impl XhttpConfig {
 
         let mut builder = http::Request::builder().method(method).uri(uri);
         for (name, value) in &self.headers {
-            if H2_SKIP.contains(&name.to_ascii_lowercase().as_str()) {
+            if HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str()) {
                 continue;
             }
             builder = builder.header(name.as_str(), value.as_str());
@@ -1301,65 +1275,109 @@ mod tests {
         assert_eq!(id.matches('-').count(), 4);
     }
 
-    /// Wire test over an in-process h2 server: the client must speak
-    /// GET-download + seq-numbered POST uploads with padding, and the
-    /// download body must flow back through the conn.
+    /// Read one HTTP/1.1 request head off a raw stream.
+    async fn read_request_head(io: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut raw = Vec::new();
+        let mut byte = [0u8; 1];
+        while !raw.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                io.read(&mut byte).await.expect("read head"),
+                1,
+                "eof in head"
+            );
+            raw.push(byte[0]);
+        }
+        String::from_utf8(raw).expect("utf8 head")
+    }
+
+    /// Wire test over in-process raw HTTP/1.1 peers: the client must send a
+    /// `Connection: close` download GET on the connection it was handed, and the
+    /// seq-numbered upload POST on a second connection from the dialer, each with
+    /// padding. The download body must flow back through the conn.
     #[tokio::test]
     async fn wire_packet_up_roundtrip() {
-        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let timeout = std::time::Duration::from_secs(10);
+
+        let (client_io, mut get_io) = tokio::io::duplex(1 << 16);
+        let (post_tx, mut post_rx) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+            let post_tx = post_tx.clone();
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(1 << 16);
+                post_tx.send(server).expect("server side");
+                Ok(Box::new(client) as AnyStream)
+            })
+        });
         let c = cfg(json!({"path": "/xhttp", "x_padding_bytes": "20-40"}));
-        let client = tokio::spawn(async move {
-            let stream: AnyStream = Box::new(client_io);
-            super::connect(stream, false, "srv", 443, &c).await
-        });
+        let stream: AnyStream = Box::new(client_io);
 
-        let mut conn = client.await.unwrap().expect("connect");
         let server = tokio::spawn(async move {
-            let mut server = h2::server::handshake(server_io).await.expect("h2 server");
+            // --- download GET: its own connection, closed after the response ---
+            let head = read_request_head(&mut get_io).await;
+            let line = head.lines().next().unwrap().to_string();
+            assert!(line.starts_with("GET /xhttp/"), "got {line:?}");
+            assert!(line.ends_with(" HTTP/1.1"), "got {line:?}");
+            let path = line.split(' ').nth(1).unwrap();
+            assert_eq!(path.matches('/').count(), 2, "got {path:?}");
+            let lower = head.to_ascii_lowercase();
+            assert!(lower.contains("\r\nconnection: close\r\n"), "got {head:?}");
+            assert!(lower.contains("\r\nhost: srv:443\r\n"), "got {head:?}");
+            assert!(lower.contains("x_padding="), "padding missing: {head:?}");
+            get_io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                .await
+                .unwrap();
 
-            // --- download GET ---
-            let (req, mut respond) = server.accept().await.expect("stream").expect("http");
-            assert_eq!(req.method(), "GET");
-            assert!(req.uri().path().starts_with("/xhttp/"));
-            assert!(req.uri().path().matches('/').count() == 2);
-            let referer = req.headers().get("referer").expect("referer padding");
-            assert!(referer.to_str().unwrap().contains("x_padding="));
-            let response = http::Response::builder().status(200).body(()).unwrap();
-            let mut send = respond.send_response(response, false).unwrap();
-            send.send_data(Bytes::from_static(b"hello"), false).unwrap();
-            send.send_data(Bytes::new(), true).unwrap();
-
-            // --- upload POST seq=0 ---
-            let (req, mut respond) = server.accept().await.expect("stream").expect("http");
-            assert_eq!(req.method(), "POST");
-            assert!(req.uri().path().ends_with("/0"));
-            let mut body = req.into_body();
-            let mut uploaded = Vec::new();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.unwrap();
-                let _ = body.flow_control().release_capacity(chunk.len());
-                uploaded.extend_from_slice(&chunk);
-            }
-            assert_eq!(&uploaded, b"ping");
-            let response = http::Response::builder().status(200).body(()).unwrap();
-            let respond = respond.send_response(response, true).unwrap();
-            // Drive the server connection so the response frames flush
-            // before the task (and the connection) is dropped.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_millis(500), server.accept()).await;
-            drop(respond);
+            // --- upload POST seq=0: a second connection from the dialer ---
+            let mut post_io = post_rx.recv().await.expect("dialled connection");
+            let head = read_request_head(&mut post_io).await;
+            let line = head.lines().next().unwrap().to_string();
+            assert!(line.starts_with("POST /xhttp/"), "got {line:?}");
+            assert!(line.contains("/0 HTTP/1.1"), "got {line:?}");
+            let lower = head.to_ascii_lowercase();
+            assert!(lower.contains("\r\ncontent-length: 4\r\n"), "got {head:?}");
+            assert!(
+                !lower.contains("connection: close"),
+                "upload must keep alive"
+            );
+            assert!(
+                !lower.contains("x-data-"),
+                "the payload rides the body, a header copy arrives twice: {head:?}"
+            );
+            let mut body = [0u8; 4];
+            post_io.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"ping");
+            post_io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            // keep both ends open until the client has read everything
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(get_io);
+            drop(post_io);
         });
 
-        let writer = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut conn = tokio::time::timeout(
+            timeout,
+            super::connect(stream, false, "srv", 443, &c, dialer),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+        tokio::time::timeout(timeout, async {
             conn.write_all(b"ping").await.expect("write");
+            conn.flush().await.expect("flush");
             let mut buf = vec![0u8; 5];
             conn.read_exact(&mut buf).await.expect("read");
-            buf
-        });
-
-        server.await.unwrap();
-        let buf = writer.await.unwrap();
-        assert_eq!(&buf, b"hello");
+            assert_eq!(&buf, b"hello");
+        })
+        .await
+        .expect("roundtrip timed out");
+        tokio::time::timeout(timeout, server)
+            .await
+            .expect("server timed out")
+            .unwrap();
     }
 }

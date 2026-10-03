@@ -23,9 +23,15 @@ pub mod tproxy;
 pub(crate) mod udp;
 pub mod vmess;
 
+#[cfg(target_os = "linux")]
+mod relay;
+
 /// Object-safe stream for dial results (TCP, TLS, future transports).
-pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyStream for T {}
+///
+/// `Any` is here so the relay can recognise a bare `TcpStream` behind the box
+/// and hand both ends to the kernel (`splice`) instead of copying.
+pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any> ProxyStream for T {}
 pub type AnyStream = Box<dyn ProxyStream>;
 pub type AnyRead = Box<dyn AsyncRead + Send + Unpin>;
 pub type AnyWrite = Box<dyn AsyncWrite + Send + Unpin>;
@@ -146,6 +152,16 @@ impl ClientConn {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.local
             .ok_or_else(|| io::Error::other("this stream has no socket address"))
+    }
+
+    /// The bare client socket, when nothing sits between us and it and no SOCKS
+    /// reply is still owed: only then may the kernel move its bytes directly.
+    #[cfg(target_os = "linux")]
+    fn raw_tcp(&self) -> Option<&TcpStream> {
+        if matches!(self.reply, LazyReply::Pending(_)) {
+            return None;
+        }
+        (&*self.inner as &dyn std::any::Any).downcast_ref::<TcpStream>()
     }
 
     fn poll_flush_reply(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -301,10 +317,24 @@ pub fn clash_meta(
     }
 }
 
+/// The bare TCP socket behind a relay client, if there is one: a socket that
+/// was accepted as is (`redirect`, `tproxy`), or a `ClientConn` with nothing
+/// between it and the socket and no SOCKS reply still owed.
+#[cfg(target_os = "linux")]
+fn client_raw_tcp(client: &dyn std::any::Any) -> Option<&TcpStream> {
+    if let Some(tcp) = client.downcast_ref::<TcpStream>() {
+        return Some(tcp);
+    }
+    client.downcast_ref::<ClientConn>()?.raw_tcp()
+}
+
 /// Relay the client stream into an established upstream connection, replaying
 /// any sniff-read `prefix` upstream first. With a `tracker` the connection is
 /// registered in the Clash connection view: byte counters feed `/connections`
 /// and `/traffic`, and `DELETE /connections/{id}` can drop it.
+///
+/// Socket to socket on Linux goes through `splice(2)` (see `relay`); every other
+/// shape of stream takes the userspace loops below.
 pub async fn pump_conn_tracked<S>(
     mut client: S,
     conn: Conn,
@@ -312,10 +342,19 @@ pub async fn pump_conn_tracked<S>(
     tracker: Option<&clash_state::ConnHandle>,
 ) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any,
 {
     match conn {
         Conn::Plain(mut upstream) => {
+            #[cfg(target_os = "linux")]
+            if let Some(tracker) = tracker
+                && let Some(client_tcp) = client_raw_tcp(&client)
+                && let Some(upstream_tcp) =
+                    (&*upstream as &dyn std::any::Any).downcast_ref::<TcpStream>()
+            {
+                return relay::relay(client_tcp, upstream_tcp, prefix, tracker).await;
+            }
+
             if !prefix.is_empty() {
                 upstream.write_all(prefix).await?;
                 if let Some(tracker) = tracker {

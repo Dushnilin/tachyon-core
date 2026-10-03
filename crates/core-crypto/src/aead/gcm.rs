@@ -1,7 +1,7 @@
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 
-use super::{DecryptBufferAdapter, EncryptBufferAdapter};
+use crate::fastgcm::Gcm;
 
 use aead::AeadInPlace;
 use crypto_common::{KeyInit, KeySizeUser};
@@ -26,27 +26,21 @@ const TLS12_GCM_EXPLICIT_NONCE_LEN: usize = 8;
 const TLS12_GCM_OVERHEAD: usize = TLS12_GCM_EXPLICIT_NONCE_LEN + 16;
 
 macro_rules! impl_gcm_tls13 {
-    ($name: ident, $aead: ty, $overhead: expr) => {
+    ($name: ident, $key_len: expr) => {
         paste! {
             pub struct [<Tls13 $name>];
 
             impl Tls13AeadAlgorithm for [<Tls13 $name>] {
                 fn encrypter(&self, key: AeadKey, iv: cipher::Iv) -> Box<dyn MessageEncrypter> {
-                    Box::new([<Tls13Cipher $name>](
-                        $aead::new_from_slice(key.as_ref()).unwrap(),
-                        iv,
-                    ))
+                    Box::new([<Tls13Cipher $name>](Gcm::new(key.as_ref()), iv))
                 }
 
                 fn decrypter(&self, key: AeadKey, iv: cipher::Iv) -> Box<dyn MessageDecrypter> {
-                    Box::new([<Tls13Cipher $name>](
-                        $aead::new_from_slice(key.as_ref()).unwrap(),
-                        iv,
-                    ))
+                    Box::new([<Tls13Cipher $name>](Gcm::new(key.as_ref()), iv))
                 }
 
                 fn key_len(&self) -> usize {
-                    $aead::key_size()
+                    $key_len
                 }
                 fn extract_keys(
                     &self,
@@ -57,7 +51,7 @@ macro_rules! impl_gcm_tls13 {
                 }
             }
 
-            struct [<Tls13Cipher $name>]($aead, cipher::Iv);
+            struct [<Tls13Cipher $name>](Gcm, cipher::Iv);
 
             impl MessageEncrypter for [<Tls13Cipher $name>] {
                 fn encrypt(&mut self, m: OutboundPlainMessage<'_>, seq: u64) -> Result<OutboundOpaqueMessage, rustls::Error> {
@@ -69,30 +63,38 @@ macro_rules! impl_gcm_tls13 {
                     payload.extend_from_chunks(&m.payload);
                     payload.extend_from_slice(&m.typ.to_array());
 
-                    self.0
-                        .encrypt_in_place(&nonce.into(), &aad, &mut EncryptBufferAdapter(&mut payload))
-                        .map_err(|_| rustls::Error::EncryptError)
-                        .map(|_| OutboundOpaqueMessage::new(
-                            ContentType::ApplicationData,
-                            ProtocolVersion::TLSv1_2,
-                            payload,
-                        ))
+                    // sealed where it lies, the tag appended after it
+                    let tag = self.0.seal(&nonce, &aad, payload.as_mut());
+                    payload.extend_from_slice(&tag);
+                    Ok(OutboundOpaqueMessage::new(
+                        ContentType::ApplicationData,
+                        ProtocolVersion::TLSv1_2,
+                        payload,
+                    ))
                 }
 
                 fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-                    payload_len + 1 + $overhead
+                    payload_len + 1 + 16
                 }
             }
 
             impl MessageDecrypter for [<Tls13Cipher $name>] {
                 fn decrypt<'a>(&mut self, mut m: InboundOpaqueMessage<'a>, seq: u64) -> Result<InboundPlainMessage<'a>, rustls::Error> {
                     let payload = &mut m.payload;
+                    let len = payload.len();
+                    if len < 16 {
+                        return Err(rustls::Error::DecryptError);
+                    }
                     let nonce = cipher::Nonce::new(&self.1, seq).0;
-                    let aad = cipher::make_tls13_aad(payload.len());
-
-                    self.0
-                        .decrypt_in_place(&nonce.into(), &aad, &mut DecryptBufferAdapter(payload))
+                    let aad = cipher::make_tls13_aad(len);
+                    let tag_at = len - 16;
+                    let tag: [u8; 16] = payload[tag_at..]
+                        .try_into()
                         .map_err(|_| rustls::Error::DecryptError)?;
+                    if !self.0.open(&nonce, &aad, &mut payload[..tag_at], &tag) {
+                        return Err(rustls::Error::DecryptError);
+                    }
+                    payload.truncate(tag_at);
 
                     m.into_tls13_unpadded_message()
                 }
@@ -225,8 +227,8 @@ macro_rules! impl_gcm_tls12 {
     };
 }
 
-impl_gcm_tls13! {Aes128Gcm, aes_gcm::Aes128Gcm, 16}
-impl_gcm_tls13! {Aes256Gcm, aes_gcm::Aes256Gcm, 16}
+impl_gcm_tls13! {Aes128Gcm, 16}
+impl_gcm_tls13! {Aes256Gcm, 32}
 
 #[cfg(feature = "tls12")]
 impl_gcm_tls12! {Aes128Gcm, aes_gcm::Aes128Gcm, TLS12_GCM_EXPLICIT_NONCE_LEN, TLS12_GCM_OVERHEAD}

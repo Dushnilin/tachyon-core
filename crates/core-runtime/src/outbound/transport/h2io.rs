@@ -14,6 +14,23 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
+/// Receive window per stream and per connection. The 64 KiB the protocol
+/// starts with makes a bulk transfer stop every window for the peer's update;
+/// Go's HTTP/2 client opens at 4 MiB and 1 GiB, which is what the peers we talk
+/// to are used to.
+const STREAM_WINDOW: u32 = 4 << 20;
+const CONN_WINDOW: u32 = 16 << 20;
+
+/// The client handshake every h2-based transport shares, with windows sized
+/// for throughput.
+pub(crate) fn client_builder() -> h2::client::Builder {
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONN_WINDOW);
+    builder
+}
+
 /// One HTTP/2 request/response stream wrapped as raw byte pipes.
 pub(crate) struct H2Stream {
     send: Option<h2::SendStream<Bytes>>,
@@ -22,8 +39,7 @@ pub(crate) struct H2Stream {
     /// Received bytes not yet handed to the caller.
     pub(crate) pending: BytesMut,
     /// Encoded bytes waiting on flow-control capacity.
-    out: Vec<u8>,
-    out_pos: usize,
+    out: Bytes,
     report: usize,
     eof: bool,
     /// `None` when a shared owner drives the connection, as mux does
@@ -59,8 +75,7 @@ impl H2Stream {
             response: None,
             recv: Some(response.into_body()),
             pending: BytesMut::new(),
-            out: Vec::new(),
-            out_pos: 0,
+            out: Bytes::new(),
             report: 0,
             eof: false,
             conn_task: Some(conn_task),
@@ -77,8 +92,7 @@ impl H2Stream {
             response: Some(Box::pin(response)),
             recv: None,
             pending: BytesMut::new(),
-            out: Vec::new(),
-            out_pos: 0,
+            out: Bytes::new(),
             report: 0,
             eof: false,
             conn_task,
@@ -86,15 +100,14 @@ impl H2Stream {
     }
 
     pub(crate) fn has_out(&self) -> bool {
-        self.out_pos < self.out.len()
+        !self.out.is_empty()
     }
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
     /// AsyncWrite caller once the whole frame has been accepted.
     pub(crate) fn stage(&mut self, frame: Vec<u8>, report: usize) {
         debug_assert!(!self.has_out());
-        self.out = frame;
-        self.out_pos = 0;
+        self.out = Bytes::from(frame);
         self.report = report;
     }
 
@@ -105,15 +118,13 @@ impl H2Stream {
     /// Flush staged bytes as flow control allows; clears `out` when done.
     pub(crate) fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
-            if self.out_pos >= self.out.len() {
-                self.out.clear();
-                self.out_pos = 0;
+            if self.out.is_empty() {
                 return Poll::Ready(Ok(()));
             }
             let Some(send) = self.send.as_mut() else {
                 return Poll::Ready(Err(io::Error::other("h2: stream send side closed")));
             };
-            let remaining = self.out.len() - self.out_pos;
+            let remaining = self.out.len();
             send.reserve_capacity(remaining);
             let cap = match ready!(send.poll_capacity(cx)) {
                 Some(Ok(cap)) => cap,
@@ -127,11 +138,9 @@ impl H2Stream {
             if cap == 0 {
                 continue;
             }
-            let n = cap.min(remaining);
-            let chunk = Bytes::copy_from_slice(&self.out[self.out_pos..self.out_pos + n]);
+            let chunk = self.out.split_to(cap.min(remaining));
             send.send_data(chunk, false)
                 .map_err(|e| io::Error::other(format!("h2: send_data: {e}")))?;
-            self.out_pos += n;
         }
     }
 

@@ -15,7 +15,28 @@ use crate::inbound::{
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
-/// mixed inbound: SOCKS5 + HTTP CONNECT on one port.
+/// Which protocols a listener of this shape speaks. `mixed` answers both, the
+/// plain `socks` and `http` inbounds answer one and refuse the other, exactly as
+/// the reference's separate inbounds do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Flavor {
+    Mixed,
+    Socks,
+    Http,
+}
+
+impl Flavor {
+    fn name(self) -> &'static str {
+        match self {
+            Flavor::Mixed => "mixed",
+            Flavor::Socks => "socks",
+            Flavor::Http => "http",
+        }
+    }
+}
+
+/// mixed inbound: SOCKS4/4a/5 + HTTP CONNECT on one port (and, with a flavor,
+/// the same listener as the plain `socks` or `http` inbound).
 pub struct Mixed {
     listener: TcpListener,
     tag: String,
@@ -23,14 +44,22 @@ pub struct Mixed {
     router: Arc<Router>,
     /// Shared UDP ASSOCIATE relay hub (`network` allows UDP).
     udp: Option<Arc<UdpHub>>,
+    flavor: Flavor,
 }
 
 impl Mixed {
     pub async fn bind(obj: &Value, router: Arc<Router>) -> anyhow::Result<Self> {
+        Self::bind_as(obj, router, Flavor::Mixed).await
+    }
+
+    pub async fn bind_as(obj: &Value, router: Arc<Router>, flavor: Flavor) -> anyhow::Result<Self> {
         let obj = obj
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("inbound: must be an object"))?;
-        let tag = obj.get("tag").and_then(Value::as_str).unwrap_or("mixed");
+        let tag = obj
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or(flavor.name());
         let at = format!("inbound[{tag}]");
         let port = require_u16(obj, "listen_port", &at)?;
         let host = obj
@@ -55,9 +84,11 @@ impl Mixed {
             })
             .unwrap_or_default();
         logging::info(format_args!(
-            "inbound mixed[{tag}] listening at {ip}:{port}"
+            "inbound {}[{tag}] listening at {ip}:{port}",
+            flavor.name()
         ));
-        let udp = network_includes_udp(obj).then(|| {
+        // an HTTP-only listener has no UDP ASSOCIATE to serve
+        let udp = (flavor != Flavor::Http && network_includes_udp(obj)).then(|| {
             UdpHub::new(
                 Arc::clone(&router),
                 DEFAULT_UDP_TIMEOUT,
@@ -70,6 +101,7 @@ impl Mixed {
             users,
             router,
             udp,
+            flavor,
         })
     }
 
@@ -85,9 +117,11 @@ impl Mixed {
                     let users = self.users.clone();
                     let tag = self.tag.clone();
                     let udp = self.udp.clone();
+                    let flavor = self.flavor;
                     tokio::spawn(async move {
                         if let Err(err) =
-                            handle_conn(stream, peer, &tag, &users, &router, udp.as_ref()).await
+                            handle_conn(stream, peer, &tag, &users, &router, udp.as_ref(), flavor)
+                                .await
                         {
                             logging::debug(format_args!("mixed[{tag}] {peer}: {err}"));
                         }
@@ -109,13 +143,122 @@ async fn handle_conn(
     users: &[(String, String)],
     router: &Arc<Router>,
     udp: Option<&Arc<UdpHub>>,
+    flavor: Flavor,
 ) -> io::Result<()> {
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).await?;
-    if first[0] == 0x05 {
-        socks5(stream, peer, tag, users, router, udp).await
+    match first[0] {
+        0x05 if flavor != Flavor::Http => socks5(stream, peer, tag, users, router, udp).await,
+        0x04 if flavor != Flavor::Http => socks4(stream, peer, tag, users, router).await,
+        0x04 | 0x05 => Err(io::Error::other("socks request on an http inbound")),
+        byte if flavor != Flavor::Socks => http(stream, byte, peer, tag, users, router).await,
+        _ => Err(io::Error::other("not a socks request on a socks inbound")),
+    }
+}
+
+/// SOCKS4 / SOCKS4a CONNECT: `[4][1][port:2][ip:4][userid]\0`, and for 4a an ip
+/// of `0.0.0.x` followed by `[domain]\0`. The reply is `[0][code][port:2][ip:4]`
+/// with 90 for granted and 91 for rejected, written once the upstream is up.
+/// With users configured the userid has to name a user whose password is empty,
+/// because SOCKS4 has nowhere to put one (the reference verifies `(userid, "")`).
+async fn socks4(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    tag: &str,
+    users: &[(String, String)],
+    router: &Arc<Router>,
+) -> io::Result<()> {
+    const GRANTED: u8 = 90;
+    const REJECTED: u8 = 91;
+    let mut head = [0u8; 7];
+    stream.read_exact(&mut head).await?;
+    // best effort: the client may be gone already
+    async fn reject(stream: &mut TcpStream) {
+        let _ = stream.write_all(&[0u8, REJECTED, 0, 0, 0, 0, 0, 0]).await;
+    }
+    if head[0] != 1 {
+        reject(&mut stream).await;
+        return Err(io::Error::other("only CONNECT is supported"));
+    }
+    let port = u16::from_be_bytes([head[1], head[2]]);
+    let ip = [head[3], head[4], head[5], head[6]];
+    let userid = read_cstring(&mut stream).await?;
+    let domain = if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0 {
+        Some(read_cstring(&mut stream).await?)
     } else {
-        http(stream, first[0], peer, tag, users, router).await
+        None
+    };
+    let mut auth_user = None;
+    if !users.is_empty() {
+        let name = String::from_utf8_lossy(&userid).into_owned();
+        if !users.iter().any(|(u, p)| *u == name && p.is_empty()) {
+            reject(&mut stream).await;
+            return Err(io::Error::other("auth failed"));
+        }
+        auth_user = Some(name);
+    }
+    let target = match domain {
+        Some(host) => Target::Domain(
+            String::from_utf8(host).map_err(|_| io::Error::other("bad domain"))?,
+            port,
+        ),
+        None => Target::Ip(SocketAddr::new(IpAddr::V4(ip.into()), port)),
+    };
+    let granted = [0u8, GRANTED, head[1], head[2], ip[0], ip[1], ip[2], ip[3]];
+
+    // no lazy SOCKS5 reply on this connection: the reply is ours to write
+    let mut client = ClientConn::http(stream);
+    let mut ctx = ConnContext::new(tag, peer, target, "tcp");
+    ctx.auth_user = auth_user;
+    let decision = match router.route(&mut client, &mut ctx).await {
+        Ok(decision) => decision,
+        Err(err) => {
+            let _ = client
+                .write_all(&[0u8, REJECTED, head[1], head[2], ip[0], ip[1], ip[2], ip[3]])
+                .await;
+            return Err(err);
+        }
+    };
+    match decision {
+        Decision::HijackDns => {
+            client.write_all(&granted).await?;
+            hijack_dns(&mut client, &ctx).await
+        }
+        Decision::Outbound(idx) => {
+            let dest = ctx.destination.clone();
+            match router.connect_index(idx, &dest).await {
+                Ok(conn) => {
+                    client.write_all(&granted).await?;
+                    logging::info(format_args!("socks[{tag}] {peer} CONNECT {dest}"));
+                    let tracker = clash_state::ConnHandle::open(clash_meta(&ctx, router, idx));
+                    pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
+                }
+                Err(err) => {
+                    let _ = client
+                        .write_all(&[0u8, REJECTED, head[1], head[2], ip[0], ip[1], ip[2], ip[3]])
+                        .await;
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+/// A NUL-terminated field of a SOCKS4 request, without the NUL. Capped, because
+/// the peer controls how long it runs.
+async fn read_cstring(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    const MAX: usize = 1024;
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await?;
+        if byte[0] == 0 {
+            return Ok(out);
+        }
+        if out.len() >= MAX {
+            return Err(io::Error::other("socks4 field too long"));
+        }
+        out.push(byte[0]);
     }
 }
 

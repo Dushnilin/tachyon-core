@@ -14,7 +14,23 @@ use std::io;
 
 use rustls::CipherSuite;
 
+use crate::fastgcm::Gcm;
 use crate::tls13::TrafficKeys;
+
+/// The in-house AES-GCM for the two AES suites; chacha stays with the provider.
+fn aes_gcm(suite: CipherSuite, keys: &TrafficKeys) -> Option<Gcm> {
+    match (suite, keys.key.len()) {
+        (CipherSuite::TLS13_AES_128_GCM_SHA256, 16)
+        | (CipherSuite::TLS13_AES_256_GCM_SHA384, 32) => Some(Gcm::new(&keys.key)),
+        _ => None,
+    }
+}
+
+fn nonce12(keys: &TrafficKeys, seq: u64) -> io::Result<[u8; 12]> {
+    keys.nonce(seq)
+        .try_into()
+        .map_err(|_| err("the record nonce is not 12 bytes"))
+}
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -91,6 +107,7 @@ pub fn take_record(input: &mut &[u8]) -> io::Result<(u8, [u8; 2], Vec<u8>)> {
 pub struct Sealer {
     suite: CipherSuite,
     keys: TrafficKeys,
+    gcm: Option<Gcm>,
     seq: u64,
 }
 
@@ -98,6 +115,7 @@ impl Sealer {
     pub fn new(suite: CipherSuite, keys: TrafficKeys) -> Self {
         Sealer {
             suite,
+            gcm: aes_gcm(suite, &keys),
             keys,
             seq: 0,
         }
@@ -107,6 +125,7 @@ impl Sealer {
     /// the handshake and application levels of one connection number their
     /// records from a single counter (RFC 8446 §5.3).
     pub fn set_keys(&mut self, keys: TrafficKeys) {
+        self.gcm = aes_gcm(self.suite, &keys);
         self.keys = keys;
     }
 
@@ -115,6 +134,19 @@ impl Sealer {
     }
 
     pub fn seal(&mut self, kind: ContentType, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(5 + payload.len() + 1 + 16);
+        self.seal_into(kind, payload, &mut out)?;
+        Ok(out)
+    }
+
+    /// Append one sealed record to `out`, sealing in place where it lies: a
+    /// whole run of records goes into one buffer and out in one write.
+    pub fn seal_into(
+        &mut self,
+        kind: ContentType,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         // Checked here rather than left to the arithmetic below: the length in
         // the header is a u16, so an oversized payload wraps round to a short
         // one and the peer reads a truncated record out of the middle of a long
@@ -122,24 +154,35 @@ impl Sealer {
         if payload.len() > MAX_FRAGMENT {
             return Err(err("plaintext over the record length limit"));
         }
-        // the inner plaintext: the content, its type, then zero padding
-        let mut inner = Vec::with_capacity(payload.len() + 1);
-        inner.extend_from_slice(payload);
-        inner.push(kind as u8);
-
-        let nonce = self.keys.nonce(self.seq);
-        let length = (inner.len() + 16) as u16;
-        let aad = header(ContentType::ApplicationData, length);
-        let sealed = core_crypto::tls13_seal(self.suite, &self.keys.key, &nonce, &aad, &inner)
-            .ok_or_else(|| err("the cipher suite cannot seal a record"))?;
         if self.seq == u64::MAX {
             return Err(err("record sequence number exhausted"));
         }
-        self.seq += 1;
-        let mut out = Vec::with_capacity(5 + sealed.len());
+        let length = (payload.len() + 1 + 16) as u16;
+        let aad = header(ContentType::ApplicationData, length);
+        let nonce = nonce12(&self.keys, self.seq)?;
+        let start = out.len();
+        out.reserve(5 + usize::from(length));
         out.extend_from_slice(&aad);
-        out.extend_from_slice(&sealed);
-        Ok(out)
+        // the inner plaintext: the content, then its type
+        out.extend_from_slice(payload);
+        out.push(kind as u8);
+        if let Some(gcm) = &self.gcm {
+            let tag = gcm.seal(&nonce, &aad, &mut out[start + 5..]);
+            out.extend_from_slice(&tag);
+        } else {
+            let sealed = core_crypto::tls13_seal(
+                self.suite,
+                &self.keys.key,
+                &nonce,
+                &aad,
+                &out[start + 5..],
+            )
+            .ok_or_else(|| err("the cipher suite cannot seal a record"))?;
+            out.truncate(start + 5);
+            out.extend_from_slice(&sealed);
+        }
+        self.seq += 1;
+        Ok(())
     }
 }
 
@@ -147,6 +190,7 @@ impl Sealer {
 pub struct Opener {
     suite: CipherSuite,
     keys: TrafficKeys,
+    gcm: Option<Gcm>,
     seq: u64,
 }
 
@@ -154,12 +198,14 @@ impl Opener {
     pub fn new(suite: CipherSuite, keys: TrafficKeys) -> Self {
         Opener {
             suite,
+            gcm: aes_gcm(suite, &keys),
             keys,
             seq: 0,
         }
     }
 
     pub fn set_keys(&mut self, keys: TrafficKeys) {
+        self.gcm = aes_gcm(self.suite, &keys);
         self.keys = keys;
     }
 
@@ -170,8 +216,16 @@ impl Opener {
     /// Open one record, returning its content type and plaintext with the type
     /// byte and any padding removed.
     pub fn open(&mut self, record: &[u8]) -> io::Result<(ContentType, Vec<u8>)> {
-        if record.len() < 5 {
-            return Err(err("short record header"));
+        let mut copy = record.to_vec();
+        let (kind, len) = self.open_in_place(&mut copy)?;
+        Ok((kind, copy[5..5 + len].to_vec()))
+    }
+
+    /// Open one whole record where it lies. The plaintext is then
+    /// `record[5..5 + len]`, with the type byte and any padding cut off.
+    pub fn open_in_place(&mut self, record: &mut [u8]) -> io::Result<(ContentType, usize)> {
+        if record.len() < 5 + 16 {
+            return Err(err("short record"));
         }
         if record[0] != ContentType::ApplicationData as u8 {
             return Err(err(format!(
@@ -179,22 +233,33 @@ impl Opener {
                 record[0]
             )));
         }
-        let aad = &record[..5];
-        let nonce = self.keys.nonce(self.seq);
-        let inner = core_crypto::tls13_open(self.suite, &self.keys.key, &nonce, aad, &record[5..])
-            .ok_or_else(|| err("record tag did not verify"))?;
-        // the last non-zero byte is the content type; everything after it is
-        // padding, and a record of only zeros is malformed
-        let at = inner
-            .iter()
-            .rposition(|b| *b != 0)
-            .ok_or_else(|| err("record has no content type"))?;
-        let kind = ContentType::from_byte(inner[at])?;
         if self.seq == u64::MAX {
             return Err(err("record sequence number exhausted"));
         }
+        let nonce = nonce12(&self.keys, self.seq)?;
+        let (aad, body) = record.split_at_mut(5);
+        let inner = if let Some(gcm) = &self.gcm {
+            let (data, tag) = body.split_at_mut(body.len() - 16);
+            let tag: [u8; 16] = (&*tag).try_into().expect("tag is 16 bytes");
+            if !gcm.open(&nonce, aad, data, &tag) {
+                return Err(err("record tag did not verify"));
+            }
+            data.len()
+        } else {
+            let plain = core_crypto::tls13_open(self.suite, &self.keys.key, &nonce, aad, body)
+                .ok_or_else(|| err("record tag did not verify"))?;
+            body[..plain.len()].copy_from_slice(&plain);
+            plain.len()
+        };
+        // the last non-zero byte is the content type; everything after it is
+        // padding, and a record of only zeros is malformed
+        let at = body[..inner]
+            .iter()
+            .rposition(|b| *b != 0)
+            .ok_or_else(|| err("record has no content type"))?;
+        let kind = ContentType::from_byte(body[at])?;
         self.seq += 1;
-        Ok((kind, inner[..at].to_vec()))
+        Ok((kind, at))
     }
 }
 

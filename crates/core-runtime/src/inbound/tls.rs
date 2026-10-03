@@ -4,7 +4,6 @@
 //! the keys the server side derived, so a vless or trojan inbound with a `tls`
 //! block costs one handshake at accept time and nothing after that.
 
-use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -171,9 +170,11 @@ impl ServerTls {
             sealer,
             opener,
             raw: Vec::new(),
-            pending: Vec::new(),
-            pending_at: 0,
-            out: VecDeque::new(),
+            rd: 0,
+            pend_at: 0,
+            pend_end: 0,
+            wbuf: Vec::new(),
+            wpos: 0,
             taken: 0,
             eof: false,
             closed: false,
@@ -212,15 +213,19 @@ pub struct TlsStream<S> {
     inner: S,
     sealer: Sealer,
     opener: Opener,
-    /// transport bytes that do not make a whole record yet
+    /// Transport bytes. Whole records are opened right where they lie, so the
+    /// plaintext being handed over is `raw[pend_at..pend_end]` and nothing is
+    /// allocated or copied per record on the way in.
     raw: Vec<u8>,
-    /// plaintext of a record bigger than the reader's buffer, and how much of it
-    /// has been handed over
-    pending: Vec<u8>,
-    pending_at: usize,
-    /// sealed records waiting to go out, in order, with how much of each one
-    /// has been written
-    out: VecDeque<(Vec<u8>, usize)>,
+    /// where the first record that has not been opened yet starts
+    rd: usize,
+    pend_at: usize,
+    pend_end: usize,
+    /// sealed records waiting to go out, in order, and how much of them has
+    /// been written: the sequence number is the record's position, so they
+    /// cannot be reordered or interleaved
+    wbuf: Vec<u8>,
+    wpos: usize,
     /// how many bytes of the caller's buffer this call has already sealed, and
     /// therefore owes back once they are on the wire
     taken: usize,
@@ -238,34 +243,29 @@ impl<S> TlsStream<S> {
         self.inner
     }
 
-    /// Push whatever is left of the queued records into the transport, oldest
-    /// first: the sequence number is the record's position, so they cannot be
-    /// reordered or interleaved.
+    /// Push whatever is left of the sealed records into the transport.
     fn drain_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
     where
         S: AsyncWrite + Unpin,
     {
-        let Self { inner, out, .. } = self;
-        while let Some((record, written)) = out.front_mut() {
-            // An empty slice reads as `Ok(0)`, which is the one thing a socket
-            // does answer with without having written anything -- so the loop
-            // has to stop on the length itself, not on what the write returns.
-            if *written >= record.len() {
-                out.pop_front();
-                continue;
-            }
-            match Pin::new(&mut *inner).poll_write(cx, &record[*written..]) {
+        // The loop stops on the length itself, not on what the write returns:
+        // an empty slice reads as `Ok(0)`, which is the one thing a socket does
+        // answer with without having written anything.
+        while self.wpos < self.wbuf.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.wbuf[self.wpos..]) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "the transport took no bytes of a sealed record",
                     )));
                 }
-                Poll::Ready(Ok(n)) => *written += n,
+                Poll::Ready(Ok(n)) => self.wpos += n,
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Pending => return Poll::Pending,
             }
         }
+        self.wbuf.clear();
+        self.wpos = 0;
         Poll::Ready(Ok(()))
     }
 }
@@ -278,14 +278,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
         loop {
-            if me.pending_at < me.pending.len() {
-                let take = (me.pending.len() - me.pending_at).min(buf.remaining());
-                buf.put_slice(&me.pending[me.pending_at..me.pending_at + take]);
-                me.pending_at += take;
-                if me.pending_at == me.pending.len() {
-                    me.pending.clear();
-                    me.pending_at = 0;
-                }
+            if me.pend_at < me.pend_end {
+                let take = (me.pend_end - me.pend_at).min(buf.remaining());
+                buf.put_slice(&me.raw[me.pend_at..me.pend_at + take]);
+                me.pend_at += take;
                 return Poll::Ready(Ok(()));
             }
             if me.eof {
@@ -294,15 +290,26 @@ impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
             // Whatever we already hold comes first and only then the socket: a
             // socket hands us half a record all the time, so asking it only when
             // the buffer was short spins over the same bytes forever.
-            if me.raw.len() >= 5 {
-                let len = u16::from_be_bytes([me.raw[3], me.raw[4]]) as usize;
-                if me.raw.len() >= 5 + len {
-                    let record: Vec<u8> = me.raw.drain(..5 + len).collect();
-                    let (kind, plain) = me.opener.open(&record)?;
+            let avail = me.raw.len() - me.rd;
+            if avail >= 5 {
+                let len = u16::from_be_bytes([me.raw[me.rd + 3], me.raw[me.rd + 4]]) as usize;
+                // RFC 8446 §5.2: more than 2^14 + 256 is a record_overflow
+                if len > core_tls::record::MAX_FRAGMENT + 256 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "tls record over the length limit",
+                    )));
+                }
+                if avail >= 5 + len {
+                    let start = me.rd;
+                    me.rd += 5 + len;
+                    let (kind, plain) = me
+                        .opener
+                        .open_in_place(&mut me.raw[start..start + 5 + len])?;
                     match kind {
-                        ContentType::ApplicationData if !plain.is_empty() => {
-                            me.pending = plain;
-                            me.pending_at = 0;
+                        ContentType::ApplicationData if plain > 0 => {
+                            me.pend_at = start + 5;
+                            me.pend_end = start + 5 + plain;
                         }
                         // an alert ends the stream, close_notify or not: the
                         // reference has nothing left to say either way
@@ -314,16 +321,28 @@ impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
                     continue;
                 }
             }
-            let mut chunk = [0u8; CHUNK];
-            let mut read = ReadBuf::new(&mut chunk);
+            // Nothing is being handed over here, so what has been opened can go.
+            if me.rd > 0 {
+                me.raw.drain(..me.rd);
+                me.rd = 0;
+                me.pend_at = 0;
+                me.pend_end = 0;
+            }
+            // Read straight into the buffer's spare room: no zeroed scratch
+            // array and no second copy.
+            me.raw.reserve(CHUNK);
+            let have = me.raw.len();
+            let mut read = ReadBuf::uninit(me.raw.spare_capacity_mut());
             match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
                 Poll::Ready(Ok(())) => {
-                    let filled = read.filled();
-                    if filled.is_empty() {
+                    let got = read.filled().len();
+                    if got == 0 {
                         me.eof = true;
                         return Poll::Ready(Ok(()));
                     }
-                    me.raw.extend_from_slice(filled);
+                    // SAFETY: the reader initialised exactly `got` bytes of the
+                    // spare capacity, starting at `have`.
+                    unsafe { me.raw.set_len(have + got) };
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Pending => return Poll::Pending,
@@ -331,6 +350,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
         }
     }
 }
+
+/// Records sealed into one write at most: a few of them leave in one syscall.
+const WRITE_RECORDS: usize = 4;
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
     fn poll_write(
@@ -350,14 +372,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
         // answer: sealing the whole buffer anyway puts a length in the header
         // that does not describe it.
         if me.taken == 0 {
-            let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
-            match me.sealer.seal(ContentType::ApplicationData, &buf[..take]) {
-                Ok(record) => {
-                    me.out.push_back((record, 0));
-                    me.taken = take;
+            let take = buf
+                .len()
+                .min(WRITE_RECORDS * core_tls::record::MAX_FRAGMENT);
+            for piece in buf[..take].chunks(core_tls::record::MAX_FRAGMENT) {
+                if let Err(err) =
+                    me.sealer
+                        .seal_into(ContentType::ApplicationData, piece, &mut me.wbuf)
+                {
+                    return Poll::Ready(Err(err));
                 }
-                Err(err) => return Poll::Ready(Err(err)),
             }
+            me.taken = take;
         }
         match me.drain_out(cx) {
             Poll::Ready(Ok(())) => {}
@@ -370,7 +396,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        // poll_write only reports ready once the whole record is out, so there is
+        // poll_write only reports ready once the whole batch is out, so there is
         // never a part-written record to flush around
         Pin::new(&mut me.inner).poll_flush(cx)
     }
@@ -382,14 +408,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
         // a truncation and complains.
         if !me.closed {
             me.closed = true;
-            if let Ok(record) = me.sealer.seal(ContentType::Alert, &CLOSE_NOTIFY) {
-                me.out.push_back((record, 0));
-            }
-            match me.drain_out(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
+            let _ = me
+                .sealer
+                .seal_into(ContentType::Alert, &CLOSE_NOTIFY, &mut me.wbuf);
+        }
+        match me.drain_out(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
         }
         Pin::new(&mut me.inner).poll_shutdown(cx)
     }

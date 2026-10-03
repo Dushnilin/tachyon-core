@@ -9,7 +9,6 @@ use std::task::{Context, Poll};
 
 use aes::Aes128;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm, Tag};
 use cfb_mode::cipher::KeyIvInit;
 use cfb_mode::{BufDecryptor, BufEncryptor};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -17,13 +16,22 @@ use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, ReadBuf};
 
+use crate::fastgcm::Gcm;
 use crate::inbound::AnyStream;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
 
 pub(crate) const WRITE_CHUNK: usize = 15000;
+/// How much of one `write` is framed into one buffer: two full chunks, which
+/// is what the relay hands over at a time.
+pub(crate) const WRITE_BATCH: usize = 2 * WRITE_CHUNK;
 const CIPHER_OVERHEAD: usize = 16;
 const MAX_PADDING: u16 = 64;
+
+/// Only these two securities seal the body; `none` frames it in the clear.
+fn has_aead(security: u8) -> bool {
+    security == super::SEC_AES128_GCM || security == super::SEC_CHACHA20_POLY1305
+}
 
 pub(crate) type CfbEncrypt = BufEncryptor<Aes128>;
 pub(crate) type CfbDecrypt = BufDecryptor<Aes128>;
@@ -38,7 +46,7 @@ fn chunk_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
 
 /// Body cipher; chacha keys expand via `GenerateChacha20Poly1305Key`.
 pub(crate) enum BodyAead {
-    Aes(Box<Aes128Gcm>),
+    Aes(Box<Gcm>),
     ChaCha(Box<ChaCha20Poly1305>),
 }
 
@@ -49,9 +57,7 @@ impl BodyAead {
                 ChaCha20Poly1305::new_from_slice(&chacha_key(key16)).expect("chacha key length"),
             ))
         } else {
-            Self::Aes(Box::new(
-                Aes128Gcm::new_from_slice(key16).expect("aes key length"),
-            ))
+            Self::Aes(Box::new(Gcm::new(key16)))
         }
     }
 
@@ -61,14 +67,25 @@ impl BodyAead {
     }
 
     pub(crate) fn seal(&self, counter: u16, iv: &[u8; 16], buf: &mut Vec<u8>) -> io::Result<()> {
+        self.seal_from(counter, iv, buf, 0)
+    }
+
+    /// Seal `buf[from..]` where it lies and append the tag: a frame is built in
+    /// one buffer instead of a copy of the plaintext per chunk.
+    pub(crate) fn seal_from(
+        &self,
+        counter: u16,
+        iv: &[u8; 16],
+        buf: &mut Vec<u8>,
+        from: usize,
+    ) -> io::Result<()> {
         let nonce = chunk_nonce(iv, counter);
-        let tag = match self {
-            BodyAead::Aes(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], buf)
-                .map_err(|_| io::Error::other("seal failed"))?,
+        let tag: [u8; 16] = match self {
+            BodyAead::Aes(cipher) => cipher.seal(&nonce, &[], &mut buf[from..]),
             BodyAead::ChaCha(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], buf)
-                .map_err(|_| io::Error::other("seal failed"))?,
+                .encrypt_in_place_detached((&nonce).into(), &[], &mut buf[from..])
+                .map_err(|_| io::Error::other("seal failed"))?
+                .into(),
         };
         buf.extend_from_slice(&tag);
         Ok(())
@@ -83,15 +100,18 @@ impl BodyAead {
         let mut tag = [0u8; 16];
         tag.copy_from_slice(&buf[split..]);
         buf.truncate(split);
-        let result = match self {
-            BodyAead::Aes(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], buf, Tag::from_slice(&tag))
-            }
-            BodyAead::ChaCha(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], buf, Tag::from_slice(&tag))
-            }
+        let ok = match self {
+            BodyAead::Aes(cipher) => cipher.open(&nonce, &[], buf, &tag),
+            BodyAead::ChaCha(cipher) => cipher
+                .decrypt_in_place_detached((&nonce).into(), &[], buf, (&tag).into())
+                .is_ok(),
         };
-        result.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk auth failed"))?;
+        if !ok {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk auth failed",
+            ));
+        }
         Ok(())
     }
 }
@@ -143,7 +163,7 @@ impl BodyWriter {
     ) -> Self {
         let legacy = security == super::SEC_LEGACY;
         Self {
-            body: (!legacy).then(|| BodyAead::new(security, request_key)),
+            body: has_aead(security).then(|| BodyAead::new(security, request_key)),
             body_iv: *request_iv,
             body_count: 0,
             auth: (!legacy && authenticated_length)
@@ -161,27 +181,29 @@ impl BodyWriter {
         }
     }
 
-    /// One frame for one chunk of plaintext (`data.len() <= WRITE_CHUNK`).
-    pub(crate) fn frame(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+    /// One frame for one chunk of plaintext (`data.len() <= WRITE_CHUNK`),
+    /// appended to `out`, so several chunks of one write leave in one buffer and
+    /// one syscall, and the plaintext is sealed where it lies.
+    pub(crate) fn frame_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         debug_assert!(!data.is_empty() && data.len() <= WRITE_CHUNK);
 
         if self.checksum {
-            let mut frame = Vec::with_capacity(2 + 4 + data.len());
-            frame.extend_from_slice(&(data.len() as u16).wrapping_add(4).to_be_bytes());
-            frame.extend_from_slice(&fnv1a32(data).to_be_bytes());
-            frame.extend_from_slice(data);
+            let from = out.len();
+            out.extend_from_slice(&(data.len() as u16).wrapping_add(4).to_be_bytes());
+            out.extend_from_slice(&fnv1a32(data).to_be_bytes());
+            out.extend_from_slice(data);
             if let Some(cfb) = &mut self.cfb {
-                cfb.encrypt(&mut frame);
+                cfb.encrypt(&mut out[from..]);
             }
-            return Ok(frame);
+            return Ok(());
         }
 
-        let mut ciphertext = data.to_vec();
-        if let Some(body) = &self.body {
-            body.seal(self.body_count, &self.body_iv, &mut ciphertext)?;
-        }
-        self.body_count = self.body_count.wrapping_add(1);
-
+        let ct_len = data.len()
+            + if self.body.is_some() {
+                CIPHER_OVERHEAD
+            } else {
+                0
+            };
         let mut pad_len: u16 = 0;
         if self.global_padding
             && let Some(shake) = &mut self.shake
@@ -189,9 +211,9 @@ impl BodyWriter {
             pad_len = shake.next_u16() % MAX_PADDING;
         }
 
-        let mut out = Vec::with_capacity(2 + CIPHER_OVERHEAD + ciphertext.len() + 64);
+        out.reserve(2 + CIPHER_OVERHEAD + ct_len + usize::from(pad_len));
         if self.authenticated_length {
-            let stored = (ciphertext.len() as u16)
+            let stored = (ct_len as u16)
                 .wrapping_add(pad_len)
                 .wrapping_sub(CIPHER_OVERHEAD as u16);
             let mut len_block = stored.to_be_bytes().to_vec();
@@ -201,7 +223,7 @@ impl BodyWriter {
             }
             out.extend_from_slice(&len_block);
         } else {
-            let mut len16 = (ciphertext.len() as u16).wrapping_add(pad_len);
+            let mut len16 = (ct_len as u16).wrapping_add(pad_len);
             if self.chunk_masking
                 && let Some(shake) = &mut self.shake
             {
@@ -209,13 +231,18 @@ impl BodyWriter {
             }
             out.extend_from_slice(&len16.to_be_bytes());
         }
-        out.extend_from_slice(&ciphertext);
-        if pad_len > 0 {
-            let mut pad = vec![0u8; pad_len as usize];
-            random_bytes(&mut pad)?;
-            out.extend_from_slice(&pad);
+        let from = out.len();
+        out.extend_from_slice(data);
+        if let Some(body) = &self.body {
+            body.seal_from(self.body_count, &self.body_iv, out, from)?;
         }
-        Ok(out)
+        self.body_count = self.body_count.wrapping_add(1);
+        if pad_len > 0 {
+            let at = out.len();
+            out.resize(at + usize::from(pad_len), 0);
+            random_bytes(&mut out[at..])?;
+        }
+        Ok(())
     }
 }
 
@@ -241,6 +268,7 @@ pub(crate) struct FrameAssembler {
     state: AssembleState,
     pending: Vec<u8>,
     pos: usize,
+    ahead: Ahead,
 }
 
 enum AssembleState {
@@ -272,7 +300,7 @@ impl FrameAssembler {
     ) -> Self {
         let legacy = security == super::SEC_LEGACY;
         Self {
-            body: (!legacy).then(|| BodyAead::new(security, response_key)),
+            body: has_aead(security).then(|| BodyAead::new(security, response_key)),
             body_iv: *response_iv,
             body_count: 0,
             auth: (!legacy && authenticated_length)
@@ -288,6 +316,7 @@ impl FrameAssembler {
             state: AssembleState::Len { buf: Vec::new() },
             pending: Vec::new(),
             pos: 0,
+            ahead: Ahead::default(),
         }
     }
 
@@ -315,7 +344,7 @@ impl FrameAssembler {
                         2
                     };
                     let start = buf.len();
-                    match poll_fill(inner, cx, &mut buf, need) {
+                    match poll_take(inner, cx, &mut self.ahead, &mut buf, need) {
                         Poll::Ready(Ok(true)) => {}
                         Poll::Ready(Ok(false)) => {
                             self.state = AssembleState::Eof;
@@ -357,7 +386,7 @@ impl FrameAssembler {
                         }
                         Some(_) => {
                             self.state = AssembleState::Data {
-                                buf: Vec::new(),
+                                buf: Vec::with_capacity(usize::from(length)),
                                 total: usize::from(length),
                                 pad,
                             };
@@ -375,7 +404,7 @@ impl FrameAssembler {
                     pad,
                 } => {
                     let start = buf.len();
-                    match poll_fill(inner, cx, &mut buf, total) {
+                    match poll_take(inner, cx, &mut self.ahead, &mut buf, total) {
                         Poll::Ready(Ok(true)) => {}
                         Poll::Ready(Ok(false)) => {
                             return Poll::Ready(Err(io::Error::new(
@@ -423,24 +452,46 @@ impl FrameAssembler {
     }
 }
 
-/// Fill `buf` to `need` bytes from `inner`. Returns `Ok(false)` on a clean
-/// EOF while `buf` is still empty; any mid-stream EOF is an error.
-fn poll_fill(
+/// What one read off the socket brings in. The old assembler asked for exactly
+/// the two length bytes and then exactly the chunk, which is two syscalls per
+/// chunk; reading ahead turns a busy stream into roughly one per 32 KiB.
+const READ_AHEAD: usize = 32 * 1024;
+
+/// Bytes read from the socket and not yet taken by a frame. The storage is
+/// allocated on the first read, so an idle connection holds none.
+#[derive(Default)]
+struct Ahead {
+    data: Vec<u8>,
+    pos: usize,
+    end: usize,
+}
+
+/// Fill `buf` to `need` bytes, from the read-ahead first and the socket after.
+/// Returns `Ok(false)` on a clean EOF while `buf` is still empty; any
+/// mid-stream EOF is an error.
+fn poll_take(
     inner: &mut AnyStream,
     cx: &mut Context<'_>,
+    ahead: &mut Ahead,
     buf: &mut Vec<u8>,
     need: usize,
 ) -> Poll<io::Result<bool>> {
     while buf.len() < need {
-        let start = buf.len();
-        buf.resize(need, 0);
-        let mut read_buf = ReadBuf::new(&mut buf[start..]);
+        if ahead.pos < ahead.end {
+            let n = (need - buf.len()).min(ahead.end - ahead.pos);
+            buf.extend_from_slice(&ahead.data[ahead.pos..ahead.pos + n]);
+            ahead.pos += n;
+            continue;
+        }
+        if ahead.data.is_empty() {
+            ahead.data = vec![0u8; READ_AHEAD];
+        }
+        let mut read_buf = ReadBuf::new(&mut ahead.data);
         match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
-                buf.truncate(start + n);
                 if n == 0 {
-                    if start == 0 {
+                    if buf.is_empty() {
                         return Poll::Ready(Ok(false));
                     }
                     return Poll::Ready(Err(io::Error::new(
@@ -448,12 +499,11 @@ fn poll_fill(
                         "stream closed mid-frame",
                     )));
                 }
+                ahead.pos = 0;
+                ahead.end = n;
             }
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => {
-                buf.truncate(start);
-                return Poll::Pending;
-            }
+            Poll::Pending => return Poll::Pending,
         }
     }
     Poll::Ready(Ok(true))

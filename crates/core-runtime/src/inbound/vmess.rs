@@ -20,7 +20,7 @@ use super::tls::ServerTls;
 use super::udp::{relay_stream_datagrams, udp_destination};
 use crate::inbound::{AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
-use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_CHUNK};
+use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_BATCH, WRITE_CHUNK};
 use crate::outbound::vmess::kdf::{cmd_key, crc32_ieee, kdf, kdf16, parse_uuid};
 use crate::outbound::vmess::wire::{derive_response_keys, gcm_open, gcm_seal};
 use crate::route::Router;
@@ -229,9 +229,16 @@ where
             "aes-128-cfb with a SHA1 key is not implemented by this server",
         ));
     }
-    // `chunk stream` only tells the server how much to read per syscall
-    // (`bufio.NewChunkReader`); the frames on the wire are the same either way
-    let _ = OPT_CHUNK_STREAM;
+    // 3 and 4 seal the body; 5 (none) and 6 (zero) leave it in the clear. sing-box
+    // picks zero for a vmess outbound that sits on TLS, and without the option
+    // bit for chunked bodies the payload is the bare stream, no frames at all.
+    if !matches!(request.security, 3..=6) {
+        return Err(io::Error::other(format!(
+            "vmess security {} is not implemented by this server",
+            request.security
+        )));
+    }
+    let bare_body = matches!(request.security, 5 | 6) && request.option & OPT_CHUNK_STREAM == 0;
     let (response_key, response_iv) =
         derive_response_keys(&request.request_key, &request.request_iv);
     // The answer is four bytes -- `[responseHeader][option][0][0]` -- behind an
@@ -278,34 +285,37 @@ where
     let global_padding = request.option & OPT_GLOBAL_PADDING != 0;
     let chunk_masking = request.option & OPT_CHUNK_MASKING != 0;
     let authenticated_length = request.option & OPT_AUTHENTICATED_LENGTH != 0;
-    let server: ServerStream = ServerStream {
-        inner: Box::new(stream),
-        // what the client writes is keyed with the request keys on both sides
-        read: FrameAssembler::new(
-            request.security,
-            &request.request_key,
-            &request.request_iv,
-            &request.request_key,
-            &request.request_iv,
-            global_padding,
-            chunk_masking,
-            authenticated_length,
-            None,
-        ),
-        write: WriterState {
-            body: BodyWriter::new(
+    let framed: AnyStream = if bare_body {
+        Box::new(stream)
+    } else {
+        Box::new(ServerStream {
+            inner: Box::new(stream),
+            // what the client writes is keyed with the request keys on both sides
+            read: FrameAssembler::new(
                 request.security,
-                &response_key,
-                &response_iv,
+                &request.request_key,
+                &request.request_iv,
+                &request.request_key,
+                &request.request_iv,
                 global_padding,
                 chunk_masking,
                 authenticated_length,
+                None,
             ),
-            flushing: None,
-            consumed: 0,
-        },
+            write: WriterState {
+                body: BodyWriter::new(
+                    request.security,
+                    &response_key,
+                    &response_iv,
+                    global_padding,
+                    chunk_masking,
+                    authenticated_length,
+                ),
+                flushing: None,
+                consumed: 0,
+            },
+        })
     };
-    let framed: AnyStream = Box::new(server);
     logging::info(format_args!(
         "vmess [{}] inbound connection to {}",
         request.user.name, request.destination
@@ -528,10 +538,18 @@ impl AsyncWrite for ServerStream {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let take = buf.len().min(WRITE_CHUNK);
-            let frame = this.write.body.frame(&buf[..take])?;
+            let batch = buf.len().min(WRITE_BATCH);
+            let mut frame = Vec::with_capacity(batch + 64 * (batch / WRITE_CHUNK + 1));
+            let mut taken = 0;
+            while taken < batch {
+                let take = (batch - taken).min(WRITE_CHUNK);
+                this.write
+                    .body
+                    .frame_into(&buf[taken..taken + take], &mut frame)?;
+                taken += take;
+            }
             this.write.flushing = Some((frame, 0));
-            this.write.consumed = take;
+            this.write.consumed = taken;
         }
     }
 

@@ -178,7 +178,7 @@ def parse_cpus(spec):
 def server_cfg(case):
     inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=SERVER_PORT)
     return {
-        "log": {"level": "error"},
+        "log": {"level": os.environ.get("PROTO_LOG", "error")},
         "inbounds": [inbound],
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "route": {"final": "direct"},
@@ -188,7 +188,7 @@ def server_cfg(case):
 def client_cfg(case):
     out = dict(case["client"], tag="proxy", server="127.0.0.1", server_port=SERVER_PORT)
     return {
-        "log": {"level": "error"},
+        "log": {"level": os.environ.get("PROTO_LOG", "error")},
         "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1",
                       "listen_port": bench.PROXY_PORT}],
         "outbounds": [out],

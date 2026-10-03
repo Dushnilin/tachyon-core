@@ -81,20 +81,51 @@ impl Cipher {
     }
 
     pub(crate) fn seal(&self, counter: u64, buf: &mut Vec<u8>) -> io::Result<()> {
+        self.seal_at(counter, buf, 0)
+    }
+
+    /// Seal `buf[from..]` in place and append its tag. What comes before `from`
+    /// is left alone, so a whole run of chunks can be built in one buffer.
+    pub(crate) fn seal_at(&self, counter: u64, buf: &mut Vec<u8>, from: usize) -> io::Result<()> {
         let nonce = counter_nonce(counter);
+        let body = &mut buf[from..];
         let tag = match self {
             Cipher::Aes128(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], buf)
+                .encrypt_in_place_detached((&nonce).into(), &[], body)
                 .map_err(|_| io::Error::other("seal failed"))?,
             Cipher::Aes256(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], buf)
+                .encrypt_in_place_detached((&nonce).into(), &[], body)
                 .map_err(|_| io::Error::other("seal failed"))?,
             Cipher::ChaCha(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], buf)
+                .encrypt_in_place_detached((&nonce).into(), &[], body)
                 .map_err(|_| io::Error::other("seal failed"))?,
         };
         buf.extend_from_slice(&tag);
         Ok(())
+    }
+
+    /// Open a `[ciphertext || tag]` block where it sits: the first `len - 16`
+    /// bytes are plaintext afterwards.
+    pub(crate) fn open_slice(&self, counter: u64, block: &mut [u8]) -> io::Result<()> {
+        if block.len() < 16 {
+            return Err(io::Error::other("chunk too short"));
+        }
+        let split = block.len() - 16;
+        let (data, tag) = block.split_at_mut(split);
+        let tag = Tag::clone_from_slice(tag);
+        let nonce = counter_nonce(counter);
+        let result = match self {
+            Cipher::Aes128(cipher) => {
+                cipher.decrypt_in_place_detached((&nonce).into(), &[], data, &tag)
+            }
+            Cipher::Aes256(cipher) => {
+                cipher.decrypt_in_place_detached((&nonce).into(), &[], data, &tag)
+            }
+            Cipher::ChaCha(cipher) => {
+                cipher.decrypt_in_place_detached((&nonce).into(), &[], data, &tag)
+            }
+        };
+        result.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk auth failed"))
     }
 
     pub(crate) fn open(&self, counter: u64, buf: &mut Vec<u8>) -> io::Result<()> {

@@ -213,7 +213,8 @@ impl Handshake {
         // ChangeCipherSpec every client is told to ignore. The message header
         // goes inside the record, which is why it is framed here. The ServerHello
         // record carries 0x0303 -- the one TLS 1.3 message that is not in the
-        // clear has to look like the version it is, and the CCS stays on 0x0301.
+        // clear has to look like the version it is, and so does the CCS: Go's
+        // crypto/tls (sing-box) rejects a 0x0301 record once 1.2 is in play.
         let mut framed_hello = vec![messages::HANDSHAKE_SERVER_HELLO];
         framed_hello.extend_from_slice(&(server_hello.len() as u32).to_be_bytes()[1..]);
         framed_hello.extend_from_slice(&server_hello);
@@ -228,7 +229,7 @@ impl Handshake {
             .write_all(&record::plaintext_record(
                 ContentType::ChangeCipherSpec,
                 &[0x01],
-                record::VERSION_1_2,
+                record::VERSION_1_3,
             )?)
             .await?;
         stream.flush().await

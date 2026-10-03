@@ -161,6 +161,7 @@ impl Vmess {
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     let users = Arc::clone(&self.users);
                     let replay = Arc::clone(&self.replay);
                     let tag = self.tag.clone();

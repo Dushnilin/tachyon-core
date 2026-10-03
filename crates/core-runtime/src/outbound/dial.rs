@@ -487,14 +487,18 @@ pub async fn connect_tcp(host: &str, port: u16, options: &DialOptions) -> io::Re
 /// One address, one connect: the plain async connect when there is nothing to
 /// set on the socket, and the socket-options path when there is.
 async fn connect_one(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpStream> {
-    if options.is_empty() {
-        return match tokio::time::timeout(options.connect_timeout(), TcpStream::connect(addr)).await
-        {
-            Ok(result) => result,
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
-        };
-    }
-    dial_tcp(addr, options).await
+    let stream = if options.is_empty() {
+        match tokio::time::timeout(options.connect_timeout(), TcpStream::connect(addr)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+        }
+    } else {
+        dial_tcp(addr, options).await?
+    };
+    // the reference sets TCP_NODELAY on every dial; without it a small header
+    // write waits out the peer's delayed ACK (a 40 ms stall per connection)
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 /// Wait for a non-blocking socket whose handshake `dial_tcp` already started:

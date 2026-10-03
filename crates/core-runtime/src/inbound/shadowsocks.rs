@@ -410,7 +410,7 @@ struct ChunkReader {
 const READ_BUF: usize = 33 * 1024;
 /// Most plaintext one write turns into a frame: a couple of legacy chunks, one
 /// syscall.
-const WRITE_FRAME: usize = 32 * 1024;
+const WRITE_FRAME: usize = 64 * 1024;
 
 impl AsyncRead for ChunkReader {
     fn poll_read(

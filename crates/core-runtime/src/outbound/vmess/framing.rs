@@ -22,9 +22,9 @@ use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
 
 pub(crate) const WRITE_CHUNK: usize = 15000;
-/// How much of one `write` is framed into one buffer: two full chunks, which
+/// How much of one `write` is framed into one buffer: four full chunks, which
 /// is what the relay hands over at a time.
-pub(crate) const WRITE_BATCH: usize = 2 * WRITE_CHUNK;
+pub(crate) const WRITE_BATCH: usize = 4 * WRITE_CHUNK;
 const CIPHER_OVERHEAD: usize = 16;
 const MAX_PADDING: u16 = 64;
 

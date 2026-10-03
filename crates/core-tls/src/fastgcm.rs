@@ -11,7 +11,7 @@
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Tag};
 
-pub(crate) enum Gcm {
+pub enum Gcm {
     #[cfg(target_arch = "x86_64")]
     Ni(Box<ni::Ni>),
     Soft128(Box<Aes128Gcm>),
@@ -20,7 +20,7 @@ pub(crate) enum Gcm {
 
 impl Gcm {
     /// `key` is 16 or 32 bytes; the callers derive it with a fixed length.
-    pub(crate) fn new(key: &[u8]) -> Gcm {
+    pub fn new(key: &[u8]) -> Gcm {
         #[cfg(target_arch = "x86_64")]
         if ni::available() {
             return Gcm::Ni(Box::new(ni::Ni::new(key)));
@@ -33,7 +33,7 @@ impl Gcm {
     }
 
     /// Encrypt `buf` in place and return the tag.
-    pub(crate) fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+    pub fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         match self {
             #[cfg(target_arch = "x86_64")]
             Gcm::Ni(ni) => ni.seal(nonce, aad, buf),
@@ -50,13 +50,7 @@ impl Gcm {
 
     /// Decrypt `buf` in place. On a bad tag nothing of the plaintext is left
     /// in `buf` and the answer is `false`.
-    pub(crate) fn open(
-        &self,
-        nonce: &[u8; 12],
-        aad: &[u8],
-        buf: &mut [u8],
-        tag: &[u8; 16],
-    ) -> bool {
+    pub fn open(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
         match self {
             #[cfg(target_arch = "x86_64")]
             Gcm::Ni(ni) => ni.open(nonce, aad, buf, tag),
@@ -78,7 +72,7 @@ mod ni {
 
     /// Round keys and the powers of H. `h[i]` is H^(i+1) in the byte-reversed
     /// domain the multiplication works in.
-    pub(crate) struct Ni {
+    pub struct Ni {
         rk: [__m128i; 16],
         nr: usize,
         h: [__m128i; 8],

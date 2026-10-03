@@ -375,7 +375,13 @@ where
                     relay_tracked(&mut client, &mut upstream, tracker).await?;
                 }
                 None => {
-                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                    tokio::io::copy_bidirectional_with_sizes(
+                        &mut client,
+                        &mut upstream,
+                        RELAY_BUF,
+                        RELAY_BUF,
+                    )
+                    .await?;
                 }
             }
             Ok(())
@@ -385,8 +391,8 @@ where
                 writer.write_chunk(prefix).await?;
             }
             let (mut client_read, mut client_write) = tokio::io::split(client);
-            let mut up_buf = vec![0u8; 0x3FFF];
-            let mut down_buf = vec![0u8; 0x3FFF];
+            let mut up_buf = vec![0u8; RELAY_BUF];
+            let mut down_buf = vec![0u8; RELAY_BUF];
             let up = async {
                 loop {
                     let n = client_read.read(&mut up_buf).await?;
@@ -437,7 +443,66 @@ fn closed_by_api() -> io::Error {
     io::Error::other("connection closed by clash api")
 }
 
+/// Each direction of a userspace relay moves up to this much per read. The
+/// 8 KiB tokio picks by default means eight times the syscalls and, for the
+/// shadowsocks 2022 chunks (up to 64 KiB), a frame cut into pieces.
+const RELAY_BUF: usize = 64 * 1024;
+
+/// The client side of a relay, counting what crosses it for the connection
+/// view: bytes read from it are upload, bytes written to it are download.
+struct Counted<'a, S> {
+    inner: &'a mut S,
+    tracker: &'a clash_state::ConnHandle,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            self.tracker
+                .add_upload((buf.filled().len() - before) as u64);
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut *self.inner).poll_write(cx, data);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            self.tracker.add_download(*n as u64);
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Counted bidirectional relay that aborts when the API closes the entry.
+///
+/// Both directions are driven by one poll-based copy, so a write that cannot
+/// finish yet never holds up the other direction.
 async fn relay_tracked<S, U>(
     client: &mut S,
     upstream: &mut U,
@@ -448,40 +513,19 @@ where
     U: AsyncRead + AsyncWrite + Unpin,
 {
     let signal = tracker.close_signal();
-    let mut up_buf = vec![0u8; 32 * 1024];
-    let mut down_buf = vec![0u8; 32 * 1024];
-    let mut up_done = false;
-    let mut down_done = false;
-    while !(up_done && down_done) {
-        tokio::select! {
-            biased;
-            _ = signal.wait() => return Err(closed_by_api()),
-            read = client.read(&mut down_buf), if !down_done => match read {
-                // half-close: like copy_bidirectional, tell the peer we are done
-                Ok(0) => {
-                    down_done = true;
-                    upstream.shutdown().await?;
-                }
-                Ok(n) => {
-                    upstream.write_all(&down_buf[..n]).await?;
-                    tracker.add_upload(n as u64);
-                }
-                Err(e) => return Err(e),
-            },
-            read = upstream.read(&mut up_buf), if !up_done => match read {
-                Ok(0) => {
-                    up_done = true;
-                    client.shutdown().await?;
-                }
-                Ok(n) => {
-                    client.write_all(&up_buf[..n]).await?;
-                    tracker.add_download(n as u64);
-                }
-                Err(e) => return Err(e),
-            },
-        }
+    let mut counted = Counted {
+        inner: client,
+        tracker,
+    };
+    tokio::select! {
+        result = tokio::io::copy_bidirectional_with_sizes(
+            &mut counted,
+            upstream,
+            RELAY_BUF,
+            RELAY_BUF,
+        ) => result.map(|_| ()),
+        _ = signal.wait() => Err(closed_by_api()),
     }
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

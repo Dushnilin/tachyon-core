@@ -12,8 +12,8 @@ use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 /// It is only allocated when the first byte of the response is about to be read.
 const READ_BUF: usize = 33 * 1024;
 /// Largest write buffer a connection keeps between writes. The relay hands over
-/// 32 KiB at a time, which seals to a little more than that.
-const WRITE_BUF_KEEP: usize = 40 * 1024;
+/// 64 KiB at a time, which seals to a little more than that.
+const WRITE_BUF_KEEP: usize = 80 * 1024;
 
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {

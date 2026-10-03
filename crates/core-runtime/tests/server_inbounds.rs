@@ -704,6 +704,21 @@ async fn vmess_server_carries_our_own_client_traffic() {
     assert_eq!(String::from_utf8_lossy(&got), "through-the-vmess-server");
 }
 
+/// sing-box puts `zero` on a vmess outbound that sits on TLS: the body is the
+/// bare stream, no frames. The server used to read it as chunks and wait for the
+/// rest of a frame that was never coming.
+#[tokio::test]
+async fn vmess_server_carries_a_zero_security_body() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut client = vmess_client(uuid);
+    client["security"] = json!("zero");
+    let got = through_our_own_client(vmess_server(uuid), client, b"bare body")
+        .await
+        .expect("vmess zero round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "bare body");
+}
+
 #[tokio::test]
 async fn vmess_server_refuses_an_unknown_uuid() {
     let _guard = test_guard().await;

@@ -23,7 +23,7 @@ use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::transport::Transport;
 use crate::outbound::vmess::framing::{
-    BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_CHUNK,
+    BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_BATCH, WRITE_CHUNK,
 };
 use crate::outbound::vmess::wire::{
     derive_response_keys, legacy_header_hash, legacy_response_keys, legacy_time_iv,
@@ -546,10 +546,20 @@ impl AsyncWrite for VmessStream {
                 if buf.is_empty() {
                     return Poll::Ready(Ok(0));
                 }
-                let take = buf.len().min(WRITE_CHUNK);
-                let frame = state.body.frame(&buf[..take])?;
+                // everything the caller handed over, up to one batch, leaves in
+                // one frame buffer and one write
+                let batch = buf.len().min(WRITE_BATCH);
+                let mut frame = Vec::with_capacity(batch + 64 * (batch / WRITE_CHUNK + 1));
+                let mut taken = 0;
+                while taken < batch {
+                    let take = (batch - taken).min(WRITE_CHUNK);
+                    state
+                        .body
+                        .frame_into(&buf[taken..taken + take], &mut frame)?;
+                    taken += take;
+                }
                 state.flushing = Some((frame, 0));
-                state.consumed = take;
+                state.consumed = taken;
             }
         };
         Pin::new(&mut this.inner).poll_write(cx, buf)

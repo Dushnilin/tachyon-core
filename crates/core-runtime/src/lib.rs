@@ -203,10 +203,15 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
             .unwrap_or_default()
             .to_string();
         match ty {
-            "mixed" => {
-                let inbound = inbound::mixed::Mixed::bind(obj, Arc::clone(&router))
+            "mixed" | "socks" | "http" => {
+                let flavor = match ty {
+                    "socks" => inbound::mixed::Flavor::Socks,
+                    "http" => inbound::mixed::Flavor::Http,
+                    _ => inbound::mixed::Flavor::Mixed,
+                };
+                let inbound = inbound::mixed::Mixed::bind_as(obj, Arc::clone(&router), flavor)
                     .await
-                    .with_context(|| format!("inbounds[{i}]: mixed"))?;
+                    .with_context(|| format!("inbounds[{i}]: {ty}"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));

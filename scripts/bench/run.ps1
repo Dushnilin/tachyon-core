@@ -37,7 +37,7 @@ if ($Quick) {
     if (Test-Path "$work\sing-box-lx") { $bins += @("--bin", "sing-box-lx=/bench/sing-box-lx") }
 }
 
-docker run --rm --ulimit nofile=1048576:1048576 `
+docker run --rm --ulimit nofile=1048576:1048576 -e TOKIO_WORKER_THREADS `
     -v "${work}:/bench" python:3 `
     sh -c "chmod +x /bench/tachyon-core /bench/sing-box* && python3 /bench/bench.py --proxy-cpus $ProxyCpus $extra $($bins -join ' ') --out /bench/result.json"
 Write-Host "result: $work\result.json"

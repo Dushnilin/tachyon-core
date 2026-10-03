@@ -349,10 +349,19 @@ where
             #[cfg(target_os = "linux")]
             if let Some(tracker) = tracker
                 && let Some(client_tcp) = client_raw_tcp(&client)
-                && let Some(upstream_tcp) =
-                    (&*upstream as &dyn std::any::Any).downcast_ref::<TcpStream>()
             {
-                return relay::relay(client_tcp, upstream_tcp, prefix, tracker).await;
+                let up = &*upstream as &dyn std::any::Any;
+                if let Some(upstream_tcp) = up.downcast_ref::<TcpStream>() {
+                    return relay::relay(client_tcp, upstream_tcp, prefix, tracker, false).await;
+                }
+                // a plain vless client: the kernel moves the bytes once the
+                // relay has eaten the two-byte answer head
+                if let Some(upstream_tcp) = up
+                    .downcast_ref::<crate::outbound::secure::VlessStream>()
+                    .and_then(|v| v.raw_pending())
+                {
+                    return relay::relay(client_tcp, upstream_tcp, prefix, tracker, true).await;
+                }
             }
 
             if !prefix.is_empty() {

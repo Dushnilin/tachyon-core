@@ -116,8 +116,43 @@ async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Consume a vless response head (`[version][addonsLen][addons]`) off a
+/// non-blocking socket, reading exactly its bytes and no more so the rest stays
+/// for the splice.
+async fn skip_vless_head(from: &TcpStream) -> io::Result<()> {
+    async fn fill(from: &TcpStream, buf: &mut [u8]) -> io::Result<()> {
+        let mut got = 0;
+        while got < buf.len() {
+            let n = from
+                .async_io(Interest::READABLE, || from.try_read(&mut buf[got..]))
+                .await?;
+            if n == 0 {
+                return Err(io::Error::other("vless: connection closed before response"));
+            }
+            got += n;
+        }
+        Ok(())
+    }
+    let mut head = [0u8; 2];
+    fill(from, &mut head).await?;
+    if head[0] != 0x00 {
+        return Err(io::Error::other("bad vless response version"));
+    }
+    let mut addons = vec![0u8; usize::from(head[1])];
+    fill(from, &mut addons).await
+}
+
 /// Move bytes `from` -> `to` until `from` reaches EOF, then half-close `to`.
-async fn one_way(from: &TcpStream, to: &TcpStream, count: impl Fn(u64)) -> io::Result<()> {
+/// With `head` the source first owes a vless response head, which is dropped.
+async fn one_way(
+    from: &TcpStream,
+    to: &TcpStream,
+    head: bool,
+    count: impl Fn(u64),
+) -> io::Result<()> {
+    if head {
+        skip_vless_head(from).await?;
+    }
     // an idle connection takes no pipe: wait for the first byte
     from.readable().await?;
     let Ok(mut pipe) = Pipe::new() else {
@@ -179,12 +214,14 @@ async fn one_way_buffered(from: &TcpStream, to: &TcpStream, count: impl Fn(u64))
 /// Relay both directions of an established connection until both sides are
 /// done, counting into the Clash view as the userspace loop does and honouring
 /// `DELETE /connections/{id}`. `prefix` is what the sniffer already read off the
-/// client: it goes upstream first.
+/// client: it goes upstream first. `vless_head` says the upstream still owes a
+/// vless response head.
 pub(crate) async fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
     prefix: &[u8],
     tracker: &ConnHandle,
+    vless_head: bool,
 ) -> io::Result<()> {
     if !prefix.is_empty() {
         write_all(upstream, prefix).await?;
@@ -193,8 +230,8 @@ pub(crate) async fn relay(
     let signal = tracker.close_signal();
     let both = async {
         tokio::try_join!(
-            one_way(client, upstream, |n| tracker.add_upload(n)),
-            one_way(upstream, client, |n| tracker.add_download(n)),
+            one_way(client, upstream, false, |n| tracker.add_upload(n)),
+            one_way(upstream, client, vless_head, |n| tracker.add_download(n)),
         )
         .map(|_| ())
     };

@@ -8,8 +8,23 @@
 //! architectures, a CPU without the instructions) goes to RustCrypto's
 //! `aes-gcm`, which is the oracle the tests compare against.
 
-use aes_gcm::aead::AeadInPlace;
+// The crate warns on casts, `panic!` and friends for the protocol code; here
+// the casts are lengths and counters that are range-checked by construction and
+// the panics are key-length contracts.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
+use aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Tag};
+
+#[cfg(feature = "alloc")]
+use alloc::boxed::Box;
 
 pub enum Gcm {
     #[cfg(target_arch = "x86_64")]
@@ -79,10 +94,23 @@ mod ni {
     }
 
     pub(super) fn available() -> bool {
-        is_x86_feature_detected!("aes")
-            && is_x86_feature_detected!("pclmulqdq")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
+        #[cfg(any(feature = "std", test))]
+        {
+            std::is_x86_feature_detected!("aes")
+                && std::is_x86_feature_detected!("pclmulqdq")
+                && std::is_x86_feature_detected!("sse4.1")
+                && std::is_x86_feature_detected!("ssse3")
+        }
+        // without `std` there is no probe: only what the build already assumes
+        #[cfg(not(any(feature = "std", test)))]
+        {
+            cfg!(all(
+                target_feature = "aes",
+                target_feature = "pclmulqdq",
+                target_feature = "sse4.1",
+                target_feature = "ssse3"
+            ))
+        }
     }
 
     /// Unreduced 256-bit sum of carry-less products: low, middle, high.
@@ -518,6 +546,7 @@ mod ni {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len() / 2)

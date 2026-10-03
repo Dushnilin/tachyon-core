@@ -5,7 +5,7 @@
 //! builds for MIPS softfloat targets where `ring`/`aws-lc-rs` do not exist.
 
 pub mod client;
-pub mod fastgcm;
+pub use core_crypto::fastgcm;
 pub mod fingerprints;
 pub mod hello;
 pub mod keyshare;

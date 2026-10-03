@@ -37,6 +37,12 @@ compile_error!("Rustls currently does not support alloc-less environments");
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+// `std` only for the CPU feature probe in `fastgcm`; the tests also want its
+// macros.
+#[cfg(any(feature = "std", test))]
+#[cfg_attr(test, macro_use)]
+extern crate std;
+
 #[cfg(feature = "alloc")]
 use alloc::sync::Arc;
 
@@ -359,6 +365,7 @@ static ALL_CIPHER_SUITES: &[SupportedCipherSuite] = misc::const_concat_slices!(
 );
 
 mod aead;
+pub mod fastgcm;
 mod hash;
 mod hmac;
 mod kx;

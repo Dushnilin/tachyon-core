@@ -20,9 +20,18 @@ use tokio::net::TcpStream;
 
 use crate::clash_state::ConnHandle;
 
-/// Bytes asked from one splice. A pipe holds at most its capacity, so this is
-/// also the size we grow the pipe to.
-const CHUNK: usize = 256 * 1024;
+/// Largest bytes asked from one splice, and the size a busy pipe grows to. One
+/// stream needs this much in flight to keep both sockets fed: 256 KiB measured
+/// 15-21 Gbit/s on a single stream, 1 MiB measured 51.
+const CHUNK: usize = 1024 * 1024;
+/// What a fresh pipe holds. Pipe capacity counts against the per-user
+/// `pipe-user-pages-soft` budget whether or not it is full, so only a direction
+/// that actually fills it gets the big one.
+const PIPE_DEFAULT: usize = 64 * 1024;
+/// A splice at least this big counts towards a pipe growing, and this many in a
+/// row do it.
+const BUSY_BYTES: usize = 16 * 1024;
+const BUSY_RUN: u32 = 4;
 /// Chunk of the buffered fallback, deliberately small: it only runs when fds
 /// are scarce, and so is memory.
 const FALLBACK_CHUNK: usize = 16 * 1024;
@@ -31,6 +40,7 @@ const FALLBACK_CHUNK: usize = 16 * 1024;
 struct Pipe {
     read: RawFd,
     write: RawFd,
+    size: usize,
 }
 
 impl Pipe {
@@ -39,14 +49,22 @@ impl Pipe {
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let pipe = Self {
+        Ok(Self {
             read: fds[0],
             write: fds[1],
-        };
-        // best effort: the default 64 KiB pipe works, it just needs more
-        // round trips. Pages are only allocated while data is in flight.
-        unsafe { libc::fcntl(pipe.write, libc::F_SETPIPE_SZ, CHUNK as libc::c_int) };
-        Ok(pipe)
+            size: PIPE_DEFAULT,
+        })
+    }
+
+    /// Called with the pipe empty once the flow has shown itself to be bulk. Best
+    /// effort: the kernel refuses past the budget, and then the small pipe just
+    /// keeps needing more round trips.
+    fn grow(&mut self) {
+        if self.size >= CHUNK {
+            return;
+        }
+        let r = unsafe { libc::fcntl(self.write, libc::F_SETPIPE_SZ, CHUNK as libc::c_int) };
+        self.size = if r < 0 { CHUNK } else { r as usize };
     }
 }
 
@@ -102,10 +120,11 @@ async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
 async fn one_way(from: &TcpStream, to: &TcpStream, count: impl Fn(u64)) -> io::Result<()> {
     // an idle connection takes no pipe: wait for the first byte
     from.readable().await?;
-    let Ok(pipe) = Pipe::new() else {
+    let Ok(mut pipe) = Pipe::new() else {
         return one_way_buffered(from, to, count).await;
     };
     let (from_fd, to_fd) = (from.as_raw_fd(), to.as_raw_fd());
+    let mut busy = 0u32;
     loop {
         let n = from
             .async_io(Interest::READABLE, || splice(from_fd, pipe.write, CHUNK))
@@ -127,6 +146,17 @@ async fn one_way(from: &TcpStream, to: &TcpStream, count: impl Fn(u64)) -> io::R
             left -= m;
         }
         count(n as u64);
+        // A splice cannot be told to "fill the pipe": its 16 slots take whatever
+        // page fragments the socket holds, so n rarely reaches the capacity. A
+        // run of big ones is the sign of a bulk flow, and that one gets room.
+        if n >= BUSY_BYTES {
+            busy += 1;
+            if busy == BUSY_RUN {
+                pipe.grow();
+            }
+        } else {
+            busy = 0;
+        }
     }
 }
 

@@ -26,7 +26,8 @@ pub(super) async fn connect(
     authority: &str,
     secure: bool,
 ) -> io::Result<AnyStream> {
-    let (send_request, connection) = h2::client::handshake(stream)
+    let (send_request, connection) = super::h2io::client_builder()
+        .handshake(stream)
         .await
         .map_err(|e| io::Error::other(format!("grpc: h2 handshake: {e}")))?;
     let conn_task = tokio::spawn(async move {

@@ -3,6 +3,7 @@ pub mod clash_api;
 pub mod clash_mode;
 pub mod clash_state;
 pub mod dns;
+pub(crate) mod fastgcm;
 pub mod http_client;
 pub mod inbound;
 pub mod logging;

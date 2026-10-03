@@ -1,9 +1,9 @@
 use base64::Engine as _;
 use std::io;
 
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Tag};
+use crate::fastgcm::Gcm;
 use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use hkdf::Hkdf;
 use md5::Digest;
 use md5::Md5;
@@ -60,20 +60,17 @@ impl Method {
 }
 
 pub(crate) enum Cipher {
-    Aes128(Box<Aes128Gcm>),
-    Aes256(Box<Aes256Gcm>),
+    Aes(Box<Gcm>),
     ChaCha(Box<ChaCha20Poly1305>),
 }
 
 impl Cipher {
     pub(crate) fn new(method: Method, key: &[u8]) -> Cipher {
         match method {
-            Method::Aes128Gcm | Method::Blake3Aes128Gcm => {
-                Cipher::Aes128(Box::new(Aes128Gcm::new(key.into())))
-            }
-            Method::Aes256Gcm | Method::Blake3Aes256Gcm => {
-                Cipher::Aes256(Box::new(Aes256Gcm::new(key.into())))
-            }
+            Method::Aes128Gcm
+            | Method::Blake3Aes128Gcm
+            | Method::Aes256Gcm
+            | Method::Blake3Aes256Gcm => Cipher::Aes(Box::new(Gcm::new(key))),
             Method::ChaCha20Poly1305 | Method::Blake3ChaCha20Poly1305 => {
                 Cipher::ChaCha(Box::new(ChaCha20Poly1305::new(key.into())))
             }
@@ -89,16 +86,12 @@ impl Cipher {
     pub(crate) fn seal_at(&self, counter: u64, buf: &mut Vec<u8>, from: usize) -> io::Result<()> {
         let nonce = counter_nonce(counter);
         let body = &mut buf[from..];
-        let tag = match self {
-            Cipher::Aes128(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], body)
-                .map_err(|_| io::Error::other("seal failed"))?,
-            Cipher::Aes256(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], body)
-                .map_err(|_| io::Error::other("seal failed"))?,
+        let tag: [u8; 16] = match self {
+            Cipher::Aes(cipher) => cipher.seal(&nonce, &[], body),
             Cipher::ChaCha(cipher) => cipher
                 .encrypt_in_place_detached((&nonce).into(), &[], body)
-                .map_err(|_| io::Error::other("seal failed"))?,
+                .map_err(|_| io::Error::other("seal failed"))?
+                .into(),
         };
         buf.extend_from_slice(&tag);
         Ok(())
@@ -112,20 +105,22 @@ impl Cipher {
         }
         let split = block.len() - 16;
         let (data, tag) = block.split_at_mut(split);
-        let tag = Tag::clone_from_slice(tag);
+        let tag: [u8; 16] = (&*tag).try_into().expect("tag is 16 bytes");
         let nonce = counter_nonce(counter);
-        let result = match self {
-            Cipher::Aes128(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], data, &tag)
-            }
-            Cipher::Aes256(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], data, &tag)
-            }
-            Cipher::ChaCha(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], data, &tag)
-            }
+        let ok = match self {
+            Cipher::Aes(cipher) => cipher.open(&nonce, &[], data, &tag),
+            Cipher::ChaCha(cipher) => cipher
+                .decrypt_in_place_detached((&nonce).into(), &[], data, (&tag).into())
+                .is_ok(),
         };
-        result.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk auth failed"))
+        if ok {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk auth failed",
+            ))
+        }
     }
 
     pub(crate) fn open(&self, counter: u64, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -137,19 +132,20 @@ impl Cipher {
         tag.copy_from_slice(&buf[split..]);
         buf.truncate(split);
         let nonce = counter_nonce(counter);
-        let tag = Tag::from(tag);
-        let result = match self {
-            Cipher::Aes128(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], buf, &tag)
-            }
-            Cipher::Aes256(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], buf, &tag)
-            }
-            Cipher::ChaCha(cipher) => {
-                cipher.decrypt_in_place_detached((&nonce).into(), &[], buf, &tag)
-            }
+        let ok = match self {
+            Cipher::Aes(cipher) => cipher.open(&nonce, &[], buf, &tag),
+            Cipher::ChaCha(cipher) => cipher
+                .decrypt_in_place_detached((&nonce).into(), &[], buf, (&tag).into())
+                .is_ok(),
         };
-        result.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk auth failed"))
+        if ok {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk auth failed",
+            ))
+        }
     }
 }
 

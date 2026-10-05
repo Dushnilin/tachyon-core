@@ -182,7 +182,9 @@ async fn vision_frames_the_payload_behind_the_uuid() {
         "the vision prefix repeats the uuid"
     );
     let frame = &seen[start + 16..];
-    assert_eq!(frame[0], 1, "commandPaddingEnd");
+    // the first frame of the padding phase is Continue: End means "the framing
+    // stops here", so a client would read this header as payload
+    assert_eq!(frame[0], 0, "commandPaddingContinue");
     let content = u16::from_be_bytes([frame[1], frame[2]]) as usize;
     assert_eq!(content, payload.len(), "the whole write is one block");
     assert_eq!(&frame[5..5 + content], &payload[..]);

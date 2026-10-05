@@ -3191,6 +3191,44 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
     allowed.extend_from_slice(own);
     allowed.extend(LEGACY_INBOUND_FIELDS);
     reject_unknown_fields(obj, &allowed, &at)?;
+    // `transport` and `multiplex` are in the allowed lists because the reference
+    // has them on a server inbound, and a migrated xray config is mostly those
+    // two fields. `ws` and `httpupgrade` are answered by
+    // `core_runtime::inbound::transport`; the rest of the transport types and
+    // every server-side mux are read by nothing on this side, so a listener
+    // started with one binds the port, answers nothing, and the failure arrives
+    // at the first connection instead of at startup. Refuse those instead, and
+    // say where they do work.
+    for (field, where_works) in [
+        (
+            "transport",
+            "move it to the outbound (outbounds[].transport speaks ws, grpc, \
+             xhttp and httpupgrade)",
+        ),
+        (
+            "multiplex",
+            "run the server side with the reference until this side catches up",
+        ),
+    ] {
+        let Some(value) = obj.get(field).filter(|value| !prunes_value(value)) else {
+            continue;
+        };
+        let kind = value
+            .get("type")
+            .or_else(|| value.get("protocol"))
+            .and_then(Value::as_str)
+            .unwrap_or("enabled");
+        if field == "transport" && matches!(kind, "ws" | "httpupgrade") {
+            // these two are served, by `core_runtime::inbound::transport`: a
+            // websocket handshake and an httpupgrade 101, then the protocol bytes
+            continue;
+        }
+        return Err(format!(
+            "{at}.{field}: server-side {field} is not implemented yet, so nothing \
+             would read this field and the listener would serve nothing: \
+             {where_works} (got {kind})"
+        ));
+    }
     Ok(())
 }
 
@@ -10128,6 +10166,78 @@ mod tests {
                 "network_namespaces": [section.clone()],
             }));
             assert!(result.is_ok(), "{section} should pass: {:?}", result.err());
+        }
+    }
+
+    #[test]
+    fn a_server_inbound_with_a_transport_is_refused_not_ignored() {
+        // measured on the router: a vless+ws inbound started, bound its port,
+        // and then every client hung, because nothing on this side reads
+        // `transport`. A migrated xray server config is mostly that field, so
+        // it has to fail at startup instead.
+        for ty in ["vless", "vmess", "trojan"] {
+            let cfg = json!({
+                "inbounds": [{
+                    "type": ty,
+                    "listen": "127.0.0.1",
+                    "listen_port": 18443,
+                    "users": [],
+                    "transport": {"type": "quic", "path": "/bench"},
+                }],
+                "outbounds": [],
+            });
+            let err = validate(&cfg).expect_err("quic is not runnable on an inbound");
+            assert!(
+                err.contains("server-side transport is not implemented yet"),
+                "{ty}: {err}"
+            );
+            assert!(err.contains("outbounds[].transport"), "{ty}: {err}");
+            // ws and httpupgrade are served now, on the inbound
+            for ok_ty in ["ws", "httpupgrade"] {
+                let served = json!({
+                    "inbounds": [{
+                        "type": ty,
+                        "listen": "127.0.0.1",
+                        "listen_port": 18443,
+                        "users": [],
+                        "transport": {"type": ok_ty, "path": "/bench"},
+                    }],
+                    "outbounds": [],
+                });
+                assert!(
+                    validate(&served).is_ok(),
+                    "{ty}/{ok_ty}: {:?}",
+                    validate(&served).err()
+                );
+            }
+            // and the field is still legal where it is spoken
+            let ok = json!({
+                "outbounds": [{
+                    "type": "vless",
+                    "server": "127.0.0.1",
+                    "server_port": 443,
+                    "uuid": "b7f8c2d1-4a3e-4f5b-9c6d-8e1a2b3c4d5e",
+                    "transport": {"type": "ws", "path": "/bench"},
+                }],
+            });
+            assert!(validate(&ok).is_ok(), "{ty} outbound: {:?}", validate(&ok).err());
+            // same class, same reason: a server-side mux is accepted by the
+            // reference and ignored here
+            let mux = json!({
+                "inbounds": [{
+                    "type": "vless",
+                    "listen": "127.0.0.1",
+                    "listen_port": 18443,
+                    "users": [],
+                    "multiplex": {"enabled": true, "protocol": "h2mux"},
+                }],
+                "outbounds": [],
+            });
+            assert!(
+                validate(&mux)
+                    .expect_err("a mux server is not runnable either")
+                    .contains("server-side multiplex is not implemented yet")
+            );
         }
     }
 

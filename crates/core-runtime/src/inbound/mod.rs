@@ -20,6 +20,7 @@ pub mod redirect;
 pub mod shadowsocks;
 pub mod tls;
 pub mod tproxy;
+pub(crate) mod transport;
 pub(crate) mod udp;
 pub mod vmess;
 

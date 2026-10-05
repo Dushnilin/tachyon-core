@@ -11,8 +11,7 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use sha1::{Digest, Sha1};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// RFC 6455 §1.3 magic string the accept value is derived from.
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -53,6 +52,11 @@ const fn http_text(status: u16) -> &'static str {
 
 impl Rejection {
     /// The whole response, as `sagernet/ws` writes it after hijacking:
+    /// Why the handshake was refused, for a log line.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
     /// a plain-text head with the length of the reason, nothing else.
     pub fn response(&self) -> String {
         let reason = self.reason;
@@ -161,14 +165,17 @@ fn text_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Send the handshake for `client_key` and switch this stream to the socket.
-pub async fn accept(stream: &mut TcpStream, client_key: &str) -> io::Result<()> {
+///
+/// Generic over the writer because a transport listener answers over whatever it
+/// was handed: a bare socket for the Clash API, a TLS stream under a vless inbound.
+pub async fn accept<W: AsyncWrite + Unpin>(stream: &mut W, client_key: &str) -> io::Result<()> {
     stream
         .write_all(handshake_head(client_key).as_bytes())
         .await
 }
 
 /// Write one text frame carrying `payload`.
-pub async fn write_text(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
+pub async fn write_text<W: AsyncWrite + Unpin>(stream: &mut W, payload: &[u8]) -> io::Result<()> {
     stream.write_all(&text_frame(payload)).await
 }
 

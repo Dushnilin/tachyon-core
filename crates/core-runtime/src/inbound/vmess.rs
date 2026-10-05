@@ -17,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tokio::net::TcpListener;
 
 use super::tls::ServerTls;
+use super::transport::Transport;
 use super::udp::{relay_stream_datagrams, udp_destination};
 use crate::inbound::{AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
@@ -96,6 +97,7 @@ pub struct Vmess {
     users: Arc<Vec<User>>,
     replay: Arc<Replay>,
     tls: Option<Arc<ServerTls>>,
+    transport: Option<Arc<Transport>>,
 }
 
 impl Vmess {
@@ -150,6 +152,7 @@ impl Vmess {
             users: Arc::new(users),
             replay: Arc::new(Replay::default()),
             tls: ServerTls::from_inbound(obj, &at)?,
+            transport: Transport::from_inbound(obj, &at)?.map(Arc::new),
         })
     }
 
@@ -167,16 +170,21 @@ impl Vmess {
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
                     let tls = self.tls.clone();
+                    let transport = self.transport.clone();
                     tokio::spawn(async move {
                         let local = stream.local_addr().unwrap_or(peer);
                         let result = match tls {
                             Some(tls) => match tls.accept(stream).await {
                                 Ok(stream) => {
-                                    handle(stream, peer, local, users, replay, tag, router).await
+                                    wrapped(stream, transport, peer, local, users, replay, tag, router)
+                                        .await
                                 }
                                 Err(err) => Err(err),
                             },
-                            None => handle(stream, peer, local, users, replay, tag, router).await,
+                            None => {
+                                wrapped(stream, transport, peer, local, users, replay, tag, router)
+                                    .await
+                            }
                         };
                         if let Err(err) = result {
                             logging::debug(format_args!("vmess {peer}: {err}"));
@@ -187,6 +195,35 @@ impl Vmess {
                     logging::debug(format_args!("vmess accept: {err}"));
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// Take the transport off the front of the connection, if the listener has one,
+/// and hand what is left to the protocol. The order is the reference's: TLS first
+/// (the handshake is inside it), then the transport, then the protocol header.
+#[allow(clippy::too_many_arguments)]
+async fn wrapped<S>(
+    stream: S,
+    transport: Option<Arc<Transport>>,
+    peer: SocketAddr,
+    local: SocketAddr,
+    users: Arc<Vec<User>>,
+    replay: Arc<Replay>,
+    tag: String,
+    router: Arc<Router>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport {
+        None => handle(stream, peer, local, users, replay, tag, router).await,
+        Some(transport) => {
+            let stream: AnyStream = Box::new(stream);
+            match transport.accept(stream).await {
+                Ok(stream) => handle(stream, peer, local, users, replay, tag, router).await,
+                Err(err) => Err(io::Error::other(err)),
             }
         }
     }
@@ -312,6 +349,7 @@ where
                     authenticated_length,
                 ),
                 flushing: None,
+                spare: Vec::new(),
                 consumed: 0,
             },
         })
@@ -497,6 +535,9 @@ struct WriterState {
     body: BodyWriter,
     /// a frame being drained onto the socket, and how far it has got
     flushing: Option<(Vec<u8>, usize)>,
+    /// the frame buffer between writes: a batch is 60 KiB, so a fresh one per
+    /// `poll_write` is an allocation and a cold page fault every 60 KiB of stream
+    spare: Vec<u8>,
     consumed: usize,
 }
 
@@ -532,14 +573,17 @@ impl AsyncWrite for ServerStream {
                     }
                     *off += n;
                 }
-                this.write.flushing = None;
+                if let Some((frame, _)) = this.write.flushing.take() {
+                    this.write.spare = frame;
+                }
                 return Poll::Ready(Ok(this.write.consumed));
             }
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
             let batch = buf.len().min(WRITE_BATCH);
-            let mut frame = Vec::with_capacity(batch + 64 * (batch / WRITE_CHUNK + 1));
+            let mut frame = std::mem::take(&mut this.write.spare);
+            frame.clear();
             let mut taken = 0;
             while taken < batch {
                 let take = (batch - taken).min(WRITE_CHUNK);

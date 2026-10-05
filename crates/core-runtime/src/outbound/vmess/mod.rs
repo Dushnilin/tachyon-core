@@ -315,6 +315,7 @@ impl Vmess {
                         self.authenticated_length,
                     ),
                     flushing: None,
+                    spare: Vec::new(),
                     consumed: 0,
                 })),
             },
@@ -364,6 +365,10 @@ enum WritePhase {
 struct WriterState {
     body: BodyWriter,
     flushing: Option<(Vec<u8>, usize)>,
+    /// the frame buffer between writes. A batch is 60 KiB, so allocating one per
+    /// `poll_write` is an allocation and a cold page fault every 60 KiB of stream;
+    /// shadowsocks already keeps its buffer the same way.
+    spare: Vec<u8>,
     consumed: usize,
 }
 
@@ -540,7 +545,9 @@ impl AsyncWrite for VmessStream {
                         }
                         *off += n;
                     }
-                    state.flushing = None;
+                    if let Some((frame, _)) = state.flushing.take() {
+                        state.spare = frame;
+                    }
                     return Poll::Ready(Ok(state.consumed));
                 }
                 if buf.is_empty() {
@@ -549,7 +556,8 @@ impl AsyncWrite for VmessStream {
                 // everything the caller handed over, up to one batch, leaves in
                 // one frame buffer and one write
                 let batch = buf.len().min(WRITE_BATCH);
-                let mut frame = Vec::with_capacity(batch + 64 * (batch / WRITE_CHUNK + 1));
+                let mut frame = std::mem::take(&mut state.spare);
+                frame.clear();
                 let mut taken = 0;
                 while taken < batch {
                     let take = (batch - taken).min(WRITE_CHUNK);

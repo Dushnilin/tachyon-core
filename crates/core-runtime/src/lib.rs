@@ -3,6 +3,7 @@ pub mod clash_api;
 pub mod clash_mode;
 pub mod clash_state;
 pub mod dns;
+pub(crate) use core_tls::fastchacha;
 pub(crate) use core_tls::fastgcm;
 pub mod http_client;
 pub mod inbound;

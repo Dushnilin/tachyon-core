@@ -24,6 +24,7 @@ import base64
 import json
 import multiprocessing
 import os
+import signal
 import socket
 import ssl
 import statistics
@@ -36,7 +37,15 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench  # noqa: E402
 
-SERVER_PORT = 45003
+# Ports are per cell, not per run. A proxy that outlives its cell used to hold
+# 45002 forever, and `wait_listen` cannot tell a fresh proxy from a stale one --
+# it returned as soon as *something* accepted, so the probe went into the corpse
+# of the previous cell and every row after the first leak read FAIL.
+# Below 32768 on purpose: anything above that is inside the ephemeral port range,
+# so a short-lived connection out of the load generator can hold the very port the
+# next cell is about to bind, and the cell dies on a port it never used.
+PROXY_PORT_BASE = 21100
+SERVER_PORT_BASE = 21200
 REALITY_DEST_PORT = 45004
 UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 SHORT_ID = "0123456789abcdef"
@@ -175,8 +184,8 @@ def parse_cpus(spec):
     return out
 
 
-def server_cfg(case):
-    inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=SERVER_PORT)
+def server_cfg(case, port):
+    inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=port)
     return {
         "log": {"level": os.environ.get("PROTO_LOG", "error")},
         "inbounds": [inbound],
@@ -185,12 +194,12 @@ def server_cfg(case):
     }
 
 
-def client_cfg(case):
-    out = dict(case["client"], tag="proxy", server="127.0.0.1", server_port=SERVER_PORT)
+def client_cfg(case, proxy_port, server_port):
+    out = dict(case["client"], tag="proxy", server="127.0.0.1", server_port=server_port)
     return {
         "log": {"level": os.environ.get("PROTO_LOG", "error")},
         "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1",
-                      "listen_port": bench.PROXY_PORT}],
+                      "listen_port": proxy_port}],
         "outbounds": [out],
         "route": {"final": "proxy"},
     }
@@ -212,9 +221,13 @@ class Proc:
         return r.returncode == 0, (r.stdout + r.stderr).strip()
 
     def start(self):
+        # its own session, so `stop` can signal the whole group: a proxy that
+        # re-execs itself into a supervisor leaves a worker behind, and killing
+        # only the pid we spawned is how the port stayed bound.
         self.p = subprocess.Popen(
             [self.path, "run", "-c", self.cfg_path],
             stdout=self.err, stderr=self.err,
+            start_new_session=True,
             preexec_fn=lambda: os.sched_setaffinity(0, self.cpus),
         )
 
@@ -222,18 +235,55 @@ class Proc:
         return self.p is not None and self.p.poll() is None
 
     def tail(self, n=4):
-        self.err.flush()
+        if not self.err.closed:
+            self.err.flush()
         with open(self.err_path, errors="replace") as f:
             return " | ".join(l.strip() for l in f.readlines()[-n:] if l.strip())
 
+    def _signal(self, sig):
+        try:
+            os.killpg(os.getpgid(self.p.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            self.p.send_signal(sig)
+
     def stop(self):
-        if self.p and self.p.poll() is None:
-            self.p.terminate()
-            try:
-                self.p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.p.kill()
-                self.p.wait()
+        if not self.p or self.p.poll() is not None:
+            return
+        self._signal(signal.SIGTERM)
+        try:
+            self.p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._signal(signal.SIGKILL)
+            self.p.wait()
+        self.err.close()
+
+
+def port_free(port):
+    """Whether nothing of this cell still holds the port.
+
+    `wait_listen` cannot answer this: it succeeds on a stale proxy just as
+    happily as on a fresh one, which is exactly how one leak used to turn into
+    fourteen FAIL rows.
+    """
+    s = socket.socket()
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def wait_port_free(port, timeout=10):
+    deadline = time.time() + timeout
+    while True:
+        if port_free(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def probe(deadline_s=25):
@@ -276,15 +326,23 @@ def connect_times(n=20):
     return statistics.median(out)
 
 
-def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, result):
+def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work, result):
     """Body of a forked child: one (client impl, server impl, case) cell."""
     client_impl, server_impl = tachyon_role
+    proxy_port, server_port = ports
     res = {"case": case["name"], "client": client_impl, "server": server_impl}
-    work = tempfile.mkdtemp()
-    server = Proc(bins[server_impl], server_cfg(case), cpus["server"], work, "server")
-    client = Proc(bins[client_impl], client_cfg(case), cpus["client"], work, "client")
+    # bench.socks_connect reads this module global on every call, so pointing it
+    # at this cell's port is what moves the load generator with it.
+    bench.PROXY_PORT = proxy_port
+    server = Proc(bins[server_impl], server_cfg(case, server_port), cpus["server"], work, "server")
+    client = Proc(bins[client_impl], client_cfg(case, proxy_port, server_port),
+                  cpus["client"], work, "client")
     try:
-        for who, proc in (("server", server), ("client", client)):
+        for who, proc, port in (("server", server, server_port),
+                                ("client", client, proxy_port)):
+            if not wait_port_free(port):
+                res.update(status="FAIL", why=f"{who} port {port} still held before start")
+                return
             ok, msg = proc.check()
             if not ok:
                 res.update(status="REJECT", why=f"{who} check: {msg[-200:]}")
@@ -292,7 +350,7 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, result):
         server.start()
         time.sleep(0.4)
         client.start()
-        bench.wait_listen(bench.PROXY_PORT, timeout=15)
+        bench.wait_listen(proxy_port, timeout=15)
         why = probe()
         if why:
             dead = " (server died)" if not server.alive() else ""
@@ -325,30 +383,43 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, result):
         res["server_rss_mib"] = bench.proc_status(server.p.pid)["VmHWM"]
         res["status"] = "OK"
     except Exception as e:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
         res.update(status="FAIL", why=f"{type(e).__name__}: {e} c:[{client.tail()}]")
     finally:
         client.stop()
         server.stop()
+        for port in ports:
+            wait_port_free(port, timeout=5)
         result.send(res)
 
 
-def run_cell_guarded(*args):
+def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports):
     ctx = multiprocessing.get_context("fork")
+    work = tempfile.mkdtemp()
     rx, tx = ctx.Pipe(duplex=False)
-    child = ctx.Process(target=run_cell, args=(*args, tx))
+    child = ctx.Process(target=run_cell,
+                        args=(role, case, bins, cpus, runs, seconds, rounds, ports, work, tx))
     child.start()
     tx.close()
     child.join(CELL_TIMEOUT)
     if child.is_alive():
+        # killing the cell skips its `finally`, so its proxies are still up.
+        # They are found by the config path this cell alone was given, which is
+        # more precise than a pattern over every `sing-box` in the container.
         child.kill()
         child.join()
-        subprocess.run(["pkill", "-f", "tachyon-core run|sing-box.* run"], check=False)
-        role, case = args[0], args[1]
+        subprocess.run(["pkill", "-9", "-f", work], check=False)
+        for port in ports:
+            wait_port_free(port, timeout=5)
         return {"case": case["name"], "client": role[0], "server": role[1],
-                "status": "FAIL", "why": f"timeout after {CELL_TIMEOUT}s"}
-    return rx.recv() if rx.poll() else {
-        "case": args[1]["name"], "client": args[0][0], "server": args[0][1],
+                "status": "FAIL", "why": f"timeout after {CELL_TIMEOUT}s",
+                "work": work}
+    out = rx.recv() if rx.poll() else {
+        "case": case["name"], "client": role[0], "server": role[1],
         "status": "FAIL", "why": "cell exited without a result"}
+    out["work"] = work
+    return out
 
 
 # ------------------------------------------------------------------ fixtures
@@ -481,6 +552,7 @@ def report(results, ref_name):
     failed = [r for r in results if r["status"] != "OK"]
     lines += ["\n### Failures and rejects\n"]
     lines += [f"- `{r['case']}` {r['client']}->{r['server']}: **{r['status']}** {r.get('why', '')}"
+              f" (logs in `{r['work']}`)"
               for r in failed] or ["none"]
     lines += ["\n### Verdict\n",
               f"Reference: `{ref_name}`. A loss is speed under {MIN_SPEED_RATIO:.0%} of the reference, "
@@ -525,13 +597,17 @@ def main():
     cases = [c for c in build_cases(certs, reality)
              if c["part"] in args.part and args.only in c["name"]]
     results = []
+    port_n = 0
     for case in cases:
         grid = [("tachyon", "tachyon"), ("ref", "ref")] if case["part"] == "A" else [
             ("tachyon", "ref"), ("ref", "ref")]
         if case["part"] == "A" and not args.no_cross:
             grid += [("tachyon", "ref"), ("ref", "tachyon")]
         for role in grid:
-            r = run_cell_guarded(role, case, bins, cpus, args.runs, args.seconds, args.rounds)
+            port_n += 1
+            ports = (PROXY_PORT_BASE + port_n, SERVER_PORT_BASE + port_n)
+            r = run_cell_guarded(role, case, bins, cpus, args.runs, args.seconds,
+                                 args.rounds, ports)
             r["part"] = case["part"]
             results.append(r)
             line = f"{case['name']:24s} {role[0]:>7s}->{role[1]:<7s} {r['status']}"
@@ -539,12 +615,18 @@ def main():
                 line += (f"  1s {r['tput_1']['gbit_s']:5.1f}  8s {r['tput_8']['gbit_s']:5.1f} Gbit/s"
                          f"  p50 {r['p50_us']:5.0f} us  conn {r['connect_ms']:5.1f} ms")
             else:
-                line += "  " + r.get("why", "")[:160]
+                line += f"  {r.get('why', '')[:160]}  [{r['work']}]"
             print(line, flush=True)
 
     text, losses, interop_bad = report(results, args.ref_name)
     out = {"cpu": next((l.split(":")[1].strip() for l in open("/proc/cpuinfo")
                         if l.startswith("model name")), "?"),
+           "cores": os.cpu_count(),
+           "client_cpus": args.client_cpus,
+           "server_cpus": args.server_cpus,
+           "runs": args.runs,
+           "seconds": args.seconds,
+           "rounds": args.rounds,
            "kernel": os.uname().release, "ref": args.ref_name,
            "results": results, "losses": losses, "interop_failures": interop_bad}
     with open(args.out, "w") as f:

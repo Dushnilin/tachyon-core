@@ -30,6 +30,26 @@ fn entropy(into: &mut [u8]) -> std::io::Result<()> {
 
 /// What the caller configures. A server with no certificate cannot be built,
 /// which is the same rule the client half keeps about trust.
+/// What a negotiated TLS 1.3 suite fixes: the hash its key schedule runs on and
+/// the length of its record key.
+///
+/// Two bugs lived in this table and neither showed up in a test, because the only
+/// client the bench ever used is Go, and Go asks for AES-128-GCM first. The
+/// SHA-384 suite kept a SHA-256 schedule and every client that prefers it got
+/// `bad record mac`; ChaCha20-Poly1305 was handed AES-128's 16-byte key and could
+/// not seal anything at all.
+fn suite_params(suite: u16) -> (Hash, usize) {
+    match suite {
+        // TLS_AES_256_GCM_SHA384: SHA-384 throughout, 32-byte key.
+        0x1302 => (Hash::Sha384, 32),
+        // TLS_CHACHA20_POLY1305_SHA256 hashes with SHA-256, like AES-128-GCM, but
+        // its key is 32 bytes and not 16.
+        0x1303 => (Hash::Sha256, 32),
+        // TLS_AES_128_GCM_SHA256
+        _ => (Hash::Sha256, 16),
+    }
+}
+
 pub struct Config {
     /// the chain to send, leaf first, DER
     pub chain: Vec<Vec<u8>>,
@@ -141,12 +161,17 @@ impl Handshake {
             .iter()
             .find(|id| [0x1301u16, 0x1303, 0x1302].contains(id))
             .ok_or_else(|| bad("the client offered no cipher suite we serve"))?;
-        let (hash, key_len) = match self.suite {
-            0x1302 => (Hash::Sha384, 32),
-            _ => (Hash::Sha256, 16),
-        };
+        let (hash, key_len) = suite_params(self.suite);
         self.hash = hash;
         self.key_len = key_len;
+        // The schedule has to be rebuilt on the negotiated hash, not just told
+        // about it: every secret in it, the early one included, was extracted with
+        // the hash it was built with. Left on SHA-256 under a SHA-384 suite it
+        // derives keys the peer cannot reproduce, and the first sealed flight comes
+        // back as `bad record mac` -- from the client, which Go never sends because
+        // Go asks for AES-128-GCM first and this stack used to take the client's
+        // order, so only openssl, curl and browsers ever chose the broken suite.
+        self.schedule = KeySchedule::new(hash, &[]);
 
         // key share: X25519 only, which is all a proxy inbound needs
         let peer = parsed
@@ -412,6 +437,17 @@ impl Handshake {
             let raw = read_record(stream).await?;
             match ContentType::from_byte(raw[0])? {
                 ContentType::ChangeCipherSpec => continue,
+                // A plaintext alert is seven bytes: five of header and the two of
+                // description. It is what a client sends when it has already given
+                // up on our flight, and its description is the only useful line
+                // there is -- handed to the opener it comes back as "short record",
+                // which says nothing about what the client objected to.
+                ContentType::Alert if raw.len() < 5 + 16 => {
+                    return Err(bad(format!(
+                        "the client sent a plaintext alert {:?}",
+                        &raw[5..]
+                    )));
+                }
                 outer => {
                     let (kind, plaintext) = match &mut self.opener {
                         None => {
@@ -535,6 +571,28 @@ fn alpn_list(body: &[u8]) -> Vec<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The table two silent bugs lived in. Both were invisible to the whole bench
+    /// because Go asks for AES-128-GCM, so every suite below is checked against
+    /// what RFC 8446 and RFC 7905 say rather than against a handshake.
+    #[test]
+    fn every_suite_gets_its_own_hash_and_key_length() {
+        assert_eq!(
+            suite_params(0x1301),
+            (Hash::Sha256, 16),
+            "TLS_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            suite_params(0x1302),
+            (Hash::Sha384, 32),
+            "TLS_AES_256_GCM_SHA384: SHA-384 schedule, and a 32-byte key"
+        );
+        assert_eq!(
+            suite_params(0x1303),
+            (Hash::Sha256, 32),
+            "TLS_CHACHA20_POLY1305_SHA256: SHA-256 schedule, 32-byte key -- not 16"
+        );
+    }
     use super::*;
 
     /// A ClientHello with the fields the server reads, so the ServerHello it

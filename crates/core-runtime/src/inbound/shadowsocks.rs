@@ -24,14 +24,13 @@ use crate::inbound::{
 };
 use crate::logging;
 use crate::outbound::shadowsocks::crypto::{
+    AEAD_TAG,
     Cipher, Method, derive_subkey, master_key, random_bytes,
 };
 use crate::route::Router;
 
 /// The 2022 head carries the client's clock; the reference allows 30 seconds.
 const TIMESTAMP_WINDOW_SECS: i64 = 30;
-
-const AEAD_TAG: usize = 16;
 
 pub struct Shadowsocks {
     listener: TcpListener,
@@ -184,6 +183,7 @@ where
             pend: prefix_len,
             want: 2 + AEAD_TAG,
             want_length: true,
+            read_buf: read_buf(method),
         },
         write: ServerWriter {
             inner: Box::new(write_half) as AnyWrite,
@@ -403,14 +403,51 @@ struct ChunkReader {
     /// whether it is a length rather than a payload
     want: usize,
     want_length: bool,
+    /// what `rbuf` is grown to when the first record is waited for
+    read_buf: usize,
 }
 
-/// Read buffer of a connection: two legacy chunks and the length blocks between
-/// them. It only grows to this when the first chunk is waited for.
+/// Read buffer of a connection, for a method whose records fit in it whole: two
+/// legacy chunks and the length blocks between them. It only grows to this when
+/// the first chunk is waited for, and a 2022 method outgrows it -- see `read_buf`.
 const READ_BUF: usize = 33 * 1024;
+/// Every sealed block carries a tag; the wire overhead of one chunk is its length
+/// block, the tag on that block and the tag on the payload.
+const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
+
+/// Read buffer big enough for one whole record of `method` plus the length block
+/// of the next one.
+///
+/// `poll_fill` is asked for a *payload* (`payload_len + AEAD_TAG`), but what it
+/// needs is room for the record that payload belongs to. Sizing to the payload
+/// leaves a 2022 buffer one length block short of its own record, so every record
+/// costs a full copy of its payload on the way to the front of the buffer plus a
+/// syscall and a wakeup. Legacy records are small enough that two of them fit,
+/// which is why only 2022 paid it.
+fn read_buf(method: Method) -> usize {
+    (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
+}
 /// Most plaintext one write turns into a frame: a couple of legacy chunks, one
 /// syscall.
 const WRITE_FRAME: usize = 64 * 1024;
+
+/// How much of `avail` one frame takes: whole chunks, and as much of
+/// [`WRITE_FRAME`] as fits in them.
+///
+/// `WRITE_FRAME` is a multiple of neither chunk size -- it is 64 KiB against
+/// `0x3FFF` and against `0xFFFF` -- so cutting a frame at it left a tail of one
+/// to three bytes that went out as a record of its own. That is two more AEAD
+/// invocations for nothing, 35 bytes of wire, and a peer that has to open a
+/// second record where it expected one. Cutting on a chunk boundary instead
+/// leaves the remainder with the caller, and the relay -- which keeps what a
+/// partial write did not take -- coalesces it with the next read into a full
+/// chunk. A write that genuinely holds less than one chunk still goes out whole:
+/// holding it back would stall anything that waits for an answer.
+fn frame_take(avail: usize, max_chunk: usize) -> usize {
+    let room = WRITE_FRAME.max(max_chunk);
+    let whole = avail.min(room) / max_chunk * max_chunk;
+    whole.max(max_chunk).min(avail)
+}
 
 impl AsyncRead for ChunkReader {
     fn poll_read(
@@ -429,7 +466,8 @@ impl AsyncRead for ChunkReader {
                 &mut this.rbuf,
                 &mut this.rpos,
                 &mut this.rend,
-                this.want
+                this.want,
+                this.read_buf
             ))?;
             let at = this.rpos;
             this.cipher
@@ -461,6 +499,7 @@ impl AsyncRead for ChunkReader {
 /// Make `rbuf[*rpos..*rend]` at least `want` bytes across as many `Pending`s as
 /// it takes. Only called with no payload left to hand out, so moving the unread
 /// bytes to the front disturbs nothing.
+#[allow(clippy::too_many_arguments)]
 fn poll_fill(
     inner: &mut AnyRead,
     cx: &mut Context<'_>,
@@ -468,6 +507,7 @@ fn poll_fill(
     rpos: &mut usize,
     rend: &mut usize,
     want: usize,
+    read_buf: usize,
 ) -> Poll<io::Result<()>> {
     if *rend - *rpos >= want {
         return Poll::Ready(Ok(()));
@@ -478,7 +518,7 @@ fn poll_fill(
         *rpos = 0;
     }
     if rbuf.len() < want {
-        rbuf.resize(want.max(READ_BUF), 0);
+        rbuf.resize((want + 2 + AEAD_TAG).max(read_buf), 0);
     }
     while *rend < want {
         let mut read_buf = ReadBuf::new(&mut rbuf[*rend..]);
@@ -625,7 +665,7 @@ impl AsyncWrite for ServerWriter {
                     this.consumed = take;
                 }
                 Some((cipher, counter)) => {
-                    let take = buf.len().min(WRITE_FRAME.max(max_chunk));
+                    let take = frame_take(buf.len(), max_chunk);
                     for segment in buf[..take].chunks(max_chunk) {
                         write_chunk(cipher, counter, &mut frame, segment);
                     }
@@ -642,5 +682,186 @@ impl AsyncWrite for ServerWriter {
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         std::pin::Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Waker;
+
+    /// Hands out one prepared slice per `poll_read` and counts the calls, so a
+    /// test can see how many times the reader had to go back to the socket for
+    /// one record.
+    struct OneSlicePerRead {
+        slices: VecDeque<Vec<u8>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for OneSlicePerRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            match self.slices.pop_front() {
+                Some(slice) => {
+                    let take = slice.len().min(out.remaining());
+                    out.put_slice(&slice[..take]);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    /// One record of `payload` bytes, sealed the way the writer seals it.
+    fn record(cipher: &Cipher, counter: &mut u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let head = out.len();
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        cipher.seal_at(*counter, &mut out, head).expect("seal length block");
+        *counter += 1;
+        let body = out.len();
+        out.extend_from_slice(payload);
+        cipher.seal_at(*counter, &mut out, body).expect("seal payload");
+        *counter += 1;
+        out
+    }
+
+    /// Drive `records` max-size records of `method` through the reader, with the
+    /// socket handing over one record per read.
+    ///
+    /// This is where a 2022 record that does not fit in the buffer shows up: the
+    /// reader consumes the length block, finds the payload 18 bytes short of the
+    /// buffer, moves the whole payload to the front and reads the missing bytes --
+    /// which are the *next* record's header. The stream desyncs from there and the
+    /// tag check fails. Legacy never gets there, because two of its records fit.
+    fn read_records(method: Method, records: usize) -> (usize, usize) {
+        let cipher = Cipher::new(method, &vec![9u8; method.key_len()]);
+        let max_chunk = usize::from(method.max_chunk());
+        let one = max_chunk + BLOCK_OVERHEAD;
+        let mut counter = 0u64;
+        let mut wire = Vec::new();
+        for round in 0..records {
+            wire.extend_from_slice(&record(&cipher, &mut counter, &vec![round as u8; max_chunk]));
+        }
+        let mut slices = VecDeque::new();
+        for chunk in wire.chunks(one) {
+            slices.push_back(chunk.to_vec());
+        }
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut reader = ChunkReader {
+            inner: Box::new(OneSlicePerRead {
+                slices,
+                polls: Arc::clone(&polls),
+            }) as AnyRead,
+            cipher,
+            counter: 0,
+            rbuf: Vec::new(),
+            rpos: 0,
+            rend: 0,
+            pos: 0,
+            pend: 0,
+            want: 2 + AEAD_TAG,
+            want_length: true,
+            read_buf: read_buf(method),
+        };
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut out = vec![0u8; max_chunk];
+        let mut got: Vec<u8> = Vec::new();
+        while got.len() < records * max_chunk {
+            let filled = {
+                let mut buf = ReadBuf::new(&mut out);
+                match std::pin::Pin::new(&mut reader).poll_read(&mut cx, &mut buf) {
+                    Poll::Ready(Ok(())) => buf.filled().len(),
+                    Poll::Ready(Err(err)) => panic!("{method:?}: read failed: {err}"),
+                    Poll::Pending => panic!("{method:?}: a ready reader went pending"),
+                }
+            };
+            got.extend_from_slice(&out[..filled]);
+        }
+        for round in 0..records {
+            let at = round * max_chunk;
+            assert!(
+                got[at..at + max_chunk].iter().all(|byte| *byte == round as u8),
+                "{method:?}: record {round} came back wrong, the framing slipped"
+            );
+        }
+        (got.len(), polls.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn a_max_size_record_of_every_method_survives_the_round_trip() {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Aes256Gcm,
+            Method::ChaCha20Poly1305,
+            Method::Blake3Aes128Gcm,
+            Method::Blake3Aes256Gcm,
+            Method::Blake3ChaCha20Poly1305,
+        ] {
+            let (got, polls) = read_records(method, 4);
+            assert_eq!(got, 4 * usize::from(method.max_chunk()));
+            assert!(
+                polls <= 4,
+                "{method:?}: one read per record is enough, took {polls}"
+            );
+        }
+    }
+
+    /// Frames leave in whole chunks, so a 64 KiB read does not turn into a full
+    /// record plus a record holding one byte.
+    #[test]
+    fn a_frame_is_whole_chunks() {
+        for (method, chunk) in [
+            (Method::Aes128Gcm, 0x3FFFu32),
+            (Method::Blake3Aes256Gcm, 0xFFFFu32),
+        ] {
+            let chunk = chunk as usize;
+            let room = 64 * 1024usize;
+            // a full relay read
+            let take = frame_take(room, chunk);
+            assert_eq!(take % chunk, 0, "{method:?}: frame cut mid-chunk");
+            assert!(
+                take >= chunk && take <= room.max(chunk),
+                "{method:?}: frame_take took {take}"
+            );
+            // and what is left over is a remainder, not a record: the next read
+            // coalesces with it
+            let first = take;
+            let leftover = room - first;
+            let next = frame_take(leftover + room, chunk);
+            assert_eq!(next % chunk, 0, "{method:?}: second frame cut mid-chunk");
+            // less than one chunk still goes out, or nothing would ever move
+            assert_eq!(frame_take(1, chunk), 1);
+            assert_eq!(frame_take(chunk - 1, chunk), chunk - 1);
+            assert_eq!(frame_take(chunk, chunk), chunk);
+        }
+    }
+
+    /// The buffer a method needs, spelled out: one whole record.
+    #[test]
+    fn the_read_buffer_holds_a_whole_record() {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Aes256Gcm,
+            Method::ChaCha20Poly1305,
+            Method::Blake3Aes128Gcm,
+            Method::Blake3Aes256Gcm,
+            Method::Blake3ChaCha20Poly1305,
+        ] {
+            let record = usize::from(method.max_chunk()) + BLOCK_OVERHEAD;
+            assert!(
+                read_buf(method) >= record,
+                "{method:?} needs room for a {record}-byte record, got {}",
+                read_buf(method)
+            );
+        }
     }
 }

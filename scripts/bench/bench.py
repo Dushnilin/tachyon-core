@@ -131,7 +131,10 @@ def measure_latency(proxy, rounds=20000):
     for _ in range(rounds):
         t = time.perf_counter_ns()
         s.sendall(msg)
-        recvn(s, 64)
+        # the content has to be checked: a proxy that answers early with its own
+        # framing bytes instead of the sink's echo still fills 64 bytes, and the
+        # round trip then reads as 10 us instead of 300
+        assert recvn(s, 64) == msg, "echo did not come back intact"
         samples.append((time.perf_counter_ns() - t) / 1000)
     s.close()
     samples.sort()

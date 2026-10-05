@@ -13,3 +13,8 @@ AGENTS.md
 ROADMAP.md
 ROADMAP.ru.md
 TELEGRAM.md
+
+# bench artifacts, run-local
+scripts/bench/__pycache__/
+proto-result.json
+proto-result.md

@@ -153,6 +153,19 @@ impl QuicTunnelOptions {
         }
         transport.datagram_receive_buffer_size(datagram_rx.then_some(65_536));
         transport.datagram_send_buffer_size(65_536);
+        // Acking every second ack-eliciting packet, and every out-of-order arrival
+        // on top of it, is quinn's default when no ack-frequency policy is set. On a
+        // saturated loopback path with several streams that is an ACK-only packet
+        // per couple of data packets: each one is its own transmit, its own
+        // `poll_writable` round trip and its own `sendmsg`, and the reordering it
+        // manufactures on the sender's side is what costs the sender its congestion
+        // window. Eight keeps the ACK path amortised without letting a lost packet
+        // wait for a timer.
+        let mut ack = quinn::AckFrequencyConfig::default();
+        ack.max_ack_delay(Some(Duration::from_millis(25)))
+            .ack_eliciting_threshold(VarInt::from_u32(8))
+            .reordering_threshold(VarInt::from_u32(4));
+        transport.ack_frequency_config(Some(ack));
         transport.congestion_controller_factory(match congestion {
             CongestionKind::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
             CongestionKind::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
@@ -188,6 +201,12 @@ impl QuicTunnelDefaults {
     }
 
     /// tuic: idle 30s, no keepalive unless set, cubic, uni 1<<60.
+    ///
+    /// The receive windows stay at quinn's defaults. Raising them to hysteria2's
+    /// 8 MiB / 20 MiB was tried and measured worse: one stream got faster, and
+    /// eight got slower (0.88x -> 0.73x of the reference, CPU 1.15x -> 1.37x).
+    /// A bigger credit means a bigger burst, and on the two cores this runs on the
+    /// burst arrives as reordering and scheduler work rather than throughput.
     pub fn tuic() -> Self {
         Self {
             idle_timeout: Duration::from_secs(30),

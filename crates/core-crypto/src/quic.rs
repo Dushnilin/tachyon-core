@@ -57,12 +57,28 @@ pub enum HeaderCipher {
 pub struct HeaderProtectionKey {
     key: AeadKey,
     cipher: HeaderCipher,
+    /// The AES key schedule, expanded once. `derive_mask` runs per packet, and the
+    /// key does not change under it.
+    aes: Option<HeaderAes>,
+}
+
+/// An AES key for the one block header protection encrypts.
+enum HeaderAes {
+    Aes128(Box<Aes128>),
 }
 
 impl HeaderProtectionKey {
     /// Construct a new header-protection key with the specified cipher variant.
     pub fn new(key: AeadKey, cipher: HeaderCipher) -> Self {
-        Self { key, cipher }
+        let aes = match cipher {
+            HeaderCipher::Aes128 => {
+                let kb = key.as_ref();
+                kb.get(..16)
+                    .map(|k| HeaderAes::Aes128(Box::new(Aes128::new(GenericArray::from_slice(k)))))
+            }
+            _ => None,
+        };
+        Self { key, cipher, aes }
     }
 
     /// Derive the 5-byte mask from `sample` using the configured cipher.
@@ -84,7 +100,11 @@ impl HeaderProtectionKey {
                         "QUIC header protection: AES-128 key must be 16 bytes".into(),
                     ));
                 }
-                let cipher = Aes128::new(GenericArray::from_slice(&key_bytes[..16]));
+                let Some(HeaderAes::Aes128(cipher)) = &self.aes else {
+                    return Err(Error::General(
+                        "QUIC header protection: AES-128 key must be 16 bytes".into(),
+                    ));
+                };
                 let mut block: GenericArray<u8, _> = GenericArray::clone_from_slice(sample);
                 cipher.encrypt_block(&mut block);
                 let mask: [u8; MASK_LEN] = block[..MASK_LEN]
@@ -257,12 +277,23 @@ pub enum PacketCipher {
 pub struct PacketKey {
     /// Computes unique nonces for each packet.
     iv: Iv,
-    /// Which AEAD to use for payload protection.
-    cipher: PacketCipher,
-    /// Key material, truncated to the cipher's key length at construction.
-    key: [u8; 32],
-    /// Valid length of `key` for this cipher (16 or 32).
-    key_len: usize,
+    /// The cipher with its key schedule already expanded.
+    ///
+    /// quinn calls `encrypt_in_place`/`decrypt_in_place` once per packet, and at a
+    /// few Gbit/s over loopback that is a quarter of a million packets a second.
+    /// Building the AEAD here instead meant an AES key schedule *and* a fresh
+    /// `polyval` `mulx` power ladder on every one of them, while the same key lives
+    /// for the whole connection. This is the only AEAD in the tree that was not
+    /// already holding its expanded key: shadowsocks, vmess and the TLS record
+    /// layer all use [`crate::fastgcm::Gcm`], which does.
+    ready: Ready,
+}
+
+/// The payload cipher, ready to use.
+enum Ready {
+    Aes128(crate::fastgcm::Gcm),
+    Aes256(crate::fastgcm::Gcm),
+    ChaCha(chacha20poly1305::ChaCha20Poly1305),
 }
 
 impl PacketKey {
@@ -280,12 +311,15 @@ impl PacketKey {
         let n = kb.len().min(want);
         let mut buf = [0u8; 32];
         buf[..n].copy_from_slice(&kb[..n]);
-        Self {
-            iv,
-            cipher,
-            key: buf,
-            key_len: n,
-        }
+        let ready = match cipher {
+            PacketCipher::Aes128Gcm => Ready::Aes128(crate::fastgcm::Gcm::new(&buf[..n])),
+            PacketCipher::Aes256Gcm => Ready::Aes256(crate::fastgcm::Gcm::new(&buf[..n])),
+            PacketCipher::ChaCha20Poly1305 => Ready::ChaCha(
+                chacha20poly1305::ChaCha20Poly1305::new_from_slice(&buf[..n])
+                    .expect("chacha key length"),
+            ),
+        };
+        Self { iv, ready }
     }
 }
 
@@ -301,32 +335,13 @@ impl quic::PacketKey for PacketKey {
         aad: &[u8],
         payload: &mut [u8],
     ) -> Result<quic::Tag, Error> {
-        let nonce = nonce(&self.iv, packet_number).into();
-        let key = &self.key[..self.key_len];
-        let tag = match self.cipher {
-            PacketCipher::Aes128Gcm => {
-                use aes_gcm::aead::AeadInPlace;
-                use aes_gcm::{Aes128Gcm, KeyInit};
-                let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| Error::EncryptError)?;
-                cipher
-                    .encrypt_in_place_detached(&nonce, aad, payload)
-                    .map_err(|_| Error::EncryptError)?
-            }
-            PacketCipher::Aes256Gcm => {
-                use aes_gcm::aead::AeadInPlace;
-                use aes_gcm::{Aes256Gcm, KeyInit};
-                let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Error::EncryptError)?;
-                cipher
-                    .encrypt_in_place_detached(&nonce, aad, payload)
-                    .map_err(|_| Error::EncryptError)?
-            }
-            PacketCipher::ChaCha20Poly1305 => {
-                let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
-                    .map_err(|_| Error::EncryptError)?;
-                cipher
-                    .encrypt_in_place_detached(&nonce, aad, payload)
-                    .map_err(|_| Error::EncryptError)?
-            }
+        let nonce = nonce(&self.iv, packet_number);
+        let tag = match &self.ready {
+            Ready::Aes128(cipher) | Ready::Aes256(cipher) => cipher.seal(&nonce, aad, payload),
+            Ready::ChaCha(cipher) => cipher
+                .encrypt_in_place_detached((&nonce).into(), aad, payload)
+                .map_err(|_| Error::EncryptError)?
+                .into(),
         };
         Ok(quic::Tag::from(tag.as_ref()))
     }
@@ -342,39 +357,24 @@ impl quic::PacketKey for PacketKey {
         aad: &[u8],
         payload: &'a mut [u8],
     ) -> Result<&'a [u8], Error> {
-        let nonce = nonce(&self.iv, packet_number).into();
-        let key = &self.key[..self.key_len];
+        let nonce = nonce(&self.iv, packet_number);
         let plain_len = payload
             .len()
             .checked_sub(self.tag_len())
             .ok_or(Error::DecryptError)?;
         let (ciphertext, tag_bytes) = payload.split_at_mut(plain_len);
-        let tag = chacha20poly1305::Tag::from_slice(tag_bytes);
+        let tag: [u8; 16] = tag_bytes
+            .try_into()
+            .map_err(|_| Error::DecryptError)?;
 
-        match self.cipher {
-            PacketCipher::Aes128Gcm => {
-                use aes_gcm::aead::AeadInPlace;
-                use aes_gcm::{Aes128Gcm, KeyInit};
-                let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| Error::DecryptError)?;
-                cipher
-                    .decrypt_in_place_detached(&nonce, aad, ciphertext, tag)
-                    .map_err(|_| Error::DecryptError)?;
-            }
-            PacketCipher::Aes256Gcm => {
-                use aes_gcm::aead::AeadInPlace;
-                use aes_gcm::{Aes256Gcm, KeyInit};
-                let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Error::DecryptError)?;
-                cipher
-                    .decrypt_in_place_detached(&nonce, aad, ciphertext, tag)
-                    .map_err(|_| Error::DecryptError)?;
-            }
-            PacketCipher::ChaCha20Poly1305 => {
-                let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
-                    .map_err(|_| Error::DecryptError)?;
-                cipher
-                    .decrypt_in_place_detached(&nonce, aad, ciphertext, tag)
-                    .map_err(|_| Error::DecryptError)?;
-            }
+        let ok = match &self.ready {
+            Ready::Aes128(cipher) | Ready::Aes256(cipher) => cipher.open(&nonce, aad, ciphertext, &tag),
+            Ready::ChaCha(cipher) => cipher
+                .decrypt_in_place_detached((&nonce).into(), aad, ciphertext, (&tag).into())
+                .is_ok(),
+        };
+        if !ok {
+            return Err(Error::DecryptError);
         }
         Ok(&payload[..plain_len])
     }

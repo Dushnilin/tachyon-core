@@ -385,6 +385,7 @@ dependencies = [
  "p384",
  "paste",
  "pkcs8",
+ "poly1305",
  "rand_core 0.6.4",
  "rsa",
  "rustls",

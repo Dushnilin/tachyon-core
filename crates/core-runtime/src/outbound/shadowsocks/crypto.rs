@@ -1,13 +1,16 @@
 use base64::Engine as _;
 use std::io;
 
+use crate::fastchacha::ChaChaPoly;
 use crate::fastgcm::Gcm;
-use chacha20poly1305::ChaCha20Poly1305;
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use hkdf::Hkdf;
 use md5::Digest;
 use md5::Md5;
 use sha1::Sha1;
+
+/// Every sealed block carries this tag, in both AEAD families and on both
+/// halves of a connection.
+pub const AEAD_TAG: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -61,7 +64,7 @@ impl Method {
 
 pub(crate) enum Cipher {
     Aes(Box<Gcm>),
-    ChaCha(Box<ChaCha20Poly1305>),
+    ChaCha(Box<ChaChaPoly>),
 }
 
 impl Cipher {
@@ -72,7 +75,7 @@ impl Cipher {
             | Method::Aes256Gcm
             | Method::Blake3Aes256Gcm => Cipher::Aes(Box::new(Gcm::new(key))),
             Method::ChaCha20Poly1305 | Method::Blake3ChaCha20Poly1305 => {
-                Cipher::ChaCha(Box::new(ChaCha20Poly1305::new(key.into())))
+                Cipher::ChaCha(Box::new(ChaChaPoly::new(key)))
             }
         }
     }
@@ -88,10 +91,7 @@ impl Cipher {
         let body = &mut buf[from..];
         let tag: [u8; 16] = match self {
             Cipher::Aes(cipher) => cipher.seal(&nonce, &[], body),
-            Cipher::ChaCha(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), &[], body)
-                .map_err(|_| io::Error::other("seal failed"))?
-                .into(),
+            Cipher::ChaCha(cipher) => cipher.seal(&nonce, &[], body),
         };
         buf.extend_from_slice(&tag);
         Ok(())
@@ -109,9 +109,7 @@ impl Cipher {
         let nonce = counter_nonce(counter);
         let ok = match self {
             Cipher::Aes(cipher) => cipher.open(&nonce, &[], data, &tag),
-            Cipher::ChaCha(cipher) => cipher
-                .decrypt_in_place_detached((&nonce).into(), &[], data, (&tag).into())
-                .is_ok(),
+            Cipher::ChaCha(cipher) => cipher.open(&nonce, &[], data, &tag),
         };
         if ok {
             Ok(())
@@ -134,9 +132,7 @@ impl Cipher {
         let nonce = counter_nonce(counter);
         let ok = match self {
             Cipher::Aes(cipher) => cipher.open(&nonce, &[], buf, &tag),
-            Cipher::ChaCha(cipher) => cipher
-                .decrypt_in_place_detached((&nonce).into(), &[], buf, (&tag).into())
-                .is_ok(),
+            Cipher::ChaCha(cipher) => cipher.open(&nonce, &[], buf, &tag),
         };
         if ok {
             Ok(())

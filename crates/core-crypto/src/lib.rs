@@ -365,6 +365,7 @@ static ALL_CIPHER_SUITES: &[SupportedCipherSuite] = misc::const_concat_slices!(
 );
 
 mod aead;
+pub mod fastchacha;
 pub mod fastgcm;
 mod hash;
 mod hmac;

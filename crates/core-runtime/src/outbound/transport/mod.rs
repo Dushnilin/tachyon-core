@@ -479,7 +479,11 @@ async fn httpupgrade_handshake(
 /// frame in one reusable buffer and masks it word by word.
 pub(crate) struct WsStream {
     inner: AnyStream,
-    /// bytes off the wire not consumed yet: `rbuf[rpos..]`
+    /// bytes off the wire not consumed yet: `rbuf[rpos..]`, its length being the
+    /// filled part. Allocated once at [`WS_READ`] and grown only if it ever fills
+    /// up: a buffer that follows the traffic means a realloc, and every realloc
+    /// over glibc's mmap threshold is a fresh mmap and munmap pair on the hot
+    /// path.
     rbuf: Vec<u8>,
     rpos: usize,
     /// payload of the data frame being handed out that is still to come, its
@@ -497,10 +501,19 @@ pub(crate) struct WsStream {
     /// Caller bytes consumed by the data frame currently flushing.
     consumed: Option<usize>,
     close_sent: bool,
+    /// A client masks what it sends and a server does not (RFC 6455 5.3), so one
+    /// codec serves both ends with this single bit between them. Reading needs no
+    /// such flag: a frame says for itself whether it is masked.
+    mask_out: bool,
 }
 
 /// What one read asks the socket for at least.
 const WS_READ: usize = 32 * 1024;
+
+/// Enough for any frame header, and no more: the biggest one is a 14-byte extended
+/// length. A read at a frame boundary asks for just this, so the payload is never
+/// staged on its way to a caller that would only copy it straight out again.
+const HEAD_PROBE: usize = 16;
 
 /// A frame header parsed out of the buffer.
 struct FrameHead {
@@ -560,10 +573,23 @@ fn xor_mask(buf: &mut [u8], mut mask: [u8; 4], at: usize) {
 }
 
 impl WsStream {
-    fn new(inner: AnyStream) -> Self {
+    /// The client end: what it sends is masked, as RFC 6455 §5.3 requires.
+    pub(crate) fn new(inner: AnyStream) -> Self {
+        Self::with_masking(inner, true)
+    }
+
+    /// The server end: same codec, no mask on the way out. Frames coming *in* are
+    /// masked either way, and the reader has always known how to unmask them, so
+    /// one codec serves both directions and the handshake is the only difference.
+    pub(crate) fn server(inner: AnyStream) -> Self {
+        Self::with_masking(inner, false)
+    }
+
+    fn with_masking(inner: AnyStream, mask_out: bool) -> Self {
         Self {
+            mask_out,
             inner,
-            rbuf: Vec::new(),
+            rbuf: Vec::with_capacity(WS_READ),
             rpos: 0,
             left: 0,
             mask: None,
@@ -579,17 +605,32 @@ impl WsStream {
 
     /// Read more of the wire into the buffer; `false` on a clean end.
     fn poll_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        // what was consumed can go: nothing points into the buffer between reads
-        if self.rpos == self.rbuf.len() {
-            self.rbuf.clear();
-            self.rpos = 0;
-        } else if self.rpos > 0 {
-            self.rbuf.drain(..self.rpos);
-            self.rpos = 0;
+        // Only a masked payload fills this buffer, and a server never masks: what
+        // gets staged here is a frame header, or the head of a payload when a mask
+        // is in play. So the common case has room and never reallocates.
+        if self.rbuf.len() == self.rbuf.capacity() {
+            if self.rpos > 0 {
+                let end = self.rbuf.len();
+                self.rbuf.copy_within(self.rpos..end, 0);
+                self.rbuf.truncate(end - self.rpos);
+                self.rpos = 0;
+            }
+            if self.rbuf.len() == self.rbuf.capacity() {
+                self.rbuf.reserve(WS_READ);
+            }
         }
-        self.rbuf.reserve(WS_READ);
         let have = self.rbuf.len();
-        let mut read = ReadBuf::uninit(self.rbuf.spare_capacity_mut());
+        // At a frame boundary only the head is wanted, and it is at most 14 bytes.
+        // Reading a whole buffer's worth here staged the payload as well, and the
+        // caller then copied that out to reach it: an extra pass over every frame,
+        // which showed up as a sixth of the client CPU. Once a head is in, read in
+        // full -- that is the masked case, where the payload has to be staged.
+        let room = if have == 0 {
+            HEAD_PROBE.min(self.rbuf.capacity())
+        } else {
+            self.rbuf.capacity() - have
+        };
+        let mut read = ReadBuf::uninit(&mut self.rbuf.spare_capacity_mut()[..room]);
         ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
         let got = read.filled().len();
         if got == 0 {
@@ -618,26 +659,34 @@ impl WsStream {
         Poll::Ready(Ok(()))
     }
 
-    /// Append one whole frame, masked, to the write queue.
+    /// Append one whole frame to the write queue, masked unless this is the
+    /// server end.
     fn push_frame(&mut self, opcode: u8, payload: &[u8]) {
         let mut mask = [0u8; 4];
-        let _ = random_bytes(&mut mask);
+        if self.mask_out {
+            let _ = random_bytes(&mut mask);
+        }
         let len = payload.len();
         self.wbuf.reserve(14 + len);
         self.wbuf.push(0x80 | opcode);
+        let masked_bit = if self.mask_out { 0x80 } else { 0 };
         if len < 126 {
-            self.wbuf.push(0x80 | len as u8);
+            self.wbuf.push(masked_bit | len as u8);
         } else if len <= usize::from(u16::MAX) {
-            self.wbuf.push(0x80 | 126);
+            self.wbuf.push(masked_bit | 126);
             self.wbuf.extend_from_slice(&(len as u16).to_be_bytes());
         } else {
-            self.wbuf.push(0x80 | 127);
+            self.wbuf.push(masked_bit | 127);
             self.wbuf.extend_from_slice(&(len as u64).to_be_bytes());
         }
-        self.wbuf.extend_from_slice(&mask);
-        let from = self.wbuf.len();
-        self.wbuf.extend_from_slice(payload);
-        xor_mask(&mut self.wbuf[from..], mask, 0);
+        if self.mask_out {
+            self.wbuf.extend_from_slice(&mask);
+            let from = self.wbuf.len();
+            self.wbuf.extend_from_slice(payload);
+            xor_mask(&mut self.wbuf[from..], mask, 0);
+        } else {
+            self.wbuf.extend_from_slice(payload);
+        }
     }
 }
 
@@ -664,6 +713,25 @@ impl AsyncRead for WsStream {
                     out.put_slice(chunk);
                     me.rpos += n;
                     me.left -= n;
+                    return Poll::Ready(Ok(()));
+                }
+                // Nothing staged and nothing to unmask: hand the caller's own
+                // buffer to the socket. Staging the payload and then copying it
+                // out cost a memmove per read on top of the one rustls already
+                // does, and on this path the payload is most of the traffic.
+                if me.mask.is_none() && out.remaining() > 0 {
+                    let n = me.left.min(out.remaining());
+                    let mut direct = ReadBuf::new(out.initialize_unfilled_to(n));
+                    ready!(Pin::new(&mut me.inner).poll_read(cx, &mut direct))?;
+                    let got = direct.filled().len();
+                    if got == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "ws: payload ended mid-frame",
+                        )));
+                    }
+                    me.left -= got;
+                    out.advance(got);
                     return Poll::Ready(Ok(()));
                 }
             } else if let Some(head) = parse_head(&me.rbuf[me.rpos..])? {

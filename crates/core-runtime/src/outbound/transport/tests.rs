@@ -2,6 +2,12 @@
 //! so the wire format is what matters here.
 
 use super::*;
+use std::future::poll_fn;
+use std::task::{Context, Poll};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::io::AsyncReadExt;
 
 /// Reads the upgrade request, replies 101 and hands the request head back.
@@ -149,4 +155,121 @@ async fn a_configured_protocol_header_is_replaced() {
         !head.contains("Sec-WebSocket-Protocol: chat"),
         "a subprotocol the user configured would collide with the early data"
     );
+}
+
+/// A socket that hands out at most `piece` bytes per read, so a websocket frame
+/// is guaranteed to land across many reads. `widest` records the largest buffer
+/// a read was ever asked for: that is how the direct path is told apart from
+/// the staging one, which can only ever ask for `WS_READ`.
+struct Trickle {
+    data: Vec<u8>,
+    at: usize,
+    piece: usize,
+    widest: Arc<AtomicUsize>,
+}
+
+impl AsyncRead for Trickle {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = &mut *self;
+        me.widest.fetch_max(out.remaining(), Ordering::Relaxed);
+        let n = (me.data.len() - me.at).min(me.piece).min(out.remaining());
+        out.put_slice(&me.data[me.at..me.at + n]);
+        me.at += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Trickle {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Once a frame is known and nothing is left to unmask, `poll_read` hands the
+/// caller's own buffer to the socket instead of staging the payload and copying
+/// it out. `poll_more` reserves exactly `WS_READ` and reads into whatever is
+/// spare, so a read through it can never ask for more than that -- which makes
+/// "asked for more than WS_READ" proof that the direct path ran. Without this
+/// the widest request stays at WS_READ and the payload pays a memmove per read.
+#[tokio::test]
+async fn an_unmasked_payload_is_read_straight_into_the_callers_buffer() {
+    const LEN: usize = 200_000;
+    let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let mut wire = vec![0x82, 127];
+    wire.extend_from_slice(&(LEN as u64).to_be_bytes());
+    wire.extend_from_slice(&payload);
+    let widest = Arc::new(AtomicUsize::new(0));
+    let stream: crate::inbound::AnyStream = Box::new(Trickle {
+        data: wire,
+        at: 0,
+        piece: 64 * 1024,
+        widest: widest.clone(),
+    });
+    let mut ws = WsStream::new(stream);
+    let mut out = vec![0u8; 1 << 20];
+    let mut got = 0;
+    while got < out.len() {
+        // one big caller buffer: that is what makes a wide socket read possible
+        let mut buf = ReadBuf::new(&mut out[got..]);
+        poll_fn(|cx| Pin::new(&mut ws).poll_read(cx, &mut buf))
+            .await
+            .expect("read frame");
+        let filled = buf.filled().len();
+        if filled == 0 {
+            break;
+        }
+        got += filled;
+    }
+    assert_eq!(got, LEN, "a split frame must come back whole");
+    assert!(out[..got] == payload, "and in order");
+    assert!(
+        widest.load(Ordering::Relaxed) > WS_READ,
+        "no read ever asked for more than {WS_READ} bytes, so the payload was staged"
+    );
+}
+
+/// A masked frame still has to be unmasked, so it cannot take the direct path:
+/// the payload has to be staged, which is the one case where the read buffer
+/// outgrows its allocation. Sized past `WS_READ` so that growth is what is
+/// being tested, not a payload that happens to fit.
+#[tokio::test]
+async fn a_masked_frame_bigger_than_the_buffer_still_reads_out_whole() {
+    const LEN: usize = WS_READ + 1000;
+    let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let key = [0xde, 0xad, 0xbe, 0xef];
+    let mut wire = vec![0x82, 127 | 0x80];
+    wire.extend_from_slice(&(LEN as u64).to_be_bytes());
+    wire.extend_from_slice(&key);
+    wire.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 4])
+            .collect::<Vec<u8>>(),
+    );
+    let stream: crate::inbound::AnyStream = Box::new(Trickle {
+        data: wire,
+        at: 0,
+        piece: 4096,
+        widest: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut ws = WsStream::new(stream);
+    let mut got = Vec::new();
+    ws.read_to_end(&mut got).await.expect("read frame");
+    assert_eq!(got.len(), LEN, "the masking key must still be applied");
+    assert!(got == payload, "and the payload must come back in order");
 }

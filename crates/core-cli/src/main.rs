@@ -62,7 +62,14 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             eprintln!("WARN[0000] {warning}");
         }
     }
+    // Sized to the cores we are actually allowed to run on. Left to itself tokio
+    // reads `sched_getaffinity` at startup, which happens to be right on a router
+    // and is a lie the moment something pins the process afterwards: the worker
+    // count is fixed by then, and a worker per host core on two pinned cores is
+    // sixteen runtimes fighting over two CPUs.
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
         .map_err(|e| format!("run: {e}"))?;

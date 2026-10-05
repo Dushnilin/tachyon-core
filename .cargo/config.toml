@@ -8,3 +8,57 @@ linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools
 [env]
 INCLUDE = { value = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\include;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\winrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\cppwinrt", force = true }
 LIB = { value = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64", force = true }
+
+# The RustCrypto crates gate their ARMv8 assembly behind cfg flags that are off by
+# default, so without these a router runs software AES and software GHASH. Measured
+# on a Cortex-A55 in OpenWrt: AES-GCM did 0.03 GiB/s with the flags off and 0.22
+# with them on, on the same binary otherwise. Chacha's NEON path is gated the same
+# way.
+#
+# Deliberately no `-C target-feature=+aes,+pmull` here: that would let the compiler
+# emit those instructions anywhere in every crate, and a core without them would
+# take SIGILL instead of running. These cfgs select `#[target_feature]` functions
+# that are reached through runtime detection, which is how the x86 path already
+# picks its backend. NEON is the one exception: it is mandatory in ARMv8-A.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "--cfg", "aes_armv8",
+    "--cfg", "polyval_armv8",
+    "--cfg", "chacha20_force_neon",
+    "-C", "target-feature=+neon",
+    # Linker flags live here, not in the environment, because cargo takes
+    # rustflags from exactly one place and `RUSTFLAGS` from the shell wins:
+    # building the router target with `RUSTFLAGS=-C linker=rust-lld ...` on the
+    # command line silently dropped everything in this array. That build is what
+    # measured 0.03 GiB/s AES-GCM on a Cortex-A53 -- the software path, with the
+    # same number the flags being off produces on the desktop.
+    "-C", "link-self-contained=yes",
+]
+
+# Both musl targets have no system linker on a Windows host and no toolchain
+# symlinks on a Linux one; rust-lld with the self-contained CRT is the only
+# combination that links everywhere.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.armv5te-unknown-linux-musleabi]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.i686-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.powerpc64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.powerpc64le-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]

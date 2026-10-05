@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
 use super::tls::ServerTls;
+use super::transport::Transport;
 use super::udp::{relay_stream_datagrams, udp_destination};
 use crate::inbound::{AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
@@ -95,6 +96,7 @@ pub struct Vless {
     router: Arc<Router>,
     users: HashMap<[u8; 16], User>,
     tls: Option<Arc<ServerTls>>,
+    transport: Option<Arc<Transport>>,
 }
 
 impl Vless {
@@ -113,6 +115,7 @@ impl Vless {
             .map(|user| (user.uuid, user))
             .collect::<HashMap<_, _>>();
         let tls = ServerTls::from_inbound(obj, &at)?;
+        let transport = Transport::from_inbound(obj, &at)?.map(Arc::new);
         let listen = parse_listen(object, &at)?;
         let listener = TcpListener::bind(listen)
             .await
@@ -123,6 +126,7 @@ impl Vless {
             router,
             users,
             tls,
+            transport,
         })
     }
 
@@ -139,6 +143,7 @@ impl Vless {
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
                     let tls = self.tls.clone();
+                    let transport = self.transport.clone();
                     tokio::spawn(async move {
                         // The socket's own address is read here because a TLS
                         // stream is handed over where the socket was, and
@@ -146,12 +151,16 @@ impl Vless {
                         let local = stream.local_addr().unwrap_or(peer);
                         let result = match tls {
                             Some(tls) => match tls.accept(stream).await {
-                                Ok(stream) => {
-                                    handle_vless(stream, peer, local, users, tag, router).await
-                                }
+                                Ok(stream) => serve_vless(
+                                    stream, transport, peer, local, users, tag, router,
+                                )
+                                .await,
                                 Err(err) => Err(err),
                             },
-                            None => handle_vless(stream, peer, local, users, tag, router).await,
+                            None => {
+                                serve_vless(stream, transport, peer, local, users, tag, router)
+                                    .await
+                            }
                         };
                         if let Err(err) = result {
                             logging::debug(format_args!("vless {peer}: {err}"));
@@ -168,6 +177,34 @@ impl Vless {
 }
 
 /// One connection: read the request, check the user, route it.
+/// Take the transport off the front of the connection, if the listener has one,
+/// then hand what is left to the protocol. TLS first: the handshake is inside it.
+async fn serve_vless<S>(
+    stream: S,
+    transport: Option<Arc<Transport>>,
+    peer: SocketAddr,
+    local: SocketAddr,
+    users: HashMap<[u8; 16], User>,
+    tag: String,
+    router: Arc<Router>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // With no transport the concrete type is kept: boxing it here would cost the
+    // relay the `Any` downcast it does to find a bare TcpStream and splice the two
+    // directions instead of copying them. Measured on vless, eight streams:
+    // 0.39 -> 0.78 CPU-s/GiB, with the latency unchanged, so only the CPU split
+    // ever saw it.
+    match transport {
+        None => handle_vless(stream, peer, local, users, tag, router).await,
+        Some(transport) => match transport.accept(Box::new(stream) as AnyStream).await {
+            Ok(stream) => handle_vless(stream, peer, local, users, tag, router).await,
+            Err(err) => Err(io::Error::other(err)),
+        },
+    }
+}
+
 async fn handle_vless<S>(
     mut stream: S,
     peer: SocketAddr,
@@ -261,6 +298,7 @@ pub struct Trojan {
     /// SHA224 hex of each password, keyed by those bytes
     keys: HashMap<[u8; KEY_LENGTH], String>,
     tls: Option<Arc<ServerTls>>,
+    transport: Option<Arc<Transport>>,
 }
 
 /// `KeyLength`: SHA224 in hex is 56 bytes.
@@ -315,6 +353,7 @@ impl Trojan {
             router,
             keys,
             tls: ServerTls::from_inbound(obj, &at)?,
+            transport: Transport::from_inbound(obj, &at)?.map(Arc::new),
         })
     }
 
@@ -331,16 +370,21 @@ impl Trojan {
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
                     let tls = self.tls.clone();
+                    let transport = self.transport.clone();
                     tokio::spawn(async move {
                         let local = stream.local_addr().unwrap_or(peer);
                         let result = match tls {
                             Some(tls) => match tls.accept(stream).await {
                                 Ok(stream) => {
-                                    handle_trojan(stream, peer, local, keys, tag, router).await
+                                    serve_trojan(stream, transport, peer, local, keys, tag, router)
+                                        .await
                                 }
                                 Err(err) => Err(err),
                             },
-                            None => handle_trojan(stream, peer, local, keys, tag, router).await,
+                            None => {
+                                serve_trojan(stream, transport, peer, local, keys, tag, router)
+                                    .await
+                            }
                         };
                         if let Err(err) = result {
                             logging::debug(format_args!("trojan {peer}: {err}"));
@@ -364,6 +408,28 @@ pub(crate) fn password_hash(password: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The same two steps for trojan, in the same order.
+async fn serve_trojan<S>(
+    stream: S,
+    transport: Option<Arc<Transport>>,
+    peer: SocketAddr,
+    local: SocketAddr,
+    keys: HashMap<[u8; KEY_LENGTH], String>,
+    tag: String,
+    router: Arc<Router>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport {
+        None => handle_trojan(stream, peer, local, keys, tag, router).await,
+        Some(transport) => match transport.accept(Box::new(stream) as AnyStream).await {
+            Ok(stream) => handle_trojan(stream, peer, local, keys, tag, router).await,
+            Err(err) => Err(io::Error::other(err)),
+        },
+    }
 }
 
 async fn handle_trojan<S>(

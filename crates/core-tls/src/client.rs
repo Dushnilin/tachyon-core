@@ -454,7 +454,7 @@ impl<'a> Handshake<'a> {
 /// detail that makes this a continuation rather than a second connection.
 ///
 /// The interface is bytes in and bytes out -- [`Connection::write_record`] seals
-/// one record, [`Connection::read_record_from`] takes whatever whole records a
+/// one record, [`Connection::read_record_in_place`] takes whatever whole records a
 /// buffer holds -- so the caller's async stream is a buffer and two calls, and
 /// nothing here blocks or owns a socket.
 pub struct Connection {
@@ -503,44 +503,56 @@ impl Connection {
         self.sealer.seal(ContentType::ApplicationData, data)
     }
 
-    /// Decrypt whatever whole records `raw` holds and return their application
-    /// data. A partial record stays in `raw` for next time, and a post-handshake
-    /// message is skipped rather than returned: a server sends its session
-    /// tickets at this level, before any data.
+    /// Decrypt whatever whole records `raw` holds and hand the application data
+    /// back **as a range of `raw`**. A partial record stays in `raw`, and a
+    /// post-handshake message is skipped rather than returned: a server sends its
+    /// session tickets at this level, before any data.
     ///
-    /// This is the whole interface an async stream needs: bytes in, bytes out,
-    /// no blocking and no stream of its own. The blocking [`Self::read`] below
-    /// is this plus a socket.
-    pub fn read_record_from(&mut self, raw: &mut Vec<u8>) -> io::Result<Vec<u8>> {
-        let mut out = Vec::new();
-        loop {
-            if raw.len() < 5 {
-                return Ok(out);
+    /// Nothing is allocated and nothing is copied on this path, which is the whole
+    /// point: the caller reads 16 KiB records at a few Gbit/s, and a `Vec` per
+    /// record (plus one per stage of unwrapping it) costs more than the
+    /// cryptography does. The caller owns the range and moves past `record_end`
+    /// once it is done -- which is why this hands out a range and not a slice.
+    ///
+    /// `record_end` is not `end`, and conflating them is a quiet bug: a sealed
+    /// record also holds its inner content type and, when the peer padded, the
+    /// padding. Stepping over only the plaintext leaves those bytes in the buffer,
+    /// and the next call reads the content type as a record header. That is a
+    /// hang, not an error: the length it makes up is larger than what is there, so
+    /// the buffer waits for bytes that never come.
+    pub fn read_record_in_place(&mut self, raw: &mut [u8]) -> io::Result<Option<Record>> {
+        if raw.len() < 5 {
+            return Ok(None);
+        }
+        let len = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+        if raw.len() < 5 + len {
+            return Ok(None);
+        }
+        let (kind, plain) = self.opener.open_in_place(&mut raw[..5 + len])?;
+        match kind {
+            // An application record with nothing in it carries no data, and
+            // handing one back as `Data` with an empty range would leave the
+            // caller looking at the same record twice: there is no copy to make
+            // it advance this time.
+            ContentType::ApplicationData if plain > 0 => Ok(Some(Record::Data {
+                start: 5,
+                end: 5 + plain,
+                record_end: 5 + len,
+            })),
+            ContentType::Handshake | ContentType::ApplicationData => {
+                Ok(Some(Record::Skip { record_end: 5 + len }))
             }
-            let len = u16::from_be_bytes([raw[3], raw[4]]) as usize;
-            if raw.len() < 5 + len {
-                return Ok(out);
+            ContentType::Alert => {
+                // close_notify is the end of the data, not a failure
+                let data = raw[5..5 + plain].to_vec();
+                if data.len() >= 2 && data[1] == 0 {
+                    self.closed = true;
+                }
+                Err(alert(&data))
             }
-            let record: Vec<u8> = raw.drain(..5 + len).collect();
-            match self.opener.open(&record)? {
-                (ContentType::ApplicationData, data) => {
-                    out.extend_from_slice(&data);
-                    return Ok(out);
-                }
-                (ContentType::Handshake, _) => continue,
-                (ContentType::Alert, data) => {
-                    // close_notify is the end of the data, not a failure
-                    if data.len() >= 2 && data[1] == 0 {
-                        self.closed = true;
-                    }
-                    return Err(alert(&data));
-                }
-                (kind, _) => {
-                    return Err(bad(format!(
-                        "the server sent a {kind:?} record after the handshake"
-                    )));
-                }
-            }
+            kind => Err(bad(format!(
+                "the server sent a {kind:?} record after the handshake"
+            ))),
         }
     }
 
@@ -548,6 +560,26 @@ impl Connection {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+}
+
+/// What [`Connection::read_record_in_place`] found at the front of a buffer.
+///
+/// Every index is relative to the slice that was handed in, and the caller is
+/// the only thing that moves: records arrive in order, so the caller's own read
+/// cursor is what steps over them, and nothing in the buffer has to be shifted
+/// to make room for the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Record {
+    /// `raw[start..end]` is application data. The record itself -- header, tag and
+    /// any padding the peer added -- runs to `record_end`.
+    Data {
+        start: usize,
+        end: usize,
+        record_end: usize,
+    },
+    /// A whole record with nothing to hand over: a post-handshake message, or an
+    /// empty application record. Step over `record_end` bytes.
+    Skip { record_end: usize },
 }
 
 async fn read_record(stream: &mut (dyn Stream + '_)) -> io::Result<Vec<u8>> {

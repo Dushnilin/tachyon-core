@@ -4,16 +4,36 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::crypto::{Cipher, Method, derive_subkey, master_key, random_bytes};
+use super::crypto::{AEAD_TAG, Cipher, Method, derive_subkey, master_key, random_bytes};
 use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 
-/// Read buffer of a connection: two legacy chunks (`0x3FFF` + tag each) and the
-/// length blocks between them, so one `read` usually brings in whole chunks.
-/// It is only allocated when the first byte of the response is about to be read.
+/// Read buffer of a connection, for a method whose records fit in it whole: two
+/// legacy chunks (`0x3FFF` + tag each) and the length blocks between them, so one
+/// `read` usually brings in whole chunks. It is only allocated when the first byte
+/// of the response is about to be read, and a 2022 method outgrows it -- see
+/// `read_buf`.
 const READ_BUF: usize = 33 * 1024;
-/// Largest write buffer a connection keeps between writes. The relay hands over
-/// 64 KiB at a time, which seals to a little more than that.
-const WRITE_BUF_KEEP: usize = 80 * 1024;
+/// Every sealed block carries a tag; the wire overhead of one chunk is its length
+/// block, the tag on that block and the tag on the payload.
+const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
+/// Largest frame a connection keeps between writes. The relay hands over 64 KiB at
+/// a time, which seals to a little more than that, so the steady state stays well
+/// under this and the buffer is never dropped.
+const WRITE_BUF_KEEP: usize = 256 * 1024;
+
+/// Read buffer big enough for one whole record of `method` plus the length block
+/// of the next one.
+///
+/// The reader asks for a *payload* (`payload_len + AEAD_TAG`), but what it needs
+/// is room for the record that payload belongs to. Sizing to the payload leaves a
+/// 2022 buffer one length block short of its own record: `need(18)` consumes the
+/// header, `need(65551)` then finds 18 bytes missing and moves the whole 65533-byte
+/// payload to the front before it can read them -- a full copy of every byte, every
+/// record, plus a syscall and a wakeup it would not have needed. Legacy records are
+/// small enough that two of them fit, which is why only 2022 paid it.
+fn read_buf(method: Method) -> usize {
+    (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
+}
 
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {
@@ -135,6 +155,7 @@ impl Shadowsocks {
             pos: 0,
             pend: 0,
             request_salt: salt,
+            read_buf: read_buf(self.method),
             state: if is_2022 {
                 ReaderState::ResponseSalt
             } else {
@@ -158,6 +179,14 @@ impl<W: tokio::io::AsyncWrite + Unpin> SsWriter<W> {
     /// lot with a single write: no temporary vectors, one syscall per call
     /// instead of one per 16 KiB.
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> io::Result<()> {
+        // sized before the frame is built: growing into it reallocates and copies,
+        // and `Vec`'s doubling lands above `WRITE_BUF_KEEP`, so the buffer used to
+        // be dropped and regrown on every single write
+        let chunks = plaintext.len().div_ceil(usize::from(self.max_chunk)).max(1);
+        let need = plaintext.len() + chunks * BLOCK_OVERHEAD;
+        if self.buf.capacity() < need {
+            self.buf.reserve_exact(need - self.buf.len());
+        }
         self.buf.clear();
         for segment in plaintext.chunks(usize::from(self.max_chunk)) {
             let head = self.buf.len();
@@ -186,6 +215,8 @@ pub struct SsReader<R> {
     master_key: Arc<Vec<u8>>,
     cipher: Option<Cipher>,
     counter: u64,
+    /// what `rbuf` is grown to when the first record is waited for
+    read_buf: usize,
     /// Bytes off the wire that nothing has consumed yet: `rbuf[rpos..rend]`.
     rbuf: Vec<u8>,
     rpos: usize,
@@ -220,7 +251,7 @@ impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
             self.rpos = 0;
         }
         if self.rbuf.len() < n {
-            self.rbuf.resize(n.max(READ_BUF), 0);
+            self.rbuf.resize((n + 2 + AEAD_TAG).max(self.read_buf), 0);
         }
         while self.rend < n {
             let got = self.inner.read(&mut self.rbuf[self.rend..]).await?;

@@ -13,7 +13,7 @@
 use std::io;
 use std::task::{Context, Poll, ready};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::AnyStream;
@@ -56,14 +56,20 @@ pub(super) async fn connect(
         io: H2Io {
             h2: H2Stream::new(response, send, conn_task),
         },
-        decoded: BytesMut::new(),
+        data_left: 0,
+        skip: 0,
     }))
 }
 
 pub(crate) struct GrpcStream {
     io: H2Io,
-    /// Decoded Hunk payloads waiting to be served to the caller.
-    decoded: BytesMut,
+    /// Payload bytes of the current Hunk still to be handed out. The payload is
+    /// served straight out of the h2 receive buffer as it arrives; a whole
+    /// message is never gathered, copied or allocated for.
+    data_left: usize,
+    /// Bytes of the current message that follow its payload (unknown protobuf
+    /// fields, normally none), dropped before the next message starts.
+    skip: usize,
 }
 
 impl GrpcStream {
@@ -87,24 +93,36 @@ impl AsyncRead for GrpcStream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
         loop {
-            if !self.decoded.is_empty() {
-                let n = out.remaining().min(self.decoded.len());
-                out.put_slice(&self.decoded[..n]);
-                self.decoded.advance(n);
-                return Poll::Ready(Ok(()));
-            }
-            if let Some(msg) = take_hunk(&mut self.io.h2.pending)? {
-                self.decoded.extend_from_slice(&msg);
+            let pending = &mut this.io.h2.pending;
+            if this.data_left > 0 {
+                if !pending.is_empty() {
+                    let n = out.remaining().min(this.data_left).min(pending.len());
+                    out.put_slice(&pending[..n]);
+                    pending.advance(n);
+                    this.data_left -= n;
+                    return Poll::Ready(Ok(()));
+                }
+            } else if this.skip > 0 {
+                let n = this.skip.min(pending.len());
+                if n > 0 {
+                    pending.advance(n);
+                    this.skip -= n;
+                    continue;
+                }
+            } else if let Some((data, skip)) = start_hunk(pending)? {
+                this.data_left = data;
+                this.skip = skip;
                 continue;
             }
-            if self.io.h2.is_eof() {
-                if !self.io.h2.pending.is_empty() {
+            if this.io.h2.is_eof() {
+                if !this.io.h2.pending.is_empty() || this.data_left > 0 || this.skip > 0 {
                     return Poll::Ready(Err(io::Error::other("grpc: stream ended mid-frame")));
                 }
                 return Poll::Ready(Ok(()));
             }
-            ready!(self.io.h2.poll_recv_more(cx))?;
+            ready!(this.io.h2.poll_recv_more(cx))?;
         }
     }
 }
@@ -168,8 +186,11 @@ fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     }
 }
 
-/// Pull one decoded Hunk out of the raw framing buffer.
-fn take_hunk(raw: &mut BytesMut) -> io::Result<Option<Bytes>> {
+/// Consume the header of the next Hunk (5-byte gRPC prefix, protobuf tag and
+/// length varint) and return `(payload_len, trailing_len)`: the payload bytes
+/// that follow in the buffer, and any bytes of the message after them. Only
+/// the header has to be buffered; the payload is served as it arrives.
+fn start_hunk(raw: &mut Bytes) -> io::Result<Option<(usize, usize)>> {
     if raw.len() < 5 {
         return Ok(None);
     }
@@ -177,26 +198,32 @@ fn take_hunk(raw: &mut BytesMut) -> io::Result<Option<Bytes>> {
         return Err(io::Error::other("grpc: compressed frames unsupported"));
     }
     let len = u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]) as usize;
-    if raw.len() < 5 + len {
+    if len == 0 {
+        return Err(io::Error::other("grpc: empty Hunk payload"));
+    }
+    // tag (1) + varint (at most 10) is all that has to be present.
+    let want = len.min(11);
+    let have = (raw.len() - 5).min(want);
+    if have == 0 {
         return Ok(None);
     }
-    let payload = &raw[5..5 + len];
-    let Some((&tag, rest)) = payload.split_first() else {
-        return Err(io::Error::other("grpc: empty Hunk payload"));
-    };
-    if tag != 0x0A {
+    let head = &raw[5..5 + have];
+    if head[0] != 0x0A {
         return Err(io::Error::other("grpc: unexpected Hunk payload tag"));
     }
-    let Some((vlen, vl)) = read_varint(rest) else {
+    let Some((vlen, vl)) = read_varint(&head[1..]) else {
+        if have < want {
+            return Ok(None);
+        }
         return Err(io::Error::other("grpc: bad Hunk length varint"));
     };
-    let end = 1 + vl + vlen as usize;
-    if end > payload.len() {
-        return Err(io::Error::other("grpc: truncated Hunk payload"));
-    }
-    let data = Bytes::copy_from_slice(&payload[1 + vl..end]);
-    raw.advance(5 + len);
-    Ok(Some(data))
+    let used = 1 + vl;
+    let vlen = usize::try_from(vlen)
+        .ok()
+        .filter(|v| used.checked_add(*v).is_some_and(|end| end <= len))
+        .ok_or_else(|| io::Error::other("grpc: truncated Hunk payload"))?;
+    raw.advance(5 + used);
+    Ok(Some((vlen, len - used - vlen)))
 }
 
 #[cfg(test)]
@@ -205,30 +232,56 @@ mod tests {
 
     #[test]
     fn hunk_roundtrip() {
-        let mut raw = BytesMut::from(&GrpcStream::encode_frame(b"hello")[..]);
-        raw.extend_from_slice(&GrpcStream::encode_frame(&[0x5A; 40000])[..]);
-        let first = take_hunk(&mut raw).unwrap().expect("first hunk");
-        assert_eq!(first.as_ref(), &b"hello"[..]);
-        let second = take_hunk(&mut raw).unwrap().expect("second hunk");
-        assert_eq!(second.len(), 40000);
-        assert!(second.iter().all(|b| *b == 0x5A));
+        let mut both = GrpcStream::encode_frame(b"hello");
+        both.extend_from_slice(&GrpcStream::encode_frame(&[0x5A; 40000]));
+        let mut raw = Bytes::from(both);
+        let (n, skip) = start_hunk(&mut raw).unwrap().expect("first hunk");
+        assert_eq!((n, skip), (5, 0));
+        assert_eq!(&raw[..n], &b"hello"[..]);
+        raw.advance(n);
+        let (n, skip) = start_hunk(&mut raw).unwrap().expect("second hunk");
+        assert_eq!((n, skip), (40000, 0));
+        assert!(raw[..n].iter().all(|b| *b == 0x5A));
+        raw.advance(n);
         assert!(raw.is_empty());
-        assert!(take_hunk(&mut raw).unwrap().is_none());
+        assert!(start_hunk(&mut raw).unwrap().is_none());
     }
 
     #[test]
     fn hunk_partial_buffer() {
         let frame = GrpcStream::encode_frame(b"partial");
-        let mut raw = BytesMut::from(&frame[..4]);
-        assert!(take_hunk(&mut raw).unwrap().is_none());
-        raw.extend_from_slice(&frame[4..]);
-        assert_eq!(take_hunk(&mut raw).unwrap().unwrap(), &b"partial"[..]);
+        let mut raw = Bytes::copy_from_slice(&frame[..4]);
+        assert!(start_hunk(&mut raw).unwrap().is_none());
+        let mut raw = Bytes::from(frame);
+        assert_eq!(start_hunk(&mut raw).unwrap().unwrap(), (7, 0));
+        assert_eq!(&raw[..], &b"partial"[..]);
+    }
+
+    #[test]
+    fn hunk_header_only_is_enough() {
+        let frame = GrpcStream::encode_frame(&[7u8; 1000]);
+        let mut raw = Bytes::copy_from_slice(&frame[..8]);
+        assert_eq!(start_hunk(&mut raw).unwrap().unwrap(), (1000, 0));
+        assert!(raw.is_empty());
+    }
+
+    #[test]
+    fn hunk_trailing_fields_are_skipped() {
+        // Payload: data field (3 bytes) followed by 2 bytes of an unknown field.
+        let mut raw = Bytes::copy_from_slice(&b"\x00\x00\x00\x00\x07\x0a\x03abc\x10\x01"[..]);
+        assert_eq!(start_hunk(&mut raw).unwrap().unwrap(), (3, 2));
     }
 
     #[test]
     fn hunk_rejects_compression_flag() {
-        let mut raw = BytesMut::from(&b"\x01\x00\x00\x00\x01\x0a\x01x"[..]);
-        assert!(take_hunk(&mut raw).is_err());
+        let mut raw = Bytes::copy_from_slice(&b"\x01\x00\x00\x00\x01\x0a\x01x"[..]);
+        assert!(start_hunk(&mut raw).is_err());
+    }
+
+    #[test]
+    fn hunk_rejects_overlong_data() {
+        let mut raw = Bytes::copy_from_slice(&b"\x00\x00\x00\x00\x03\x0a\x09x"[..]);
+        assert!(start_hunk(&mut raw).is_err());
     }
 
     #[test]

@@ -20,6 +20,9 @@ use tokio::task::JoinHandle;
 /// to are used to.
 const STREAM_WINDOW: u32 = 4 << 20;
 const CONN_WINDOW: u32 = 16 << 20;
+/// Largest DATA frame we ask the peer to send (the protocol default is 16 KiB;
+/// Go's client asks for 1 MiB).
+const MAX_FRAME: u32 = 1 << 20;
 
 /// The client handshake every h2-based transport shares, with windows sized
 /// for throughput.
@@ -27,7 +30,8 @@ pub(crate) fn client_builder() -> h2::client::Builder {
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(STREAM_WINDOW)
-        .initial_connection_window_size(CONN_WINDOW);
+        .initial_connection_window_size(CONN_WINDOW)
+        .max_frame_size(MAX_FRAME);
     builder
 }
 
@@ -37,7 +41,7 @@ pub(crate) struct H2Stream {
     response: Option<Pin<Box<ResponseFuture>>>,
     recv: Option<RecvStream>,
     /// Received bytes not yet handed to the caller.
-    pub(crate) pending: BytesMut,
+    pub(crate) pending: Bytes,
     /// Encoded bytes waiting on flow-control capacity.
     out: Bytes,
     report: usize,
@@ -74,7 +78,7 @@ impl H2Stream {
             send: Some(send),
             response: None,
             recv: Some(response.into_body()),
-            pending: BytesMut::new(),
+            pending: Bytes::new(),
             out: Bytes::new(),
             report: 0,
             eof: false,
@@ -91,7 +95,7 @@ impl H2Stream {
             send: Some(send),
             response: Some(Box::pin(response)),
             recv: None,
-            pending: BytesMut::new(),
+            pending: Bytes::new(),
             out: Bytes::new(),
             report: 0,
             eof: false,
@@ -173,7 +177,14 @@ impl H2Stream {
             Some(Ok(chunk)) => {
                 let len = chunk.len();
                 let _ = recv.flow_control().release_capacity(len);
-                self.pending.extend_from_slice(&chunk);
+                if self.pending.is_empty() {
+                    self.pending = chunk;
+                } else {
+                    let mut joined = BytesMut::with_capacity(self.pending.len() + len);
+                    joined.extend_from_slice(&self.pending);
+                    joined.extend_from_slice(&chunk);
+                    self.pending = joined.freeze();
+                }
                 Poll::Ready(Ok(true))
             }
             Some(Err(e)) => Poll::Ready(Err(io::Error::other(format!("h2: recv: {e}")))),

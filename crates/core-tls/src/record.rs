@@ -225,7 +225,11 @@ impl Opener {
     /// `record[5..5 + len]`, with the type byte and any padding cut off.
     pub fn open_in_place(&mut self, record: &mut [u8]) -> io::Result<(ContentType, usize)> {
         if record.len() < 5 + 16 {
-            return Err(err("short record"));
+            return Err(err(format!(
+                "short record: {} bytes of type {:#04x}, a sealed one is at least 21",
+                record.len(),
+                record.first().copied().unwrap_or(0)
+            )));
         }
         if record[0] != ContentType::ApplicationData as u8 {
             return Err(err(format!(

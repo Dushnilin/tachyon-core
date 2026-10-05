@@ -12,7 +12,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use core_tls::client::{self, Config, Handshake};
+use core_tls::client::{self, Config, Handshake, Record};
 use core_tls::fingerprints;
 use core_tls::hello::parse_record;
 use core_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -326,18 +326,43 @@ async fn application_data_flows_after_the_handshake() {
 
     // and the answer comes back, decrypted
     let mut raw = Vec::new();
+    let mut at = 0usize;
     let mut chunk = [0u8; 4096];
-    let answer = loop {
+    let mut answer: Option<Vec<u8>> = None;
+    while answer.is_none() {
+        // A server sends its session tickets at this level, before any data, so
+        // the buffer can hold a post-handshake record before the answer: step over
+        // whatever is whole and look at the next, and only read when what is left
+        // is not a record yet.
+        loop {
+            match connection
+                .read_record_in_place(&mut raw[at..])
+                .expect("open the record")
+            {
+                Some(Record::Data {
+                    start,
+                    end,
+                    record_end,
+                }) => {
+                    let data = raw[at + start..at + end].to_vec();
+                    at += record_end;
+                    if !data.is_empty() {
+                        answer = Some(data);
+                        break;
+                    }
+                }
+                Some(Record::Skip { record_end }) => at += record_end,
+                None => break,
+            }
+        }
+        if answer.is_some() {
+            break;
+        }
         let n = sock.read(&mut chunk).await.expect("read the socket");
         assert_ne!(n, 0, "the server closed before answering");
         raw.extend_from_slice(&chunk[..n]);
-        let data = connection
-            .read_record_from(&mut raw)
-            .expect("open the record");
-        if !data.is_empty() {
-            break data;
-        }
-    };
+    }
+    let answer = answer.expect("the answer came");
     assert_eq!(answer, b"HTTP/1.1 204 No Content\r\n\r\n");
     let request = tokio::time::timeout(deadline, server)
         .await

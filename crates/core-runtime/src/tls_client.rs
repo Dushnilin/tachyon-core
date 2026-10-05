@@ -98,6 +98,11 @@ pub struct TlsOptions {
     /// and the handshake written for it.
     fingerprint: Option<Fingerprint>,
     reality: Option<Reality>,
+    /// Which stack does the handshake and the record layer. Our own reads
+    /// records in place out of a fixed buffer; rustls shifts plaintext between
+    /// two of its own buffers, and that came to a third of the client CPU on a
+    /// busy websocket. `None` means "decide", see [`TlsOptions::own_stack`].
+    stack: Option<bool>,
 }
 
 impl TlsOptions {
@@ -216,9 +221,21 @@ impl TlsOptions {
             _ => None,
         };
 
+        let stack = match tls.get("stack").and_then(Value::as_str) {
+            Some("core") | Some("own") => Some(true),
+            Some("rustls") => Some(false),
+            Some(other) => {
+                return Err(anyhow::anyhow!(
+                    "{at}: tls.stack: {other:?} is not one of core, own, rustls"
+                ));
+            }
+            None => None,
+        };
+
         Ok(Some(Self {
             fingerprint,
             reality,
+            stack,
             server_name,
             insecure,
             disable_sni,
@@ -350,6 +367,24 @@ impl TlsOptions {
         self.reality.as_ref()
     }
 
+    /// Whose TLS does the handshake and the record layer.
+    ///
+    /// A fingerprint or REALITY settles it: neither can be presented through
+    /// rustls. Past that the config decides (`tls.stack`), and by default ours
+    /// does, because it decrypts in place out of one fixed buffer where rustls
+    /// moves plaintext between two of its own -- on a busy websocket that was a
+    /// third of the client CPU. The one thing ours cannot do is TLS 1.2 on the
+    /// client, so a config pinned to 1.2 stays on rustls.
+    fn own_stack(&self) -> bool {
+        if self.fingerprint().is_some() {
+            return true;
+        }
+        if let Some(stack) = self.stack {
+            return stack;
+        }
+        !self.max_tls12
+    }
+
     /// Establish the connection, with our own TLS when a fingerprint is
     /// configured and the library's otherwise.
     ///
@@ -360,14 +395,22 @@ impl TlsOptions {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        if self.fingerprint().is_none() {
-            return Ok(Box::new(self.connect_stream(stream, default_alpn).await?));
-        }
-        let fingerprint = self.fingerprint().expect("checked above");
-        let alpn: Vec<&[u8]> = if self.alpn.is_empty() {
+        let mut alpn: Vec<&[u8]> = if self.alpn.is_empty() {
             default_alpn.to_vec()
         } else {
             self.alpn.iter().map(|p| p.as_slice()).collect()
+        };
+        if alpn.is_empty() && (self.reality.is_some() || self.fingerprint.is_some()) {
+            alpn = vec![b"h2", b"http/1.1"];
+        }
+        if !self.own_stack() {
+            return Ok(Box::new(self.connect_stream(stream, default_alpn).await?));
+        }
+        // With no fingerprint named, present chrome: ours always writes its own
+        // hello, so there is a template to pick either way.
+        let (name, template) = match self.fingerprint() {
+            Some(f) => (f.name.clone(), f.template.clone()),
+            None => ("chrome".to_string(), core_tls::fingerprints::chrome()),
         };
         // a REALITY server is trusted by its own borrowed certificate under the
         // auth key, so the ordinary chain check is the fallback, not the answer
@@ -405,7 +448,7 @@ impl TlsOptions {
                 (plain, None)
             };
         let config = core_tls::client::Config {
-            template: &fingerprint.template,
+            template: &template,
             server_name: if self.disable_sni {
                 ""
             } else {
@@ -420,7 +463,7 @@ impl TlsOptions {
         let result = handshake
             .run(&mut stream)
             .await
-            .map_err(|e| io::Error::other(format!("{} handshake: {e}", fingerprint.name)));
+            .map_err(|e| io::Error::other(format!("{name} handshake: {e}")));
         if let Some(v) = reality_verifier.as_ref() {
             crate::logging::debug(format_args!(
                 "REALITY {}: {}",

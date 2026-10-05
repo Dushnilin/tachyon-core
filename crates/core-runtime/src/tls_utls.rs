@@ -13,23 +13,32 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use core_tls::client::Connection;
+use core_tls::client::{Connection, Record};
 
-/// How much to pull off the socket at once. A record is at most 2^14 + 256
-/// bytes with its tag, so this reads a whole one in a single go on any socket
+/// How much the raw buffer grows by when it needs room. A record is at most
+/// 2^14 + 256 bytes with its tag, so one read fills several of them on any socket
 /// that is not pathological.
-const CHUNK: usize = 18 * 1024;
+const CHUNK: usize = 64 * 1024;
 
 /// TLS over `S`, established by us rather than by a library.
 pub struct FingerprintStream<S> {
     inner: S,
     connection: Connection,
-    /// transport bytes that do not make a whole record yet
+    /// transport bytes, and where the opened plaintext of the record at the front
+    /// of them starts and ends
     raw: Vec<u8>,
-    /// plaintext of a record bigger than the buffer a reader brought, and how much
-    /// of it has been handed over
-    pending: Vec<u8>,
-    pending_at: usize,
+    /// how far into `raw` the bytes already handed over run. A 64 KiB read holds
+    /// four records, and shifting what is left down after each one moves three
+    /// times the payload it just finished reading: a second pass over every byte
+    /// on the hottest path in the tree. The cursor costs nothing, and the buffer
+    /// is compacted only when it is actually full.
+    rpos: usize,
+    /// `raw[plain_at..plain_end]` has been opened and not handed over yet, and
+    /// the record it came from runs to `plain_end` no further: `raw[..record_end]`
+    /// is what a caller drops once it is done with the plaintext
+    plain_at: usize,
+    plain_end: usize,
+    record_end: usize,
     /// a record waiting to go out, and how much of it has been written
     out: Option<(Vec<u8>, usize)>,
     eof: bool,
@@ -42,8 +51,10 @@ impl<S> FingerprintStream<S> {
             inner,
             connection,
             raw: Vec::new(),
-            pending: Vec::new(),
-            pending_at: 0,
+            rpos: 0,
+            plain_at: 0,
+            plain_end: 0,
+            record_end: 0,
             out: None,
             eof: false,
         }
@@ -70,15 +81,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
         loop {
-            // plaintext left over from a record the reader's buffer could not
-            // take whole
-            if me.pending_at < me.pending.len() {
-                let take = (me.pending.len() - me.pending_at).min(buf.remaining());
-                buf.put_slice(&me.pending[me.pending_at..me.pending_at + take]);
-                me.pending_at += take;
-                if me.pending_at == me.pending.len() {
-                    me.pending.clear();
-                    me.pending_at = 0;
+            // plaintext the reader's buffer could not take whole
+            if me.plain_at < me.plain_end {
+                let take = (me.plain_end - me.plain_at).min(buf.remaining());
+                buf.put_slice(&me.raw[me.plain_at..me.plain_at + take]);
+                me.plain_at += take;
+                if me.plain_at == me.plain_end {
+                    // the record is out of the caller's hands: its transport bytes
+                    // are behind the cursor, and the buffer keeps its room
+                    me.rpos = me.record_end;
+                    me.plain_at = 0;
+                    me.plain_end = 0;
+                    me.record_end = 0;
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -92,29 +106,55 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
             // record left us spinning over the same bytes forever, never reading
             // the rest of it -- which is what a REALITY server's post-handshake
             // ticket is.
-            let data = match me.connection.read_record_from(&mut me.raw) {
-                Ok(data) => data,
-                Err(e) => return Poll::Ready(Err(e)),
-            };
-            if !data.is_empty() {
-                me.pending = data;
-                me.pending_at = 0;
-                continue;
-            }
-            let mut chunk = [0u8; CHUNK];
-            let mut read = ReadBuf::new(&mut chunk);
-            match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
-                Poll::Ready(Ok(())) => {
-                    let filled = read.filled();
-                    if filled.is_empty() {
-                        me.eof = true;
-                        return Poll::Ready(Ok(()));
-                    }
-                    me.raw.extend_from_slice(filled);
+            match me.connection.read_record_in_place(&mut me.raw[me.rpos..]) {
+                Ok(Some(Record::Data {
+                    start,
+                    end,
+                    record_end,
+                })) => {
+                    me.plain_at = me.rpos + start;
+                    me.plain_end = me.rpos + end;
+                    me.record_end = me.rpos + record_end;
+                    continue;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Ok(Some(Record::Skip { record_end })) => {
+                    me.rpos += record_end;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
+            // Read straight into the buffer's spare room: a zeroed stack array per
+            // read is 18 KiB of memset plus a copy out of it, on every read. The
+            // cursor is folded away here and nowhere else, because this is the one
+            // place that needs the room.
+            if me.raw.len() == me.raw.capacity() {
+                if me.rpos > 0 {
+                    let left = me.raw.len() - me.rpos;
+                    me.raw.copy_within(me.rpos.., 0);
+                    me.raw.truncate(left);
+                    me.rpos = 0;
+                }
+                if me.raw.len() == me.raw.capacity() {
+                    me.raw.reserve(CHUNK);
+                }
+            }
+            let have = me.raw.len();
+            let got = {
+                let mut read = ReadBuf::uninit(me.raw.spare_capacity_mut());
+                match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
+                    Poll::Ready(Ok(())) => read.filled().len(),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+            if got == 0 {
+                me.eof = true;
+                return Poll::Ready(Ok(()));
+            }
+            // SAFETY: the reader initialised exactly `got` bytes of the spare
+            // capacity, starting at `have`
+            unsafe { me.raw.set_len(have + got) };
         }
     }
 }
@@ -134,12 +174,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let taken = buf.len();
+        // one record per call, so the sequence number moves with each record
+        // rather than with each call. A caller with more than a record's worth
+        // writes it in pieces: `write_record` refuses more, and the number handed
+        // back has to be what really left.
+        let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
         loop {
             let Some((record, written)) = me.out.as_mut() else {
-                // one record per call: a caller with more writes again, and the
-                // sequence number moves with each record, not with each call
-                let record = match me.connection.write_record(buf) {
+                let record = match me.connection.write_record(&buf[..take]) {
                     Ok(record) => record,
                     Err(e) => return Poll::Ready(Err(e)),
                 };
@@ -151,7 +193,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
                     *written += n;
                     if *written == record.len() {
                         me.out = None;
-                        return Poll::Ready(Ok(taken));
+                        return Poll::Ready(Ok(take));
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

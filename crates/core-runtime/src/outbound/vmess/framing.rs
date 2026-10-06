@@ -21,16 +21,21 @@ use crate::inbound::AnyStream;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
 
-pub(crate) const WRITE_CHUNK: usize = 15000;
-/// How much of one `write` is framed into one buffer: four full chunks, which
-/// is what the relay hands over at a time.
+/// One frame's worth of plaintext. The frame's length field is a `u16`
+/// covering ciphertext, tag and padding, so the ceiling is what still encodes
+/// with a full pad: 15 000 sat far below it, and every 15 KB paid a framing
+/// pass and a record-sized wake-up on the read side.
+pub(crate) const WRITE_CHUNK: usize =
+    u16::MAX as usize - CIPHER_OVERHEAD - (MAX_PADDING as usize - 1);
+/// How much of one `write` is framed into one buffer and leaves in one syscall:
+/// several full chunks, at least the 128 KiB the relay hands over at a time.
 pub(crate) const WRITE_BATCH: usize = 4 * WRITE_CHUNK;
 const CIPHER_OVERHEAD: usize = 16;
 const MAX_PADDING: u16 = 64;
 
 /// Read-ahead the frame buffer aims for: enough that one read brings in several
 /// chunks rather than the two bytes of a length block.
-const READ_CHUNK: usize = 32 * 1024;
+const READ_CHUNK: usize = 64 * 1024;
 /// Hard ceiling on the frame buffer: one whole chunk (a `u16` of ciphertext plus
 /// its tag) behind the length block, plus the read-ahead.
 ///
@@ -309,7 +314,10 @@ enum AssembleState {
     Len,
     /// `frame` owes `total` sealed bytes after the length block, `pad` of them
     /// padding.
-    Data { total: usize, pad: usize },
+    Data {
+        total: usize,
+        pad: usize,
+    },
     /// A whole chunk is assembled and opened at `frame[pos..]`, waiting for the
     /// caller to take it.
     Frame,
@@ -359,14 +367,24 @@ impl FrameAssembler {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // `filled` at entry is not zero for every caller: tokio's `read_to_end`
+        // hands over one ReadBuf with everything read so far already in it and
+        // counts this call's bytes as the delta, zero meaning end of stream.
+        // So "did I put bytes in" is a delta, not emptiness.
+        let had = out.filled().len();
         loop {
             // a whole chunk is sitting in `frame`, opened: hand out as much of it
-            // as the caller's buffer takes and keep the rest for the next poll
+            // as the caller's buffer takes, then keep taking while the buffer has
+            // room -- one record per call meant a framing pass and a wake-up per
+            // 15 KB, the same bill that broke the ss2022 cells
             if matches!(self.state, AssembleState::Frame) && self.pos < self.end {
                 let n = out.remaining().min(self.end - self.pos);
                 out.put_slice(&self.frame[self.pos..self.pos + n]);
                 self.pos += n;
-                return Poll::Ready(Ok(()));
+                if out.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
             let Self {
                 body,
@@ -413,6 +431,12 @@ impl FrameAssembler {
                         Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                         Poll::Pending => {
                             *state = AssembleState::Len;
+                            // bytes from earlier records are already in the
+                            // caller's buffer: hand them over now, a `Pending`
+                            // with data in hand would strand them
+                            if out.filled().len() > had {
+                                return Poll::Ready(Ok(()));
+                            }
                             return Poll::Pending;
                         }
                     }
@@ -433,9 +457,7 @@ impl FrameAssembler {
                         u16::from_be_bytes([frame[at], frame[at + 1]])
                     };
                     let mut pad = 0usize;
-                    if *global_padding
-                        && let Some(shake) = shake
-                    {
+                    if *global_padding && let Some(shake) = shake {
                         pad = usize::from(shake.next_u16() % MAX_PADDING);
                     }
                     if *chunk_masking
@@ -473,6 +495,9 @@ impl FrameAssembler {
                         Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                         Poll::Pending => {
                             *state = AssembleState::Data { total, pad };
+                            if out.filled().len() > had {
+                                return Poll::Ready(Ok(()));
+                            }
                             return Poll::Pending;
                         }
                     }
@@ -511,7 +536,11 @@ impl FrameAssembler {
                         // the tag sits right after the ciphertext and before the
                         // padding, so the sealed block is exactly `ct_len` long
                         plain_len = body
-                            .open(*body_count, body_iv, &mut frame[plain_at..plain_at + ct_len])
+                            .open(
+                                *body_count,
+                                body_iv,
+                                &mut frame[plain_at..plain_at + ct_len],
+                            )
                             .map_err(|e| io::Error::other(format!("body-chunk: {e}")))?;
                     }
                     *body_count = body_count.wrapping_add(1);
@@ -566,10 +595,7 @@ fn fill(
         // enough room to make this read worth a syscall, and never past the
         // ceiling. `reserve_exact`, because `reserve` rounds up to twice the
         // capacity and that is what used to walk the buffer up with the stream.
-        let want = need
-            .saturating_add(READ_CHUNK)
-            .min(FRAME_ROOM)
-            .max(need);
+        let want = need.saturating_add(READ_CHUNK).min(FRAME_ROOM).max(need);
         if frame.capacity() < want {
             frame.reserve_exact(want - frame.len());
         }
@@ -724,11 +750,7 @@ mod tests {
     async fn the_authenticated_length_variant_reads_whole_frames() {
         for chunk in [1usize, 19, 1018, 4096] {
             let out = round_trip(super::super::SEC_AES128_GCM, true, 4, chunk).await;
-            assert_eq!(
-                out.len(),
-                4000,
-                "chunk size {chunk}: bytes went missing"
-            );
+            assert_eq!(out.len(), 4000, "chunk size {chunk}: bytes went missing");
         }
     }
 
@@ -737,6 +759,105 @@ mod tests {
     async fn the_chacha_body_reads_whole_frames() {
         let out = round_trip(super::super::SEC_CHACHA20_POLY1305, false, 4, 1000).await;
         assert_eq!(out.len(), 4000);
+    }
+
+    /// Every length variant of a frame must still encode its own `u16`, at the
+    /// worst padding the writer can draw.
+    #[test]
+    fn the_write_chunk_fits_the_u16_length_field() {
+        let pad = MAX_PADDING as usize - 1;
+        // the plain length carries ciphertext, its tag and the padding
+        assert!(WRITE_CHUNK + CIPHER_OVERHEAD + pad <= u16::MAX as usize);
+        // the authenticated length carries plaintext and padding
+        assert!(WRITE_CHUNK + pad <= u16::MAX as usize);
+        // the legacy length carries the payload and its checksum
+        assert!(WRITE_CHUNK + 4 <= u16::MAX as usize);
+    }
+
+    /// A frame of the maximum size, through the whole path, in both length
+    /// variants: the bound is only worth as much as the round trip that proves
+    /// the writer never wraps it.
+    #[tokio::test]
+    async fn the_largest_chunk_round_trips() {
+        for authenticated_length in [false, true] {
+            let mut writer = BodyWriter::new(
+                super::super::SEC_AES128_GCM,
+                &key16(1),
+                &key16(2),
+                /* global_padding */ false,
+                /* chunk_masking */ false,
+                authenticated_length,
+            );
+            let mut wire = Vec::new();
+            writer
+                .frame_into(&vec![0xA5; WRITE_CHUNK], &mut wire)
+                .expect("frame");
+            let (client, mut server) = tokio::io::duplex(1 << 20);
+            let feed = async move {
+                server.write_all(&wire).await.expect("feed");
+                server.shutdown().await.expect("shutdown");
+            };
+            let mut stream = Assembled {
+                reader: FrameAssembler::new(
+                    super::super::SEC_AES128_GCM,
+                    &key16(1),
+                    &key16(2),
+                    &key16(1),
+                    &key16(2),
+                    false,
+                    false,
+                    authenticated_length,
+                    /* cfb */ None,
+                ),
+                inner: Box::new(client),
+            };
+            let read = async {
+                let mut out = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read_to_end(&mut out),
+                )
+                .await
+                .expect("no hang")
+                .expect("read the largest chunk");
+                out
+            };
+            let (_, out) = tokio::join!(feed, read);
+            assert_eq!(out.len(), WRITE_CHUNK, "auth_len={authenticated_length}");
+            assert!(
+                out.iter().all(|byte| *byte == 0xA5),
+                "auth_len={authenticated_length}: payload came back wrong"
+            );
+        }
+    }
+
+    /// Several records that are already in the socket come back from one
+    /// `poll_read`: one record per call was a framing pass and a wake-up per
+    /// record on the download side.
+    #[tokio::test]
+    async fn one_read_drains_every_record_that_is_ready() {
+        let (mut writer, mut reader) = pool(super::super::SEC_AES128_GCM);
+        let mut wire = Vec::new();
+        for round in 0..4u8 {
+            writer
+                .frame_into(&vec![round; 1000], &mut wire)
+                .expect("frame");
+        }
+        let (client, mut server) = tokio::io::duplex(1 << 20);
+        server.write_all(&wire).await.expect("feed");
+        let mut inner: AnyStream = Box::new(client);
+        let mut scratch = vec![0u8; 8 * 1024];
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut buf = ReadBuf::new(&mut scratch);
+        match reader.poll_read(&mut inner, &mut cx, &mut buf) {
+            Poll::Ready(Ok(())) => assert_eq!(
+                buf.filled().len(),
+                4000,
+                "all four records were in the socket, one call must drain them"
+            ),
+            Poll::Ready(Err(err)) => panic!("read failed: {err}"),
+            Poll::Pending => panic!("the records are already in the socket"),
+        }
     }
 
     /// The frame buffer must not follow the stream. It used to be grown with
@@ -795,14 +916,7 @@ mod tests {
 
     /// One set of keys for both halves: the framing does not care which is which.
     fn pool(security: u8) -> (BodyWriter, FrameAssembler) {
-        let writer = BodyWriter::new(
-            security,
-            &key16(1),
-            &key16(2),
-            false,
-            false,
-            false,
-        );
+        let writer = BodyWriter::new(security, &key16(1), &key16(2), false, false, false);
         let reader = FrameAssembler::new(
             security,
             &key16(1),

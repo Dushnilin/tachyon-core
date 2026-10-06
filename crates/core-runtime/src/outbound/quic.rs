@@ -7,6 +7,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,33 @@ pub(crate) const HY2_MAX_UDP: usize = 4096;
 pub(crate) const TUIC_MAX_UDP: usize = 0xffff;
 
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// Pool bounds for the per-outbound QUIC connection pool: one shared QUIC
+/// connection serializes every stream through a single quinn driver task and
+/// one UDP socket, which loses to the reference at 8 streams.
+pub(crate) const POOL_MAX_CONNS: usize = 8;
+/// Streams (or UDP sessions) one pooled connection takes before the pool
+/// opens the next one.
+pub(crate) const POOL_STREAMS_PER_CONN: u32 = 2;
+
+/// Slot in a pooled QUIC connection; dropping it returns the slot, so the
+/// pool sees how busy each connection is.
+pub struct PoolLease {
+    count: Arc<AtomicU32>,
+}
+
+impl PoolLease {
+    pub(crate) fn new(count: Arc<AtomicU32>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self { count }
+    }
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CongestionKind {
@@ -806,11 +834,25 @@ pub(crate) fn bind_udp_loopback(is_ipv4: bool) -> io::Result<std::net::UdpSocket
 pub struct QuicStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    _lease: Option<PoolLease>,
 }
 
 impl QuicStream {
     pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv }
+        Self {
+            send,
+            recv,
+            _lease: None,
+        }
+    }
+
+    /// Same stream, holding a pool slot for as long as it lives.
+    pub fn with_lease(send: quinn::SendStream, recv: quinn::RecvStream, lease: PoolLease) -> Self {
+        Self {
+            send,
+            recv,
+            _lease: Some(lease),
+        }
     }
 
     pub fn split(self) -> (quinn::SendStream, quinn::RecvStream) {

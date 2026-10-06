@@ -121,10 +121,7 @@ impl Vmess {
                 || multiplex.max_connections > 0
                 || multiplex.max_streams > 0
             {
-                Some(mux::Client::new(
-                    multiplex,
-                    packet_encoding == PacketEncoding::PacketAddr,
-                )?)
+                Some(mux::Client::new(multiplex)?)
             } else {
                 None
             },

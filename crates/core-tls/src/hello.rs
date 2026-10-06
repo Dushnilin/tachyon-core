@@ -159,9 +159,21 @@ pub fn build(
     hs.extend_from_slice(&template.compression);
 
     let mut exts = Vec::new();
-    // GREASE ids must not repeat inside one hello, so the key share and the
-    // extension list draw from the same pool
+    // GREASE ids must not repeat inside one hello. The key share keeps the
+    // captured GREASE id (it has to equal supported_groups' -- servers check),
+    // so reserve it here before the extension list draws from the pool.
     let mut grease_used = Vec::new();
+    for e in &template.extensions {
+        if let Ext::Static(0x000a, body) = e {
+            for w in body.chunks_exact(2) {
+                let v = u16::from_be_bytes([w[0], w[1]]);
+                if keyshare::is_grease(v) {
+                    grease_used.push(v);
+                }
+            }
+            break;
+        }
+    }
     for e in &template.extensions {
         let (id, body): (u16, Vec<u8>) = match e {
             // a GREASE extension id is reserved and fresh per handshake, the
@@ -183,7 +195,7 @@ pub fn build(
             Ext::KeyShare(raw) => (
                 0x0033,
                 match shares {
-                    Some(s) => s.body(raw, &mut grease_used)?,
+                    Some(s) => s.body(raw)?,
                     None => raw.clone(),
                 },
             ),

@@ -161,18 +161,13 @@ impl Shares {
 
     /// The `key_share` body to write: the template's group list in the
     /// template's order, with our data in place of the captured data. A GREASE
-    /// group keeps its captured data (a byte of noise) and gets a fresh reserved
-    /// id, as BoringSSL does. `grease_used` carries the values the rest of the
-    /// hello already spent, so two GREASE ids cannot collide.
-    pub fn body(&self, template: &[u8], grease_used: &mut Vec<u16>) -> io::Result<Vec<u8>> {
+    /// group keeps its captured data *and* its captured id: real clients send
+    /// one GREASE value for both `supported_groups` and `key_share`, and
+    /// OpenSSL rejects a hello whose two GREASE ids differ.
+    pub fn body(&self, template: &[u8]) -> io::Result<Vec<u8>> {
         let mut list = Vec::new();
         for (group, data) in entries(template)? {
             let grease = is_grease(group);
-            let id = if grease {
-                unique_grease(grease_used)
-            } else {
-                group
-            };
             let share: &[u8] = if grease {
                 data
             } else {
@@ -182,7 +177,7 @@ impl Shares {
                     .map(|(_, s)| s.as_slice())
                     .ok_or_else(|| err(format!("no key for key share group 0x{group:04x}")))?
             };
-            list.extend_from_slice(&id.to_be_bytes());
+            list.extend_from_slice(&group.to_be_bytes());
             list.extend_from_slice(&(share.len() as u16).to_be_bytes());
             list.extend_from_slice(share);
         }
@@ -318,7 +313,7 @@ mod tests {
     fn the_built_body_keeps_the_template_shape() {
         let template = chrome_template();
         let shares = Shares::for_body(&template).expect("shares");
-        let body = shares.body(&template, &mut Vec::new()).expect("body");
+        let body = shares.body(&template).expect("body");
 
         // the same length, the same groups in the same order
         assert_eq!(body.len(), template.len());
@@ -342,7 +337,7 @@ mod tests {
         // the standard library instead of the browser.
         let template = chrome_template();
         let shares = Shares::for_body(&template).expect("shares");
-        let body = shares.body(&template, &mut Vec::new()).expect("body");
+        let body = shares.body(&template).expect("body");
         let entries = entries(&body).unwrap();
         let hybrid_x = &entries[1].1[MLKEM768_EK_LEN..];
         let plain_x = entries[2].1;

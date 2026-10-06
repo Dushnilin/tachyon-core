@@ -15,7 +15,8 @@ use crate::inbound::{AnyStream, Target, network_includes_tcp, network_includes_u
 use crate::logging;
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::quic::{
-    CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, QuicStream, QuicTunnelDefaults,
+    CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
+    PoolLease, QuicStream, QuicTunnelDefaults,
     QuicTunnelOptions, SalamanderRelay, VarintReader, bind_udp, bind_udp_loopback, dest_string,
     io_from_datagram, io_from_quinn, put_varint, random_padding, read_varint, resolve_host,
     spawn_gecko_relay, spawn_salamander_relay, udp_loopback_pair,
@@ -46,7 +47,7 @@ pub struct Hysteria2 {
     quic: QuicTunnelOptions,
     tls: TlsOptions,
     connect_timeout: Duration,
-    shared: tokio::sync::Mutex<Option<Arc<Hy2Shared>>>,
+    shared: tokio::sync::Mutex<Vec<Arc<Hy2Shared>>>,
 }
 
 impl Hysteria2 {
@@ -173,22 +174,31 @@ impl Hysteria2 {
             quic,
             tls,
             connect_timeout,
-            shared: tokio::sync::Mutex::new(None),
+            shared: tokio::sync::Mutex::new(Vec::new()),
         })
     }
 
     async fn shared(&self) -> io::Result<Arc<Hy2Shared>> {
-        let mut guard = self.shared.lock().await;
-        if let Some(s) = guard.as_ref() {
-            if s.conn.close_reason().is_none() {
-                return Ok(Arc::clone(s));
+        let mut pool = self.shared.lock().await;
+        pool.retain(|s| s.conn.close_reason().is_none());
+        let best = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.leases.load(Ordering::Relaxed));
+        let shared = match best {
+            Some((i, s)) if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
+                || pool.len() >= POOL_MAX_CONNS =>
+            {
+                Arc::clone(&pool[i])
             }
-            *guard = None;
-        }
-        let s = self.dial().await?;
-        s.start_demux();
-        *guard = Some(Arc::clone(&s));
-        Ok(s)
+            _ => {
+                let s = self.dial().await?;
+                s.start_demux();
+                pool.push(Arc::clone(&s));
+                Arc::clone(pool.last().expect("pushed"))
+            }
+        };
+        Ok(shared)
     }
 
     async fn dial(&self) -> io::Result<Arc<Hy2Shared>> {
@@ -282,6 +292,7 @@ impl Hysteria2 {
             sessions: std::sync::Mutex::new(HashMap::new()),
             demux: std::sync::Mutex::new(None),
             handles: std::sync::Mutex::new(Vec::new()),
+            leases: Arc::new(AtomicU32::new(0)),
         }))
     }
 
@@ -292,6 +303,7 @@ impl Hysteria2 {
             ));
         }
         let shared = self.shared().await?;
+        let lease = PoolLease::new(Arc::clone(&shared.leases));
         let (send, mut recv) = shared.conn.open_bi().await.map_err(io_from_quinn)?;
 
         let dest = dest_string(target);
@@ -309,7 +321,7 @@ impl Hysteria2 {
         let mut send = send;
         send.write_all(&head).await?;
         read_tcp_response(&mut recv).await?;
-        Ok(Box::new(QuicStream::new(send, recv)))
+        Ok(Box::new(QuicStream::with_lease(send, recv, lease)))
     }
 
     pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
@@ -319,6 +331,7 @@ impl Hysteria2 {
             ));
         }
         let shared = self.shared().await?;
+        let lease = PoolLease::new(Arc::clone(&shared.leases));
         if !shared.udp_enabled {
             return Err(io::Error::other("hysteria2: UDP disabled by server"));
         }
@@ -346,6 +359,7 @@ impl Hysteria2 {
         let sess_f = Arc::clone(&session);
         let peer_f = Arc::clone(&peer);
         let handle = tokio::spawn(async move {
+            let _lease = lease;
             let mut buf = vec![0u8; 65_535];
             loop {
                 match tokio::time::timeout(DEFAULT_UDP_TIMEOUT, peer_f.recv(&mut buf)).await {
@@ -387,6 +401,7 @@ struct Hy2Shared {
     sessions: std::sync::Mutex<HashMap<u32, Arc<UdpSession>>>,
     demux: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    leases: Arc<AtomicU32>,
 }
 
 impl Hy2Shared {

@@ -431,7 +431,10 @@ mod tests {
         vision.build_frame(b"two", PADDING_CONTINUE);
         let second = vision.framed.clone();
         assert_eq!(&first[..16], &uuid()[..], "the uuid opens the stream");
-        assert_eq!(second[0], PADDING_CONTINUE, "the second frame starts at the header");
+        assert_eq!(
+            second[0], PADDING_CONTINUE,
+            "the second frame starts at the header"
+        );
         assert_eq!(u16::from_be_bytes([second[1], second[2]]), 3);
     }
 
@@ -509,8 +512,7 @@ mod tests {
             sink.raw = wire;
             sink.unpad();
             assert_eq!(
-                sink.payload,
-                b"framedlastraw tail",
+                sink.payload, b"framedlastraw tail",
                 "command {command} must end the framing"
             );
             assert!(sink.raw.is_empty());

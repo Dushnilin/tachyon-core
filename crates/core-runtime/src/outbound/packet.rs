@@ -102,12 +102,6 @@ pub(crate) fn put_addr_port(out: &mut Vec<u8>, target: &Target) -> io::Result<()
     Ok(())
 }
 
-/// The serialized address, for callers that only need the bytes.
-pub(crate) fn put_addr_port_bytes(target: &Target) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MAX_ADDR_PORT);
-    put_addr_port(&mut out, target).expect("address fits");
-    out
-}
 
 /// `AddressSerializer.ReadAddrPort`
 pub(crate) fn take_addr_port(buf: &[u8]) -> io::Result<(Target, &[u8])> {

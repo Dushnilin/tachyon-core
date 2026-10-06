@@ -172,6 +172,26 @@ def build_cases(certs, reality):
          "congestion_control": "bbr", "tls": tls_server(certs, ["h3"])},
         {"type": "tuic", "uuid": UUID, "password": "bench-pass",
          "congestion_control": "bbr", "udp_relay_mode": "native", "tls": tls_client(["h3"])})
+
+    # ---- Part B: naive / anytls / snell on the reference server
+    ref_tls = {"enabled": True, "certificate_path": certs["crt"], "key_path": certs["key"]}
+    add("naive-tls", "B",
+        {"type": "naive",
+         "users": [{"username": "naive-user", "password": "naive-secret"}],
+         "tls": ref_tls},
+        {"type": "naive",
+         "username": "naive-user", "password": "naive-secret",
+         "tls": {"enabled": True, "server_name": "localhost", "certificate_path": certs["crt"]}})
+    add("anytls-tls", "B",
+        {"type": "anytls", "users": [{"password": "bench-pass"}], "tls": ref_tls},
+        {"type": "anytls", "password": "bench-pass", "tls": tls_client()})
+    psk = "bench-snell-psk-012345"
+    add("snell", "B",
+        {"type": "snell", "version": 5, "psk": psk, "obfs_mode": "none"},
+        {"type": "snell", "version": 4, "psk": psk, "obfs_mode": "none"})
+    add("snell-v6", "B",
+        {"type": "snell", "version": 6, "psk": psk, "mode": "default"},
+        {"type": "snell", "version": 6, "psk": psk, "mode": "default"})
     return cases
 
 
@@ -361,14 +381,22 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
         lat = [bench.measure_latency(True, rounds) for _ in range(2)]
         res["p50_us"] = statistics.median(x["p50_us"] for x in lat)
         res["p99_us"] = statistics.median(x["p99_us"] for x in lat)
+        cf0, sf0 = bench.proc_faults(client.p.pid), bench.proc_faults(server.p.pid)
+        total_gib = 0.0
         for streams in (1, 8):
             samples = []
             for _ in range(runs):
-                s_cpu0 = bench.cpu_seconds(server.p.pid)
+                s0 = bench.cpu_split(server.p.pid)
                 r = bench.measure_throughput(True, streams, seconds, client.p.pid)
-                s_cpu1 = bench.cpu_seconds(server.p.pid)
+                s1 = bench.cpu_split(server.p.pid)
                 gib = r["gbit_s"] * 1e9 / 8 * seconds / (1 << 30)
-                r["server_cpu_s_per_gib"] = (s_cpu1 - s_cpu0) / gib if gib else None
+                total_gib += gib
+                if gib:
+                    r["server_cpu_s_per_gib"] = ((s1[0] + s1[1]) - (s0[0] + s0[1])) / gib
+                    r["server_user_s_per_gib"] = (s1[0] - s0[0]) / gib
+                    r["server_sys_s_per_gib"] = (s1[1] - s0[1]) / gib
+                else:
+                    r["server_cpu_s_per_gib"] = None
                 samples.append(r)
             samples.sort(key=lambda r: r["gbit_s"])
             m = samples[len(samples) // 2]
@@ -376,9 +404,21 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
             res[f"tput_{streams}"] = {
                 "gbit_s": m["gbit_s"],
                 "client_cpu_s_per_gib": cc,
+                "client_user_s_per_gib": m.get("proxy_user_s_per_gib"),
+                "client_sys_s_per_gib": m.get("proxy_sys_s_per_gib"),
                 "server_cpu_s_per_gib": sc,
+                "server_user_s_per_gib": m.get("server_user_s_per_gib"),
+                "server_sys_s_per_gib": m.get("server_sys_s_per_gib"),
                 "cpu_s_per_gib": (cc + sc) if cc is not None and sc is not None else None,
             }
+        cf1, sf1 = bench.proc_faults(client.p.pid), bench.proc_faults(server.p.pid)
+        if total_gib:
+            # minor faults inside the throughput window: page faults show up in
+            # /proc as system time, so a cell that allocates per record pays here
+            res["client_minflt_per_gib"] = (cf1[0] - cf0[0]) / total_gib
+            res["client_majflt_per_gib"] = (cf1[1] - cf0[1]) / total_gib
+            res["server_minflt_per_gib"] = (sf1[0] - sf0[0]) / total_gib
+            res["server_majflt_per_gib"] = (sf1[1] - sf0[1]) / total_gib
         res["client_rss_mib"] = bench.proc_status(client.p.pid)["VmHWM"]
         res["server_rss_mib"] = bench.proc_status(server.p.pid)["VmHWM"]
         res["status"] = "OK"
@@ -396,7 +436,9 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
 
 def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports):
     ctx = multiprocessing.get_context("fork")
-    work = tempfile.mkdtemp()
+    # PROTO_WORK pins the cell dir outside the container's /tmp so server.err
+    # survives the run; without it the logs die with --rm.
+    work = os.environ.get("PROTO_WORK") or tempfile.mkdtemp()
     rx, tx = ctx.Pipe(duplex=False)
     child = ctx.Process(target=run_cell,
                         args=(role, case, bins, cpus, runs, seconds, rounds, ports, work, tx))
@@ -425,10 +467,17 @@ def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports):
 # ------------------------------------------------------------------ fixtures
 def make_certs(work):
     crt, key = os.path.join(work, "localhost.crt"), os.path.join(work, "localhost.key")
+    # CA:TRUE is openssl 3's default for a self-signed -x509, and a naive
+    # outbound (which forbids insecure) verifies honestly: rustls rejects a
+    # CA cert used as the end entity (CaUsedAsEndEntity). A plain leaf with
+    # SAN is what the golden test cert has, and it serves both roles.
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
          "-nodes", "-keyout", key, "-out", crt, "-days", "2", "-subj", "/CN=localhost",
-         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+         "-addext", "basicConstraints=critical,CA:FALSE",
+         "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+         "-addext", "extendedKeyUsage=serverAuth"],
         check=True, capture_output=True)
     return {"crt": crt, "key": key}
 
@@ -451,14 +500,32 @@ def run_tls_dest(certs, cpus):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", REALITY_DEST_PORT))
     srv.listen(64)
+    n, prev = 0, None
     while True:
-        c, _ = srv.accept()
+        c, peer = srv.accept()
+        print(f"reality-dest: accepted from {peer}", flush=True)
         try:
             c.settimeout(3)
+            # PEEK-poll until the whole ClientHello record is buffered: a hello
+            # can split across TCP segments and a single PEEK sees only the first.
+            hello, t0 = b"", time.time()
+            while time.time() - t0 < 3:
+                hello = c.recv(65535, socket.MSG_PEEK)
+                if len(hello) >= 5 and len(hello) >= 5 + int.from_bytes(hello[3:5], "big"):
+                    break
+                time.sleep(0.01)
+            if hello and hello != prev:
+                n += 1
+                outdir = os.environ.get("PROTO_WORK") or os.path.dirname(certs["crt"])
+                with open(os.path.join(outdir, f"hello-{n}.bin"), "wb") as f:
+                    f.write(hello)
+                prev = hello
             with ctx.wrap_socket(c, server_side=True) as t:
                 t.recv(1)
-        except OSError:
-            pass
+        except Exception as e:  # noqa: BLE001 - a refused dest hello is the bug
+            import traceback
+            traceback.print_exc()
+            print(f"reality-dest: {type(e).__name__}: {e}", flush=True)
 
 
 # --------------------------------------------------------------------- report
@@ -561,6 +628,39 @@ def report(results, ref_name):
     return "\n".join(lines), losses, interop_bad
 
 
+def live_refresh(out, results, run_meta, ref_name, done, total, current=None):
+    """Rewrite the partial json + md after every cell and rebuild report.html:
+    one merged table over every run next to this file, freshest cell wins, the
+    cell being measured replaced as it lands. Needs report.py beside this file;
+    on a host without it (a bare router run) only json and md are refreshed."""
+    text, losses, interop_bad = report(results, ref_name)
+    payload = dict(run_meta)
+    payload["results"] = results
+    payload["losses"] = losses
+    payload["interop_failures"] = interop_bad
+    payload["progress"] = {"done": done, "total": total}
+    if current:
+        payload["progress"]["current"] = current
+    md = os.path.splitext(out)[0] + ".md"
+    for path, data in ((out, json.dumps(payload, indent=2)), (md, text + "\n")):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic: a reader never sees a half report
+    here = os.path.dirname(os.path.abspath(__file__))
+    rpt = os.path.join(here, "report.py")
+    if os.path.exists(rpt):
+        html_out = os.path.join(os.path.dirname(os.path.abspath(out)), "report.html")
+        try:
+            subprocess.run(
+                [sys.executable, rpt, "--all", os.path.dirname(os.path.abspath(out)),
+                 "--live", out, "--out", html_out],
+                check=True, capture_output=True, timeout=60)
+        except Exception as e:  # a broken report must not kill the bench
+            print(f"live-report: {e}", flush=True)
+    return text
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tachyon", required=True)
@@ -571,7 +671,7 @@ def main():
     ap.add_argument("--seconds", type=int, default=3)
     ap.add_argument("--runs", type=int, default=3, help="throughput runs per cell, median kept")
     ap.add_argument("--rounds", type=int, default=5000, help="latency round trips")
-    ap.add_argument("--only", default="", help="substring filter on case names")
+    ap.add_argument("--only", default="", help="comma-separated substring filter on case names")
     ap.add_argument("--part", default="AB", help="A, B or AB")
     ap.add_argument("--no-cross", action="store_true", help="skip the crossed interop cells")
     ap.add_argument("--out", default="proto-result.json")
@@ -594,22 +694,40 @@ def main():
         dest.start()
         bench.wait_listen(REALITY_DEST_PORT)
 
+    only = [s for s in args.only.split(",") if s]
     cases = [c for c in build_cases(certs, reality)
-             if c["part"] in args.part and args.only in c["name"]]
-    results = []
-    port_n = 0
+             if c["part"] in args.part and (not only or any(s in c["name"] for s in only))]
+    plan = []
     for case in cases:
         grid = [("tachyon", "tachyon"), ("ref", "ref")] if case["part"] == "A" else [
             ("tachyon", "ref"), ("ref", "ref")]
         if case["part"] == "A" and not args.no_cross:
             grid += [("tachyon", "ref"), ("ref", "tachyon")]
+        plan.append((case, grid))
+    total_cells = sum(len(grid) for _, grid in plan)
+    run_meta = {"cpu": next((l.split(":")[1].strip() for l in open("/proc/cpuinfo")
+                             if l.startswith("model name")), "?"),
+                "cores": os.cpu_count(),
+                "client_cpus": args.client_cpus,
+                "server_cpus": args.server_cpus,
+                "runs": args.runs,
+                "seconds": args.seconds,
+                "rounds": args.rounds,
+                "kernel": os.uname().release, "ref": args.ref_name}
+    results = []
+    port_n = 0
+    done = 0
+    for case, grid in plan:
         for role in grid:
+            live_refresh(args.out, results, run_meta, args.ref_name, done, total_cells,
+                         current=f"{case['name']} {role[0]}->{role[1]}")
             port_n += 1
             ports = (PROXY_PORT_BASE + port_n, SERVER_PORT_BASE + port_n)
             r = run_cell_guarded(role, case, bins, cpus, args.runs, args.seconds,
                                  args.rounds, ports)
             r["part"] = case["part"]
             results.append(r)
+            done += 1
             line = f"{case['name']:24s} {role[0]:>7s}->{role[1]:<7s} {r['status']}"
             if r["status"] == "OK":
                 line += (f"  1s {r['tput_1']['gbit_s']:5.1f}  8s {r['tput_8']['gbit_s']:5.1f} Gbit/s"
@@ -618,21 +736,8 @@ def main():
                 line += f"  {r.get('why', '')[:160]}  [{r['work']}]"
             print(line, flush=True)
 
-    text, losses, interop_bad = report(results, args.ref_name)
-    out = {"cpu": next((l.split(":")[1].strip() for l in open("/proc/cpuinfo")
-                        if l.startswith("model name")), "?"),
-           "cores": os.cpu_count(),
-           "client_cpus": args.client_cpus,
-           "server_cpus": args.server_cpus,
-           "runs": args.runs,
-           "seconds": args.seconds,
-           "rounds": args.rounds,
-           "kernel": os.uname().release, "ref": args.ref_name,
-           "results": results, "losses": losses, "interop_failures": interop_bad}
-    with open(args.out, "w") as f:
-        json.dump(out, f, indent=2)
-    with open(os.path.splitext(args.out)[0] + ".md", "w") as f:
-        f.write(text + "\n")
+    text = live_refresh(args.out, results, run_meta, args.ref_name, total_cells,
+                        total_cells)
     print(text)
 
 

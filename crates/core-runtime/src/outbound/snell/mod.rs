@@ -5,6 +5,7 @@
 //! `default`) sharing the same request/reply protocol.
 
 mod crypto;
+mod gcm;
 mod obfs;
 mod pool;
 mod profile;
@@ -12,7 +13,6 @@ mod record;
 mod request;
 mod v6;
 
-use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use self::crypto::MAX_PAYLOAD_LEN;
 use self::obfs::{ObfsMode, ObfsStream, parse_obfs_mode};
 use self::pool::{Pool, Session};
 use self::profile::Profile;
-use self::record::{RecordReader, RecordWriter, now_unix, poll_flush};
+use self::record::{RecordReader, RecordWriter, now_unix, poll_flush_wbuf};
 use self::request::{
     ADDRESS_TYPE_IPV4, ADDRESS_TYPE_IPV6, CMD_CONNECT_V2, CMD_UDP, UDP_FORWARD, parse_reply,
     read_udp_response_address, write_request, write_udp_request_address,
@@ -67,6 +67,15 @@ impl<W> WriterLayer<W> {
             Self::V6(writer) => writer.emit_packet(now_unix, data),
         }
     }
+
+    /// Append the records for one caller write to `out` (the hot path uses a
+    /// single reused buffer instead of per-record Vecs).
+    fn emit_into(&mut self, out: &mut Vec<u8>, now_unix: i64, data: &[u8]) -> io::Result<()> {
+        match self {
+            Self::V4(writer) => writer.emit_into(out, now_unix, data),
+            Self::V6(writer) => writer.emit_into(out, now_unix, data),
+        }
+    }
 }
 
 impl<W: AsyncWrite + Unpin> WriterLayer<W> {
@@ -92,10 +101,14 @@ pub(crate) enum ReaderLayer<R> {
 }
 
 impl<R: AsyncRead + Unpin> ReaderLayer<R> {
-    fn poll_read_record(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
+    fn poll_read_record(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<u8>,
+    ) -> Poll<io::Result<Option<()>>> {
         match self {
-            Self::V4(reader) => reader.poll_read_record(cx),
-            Self::V6(reader) => reader.poll_read_record(cx),
+            Self::V4(reader) => reader.poll_read_record(cx, out),
+            Self::V6(reader) => reader.poll_read_record(cx, out),
         }
     }
 
@@ -440,7 +453,11 @@ pub struct SnellStream {
     pool: Option<Arc<SnellPool>>,
     leftover: Vec<u8>,
     leftover_pos: usize,
-    pending: VecDeque<(Vec<u8>, usize)>,
+    /// Serialized records for the next flush; drained and cleared in place.
+    wbuf: Vec<u8>,
+    wbuf_pos: usize,
+    /// Decoded record payload handed to `poll_read`; reused per record.
+    record_buf: Vec<u8>,
     fatal: Option<io::Error>,
     read_eof: bool,
     shutdown_done: bool,
@@ -462,7 +479,9 @@ impl SnellStream {
             pool,
             leftover: Vec::new(),
             leftover_pos: 0,
-            pending: VecDeque::new(),
+            wbuf: Vec::new(),
+            wbuf_pos: 0,
+            record_buf: Vec::new(),
             fatal: None,
             read_eof: false,
             shutdown_done: false,
@@ -476,12 +495,15 @@ impl SnellStream {
             .map(|e| io::Error::new(e.kind(), e.to_string()))
     }
 
-    fn flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn flush_wbuf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.wbuf_pos >= self.wbuf.len() {
+            return Poll::Ready(Ok(()));
+        }
         let writer = match self.writer.as_mut() {
             Some(writer) => writer,
             None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
         };
-        let result = poll_flush(cx, writer.inner_mut(), &mut self.pending);
+        let result = poll_flush_wbuf(cx, writer.inner_mut(), &mut self.wbuf, &mut self.wbuf_pos);
         if let Poll::Ready(Err(e)) = &result {
             self.fatal = Some(io::Error::new(e.kind(), e.to_string()));
         }
@@ -517,26 +539,27 @@ impl AsyncRead for SnellStream {
         // `readResponse`): only this first read triggers it, any bytes cached
         // after the opcode become the first delivered payload.
         if this.reply_pending {
-            let record = {
+            let outcome = {
                 let reader = match this.reader.as_mut() {
                     Some(reader) => reader,
                     None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
                 };
-                match reader.poll_read_record(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => {
-                        this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Ready(Ok(None)) => {
-                        this.reply_pending = false;
-                        this.read_eof = true;
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready(Ok(Some(record))) => record,
-                }
+                reader.poll_read_record(cx, &mut this.record_buf)
             };
-            match parse_reply(&record) {
+            match outcome {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Ok(None)) => {
+                    this.reply_pending = false;
+                    this.read_eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Ok(Some(()))) => {}
+            }
+            match parse_reply(&this.record_buf) {
                 Ok(None) => this.reply_pending = false,
                 Ok(Some(cache)) => {
                     this.reply_pending = false;
@@ -556,11 +579,14 @@ impl AsyncRead for SnellStream {
                 }
             }
         }
-        let reader = match this.reader.as_mut() {
-            Some(reader) => reader,
-            None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
+        let outcome = {
+            let reader = match this.reader.as_mut() {
+                Some(reader) => reader,
+                None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
+            };
+            reader.poll_read_record(cx, &mut this.record_buf)
         };
-        match reader.poll_read_record(cx) {
+        match outcome {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => {
                 this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
@@ -570,12 +596,14 @@ impl AsyncRead for SnellStream {
                 this.read_eof = true;
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Ok(Some(payload))) => {
-                let len = payload.len().min(buf.remaining());
-                buf.put_slice(&payload[..len]);
-                if len < payload.len() {
-                    this.leftover = payload;
-                    this.leftover_pos = len;
+            Poll::Ready(Ok(Some(()))) => {
+                let record = &this.record_buf;
+                let len = record.len().min(buf.remaining());
+                buf.put_slice(&record[..len]);
+                if len < record.len() {
+                    this.leftover.clear();
+                    this.leftover.extend_from_slice(&record[len..]);
+                    this.leftover_pos = 0;
                 }
                 Poll::Ready(Ok(()))
             }
@@ -593,8 +621,8 @@ impl AsyncWrite for SnellStream {
         if let Some(error) = this.check_fatal() {
             return Poll::Ready(Err(error));
         }
-        if !this.pending.is_empty() {
-            match this.flush_pending(cx) {
+        if this.wbuf_pos < this.wbuf.len() {
+            match this.flush_wbuf(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {}
@@ -607,18 +635,12 @@ impl AsyncWrite for SnellStream {
             Some(writer) => writer,
             None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
         };
-        match writer.emit(now_unix(), buf) {
-            Ok(records) => {
-                this.pending
-                    .extend(records.into_iter().map(|record| (record, 0)));
-            }
-            Err(e) => {
-                this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
-                return Poll::Ready(Err(e));
-            }
+        if let Err(e) = writer.emit_into(&mut this.wbuf, now_unix(), buf) {
+            this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
+            return Poll::Ready(Err(e));
         }
         // Data is accepted once queued; the next poll flushes what remains.
-        match this.flush_pending(cx) {
+        match this.flush_wbuf(cx) {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
         }
@@ -629,8 +651,8 @@ impl AsyncWrite for SnellStream {
         if let Some(error) = this.check_fatal() {
             return Poll::Ready(Err(error));
         }
-        if !this.pending.is_empty() {
-            return this.flush_pending(cx);
+        if this.wbuf_pos < this.wbuf.len() {
+            return this.flush_wbuf(cx);
         }
         Poll::Ready(Ok(()))
     }
@@ -647,19 +669,13 @@ impl AsyncWrite for SnellStream {
                 Some(writer) => writer,
                 None => return Poll::Ready(Err(io::Error::other("snell: stream closed"))),
             };
-            match writer.emit(now_unix(), &[]) {
-                Ok(records) => {
-                    this.pending
-                        .extend(records.into_iter().map(|record| (record, 0)));
-                    this.shutdown_done = true;
-                }
-                Err(e) => {
-                    this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
-                    return Poll::Ready(Err(e));
-                }
+            if let Err(e) = writer.emit_into(&mut this.wbuf, now_unix(), &[]) {
+                this.fatal = Some(io::Error::new(e.kind(), e.to_string()));
+                return Poll::Ready(Err(e));
             }
+            this.shutdown_done = true;
         }
-        this.flush_pending(cx)
+        this.flush_wbuf(cx)
     }
 }
 
@@ -668,8 +684,10 @@ impl Drop for SnellStream {
         // Reuse requires the full drain: request sent (always, eager), zero
         // chunk flushed, server EOF observed, no fatal error. Otherwise the
         // session dies with the stream (reference `Release(false)`).
-        let reusable =
-            self.fatal.is_none() && self.pending.is_empty() && self.shutdown_done && self.read_eof;
+        let reusable = self.fatal.is_none()
+            && self.wbuf_pos >= self.wbuf.len()
+            && self.shutdown_done
+            && self.read_eof;
         let halves = match (self.writer.take(), self.reader.take()) {
             (Some(writer), Some(reader)) => Some((writer, reader)),
             _ => None,

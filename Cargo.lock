@@ -455,6 +455,7 @@ dependencies = [
  "sm4",
  "smoltcp",
  "socket2",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "x25519-dalek",

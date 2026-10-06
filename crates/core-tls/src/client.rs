@@ -124,7 +124,7 @@ impl<'a> Handshake<'a> {
         let offered: Vec<u16> = suites
             .iter()
             .step_by(2)
-            .zip(suites.iter().skip(1))
+            .zip(suites.iter().skip(1).step_by(2))
             .map(|(high, low)| u16::from_be_bytes([*high, *low]))
             .collect();
         Ok(Handshake {
@@ -237,7 +237,20 @@ impl<'a> Handshake<'a> {
     pub async fn read_server_hello(&mut self, stream: &mut (dyn Stream + '_)) -> io::Result<()> {
         let raw = read_record(stream).await?;
         if raw[0] != ContentType::Handshake as u8 {
-            return Err(bad("the first record from the server is not a handshake"));
+            // an alert here is a server refusing the hello (record type, alert
+            // level and description after the 5-byte record header)
+            let detail = if raw[0] == ContentType::Alert as u8 && raw.len() >= 7 {
+                format!(", alert level {} code {}", raw[5], raw[6])
+            } else {
+                String::new()
+            };
+            return Err(bad(format!(
+                "the first record from the server is not a handshake \
+                 (record type {}, len {}{})",
+                raw[0],
+                raw.len(),
+                detail
+            )));
         }
         let framed = raw[5..].to_vec();
         let message = messages::take_message(&mut framed.as_slice())?;
@@ -258,7 +271,10 @@ impl<'a> Handshake<'a> {
             return Err(bad("ServerHello echoed a different session id"));
         }
         if !self.offered.contains(&hello.cipher_suite) {
-            return Err(bad("the server chose a suite we did not offer"));
+            return Err(bad(format!(
+                "the server chose a suite we did not offer ({:#06x}, we offered {:?})",
+                hello.cipher_suite, self.offered
+            )));
         }
         let (group, peer_share) = hello
             .key_share
@@ -539,9 +555,9 @@ impl Connection {
                 end: 5 + plain,
                 record_end: 5 + len,
             })),
-            ContentType::Handshake | ContentType::ApplicationData => {
-                Ok(Some(Record::Skip { record_end: 5 + len }))
-            }
+            ContentType::Handshake | ContentType::ApplicationData => Ok(Some(Record::Skip {
+                record_end: 5 + len,
+            })),
             ContentType::Alert => {
                 // close_notify is the end of the data, not a failure
                 let data = raw[5..5 + plain].to_vec();
@@ -603,4 +619,46 @@ fn alert(payload: &[u8]) -> io::Error {
     bad(format!(
         "the server sent alert {description} (level {level}) at the end of its flight"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprints;
+    use crate::verify::AcceptsAnything;
+
+    /// The list we check the server's suite against has to be the one that
+    /// went out on the wire: pairing the template bytes with mismatched
+    /// strides used to produce a list of garbage, and every real server
+    /// answer then looked like "a suite we did not offer".
+    #[test]
+    fn offered_matches_the_hello_on_the_wire() {
+        let template = fingerprints::chrome();
+        let hs = Handshake::new(Config {
+            template: &template,
+            server_name: "example.com",
+            alpn: &[],
+            verifier: &AcceptsAnything,
+            reality: None,
+        })
+        .expect("handshake");
+        let raw = hello::build(
+            &template,
+            &[7u8; 32],
+            &[0u8; 32],
+            "example.com",
+            &[],
+            Some(&hs.shares),
+        )
+        .expect("hello");
+        // record(5) + handshake header(4) + client_version(2) + random(32)
+        // + session_id_len(1) + session_id(32)
+        let i = 5 + 4 + 2 + 32 + 1 + 32;
+        let n = u16::from_be_bytes([raw[i], raw[i + 1]]) as usize;
+        let on_wire: Vec<u16> = raw[i + 2..i + 2 + n]
+            .chunks_exact(2)
+            .map(|w| u16::from_be_bytes([w[0], w[1]]))
+            .collect();
+        assert_eq!(hs.offered, on_wire);
+    }
 }

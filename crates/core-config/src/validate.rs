@@ -10220,7 +10220,11 @@ mod tests {
                     "transport": {"type": "ws", "path": "/bench"},
                 }],
             });
-            assert!(validate(&ok).is_ok(), "{ty} outbound: {:?}", validate(&ok).err());
+            assert!(
+                validate(&ok).is_ok(),
+                "{ty} outbound: {:?}",
+                validate(&ok).err()
+            );
             // same class, same reason: a server-side mux is accepted by the
             // reference and ignored here
             let mux = json!({

@@ -503,7 +503,8 @@ impl Naive {
         .await
         .map_err(|_| io::Error::other("naive: connect timeout"))??;
         let stream = self.tls.wrap_with_defaults(tcp, &[b"h2"]).await?;
-        let (send_request, connection) = h2::client::handshake(stream)
+        let (send_request, connection) = crate::outbound::transport::h2io::client_builder()
+            .handshake(stream)
             .await
             .map_err(|e| io::Error::other(format!("naive: h2 handshake: {e}")))?;
         let conn_task = tokio::spawn(async move {

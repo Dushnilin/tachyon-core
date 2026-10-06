@@ -86,7 +86,13 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
+      # Skipped for aarch64: RUSTFLAGS from the env would override the
+      # `[target.aarch64-*]` rustflags array in .cargo/config.toml and drop
+      # its `--cfg aes_armv8`/`polyval_armv8`/`chacha20_force_neon`, which is
+      # what selects the RustCrypto ARMv8 assembly. The config already
+      # provides linker=rust-lld and link-self-contained=yes for that target.
       - name: Link musl with rust-lld
+        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
         run: echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
       - name: Build
         run: |

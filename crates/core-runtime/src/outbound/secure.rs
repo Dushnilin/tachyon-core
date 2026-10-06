@@ -1,9 +1,11 @@
 use std::io;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
+use crate::outbound::mux;
 use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
@@ -58,6 +60,7 @@ fn parse_uuid(raw: &str) -> io::Result<[u8; 16]> {
 const FLOW: &str = "xtls-rprx-vision";
 
 /// vless outbound (TCP command, with the `xtls-rprx-vision` flow).
+#[derive(Clone)]
 pub struct Vless {
     server: String,
     port: u16,
@@ -68,6 +71,8 @@ pub struct Vless {
     vision: bool,
     /// how datagrams are framed on the stream, see `packet`
     packet_encoding: PacketEncoding,
+    /// Mux.Cool session pool; `None` when multiplexing is off
+    mux: Option<Arc<mux::Client>>,
     dial: crate::outbound::dial::DialOptions,
 }
 
@@ -87,6 +92,12 @@ impl Vless {
         };
         let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
+        let multiplex = match obj.get("multiplex") {
+            Some(value) if !value.is_null() => {
+                mux::MuxOptions::parse(value, &format!("{at}.multiplex"))?
+            }
+            _ => mux::MuxOptions::default(),
+        };
         let packet_encoding =
             PacketEncoding::parse(obj.get("packet_encoding").and_then(Value::as_str), at)?;
         Ok(Self {
@@ -97,11 +108,38 @@ impl Vless {
             tls,
             vision,
             packet_encoding,
+            mux: if multiplex.min_streams > 0
+                || multiplex.max_connections > 0
+                || multiplex.max_streams > 0
+            {
+                Some(mux::Client::new(multiplex)?)
+            } else {
+                None
+            },
             dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        if let Some(mux) = &self.mux {
+            if !mux.has_dialer().await {
+                // a session is opened against the magic destination through the
+                // same request machinery a normal connection uses
+                let copy = self.clone();
+                mux.set_dialer(Arc::new(move || {
+                    let copy = copy.clone();
+                    let target = mux::mux_target();
+                    Box::pin(async move { copy.connect_direct(&target).await })
+                }))
+                .await;
+            }
+            let stream = mux.open(target).await?;
+            return Ok(Box::new(stream));
+        }
+        self.connect_direct(target).await
+    }
+
+    async fn connect_direct(&self, target: &Target) -> io::Result<AnyStream> {
         self.dial(CMD_TCP, target).await
     }
 

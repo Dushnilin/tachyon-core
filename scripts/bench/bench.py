@@ -114,17 +114,31 @@ def proc_status(pid):
     return out
 
 
-def cpu_seconds(pid):
+def cpu_split(pid):
+    """(user, system) seconds of a process from /proc/<pid>/stat."""
     with open(f"/proc/{pid}/stat") as f:
         fields = f.read().rsplit(")", 1)[1].split()
-    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    tick = os.sysconf("SC_CLK_TCK")
+    return int(fields[11]) / tick, int(fields[12]) / tick
+
+
+def proc_faults(pid):
+    """(minor, major) page faults of a process from /proc/<pid>/stat."""
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return int(fields[7]), int(fields[9])
+
+
+def cpu_seconds(pid):
+    user, sys = cpu_split(pid)
+    return user + sys
 
 
 # -------------------------------------------------------------------- phases
 def measure_latency(proxy, rounds=20000):
     s = socks_connect(proxy, MODE_ECHO)
     msg = b"x" * 64
-    for _ in range(500):  # warm-up
+    for _ in range(100):  # warm-up
         s.sendall(msg)
         recvn(s, 64)
     samples = []
@@ -162,21 +176,24 @@ def measure_throughput(proxy, streams, seconds, pid):
         s.close()
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(streams)]
-    cpu0 = cpu_seconds(pid) if pid else 0.0
+    u0, s0 = cpu_split(pid) if pid else (0.0, 0.0)
     t0 = time.perf_counter()
     for t in threads:
         t.start()
     time.sleep(seconds)
     got = sum(total)
     elapsed = time.perf_counter() - t0
-    cpu1 = cpu_seconds(pid) if pid else 0.0
+    u1, s1 = cpu_split(pid) if pid else (0.0, 0.0)
     stop.set()
     for t in threads:
         t.join(timeout=10)
     gib = got / (1 << 30)
+    per_gib = (lambda x: x / gib if pid and gib else None)
     return {
         "gbit_s": got * 8 / elapsed / 1e9,
-        "proxy_cpu_s_per_gib": (cpu1 - cpu0) / gib if pid and gib else None,
+        "proxy_cpu_s_per_gib": per_gib((u1 + s1) - (u0 + s0)),
+        "proxy_user_s_per_gib": per_gib(u1 - u0),
+        "proxy_sys_s_per_gib": per_gib(s1 - s0),
     }
 
 

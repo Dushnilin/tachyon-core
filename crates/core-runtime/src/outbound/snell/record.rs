@@ -16,9 +16,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::crypto::{
     AEAD_TAG_LEN, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, HEADER_VERSION, MAX_PAYLOAD_LEN, NONCE_LEN,
-    SALT_LEN, derive_key, increase_nonce, new_aead, open_in_place, random_bytes, random_int31,
-    seal_in_place,
+    SALT_LEN, derive_key, increase_nonce, new_aead, open_in_place, random_bytes,
+    random_int31, seal_region,
 };
+use super::gcm::{BATCH_MAX, BatchSealer, FastOpener};
 
 pub(crate) const FRAME_SIZE: usize = 1460;
 pub(crate) const FIRST_RECORD_OVERHEAD: usize = 55;
@@ -40,6 +41,7 @@ pub(crate) struct RecordWriter<W> {
     pub(super) inner: W,
     psk: Vec<u8>,
     cipher: Option<Aes128Gcm>,
+    sealer: Option<BatchSealer>,
     nonce: [u8; NONCE_LEN],
     salt: [u8; SALT_LEN],
     salt_sent: bool,
@@ -54,6 +56,7 @@ impl<W> RecordWriter<W> {
             inner,
             psk: psk.to_vec(),
             cipher: None,
+            sealer: None,
             nonce: [0; NONCE_LEN],
             salt: [0; SALT_LEN],
             salt_sent: false,
@@ -72,6 +75,7 @@ impl<W> RecordWriter<W> {
         let mut delta = [0u8; 1];
         random_bytes(&mut delta)?;
         self.cipher = Some(new_aead(&key));
+        self.sealer = Some(BatchSealer::new(&key));
         self.nonce = [0; NONCE_LEN];
         self.initial_padding = INITIAL_PADDING_MIN + (delta[0] as usize % INITIAL_PADDING_SPAN);
         Ok(())
@@ -153,8 +157,15 @@ impl<W> RecordWriter<W> {
         self.make_record(data, padding_len)
     }
 
-    /// Reference `makeSliceRecordLocked`: [salt?][sealed header][padding][payload].
-    fn make_record(&mut self, payload: &[u8], padding_len: usize) -> io::Result<Vec<u8>> {
+    /// Reference `makeSliceRecordLocked`: [salt?][sealed header][padding]
+    /// [payload], appended to `out` — no intermediate record Vecs, the seal
+    /// runs directly on the shared output buffer.
+    fn write_record(
+        &mut self,
+        out: &mut Vec<u8>,
+        payload: &[u8],
+        padding_len: usize,
+    ) -> io::Result<()> {
         self.initialize()?;
         if payload.len() > MAX_PAYLOAD_LEN || padding_len > MAX_PAYLOAD_LEN {
             return Err(io::Error::other("snell: v4 record exceeds maximum"));
@@ -170,8 +181,7 @@ impl<W> RecordWriter<W> {
         } else {
             payload.len() + AEAD_TAG_LEN
         };
-        let mut out =
-            Vec::with_capacity(salt_len + HEADER_CIPHER_LEN + padding_len + payload_cipher_len);
+        out.reserve(salt_len + HEADER_CIPHER_LEN + padding_len + payload_cipher_len);
 
         if salt_len > 0 {
             out.extend_from_slice(&self.salt);
@@ -182,29 +192,34 @@ impl<W> RecordWriter<W> {
         header[0] = HEADER_VERSION;
         header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
         header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        let mut header = header.to_vec();
-        seal_in_place(
+        let mut tag = [0u8; AEAD_TAG_LEN];
+        seal_region(
             self.cipher.as_ref().expect("snell: writer initialized"),
             &self.nonce,
             &mut header,
+            &mut tag,
         )?;
         increase_nonce(&mut self.nonce);
         out.extend_from_slice(&header);
+        out.extend_from_slice(&tag);
 
         let padding_start = out.len();
         out.resize(padding_start + padding_len, 0u8);
         if !payload.is_empty() {
-            let mut payload_cipher = payload.to_vec();
-            seal_in_place(
+            let payload_start = padding_start + padding_len;
+            out.extend_from_slice(payload);
+            let mut tag = [0u8; AEAD_TAG_LEN];
+            let payload_end = payload_start + payload.len();
+            seal_region(
                 self.cipher.as_ref().expect("snell: writer initialized"),
                 &self.nonce,
-                &mut payload_cipher,
+                &mut out[payload_start..payload_end],
+                &mut tag,
             )?;
             increase_nonce(&mut self.nonce);
-            out.extend_from_slice(&payload_cipher);
+            out.extend_from_slice(&tag);
 
             if padding_len > 0 {
-                let payload_start = padding_start + padding_len;
                 let (head, tail) = out.split_at_mut(payload_start);
                 fill_padding(&mut head[padding_start..], tail)?;
                 let limit = padding_len.min(payload_cipher_len);
@@ -213,7 +228,146 @@ impl<W> RecordWriter<W> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn make_record(&mut self, payload: &[u8], padding_len: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_record(&mut out, payload, padding_len)?;
         Ok(out)
+    }
+
+    /// Serialize up to [`BATCH_MAX`] records into `out` as one group: the
+    /// headers seal one by one (23 bytes each, not worth scheduling), then
+    /// the payload regions seal together in a single interleaved GHASH pass
+    /// and the padding follows per record. Wire order, nonces and padding
+    /// bytes match serial [`Self::write_record`] calls exactly — the batch
+    /// only changes how the hash chains are scheduled.
+    fn write_records(
+        &mut self,
+        out: &mut Vec<u8>,
+        items: &[(&[u8], usize)],
+    ) -> io::Result<()> {
+        debug_assert!(!items.is_empty() && items.len() <= BATCH_MAX);
+        self.initialize()?;
+        for (payload, padding_len) in items {
+            if payload.is_empty() {
+                return Err(io::Error::other("snell: zero-length v4 record in batch"));
+            }
+            if payload.len() > MAX_PAYLOAD_LEN || *padding_len > MAX_PAYLOAD_LEN {
+                return Err(io::Error::other("snell: v4 record exceeds maximum"));
+            }
+        }
+
+        let salt_len = if !self.salt_sent { SALT_LEN } else { 0 };
+        let total = salt_len
+            + items
+                .iter()
+                .map(|(payload, padding_len)| {
+                    HEADER_CIPHER_LEN + padding_len + payload.len() + AEAD_TAG_LEN
+                })
+                .sum::<usize>();
+        out.reserve(total);
+        if salt_len > 0 {
+            out.extend_from_slice(&self.salt);
+            self.salt_sent = true;
+        }
+
+        let base = self.nonce;
+        let mut header_nonce = base;
+        let mut payload_nonce = base;
+        increase_nonce(&mut payload_nonce);
+        let mut ranges = [(0usize, 0usize); BATCH_MAX];
+        let mut nonces = [[0u8; NONCE_LEN]; BATCH_MAX];
+
+        for (k, &(payload, padding_len)) in items.iter().enumerate() {
+            let mut header = [0u8; HEADER_PLAIN_LEN];
+            header[0] = HEADER_VERSION;
+            header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
+            header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+            let mut tag = [0u8; AEAD_TAG_LEN];
+            seal_region(
+                self.cipher.as_ref().expect("snell: writer initialized"),
+                &header_nonce,
+                &mut header,
+                &mut tag,
+            )?;
+            increase_nonce(&mut header_nonce);
+            increase_nonce(&mut header_nonce);
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&tag);
+
+            let padding_start = out.len();
+            out.resize(padding_start + padding_len, 0u8);
+            let payload_start = out.len();
+            out.extend_from_slice(payload);
+            ranges[k] = (payload_start, out.len());
+            out.extend_from_slice(&[0u8; AEAD_TAG_LEN]);
+            nonces[k] = payload_nonce;
+            increase_nonce(&mut payload_nonce);
+            increase_nonce(&mut payload_nonce);
+        }
+
+        let mut tags = [[0u8; AEAD_TAG_LEN]; BATCH_MAX];
+        self.sealer
+            .as_ref()
+            .expect("snell: writer initialized")
+            .seal(out, &ranges, items.len(), &nonces, &mut tags);
+
+        for (k, &(payload, padding_len)) in items.iter().enumerate() {
+            let (payload_start, payload_end) = ranges[k];
+            out[payload_end..payload_end + AEAD_TAG_LEN].copy_from_slice(&tags[k]);
+            if padding_len > 0 {
+                let padding_start = payload_start - padding_len;
+                let region_len = payload.len() + AEAD_TAG_LEN;
+                let (head, tail) = out.split_at_mut(payload_start);
+                fill_padding(&mut head[padding_start..], &tail[..region_len])?;
+                let payload_cipher_len = region_len;
+                let limit = padding_len.min(payload_cipher_len);
+                for index in (0..limit).step_by(2) {
+                    out.swap(padding_start + index, payload_start + index);
+                }
+            }
+        }
+
+        self.nonce = header_nonce;
+        Ok(())
+    }
+
+    /// Hot-path twin of [`emit`]: the serialized records are appended to the
+    /// caller's reused buffer instead of being allocated one Vec at a time.
+    /// Records go out in groups of [`BATCH_MAX`] so the payload seals share
+    /// one interleaved GHASH pass.
+    pub(crate) fn emit_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        now_unix: i64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        self.initialize()?;
+        let payload_limit = self.limit_checked(now_unix)?;
+        self.advance_payload_limit(payload_limit, now_unix);
+        if data.is_empty() {
+            return self.write_record(out, &[], 0);
+        }
+        let mut rest = data;
+        while !rest.is_empty() {
+            let mut items: [(&[u8], usize); BATCH_MAX] = [(&[], 0); BATCH_MAX];
+            let mut count = 0;
+            while count < BATCH_MAX && !rest.is_empty() {
+                let len = rest.len().min(payload_limit as usize);
+                let padding_len = if count == 0 {
+                    self.frame_padding_len(len)
+                } else {
+                    0
+                };
+                items[count] = (&rest[..len], padding_len);
+                rest = &rest[len..];
+                count += 1;
+            }
+            self.write_records(out, &items[..count])?;
+        }
+        Ok(())
     }
 }
 
@@ -227,27 +381,96 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
 }
 
 /// Drain `pending` records into `inner`, tracking partial writes.
+///
+/// Records go out coalesced: one syscall per batch instead of one per record.
+/// A snell record is capped at ~16 KiB by the payload window, so a relay write
+/// arrives as a queue of them, and writing them one by one multiplies the
+/// syscalls (and the socket lock hits) by the record count. The batch is copied
+/// into one buffer because the layers below offer no vectored write; the copy
+/// is far cheaper than the syscalls it removes.
 pub(crate) fn poll_flush<W: AsyncWrite + Unpin>(
     cx: &mut Context<'_>,
     inner: &mut W,
     pending: &mut VecDeque<(Vec<u8>, usize)>,
 ) -> Poll<io::Result<()>> {
-    while let Some((record, pos)) = pending.front_mut() {
-        while *pos < record.len() {
-            match Pin::new(&mut *inner).poll_write(cx, &record[*pos..]) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "snell: failed to write whole record",
-                    )));
+    loop {
+        if pending.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        if pending.len() == 1 {
+            let (record, pos) = pending.front_mut().expect("checked non-empty");
+            while *pos < record.len() {
+                match Pin::new(&mut *inner).poll_write(cx, &record[*pos..]) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "snell: failed to write whole record",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => *pos += n,
                 }
-                Poll::Ready(Ok(n)) => *pos += n,
+            }
+            pending.pop_front();
+            continue;
+        }
+        let total: usize = pending.iter().map(|(r, p)| r.len() - p).sum();
+        let mut merged = Vec::with_capacity(total);
+        for (record, pos) in pending.iter() {
+            merged.extend_from_slice(&record[*pos..]);
+        }
+        match Pin::new(&mut *inner).poll_write(cx, &merged) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(0)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "snell: failed to write whole record",
+                )));
+            }
+            Poll::Ready(Ok(mut n)) => {
+                while n > 0 {
+                    let (record, pos) = pending.front_mut().expect("checked non-empty");
+                    let left = record.len() - *pos;
+                    if left <= n {
+                        n -= left;
+                        pending.pop_front();
+                    } else {
+                        *pos += n;
+                        n = 0;
+                    }
+                }
             }
         }
-        pending.pop_front();
     }
+}
+
+/// Drain the shared write buffer `wbuf[*pos..]` into `inner`, resetting both
+/// once fully written. This is the hot-path flush: the records were already
+/// serialized into `wbuf` by `emit_into`, so there is no merge copy here —
+/// one `poll_write` per pump chunk and the buffer keeps its capacity.
+pub(crate) fn poll_flush_wbuf<W: AsyncWrite + Unpin>(
+    cx: &mut Context<'_>,
+    inner: &mut W,
+    wbuf: &mut Vec<u8>,
+    pos: &mut usize,
+) -> Poll<io::Result<()>> {
+    while *pos < wbuf.len() {
+        match Pin::new(&mut *inner).poll_write(cx, &wbuf[*pos..]) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(0)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "snell: failed to write whole record",
+                )));
+            }
+            Poll::Ready(Ok(n)) => *pos += n,
+        }
+    }
+    wbuf.clear();
+    *pos = 0;
     Poll::Ready(Ok(()))
 }
 
@@ -260,9 +483,10 @@ enum ReadStage {
 }
 
 pub(crate) struct RecordReader<R> {
-    inner: R,
+    cache: ReadAhead<R>,
     psk: Vec<u8>,
     cipher: Option<Aes128Gcm>,
+    opener: Option<FastOpener>,
     nonce: [u8; NONCE_LEN],
     stage: ReadStage,
     head: Vec<u8>,
@@ -282,42 +506,85 @@ pub(crate) enum Fill {
     Eof,
 }
 
-pub(crate) fn poll_fill<R: AsyncRead + Unpin>(
-    cx: &mut Context<'_>,
-    inner: &mut R,
-    buf: &mut [u8],
-    filled: &mut usize,
-) -> Poll<io::Result<Fill>> {
-    while *filled < buf.len() {
-        let mut read_buf = ReadBuf::new(&mut buf[*filled..]);
-        match Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {
-                let n = read_buf.filled().len();
-                if n == 0 {
-                    return Poll::Ready(if *filled == 0 {
-                        Ok(Fill::Eof)
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "snell: unexpected EOF",
-                        ))
-                    });
-                }
-                *filled += n;
-            }
+/// Readahead wrapper: one transport read feeds several record fills.
+///
+/// A record arrives as a sealed header (23 bytes) followed by its body, and a
+/// pump chunk lands as several records at once — reading each piece straight
+/// from the socket turns every record into two syscalls and keeps the reader
+/// waking per fragment. The cache absorbs the whole chunk and serves header
+/// and body from memory.
+pub(crate) struct ReadAhead<R> {
+    inner: R,
+    raw: Vec<u8>,
+    pos: usize,
+    end: usize,
+}
+
+/// One pump chunk worth of readahead (`RELAY_BUF` is the writer's view of the
+/// same size; the reader cache just matches it).
+const READAHEAD_CAP: usize = 64 * 1024;
+
+impl<R> ReadAhead<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            inner,
+            raw: Vec::new(),
+            pos: 0,
+            end: 0,
         }
     }
-    Poll::Ready(Ok(Fill::Done))
+}
+
+impl<R: AsyncRead + Unpin> ReadAhead<R> {
+    pub(crate) fn poll_fill(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+        filled: &mut usize,
+    ) -> Poll<io::Result<Fill>> {
+        while *filled < buf.len() {
+            if self.pos < self.end {
+                let n = (buf.len() - *filled).min(self.end - self.pos);
+                buf[*filled..*filled + n].copy_from_slice(&self.raw[self.pos..self.pos + n]);
+                self.pos += n;
+                *filled += n;
+                continue;
+            }
+            if self.raw.len() != READAHEAD_CAP {
+                self.raw.resize(READAHEAD_CAP, 0u8);
+            }
+            let mut read_buf = ReadBuf::new(&mut self.raw);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(if *filled == 0 {
+                            Ok(Fill::Eof)
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "snell: unexpected EOF",
+                            ))
+                        });
+                    }
+                    self.end = n;
+                    self.pos = 0;
+                }
+            }
+        }
+        Poll::Ready(Ok(Fill::Done))
+    }
 }
 
 impl<R: AsyncRead + Unpin> RecordReader<R> {
     pub(crate) fn new(inner: R, psk: &[u8]) -> Self {
         Self {
-            inner,
+            cache: ReadAhead::new(inner),
             psk: psk.to_vec(),
             cipher: None,
+            opener: None,
             nonce: [0; NONCE_LEN],
             stage: ReadStage::Salt,
             head: Vec::new(),
@@ -336,12 +603,15 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
         io::Error::new(kind, msg)
     }
 
-    /// Read the next decrypted record payload; `Ok(None)` is the zero-chunk
-    /// EOF (or a clean close at a record boundary).
+    /// Read the next decrypted record payload into `out` (cleared first);
+    /// `Ok(None)` is the zero-chunk EOF (or a clean close at a record
+    /// boundary). The reader keeps its body buffer across records, so the
+    /// steady state allocates nothing per record.
     pub(crate) fn poll_read_record(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<Option<Vec<u8>>>> {
+        out: &mut Vec<u8>,
+    ) -> Poll<io::Result<Option<()>>> {
         loop {
             if let Some((kind, msg)) = &self.fatal {
                 return Poll::Ready(Err(io::Error::new(*kind, msg.clone())));
@@ -354,7 +624,10 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                     if self.head.len() != SALT_LEN {
                         self.head.resize(SALT_LEN, 0u8);
                     }
-                    match poll_fill(cx, &mut self.inner, &mut self.head, &mut self.head_filled) {
+                    match self
+                        .cache
+                        .poll_fill(cx, &mut self.head, &mut self.head_filled)
+                    {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(e)) => {
                             let e = self.fail(e.kind(), e.to_string());
@@ -373,6 +646,7 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                                 }
                             };
                             self.cipher = Some(new_aead(&key));
+                            self.opener = Some(FastOpener::new(&key));
                             self.nonce = [0; NONCE_LEN];
                             self.head.resize(HEADER_CIPHER_LEN, 0u8);
                             self.head_filled = 0;
@@ -381,7 +655,10 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                     }
                 }
                 ReadStage::Header => {
-                    match poll_fill(cx, &mut self.inner, &mut self.head, &mut self.head_filled) {
+                    match self
+                        .cache
+                        .poll_fill(cx, &mut self.head, &mut self.head_filled)
+                    {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(e)) => {
                             let e = self.fail(e.kind(), e.to_string());
@@ -429,15 +706,23 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                                 self.stage = ReadStage::Header;
                                 return Poll::Ready(Ok(None));
                             }
-                            self.body =
-                                vec![0u8; self.padding_len + self.payload_len + AEAD_TAG_LEN];
+                            let need =
+                                self.padding_len + self.payload_len + AEAD_TAG_LEN;
+                            if self.body.len() != need {
+                                // Resize, not replace: the capacity survives
+                                // the shrink and the next record reuses it.
+                                self.body.resize(need, 0u8);
+                            }
                             self.body_filled = 0;
                             self.stage = ReadStage::Body;
                         }
                     }
                 }
                 ReadStage::Body => {
-                    match poll_fill(cx, &mut self.inner, &mut self.body, &mut self.body_filled) {
+                    match self
+                        .cache
+                        .poll_fill(cx, &mut self.body, &mut self.body_filled)
+                    {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(e)) => {
                             let e = self.fail(e.kind(), e.to_string());
@@ -454,13 +739,14 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                             for index in (0..limit).step_by(2) {
                                 self.body.swap(index, self.padding_len + index);
                             }
-                            let mut payload_cipher =
-                                self.body[self.padding_len..payload_end].to_vec();
-                            let opened = open_in_place(
-                                self.cipher.as_ref().expect("snell: reader initialized"),
-                                &self.nonce,
-                                &mut payload_cipher,
-                            );
+                            let opened = self
+                                .opener
+                                .as_ref()
+                                .expect("snell: reader initialized")
+                                .open(
+                                    &self.nonce,
+                                    &mut self.body[self.padding_len..payload_end],
+                                );
                             if opened.is_err() {
                                 let e = self.fail(
                                     io::ErrorKind::InvalidData,
@@ -469,10 +755,14 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                                 return Poll::Ready(Err(e));
                             }
                             increase_nonce(&mut self.nonce);
+                            out.clear();
+                            out.extend_from_slice(
+                                &self.body[self.padding_len..self.padding_len + self.payload_len],
+                            );
                             self.head.resize(HEADER_CIPHER_LEN, 0u8);
                             self.head_filled = 0;
                             self.stage = ReadStage::Header;
-                            return Poll::Ready(Ok(Some(payload_cipher)));
+                            return Poll::Ready(Ok(Some(())));
                         }
                     }
                 }
@@ -483,7 +773,16 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
 
 impl<R: AsyncRead + Unpin> RecordReader<R> {
     pub(crate) async fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
-        std::future::poll_fn(|cx| self.poll_read_record(cx)).await
+        let mut out = Vec::new();
+        let found = std::future::poll_fn(|cx| {
+            match self.poll_read_record(cx, &mut out) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(found)) => Poll::Ready(Ok(found.is_some())),
+            }
+        })
+        .await?;
+        Ok(found.then_some(out))
     }
 }
 
@@ -587,7 +886,7 @@ mod tests {
                 }
                 Err(e) => panic!("reader error: {e}"),
             }
-            if out.len() > 16 {
+            if out.len() > 64 {
                 panic!("too many records");
             }
         }
@@ -674,6 +973,93 @@ mod tests {
         let mut reader = RecordReader::new(SliceReader(std::io::Cursor::new(wire)), psk);
         let decoded = read_all(&mut reader).await;
         assert_eq!(decoded, vec![Some(b"data".to_vec()), None]);
+    }
+
+    /// Writer with fully deterministic state (fixed salt, nonce, no initial
+    /// padding — `fill_padding` draws fresh randomness per call, so padding
+    /// bytes are never reproducible across two writers) so two instances can
+    /// be compared byte for byte.
+    fn seeded_writer(psk: &[u8]) -> RecordWriter<tokio::io::Sink> {
+        let mut w = writer(psk);
+        w.initialize().expect("init");
+        w.salt = [7u8; SALT_LEN];
+        let key = derive_key(psk, &w.salt).expect("derive");
+        w.cipher = Some(new_aead(&key));
+        w.sealer = Some(BatchSealer::new(&key));
+        w.nonce = [0; NONCE_LEN];
+        w.salt_sent = false;
+        w.payload_limit = 0;
+        w.last_write_unix = 0;
+        w.initial_padding = 0;
+        w
+    }
+
+    /// The batched `emit_into` path must be byte-identical to serial `emit`
+    /// records: same split, same nonces (header even / payload odd) — and
+    /// the wire must still decode.
+    #[tokio::test]
+    async fn emit_into_matches_serial_wire() {
+        let psk = b"batch-psk-0123456789abcdef";
+        let now = now_unix();
+        let big: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let small: Vec<u8> = (0..300u32).map(|i| (i * 7 % 253) as u8).collect();
+
+        let mut serial_w = seeded_writer(psk);
+        let mut batch_w = seeded_writer(psk);
+        let mut wire = Vec::new();
+
+        for payload in [&big, &small] {
+            let serial = serial_w.emit(now, payload).expect("serial emit");
+            let serial_wire = serial.concat();
+            let before = wire.len();
+            batch_w.emit_into(&mut wire, now, payload).expect("batch emit");
+            let batched = &wire[before..];
+            assert_eq!(batched.len(), serial_wire.len(), "length diverged");
+            assert!(batched == serial_wire, "wire diverged after {} bytes", {
+                batched
+                    .iter()
+                    .zip(serial_wire.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0)
+            });
+        }
+
+        let mut reader = RecordReader::new(SliceReader(std::io::Cursor::new(wire)), psk);
+        let decoded = read_all(&mut reader).await;
+        let mut joined = Vec::new();
+        for chunk in decoded.iter().flatten() {
+            joined.extend_from_slice(chunk);
+        }
+        assert_eq!(joined.len(), big.len() + small.len());
+        assert_eq!(decoded.last(), Some(&None));
+    }
+
+    /// First record carries shaped initial padding through the batch path:
+    /// fill, swap, seal together — the reader must still reassemble the
+    /// payload (the unswap mirrors the writer's).
+    #[tokio::test]
+    async fn emit_into_roundtrip_with_initial_padding() {
+        let psk = b"batch-padding-psk-0123456";
+        let now = now_unix();
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 13 % 249) as u8).collect();
+
+        let mut w = seeded_writer(psk);
+        w.initial_padding = 0x123;
+        let mut wire = Vec::new();
+        w.emit_into(&mut wire, now, &payload).expect("batch emit");
+        assert!(
+            wire.len() > payload.len(),
+            "wire must carry framing overhead"
+        );
+
+        let mut reader = RecordReader::new(SliceReader(std::io::Cursor::new(wire)), psk);
+        let decoded = read_all(&mut reader).await;
+        let mut joined = Vec::new();
+        for chunk in decoded.iter().flatten() {
+            joined.extend_from_slice(chunk);
+        }
+        assert_eq!(joined, payload);
+        assert_eq!(decoded.last(), Some(&None));
     }
 
     #[test]

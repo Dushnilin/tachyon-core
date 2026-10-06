@@ -363,12 +363,12 @@ impl quic::PacketKey for PacketKey {
             .checked_sub(self.tag_len())
             .ok_or(Error::DecryptError)?;
         let (ciphertext, tag_bytes) = payload.split_at_mut(plain_len);
-        let tag: [u8; 16] = tag_bytes
-            .try_into()
-            .map_err(|_| Error::DecryptError)?;
+        let tag: [u8; 16] = tag_bytes.try_into().map_err(|_| Error::DecryptError)?;
 
         let ok = match &self.ready {
-            Ready::Aes128(cipher) | Ready::Aes256(cipher) => cipher.open(&nonce, aad, ciphertext, &tag),
+            Ready::Aes128(cipher) | Ready::Aes256(cipher) => {
+                cipher.open(&nonce, aad, ciphertext, &tag)
+            }
             Ready::ChaCha(cipher) => cipher
                 .decrypt_in_place_detached((&nonce).into(), aad, ciphertext, (&tag).into())
                 .is_ok(),

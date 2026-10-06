@@ -195,4 +195,3 @@ impl MessageDecrypter for Tls12Cipher {
 }
 
 const CHACHAPOLY1305_OVERHEAD: usize = 16;
-

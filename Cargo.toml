@@ -34,6 +34,8 @@ cfb-mode = "0.8"
 chacha20poly1305 = "0.10"
 ml-kem = "0.2"
 ctr = "0.9"
+# constant-time tag compares for the snell batch opener
+subtle = "2.6"
 rand_core = "0.6"
 getrandom = "0.3"
 h2 = "0.4"

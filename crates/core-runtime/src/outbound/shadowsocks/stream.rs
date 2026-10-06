@@ -7,18 +7,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::crypto::{AEAD_TAG, Cipher, Method, derive_subkey, master_key, random_bytes};
 use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 
-/// Read buffer of a connection, for a method whose records fit in it whole: two
-/// legacy chunks (`0x3FFF` + tag each) and the length blocks between them, so one
-/// `read` usually brings in whole chunks. It is only allocated when the first byte
-/// of the response is about to be read, and a 2022 method outgrows it -- see
-/// `read_buf`.
-const READ_BUF: usize = 33 * 1024;
+/// Read buffer floor, several records deep: `need` reads as much as the buffer
+/// has room for in one syscall, so a bigger buffer means fewer syscalls per GiB
+/// -- with 33 KiB the steady state was one record per `recvfrom` while a peer
+/// with a large buffer drained four or five records per `read`. Allocated only
+/// when the first byte of the response is about to be read.
+const READ_BUF: usize = 256 * 1024;
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
 /// block, the tag on that block and the tag on the payload.
 const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
-/// Largest frame a connection keeps between writes. The relay hands over 64 KiB at
-/// a time, which seals to a little more than that, so the steady state stays well
-/// under this and the buffer is never dropped.
+/// Largest frame a connection keeps between writes. The relay hands over 128 KiB
+/// at a time, which seals to a little more than that, so the steady state stays
+/// well under this and the buffer is never dropped.
 const WRITE_BUF_KEEP: usize = 256 * 1024;
 
 /// Read buffer big enough for one whole record of `method` plus the length block
@@ -154,6 +154,7 @@ impl Shadowsocks {
             rend: 0,
             pos: 0,
             pend: 0,
+            pending_len: None,
             request_salt: salt,
             read_buf: read_buf(self.method),
             state: if is_2022 {
@@ -224,6 +225,9 @@ pub struct SsReader<R> {
     /// The decrypted payload being handed out, in place: `rbuf[pos..pend]`.
     pos: usize,
     pend: usize,
+    /// Length block already opened, payload not yet fully buffered: the record
+    /// is half-parsed and `fill` owes the caller its payload.
+    pending_len: Option<usize>,
     request_salt: Vec<u8>,
     state: ReaderState,
 }
@@ -341,17 +345,228 @@ impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
                 self.establish_response_cipher(&salt);
                 self.take_chunk().await
             }
-            ReaderState::Chunks => self.take_chunk().await,
+            ReaderState::Chunks => {
+                if let Some(payload_len) = self.pending_len.take() {
+                    self.take_payload(payload_len).await
+                } else {
+                    self.take_chunk().await
+                }
+            }
         }
     }
 
-    pub async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pos == self.pend {
-            self.fill().await?;
+    /// The next record without touching the socket: false when a byte it needs
+    /// is not buffered yet. Opening the length block that turns out to be
+    /// short is not thrown away -- its length is parked in `pending_len` and
+    /// the next `fill` picks the payload up from there.
+    fn try_fill_buffered(&mut self) -> io::Result<bool> {
+        if !matches!(self.state, ReaderState::Chunks) || self.cipher.is_none() {
+            return Ok(false);
         }
-        let n = out.len().min(self.pend - self.pos);
-        out[..n].copy_from_slice(&self.rbuf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
+        if self.pending_len.is_none() {
+            if self.rend - self.rpos < 2 + AEAD_TAG {
+                return Ok(false);
+            }
+            let head = self.rpos;
+            self.open_next(2 + AEAD_TAG)?;
+            let payload_len =
+                usize::from(u16::from_be_bytes([self.rbuf[head], self.rbuf[head + 1]]));
+            if payload_len == 0 {
+                return Err(io::Error::other("zero-length chunk"));
+            }
+            self.pending_len = Some(payload_len);
+        }
+        let payload_len = self.pending_len.expect("set above");
+        if self.rend - self.rpos < payload_len + AEAD_TAG {
+            return Ok(false);
+        }
+        self.pending_len = None;
+        self.pos = self.rpos;
+        self.pend = self.rpos + payload_len;
+        self.open_next(payload_len + AEAD_TAG)?;
+        Ok(true)
+    }
+
+    /// Hand out as much of `out` as complete buffered records allow: the relay
+    /// writes whole multiples of a record to the socket only if this fills past
+    /// one record, and one record per `write` is one syscall per record.
+    pub async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut got = 0;
+        loop {
+            if self.pos == self.pend {
+                if got == 0 {
+                    self.fill().await?;
+                } else if !self.try_fill_buffered()? {
+                    break;
+                }
+            }
+            let n = (out.len() - got).min(self.pend - self.pos);
+            out[got..got + n].copy_from_slice(&self.rbuf[self.pos..self.pos + n]);
+            self.pos += n;
+            got += n;
+            if got == out.len() {
+                break;
+            }
+        }
+        Ok(got)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Instant;
+
+    struct Slab {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl tokio::io::AsyncRead for Slab {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            out: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = out.remaining().min(self.data.len() - self.pos);
+            out.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The outbound reader the client relay drives, against the bare open and
+    /// against the inbound ChunkReader's numbers: the client half of a matrix
+    /// cell in isolation.
+    ///
+    ///     cargo test --release -p core-runtime --lib outbound::shadowsocks::stream::tests::ssreader_costs -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "microbenchmark, run by hand"]
+    async fn ssreader_costs() {
+        const PAYLOAD: usize = 65535;
+        const GIB: u64 = 1u64 << 30;
+        let payload = vec![0x5Au8; PAYLOAD];
+        let key = vec![7u8; 32];
+        let records = GIB / PAYLOAD as u64;
+
+        for method in [Method::Blake3Aes128Gcm, Method::Blake3ChaCha20Poly1305] {
+            // the wire the peer would have sent: length block + payload
+            let mut wire = Vec::new();
+            {
+                let peer = Cipher::new(method, &key);
+                let mut ctr = 0u64;
+                for _ in 0..records {
+                    let at = wire.len();
+                    wire.extend_from_slice(&(PAYLOAD as u16).to_be_bytes());
+                    peer.seal_at(ctr, &mut wire, at).expect("seal");
+                    ctr += 1;
+                    let at = wire.len();
+                    wire.extend_from_slice(&payload);
+                    peer.seal_at(ctr, &mut wire, at).expect("seal");
+                    ctr += 1;
+                }
+            }
+
+            // the bare open, in place, run in full every time against the
+            // already-plain block: no re-seal, no copy
+            {
+                let cipher = Cipher::new(method, &key);
+                let peer = Cipher::new(method, &key);
+                let mut block = payload.clone();
+                peer.seal_at(0, &mut block, 0).expect("seal");
+                let n = GIB / PAYLOAD as u64;
+                let t = Instant::now();
+                for _ in 0..n {
+                    let _ = cipher.open_slice(0, &mut block);
+                }
+                let secs = t.elapsed().as_secs_f64();
+                let gib = (n * PAYLOAD as u64) as f64 / GIB as f64;
+                println!(
+                    "{method:?} open_slice (in place)   {:7.3} s/GiB",
+                    secs / gib
+                );
+            }
+
+            // stage B: the reader's own machinery (need, open, two blocks per
+            // record) without the copy into the relay's buffer
+            {
+                let mut reader = SsReader {
+                    inner: Box::new(Slab {
+                        data: wire.clone(),
+                        pos: 0,
+                    }) as AnyRead,
+                    method,
+                    master_key: Arc::new(key.clone()),
+                    cipher: Some(Cipher::new(method, &key)),
+                    counter: 0,
+                    rbuf: Vec::new(),
+                    rpos: 0,
+                    rend: 0,
+                    pos: 0,
+                    pend: 0,
+                    pending_len: None,
+                    request_salt: vec![9u8; method.salt_len()],
+                    read_buf: read_buf(method),
+                    state: ReaderState::Chunks,
+                };
+                for _ in 0..2 {
+                    reader.fill().await.expect("warm fill");
+                }
+                let n = records - 2;
+                let t = Instant::now();
+                for _ in 0..n {
+                    reader.fill().await.expect("fill");
+                }
+                let secs = t.elapsed().as_secs_f64();
+                let gib = (records.saturating_sub(2)) as f64 * PAYLOAD as f64 / GIB as f64;
+                println!(
+                    "{method:?} SsReader::fill (no copy)  {:7.3} s/GiB",
+                    secs / gib
+                );
+            }
+
+            let mut reader = SsReader {
+                inner: Box::new(Slab { data: wire, pos: 0 }) as AnyRead,
+                method,
+                master_key: Arc::new(key.clone()),
+                cipher: Some(Cipher::new(method, &key)),
+                counter: 0,
+                rbuf: Vec::new(),
+                rpos: 0,
+                rend: 0,
+                pos: 0,
+                pend: 0,
+                pending_len: None,
+                request_salt: vec![9u8; method.salt_len()],
+                read_buf: read_buf(method),
+                state: ReaderState::Chunks,
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut got = 0u64;
+            let warm = 2 * PAYLOAD as u64;
+            while got < warm {
+                got += reader.read(&mut buf).await.expect("warm read") as u64;
+            }
+            // one read may straddle two records, so the warm phase can carry a
+            // byte or two into the timed one: count from where warm stopped,
+            // never from zero, or the tail asks the slab for bytes it split off
+            let target = records * PAYLOAD as u64;
+            let t = Instant::now();
+            while got < target {
+                let n = reader.read(&mut buf).await.expect("read");
+                assert!(n > 0, "the slab ran short");
+                got += n as u64;
+            }
+            let secs = t.elapsed().as_secs_f64();
+            let gib = (target - warm) as f64 / GIB as f64;
+            println!(
+                "{method:?} SsReader::read          {:7.3} s/GiB",
+                secs / gib
+            );
+        }
     }
 }

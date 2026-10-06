@@ -444,10 +444,11 @@ fn closed_by_api() -> io::Error {
     io::Error::other("connection closed by clash api")
 }
 
-/// Each direction of a userspace relay moves up to this much per read. The
-/// 8 KiB tokio picks by default means eight times the syscalls and, for the
-/// shadowsocks 2022 chunks (up to 64 KiB), a frame cut into pieces.
-const RELAY_BUF: usize = 64 * 1024;
+/// Each direction of a userspace relay moves up to this much per read. The 8 KiB
+/// tokio picks by default means eight times the syscalls and, for the shadowsocks
+/// 2022 chunks (up to 64 KiB), a frame cut into pieces; at 128 KiB one read also
+/// covers two whole records, so a steady download costs one write per two of them.
+const RELAY_BUF: usize = 128 * 1024;
 
 /// The client side of a relay, counting what crosses it for the connection
 /// view: bytes read from it are upload, bytes written to it are download.

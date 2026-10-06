@@ -14,11 +14,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::crypto::{
     AEAD_TAG_LEN, HEADER_PLAIN_LEN, HEADER_VERSION, NONCE_LEN, SALT_LEN, derive_key,
-    increase_nonce, new_aead, open_in_place, open_in_place_aad, random_bytes, seal_in_place,
-    seal_in_place_aad,
+    increase_nonce, new_aead, open_in_place, open_region_aad, random_bytes, seal_region,
+    seal_region_aad,
 };
 use super::profile::Profile;
-use super::record::{Fill, poll_fill, poll_flush};
+use super::record::{Fill, ReadAhead, poll_flush};
 
 pub(crate) const MAX_PAYLOAD_V6: usize = 0xffff;
 const HEADER_CIPHER_LEN: usize = HEADER_PLAIN_LEN + AEAD_TAG_LEN;
@@ -147,43 +147,58 @@ impl<W> V6Writer<W> {
         Ok(go_max(1, go_min(payload_limit, MAX_PAYLOAD_V6 as i64)))
     }
 
-    /// `unsafe-raw` record: `[plain header][payload]`.
+    /// `unsafe-raw` record: `[plain header][payload]` appended into `out`.
+    fn raw_record_into(&self, payload: &[u8], out: &mut Vec<u8>) {
+        let start = out.len();
+        out.resize(start + HEADER_PLAIN_LEN, 0u8);
+        put_header(&mut out[start..], 0, payload.len());
+        out.extend_from_slice(payload);
+    }
+
     fn raw_record(&self, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_PLAIN_LEN + payload.len());
-        out.resize(HEADER_PLAIN_LEN, 0u8);
-        put_header(&mut out, 0, payload.len());
-        out.extend_from_slice(payload);
+        self.raw_record_into(payload, &mut out);
         out
     }
 
     /// `unshaped` record: `[salt?][sealed header][sealed payload]` — the zero
-    /// chunk stops after the header (reference `WriteZeroChunk`).
-    fn unshaped_record(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+    /// chunk stops after the header (reference `WriteZeroChunk`). Appended
+    /// into `out`; the steady state allocates nothing per record.
+    fn unshaped_record_into(&mut self, payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         let cipher = self.cipher()?.clone();
-        let mut out =
-            Vec::with_capacity(SALT_LEN + HEADER_CIPHER_LEN + payload.len() + AEAD_TAG_LEN);
         if !self.salt_sent {
             out.extend_from_slice(&self.salt);
             self.salt_sent = true;
         }
-        let mut header = vec![0u8; HEADER_PLAIN_LEN];
-        put_header(&mut header, 0, payload.len());
-        seal_in_place(&cipher, &self.nonce, &mut header)?;
+        let header_start = out.len();
+        out.resize(header_start + HEADER_PLAIN_LEN, 0u8);
+        put_header(&mut out[header_start..], 0, payload.len());
+        let mut tag = [0u8; AEAD_TAG_LEN];
+        seal_region(&cipher, &self.nonce, &mut out[header_start..], &mut tag)?;
         increase_nonce(&mut self.nonce);
-        out.extend_from_slice(&header);
+        out.extend_from_slice(&tag);
         if !payload.is_empty() {
-            let mut body = payload.to_vec();
-            seal_in_place(&cipher, &self.nonce, &mut body)?;
+            let payload_start = out.len();
+            out.extend_from_slice(payload);
+            seal_region(&cipher, &self.nonce, &mut out[payload_start..], &mut tag)?;
             increase_nonce(&mut self.nonce);
-            out.extend_from_slice(&body);
+            out.extend_from_slice(&tag);
         }
+        Ok(())
+    }
+
+    fn unshaped_record(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out =
+            Vec::with_capacity(SALT_LEN + HEADER_CIPHER_LEN + payload.len() + AEAD_TAG_LEN);
+        self.unshaped_record_into(payload, &mut out)?;
         Ok(out)
     }
 
     /// `default` shaped record (reference `shapedWriter.makeSliceRecord`):
     /// `[salt block?][prefix][sealed header AAD=prefix][padding][sealed
-    /// payload AAD=padding mixed with padding]`.
-    fn shaped_record(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+    /// payload AAD=padding mixed with padding]`. Appended into `out` — the
+    /// hot path never builds a per-record Vec.
+    fn shaped_record_into(&mut self, payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         let profile = Arc::clone(self.profile()?);
         let cipher = self.cipher()?.clone();
         let prefix_len = profile.record_prefix_len(self.seq) as usize;
@@ -200,35 +215,31 @@ impl<W> V6Writer<W> {
             salt_prefix_len,
             salt_block_len as i64,
         ) as usize;
-        let payload_cipher_len = if payload.is_empty() {
-            0
-        } else {
-            payload.len() + AEAD_TAG_LEN
-        };
-        let mut out = Vec::with_capacity(
-            salt_block_len + prefix_len + HEADER_CIPHER_LEN + padding_len + payload_cipher_len,
-        );
 
         if salt_block_len > 0 {
-            out.resize(salt_block_len, 0u8);
-            profile.fill_padding(u32::MAX, &mut out[..salt_block_len]);
-            profile.write_salt_block(&self.salt, &mut out[..salt_block_len]);
+            let salt_start = out.len();
+            out.resize(salt_start + salt_block_len, 0u8);
+            profile.fill_padding(u32::MAX, &mut out[salt_start..salt_start + salt_block_len]);
+            profile.write_salt_block(&self.salt, &mut out[salt_start..salt_start + salt_block_len]);
             self.salt_sent = true;
         }
         let prefix_start = out.len();
         out.resize(prefix_start + prefix_len, 0u8);
         profile.fill_padding(self.seq, &mut out[prefix_start..prefix_start + prefix_len]);
 
-        let mut header = vec![0u8; HEADER_PLAIN_LEN];
+        let mut header = [0u8; HEADER_PLAIN_LEN];
         put_header(&mut header, padding_len, payload.len());
-        seal_in_place_aad(
+        let mut tag = [0u8; AEAD_TAG_LEN];
+        seal_region_aad(
             &cipher,
             &self.nonce,
             &mut header,
             &out[prefix_start..prefix_start + prefix_len],
+            &mut tag,
         )?;
         increase_nonce(&mut self.nonce);
         out.extend_from_slice(&header);
+        out.extend_from_slice(&tag);
 
         let padding_start = out.len();
         out.resize(padding_start + padding_len, 0u8);
@@ -238,24 +249,32 @@ impl<W> V6Writer<W> {
         );
 
         if !payload.is_empty() {
-            let mut body = payload.to_vec();
-            seal_in_place_aad(
+            let payload_start = out.len();
+            out.extend_from_slice(payload);
+            let (before, after) = out.split_at_mut(payload_start);
+            seal_region_aad(
                 &cipher,
                 &self.nonce,
-                &mut body,
-                &out[padding_start..padding_start + padding_len],
+                after,
+                &before[padding_start..padding_start + padding_len],
+                &mut tag,
             )?;
             increase_nonce(&mut self.nonce);
-            let payload_start = out.len();
-            out.extend_from_slice(&body);
+            out.extend_from_slice(&tag);
             let (before, after) = out.split_at_mut(payload_start);
             profile.mix_padding_payload(
                 self.seq,
                 &mut before[padding_start..padding_start + padding_len],
-                &mut after[..],
+                after,
             );
         }
         self.seq = self.seq.wrapping_add(1);
+        Ok(())
+    }
+
+    fn shaped_record(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.shaped_record_into(payload, &mut out)?;
         Ok(out)
     }
 
@@ -327,6 +346,61 @@ impl<W> V6Writer<W> {
             .pop()
             .ok_or_else(|| io::Error::other("snell: empty v6 packet record"))
     }
+
+    /// Hot-path twin of `emit`: the records are appended straight into the
+    /// caller's reused buffer — no per-record Vecs, no intermediate Vec of
+    /// records.
+    pub(crate) fn emit_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        now_unix: i64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        self.initialize()?;
+        match self.mode {
+            Mode::UnsafeRaw => {
+                if data.is_empty() {
+                    self.raw_record_into(&[], out);
+                    return Ok(());
+                }
+                let mut rest = data;
+                while !rest.is_empty() {
+                    let len = rest.len().min(MAX_PAYLOAD_V6);
+                    self.raw_record_into(&rest[..len], out);
+                    rest = &rest[len..];
+                }
+                Ok(())
+            }
+            Mode::Unshaped => {
+                if data.is_empty() {
+                    return self.unshaped_record_into(&[], out);
+                }
+                let mut rest = data;
+                while !rest.is_empty() {
+                    let len = rest.len().min(MAX_PAYLOAD_V6);
+                    self.unshaped_record_into(&rest[..len], out)?;
+                    rest = &rest[len..];
+                }
+                Ok(())
+            }
+            Mode::Default => {
+                if data.is_empty() {
+                    // Reference `WriteZeroChunk`: advance the chunk window,
+                    // then emit a payload-less record.
+                    self.payload_limit_for(now_unix)?;
+                    return self.shaped_record_into(&[], out);
+                }
+                let mut rest = data;
+                while !rest.is_empty() {
+                    let limit = self.payload_limit_for(now_unix)?;
+                    let len = rest.len().min(limit as usize);
+                    self.shaped_record_into(&rest[..len], out)?;
+                    rest = &rest[len..];
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<W: AsyncWrite + Unpin> V6Writer<W> {
@@ -349,7 +423,7 @@ enum Stage {
 }
 
 pub(crate) struct V6Reader<R> {
-    inner: R,
+    cache: ReadAhead<R>,
     mode: Mode,
     psk: Vec<u8>,
     profile: Option<Arc<Profile>>,
@@ -373,7 +447,7 @@ pub(crate) struct V6Reader<R> {
 impl<R> V6Reader<R> {
     pub(crate) fn new(inner: R, mode: Mode, psk: &[u8], profile: Option<Arc<Profile>>) -> Self {
         Self {
-            inner,
+            cache: ReadAhead::new(inner),
             mode,
             psk: psk.to_vec(),
             profile,
@@ -450,7 +524,10 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
             self.head.resize(salt_len, 0u8);
             self.head_filled = 0;
         }
-        match poll_fill(cx, &mut self.inner, &mut self.head, &mut self.head_filled) {
+        match self
+            .cache
+            .poll_fill(cx, &mut self.head, &mut self.head_filled)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => {
                 let e = self.fail(e.kind(), e.to_string());
@@ -479,12 +556,25 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
         }
     }
 
-    /// Read the next decrypted record payload; `Ok(None)` is the zero-chunk
-    /// EOF (or a clean close at a record boundary).
+    /// Read the next decrypted record payload into `out` (cleared first);
+    /// `Ok(None)` is the zero-chunk EOF (or a clean close at a record
+    /// boundary). The reader keeps its body buffer across records, so the
+    /// steady state allocates nothing per record.
     pub(crate) fn poll_read_record(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<Option<Vec<u8>>>> {
+        out: &mut Vec<u8>,
+    ) -> Poll<io::Result<Option<()>>> {
+        self.poll_read_record_inner(cx, out)
+    }
+
+    /// Read the next decrypted record payload into `out`; `Ok(None)` is the
+    /// zero-chunk EOF (or a clean close at a record boundary).
+    fn poll_read_record_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<u8>,
+    ) -> Poll<io::Result<Option<()>>> {
         loop {
             if let Some((kind, msg)) = &self.fatal {
                 return Poll::Ready(Err(io::Error::new(*kind, msg.clone())));
@@ -514,7 +604,7 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                     Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
                     Poll::Ready(Ok(Some(()))) => {}
                 },
-                Stage::Body => match self.poll_read_body(cx) {
+                Stage::Body => match self.poll_read_body(cx, out) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => {
                         let e = self.fail(e.kind(), e.to_string());
@@ -535,7 +625,10 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
             self.head.resize(needed, 0u8);
             self.head_filled = 0;
         }
-        match poll_fill(cx, &mut self.inner, &mut self.head, &mut self.head_filled) {
+        match self
+            .cache
+            .poll_fill(cx, &mut self.head, &mut self.head_filled)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Ready(Ok(Fill::Eof)) => {
@@ -573,7 +666,11 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                 }
                 self.padding_len = 0;
                 self.payload_len = payload_len;
-                self.body = vec![0u8; payload_len];
+                if self.body.len() != payload_len {
+                    // Resize, not replace: the capacity survives and the
+                    // next record reuses it.
+                    self.body.resize(payload_len, 0u8);
+                }
                 self.body_filled = 0;
                 self.stage = Stage::Body;
                 Poll::Ready(Ok(Some(())))
@@ -616,7 +713,9 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                 }
                 self.padding_len = 0;
                 self.payload_len = payload_len;
-                self.body = vec![0u8; payload_len + AEAD_TAG_LEN];
+                if self.body.len() != payload_len + AEAD_TAG_LEN {
+                    self.body.resize(payload_len + AEAD_TAG_LEN, 0u8);
+                }
                 self.body_filled = 0;
                 self.stage = Stage::Body;
                 Poll::Ready(Ok(Some(())))
@@ -632,16 +731,23 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                     Ok(len) => len,
                     Err(_) => return Poll::Ready(Err(io::Error::other("snell: bad prefix len"))),
                 };
-                // Split the prefix (AAD) from the sealed header so the open
-                // runs on an owned Vec while the prefix stays borrowed.
-                let mut sealed = self.head.split_off(prefix_len);
-                if open_in_place_aad(&cipher, &self.nonce, &mut sealed, &self.head).is_err() {
+                // head = [prefix (AAD) | sealed header]: open the sealed
+                // half in place — no split_off, nothing allocated per record.
+                if self.head.len() != prefix_len + HEADER_CIPHER_LEN {
+                    return Poll::Ready(Err(io::Error::other("snell: bad shaped header length")));
+                }
+                let opened = {
+                    let (aad, sealed) = self.head.split_at_mut(prefix_len);
+                    open_region_aad(&cipher, &self.nonce, sealed, aad)
+                };
+                if opened.is_err() {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "snell: open shaped header",
                     )));
                 }
                 increase_nonce(&mut self.nonce);
+                let sealed = &self.head[prefix_len..];
                 if sealed[0] != HEADER_VERSION {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -653,14 +759,18 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                 let payload_len = usize::from(u16::from_be_bytes([sealed[5], sealed[6]]));
                 self.record_seq = self.seq;
                 self.seq = self.seq.wrapping_add(1);
+                let body_len = padding_len + payload_len + AEAD_TAG_LEN;
                 if payload_len == 0 {
-                    if padding_len > 0 {
+                    let body_len = padding_len;
+                    if body_len > 0 {
                         // Zero chunk may still carry shaped padding: consume
                         // it before reporting tunnel EOF.
                         self.padding_len = padding_len;
                         self.payload_len = 0;
                         self.zero_chunk = true;
-                        self.body = vec![0u8; padding_len];
+                        if self.body.len() != body_len {
+                            self.body.resize(body_len, 0u8);
+                        }
                         self.body_filled = 0;
                         self.stage = Stage::Body;
                         return Poll::Ready(Ok(Some(())));
@@ -672,7 +782,9 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                 }
                 self.padding_len = padding_len;
                 self.payload_len = payload_len;
-                self.body = vec![0u8; padding_len + payload_len + AEAD_TAG_LEN];
+                if self.body.len() != body_len {
+                    self.body.resize(body_len, 0u8);
+                }
                 self.body_filled = 0;
                 self.stage = Stage::Body;
                 Poll::Ready(Ok(Some(())))
@@ -680,8 +792,15 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
         }
     }
 
-    fn poll_read_body(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
-        match poll_fill(cx, &mut self.inner, &mut self.body, &mut self.body_filled) {
+    fn poll_read_body(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<u8>,
+    ) -> Poll<io::Result<Option<()>>> {
+        match self
+            .cache
+            .poll_fill(cx, &mut self.body, &mut self.body_filled)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Ready(Ok(Fill::Eof)) => Poll::Ready(Err(io::Error::new(
@@ -690,12 +809,13 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
             ))),
             Poll::Ready(Ok(Fill::Done)) => match self.mode {
                 Mode::UnsafeRaw => {
-                    let payload = std::mem::take(&mut self.body);
                     self.body_filled = 0;
+                    out.clear();
+                    out.extend_from_slice(&self.body);
                     if let Err(e) = self.rearm_header() {
                         return Poll::Ready(Err(e));
                     }
-                    Poll::Ready(Ok(Some(payload)))
+                    Poll::Ready(Ok(Some(())))
                 }
                 Mode::Unshaped => {
                     let cipher = match &self.cipher {
@@ -713,15 +833,17 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                         )));
                     }
                     increase_nonce(&mut self.nonce);
-                    let payload = std::mem::take(&mut self.body);
                     self.body_filled = 0;
+                    out.clear();
+                    out.extend_from_slice(&self.body);
                     if let Err(e) = self.rearm_header() {
                         return Poll::Ready(Err(e));
                     }
-                    Poll::Ready(Ok(Some(payload)))
+                    Poll::Ready(Ok(Some(())))
                 }
                 Mode::Default => {
                     if self.zero_chunk {
+                        self.body_filled = 0;
                         if let Err(e) = self.rearm_header() {
                             return Poll::Ready(Err(e));
                         }
@@ -736,37 +858,48 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                         }
                     };
                     let padding_len = self.padding_len;
-                    // Unmix first: the writer sealed with the raw padding as
-                    // AAD, then swapped the two regions.
-                    let mut payload_cipher = self.body.split_off(padding_len);
-                    profile.mix_padding_payload(
-                        self.record_seq,
-                        &mut self.body,
-                        &mut payload_cipher,
-                    );
-                    if open_in_place_aad(&cipher, &self.nonce, &mut payload_cipher, &self.body)
-                        .is_err()
+                    // The writer sealed with the raw padding as AAD, then
+                    // swapped the two regions: unmix first, open second.
                     {
+                        let (padding, rest) = self.body.split_at_mut(padding_len);
+                        profile.mix_padding_payload(self.record_seq, padding, rest);
+                    }
+                    let opened = {
+                        let (padding, rest) = self.body.split_at_mut(padding_len);
+                        open_region_aad(&cipher, &self.nonce, rest, padding)
+                    };
+                    if opened.is_err() {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "snell: open shaped payload",
                         )));
                     }
                     increase_nonce(&mut self.nonce);
-                    let payload = payload_cipher[..self.payload_len].to_vec();
-                    self.body.clear();
                     self.body_filled = 0;
+                    out.clear();
+                    out.extend_from_slice(
+                        &self.body[padding_len..padding_len + self.payload_len],
+                    );
                     if let Err(e) = self.rearm_header() {
                         return Poll::Ready(Err(e));
                     }
-                    Poll::Ready(Ok(Some(payload)))
+                    Poll::Ready(Ok(Some(())))
                 }
             },
         }
     }
 
     pub(crate) async fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
-        std::future::poll_fn(|cx| self.poll_read_record(cx)).await
+        let mut out = Vec::new();
+        let found = std::future::poll_fn(|cx| {
+            match self.poll_read_record_inner(cx, &mut out) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(found)) => Poll::Ready(Ok(found.is_some())),
+            }
+        })
+        .await?;
+        Ok(found.then_some(out))
     }
 }
 

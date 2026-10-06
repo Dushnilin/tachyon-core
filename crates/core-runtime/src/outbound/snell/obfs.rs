@@ -203,6 +203,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObfsStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if self.mode == ObfsMode::None {
+            // Nothing to frame: forward straight to the transport instead of
+            // staging a full copy of every pump chunk in `pending`.
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
         self.build_first_write(buf)?;
         self.accepted = Some(buf.len());
         self.poll_pending(cx)

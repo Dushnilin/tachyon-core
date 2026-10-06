@@ -2,11 +2,14 @@
 //!
 //! RustCrypto's AEAD makes two passes: ChaCha20 over the buffer, then Poly1305
 //! over the result, and on this class of CPU neither pass is fast enough to
-//! hide the other (2.7 GiB/s each, 1.3 GiB/s together). Here the x86_64 path
-//! runs eight ChaCha blocks at a time with each state word in its own YMM
-//! register, and feeds Poly1305 blocks to the scalar multiplier while those
-//! vector rounds are in flight: the two use different execution ports, so the
-//! out-of-order core overlaps them instead of adding them up.
+//! hide the other. Here the x86_64 path runs eight ChaCha blocks at a time with
+//! each state word in its own YMM register, and hands each 512-byte window to
+//! the poly1305 crate's AVX2 backend (four lanes of 26-bit limbs) while those
+//! vector rounds are in flight. The MAC's multiply chains sit on different
+//! execution ports than ChaCha's shuffles, but with the call boundary at the
+//! window rather than between the quarters the two mostly run back to back --
+//! the win is the vector MAC itself: 4.1 GiB/s against the hand-written scalar's
+//! 2.3, which takes 65535-byte records from 1.47 to 1.74 GiB/s.
 //!
 //! The first call to the block function yields block 0 (the Poly1305 key) and
 //! blocks 1..7 (the first 448 bytes of keystream), which is why the bulk loop
@@ -53,8 +56,9 @@ impl ChaChaPoly {
         #[cfg(target_arch = "x86_64")]
         let words = if avx2::available() {
             let mut w = [0u32; 8];
-            for (i, c) in key.chunks_exact(4).enumerate() {
-                w[i] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let (words, _) = key.as_chunks::<4>();
+            for (i, c) in words.iter().enumerate() {
+                w[i] = u32::from_le_bytes(*c);
             }
             Some(w)
         } else {
@@ -177,7 +181,13 @@ pub(crate) mod poly {
         /// window, and a `&mut self` version sends it through the stack on every
         /// absorb.
         #[inline(always)]
-        pub(super) fn step(h: (u64, u64, u64), m0: u64, m1: u64, r0: u64, r1: u64) -> (u64, u64, u64) {
+        pub(super) fn step(
+            h: (u64, u64, u64),
+            m0: u64,
+            m1: u64,
+            r0: u64,
+            r1: u64,
+        ) -> (u64, u64, u64) {
             let (a0, c) = h.0.overflowing_add(m0);
             let (a1, c1) = h.1.overflowing_add(m1);
             let (a1, c2) = a1.overflowing_add(u64::from(c));
@@ -303,7 +313,11 @@ pub(crate) mod poly {
         /// of them live at once, and on sixteen YMM registers that sends the MAC
         /// state through the stack.
         #[inline(always)]
-        pub(super) unsafe fn pair(poly: &Poly, p: *const u8, h: (u64, u64, u64)) -> (u64, u64, u64) {
+        pub(super) unsafe fn pair(
+            poly: &Poly,
+            p: *const u8,
+            h: (u64, u64, u64),
+        ) -> (u64, u64, u64) {
             let m0 = u64::from_le((p as *const u64).read_unaligned());
             let m1 = u64::from_le((p.add(8) as *const u64).read_unaligned());
             let m2 = u64::from_le((p.add(16) as *const u64).read_unaligned());
@@ -378,7 +392,8 @@ pub(crate) mod poly {
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use core::arch::x86_64::*;
-    use super::poly::Poly;
+    use poly1305::Poly1305;
+    use poly1305::universal_hash::{KeyInit, UniversalHash};
 
     pub(super) fn available() -> bool {
         #[cfg(any(feature = "std", test))]
@@ -441,27 +456,30 @@ mod avx2 {
         ]
     }
 
-    /// Twenty rounds over eight blocks. With `FUSE` the scalar unit also absorbs
-    /// exactly 32 Poly1305 blocks (512 bytes) from `pp`: three after chosen
-    /// quarter rounds of each double round, two at the end. A fixed schedule keeps
-    /// the loop free of branches and puts the scalar work between the vector
-    /// instructions, where the out-of-order core can overlap it.
+    /// Twenty rounds over eight blocks. With `FUSE` the AVX2 Poly1305 also
+    /// absorbs exactly 32 blocks (512 bytes) from `pp` before the quarters run.
     ///
-    /// Thirty single absorbs and one pair, and nothing else: the pair computes
-    /// `((h + m0) * r^2 + m1 * r)` in one carry chain, which needs nine 128-bit
-    /// products with about twenty of them live at once, and on sixteen YMM
-    /// registers that means the MAC state round-trips through the stack. Measured
-    /// on the desktop, this schedule fuses at 1.58 GiB/s; spreading the window over
-    /// sixteen pair absorbs drops it to 0.92, and the same sixteen absorbs done as
-    /// two plain multiplies each reach only 1.16. Two lanes pay off as vectors,
-    /// where both chains fit in one register -- not as precomputed scalar powers,
-    /// which shorten nothing: the accumulator chain is the length it always was.
+    /// The MAC sits at the top of the call rather than between the quarters:
+    /// its four-lane 26-bit limbs live in YMM, so interleaving it at the
+    /// quarter-round granularity would only thrash the sixteen registers the
+    /// cipher needs. The window granularity costs some out-of-order overlap --
+    /// measured, the two passes land close to their serial sum -- but the
+    /// vector MAC is fast enough that the serial sum itself is the win. The
+    /// read at `pp` is always either the ciphertext of an already-emitted
+    /// window (seal) or the window this call's own emit has not touched yet
+    /// (open), so the two sides never order against each other beyond the call
+    /// itself.
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn rounds<const FUSE: bool>(
         init: &[__m256i; 16],
-        poly: &mut Poly,
+        mac: Option<&mut Poly1305>,
         pp: *const u8,
     ) -> [__m256i; 16] {
+        if FUSE {
+            // SAFETY: pp points at 512 bytes of ciphertext by the caller's contract
+            let msg = core::slice::from_raw_parts(pp, 512);
+            mac.expect("FUSE carries a mac").update_padded(msg);
+        }
         // opaque on purpose: as a visible constant the optimizer rewrites the
         // 16-bit rotate into two shuffles, and shuffles are what the core has
         // the fewest ports for
@@ -470,58 +488,24 @@ mod avx2 {
             8, 9, 14, 15, 12, 13,
         ));
         let r8 = _mm256_setr_epi8(
-            3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14, 3, 0, 1, 2, 7, 4, 5, 6, 11, 8,
-            9, 10, 15, 12, 13, 14,
+            3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14, 3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9,
+            10, 15, 12, 13, 14,
         );
         let mut x = *init;
-        // the MAC state is kept in registers for the whole call: three words of
-        // accumulator and two of r, out of `poly` once and back into it once
-        let (mut h0, mut h1, mut h2) = (poly.h0, poly.h1, poly.h2);
-        let (r0, r1) = (poly.r0, poly.r1);
-        let mut h = (h0, h1, h2);
-        for it in 0..10 {
+        for _ in 0..10 {
             quarter!(x, 0, 4, 8, 12, r16, r8);
             quarter!(x, 1, 5, 9, 13, r16, r8);
-            if FUSE {
-                h = absorb(pp.add(48 * it), h, r0, r1);
-            }
             quarter!(x, 2, 6, 10, 14, r16, r8);
             quarter!(x, 3, 7, 11, 15, r16, r8);
-            if FUSE {
-                h = absorb(pp.add(48 * it + 16), h, r0, r1);
-            }
             quarter!(x, 0, 5, 10, 15, r16, r8);
             quarter!(x, 1, 6, 11, 12, r16, r8);
-            if FUSE {
-                h = absorb(pp.add(48 * it + 32), h, r0, r1);
-            }
             quarter!(x, 2, 7, 8, 13, r16, r8);
             quarter!(x, 3, 4, 9, 14, r16, r8);
-        }
-        if FUSE {
-            h = super::poly::Poly::pair(poly, pp.add(480), h);
         }
         for i in 0..16 {
             x[i] = _mm256_add_epi32(x[i], init[i]);
         }
-        (h0, h1, h2) = h;
-        poly.h0 = h0;
-        poly.h1 = h1;
-        poly.h2 = h2;
         x
-    }
-
-    /// One 16-byte block of MAC read straight out of the buffer.
-    #[inline(always)]
-    unsafe fn absorb(
-        p: *const u8,
-        h: (u64, u64, u64),
-        r0: u64,
-        r1: u64,
-    ) -> (u64, u64, u64) {
-        let m0 = u64::from_le((p as *const u64).read_unaligned());
-        let m1 = u64::from_le((p.add(8) as *const u64).read_unaligned());
-        super::poly::Poly::step(h, m0, m1, r0, r1)
     }
 
     /// 8x8 transpose of 32-bit words: row `i` in, block `i` out.
@@ -573,12 +557,26 @@ mod avx2 {
         }
     }
 
+    /// A MAC over `key`, from the first 32 bytes of block 0.
+    fn new_mac(key: &[u8]) -> Poly1305 {
+        let k = poly1305::universal_hash::generic_array::GenericArray::clone_from_slice(key);
+        Poly1305::new(&k)
+    }
+
+    /// `aad.len() || buf.len()` as the two little-endian u64s the construction
+    /// appends to the MAC input.
+    fn lengths(aad_len: usize, ct_len: usize) -> [u8; 16] {
+        let mut l = [0u8; 16];
+        l[..8].copy_from_slice(&(aad_len as u64).to_le_bytes());
+        l[8..].copy_from_slice(&(ct_len as u64).to_le_bytes());
+        l
+    }
+
     /// Keystream blocks `counter..counter + 8`.
     #[target_feature(enable = "avx2,bmi2")]
     pub(super) unsafe fn keystream(key: &[u32; 8], nonce: &[u8; 12], counter: u32) -> [u8; 512] {
         let init = setup(key, nonce, counter);
-        let mut dummy = Poly::new(&[0u8; 32]);
-        let x = rounds::<false>(&init, &mut dummy, core::ptr::null());
+        let x = rounds::<false>(&init, None, core::ptr::null());
         let mut ks = [0u8; 512];
         emit::<false>(&x, ks.as_mut_ptr());
         ks
@@ -599,8 +597,8 @@ mod avx2 {
     ) -> [u8; 16] {
         let len = buf.len();
         let ks = keystream(key, nonce, 0);
-        let mut poly = Poly::new(&ks[..32]);
-        poly.update_padded(aad);
+        let mut mac = new_mac(&ks[..32]);
+        mac.update_padded(aad);
 
         // block 0 was the MAC key; blocks 1..7 cover the first 448 bytes
         let first = len.min(448);
@@ -614,14 +612,14 @@ mod avx2 {
         let base = buf.as_mut_ptr();
         if len - done >= 512 {
             let init = setup(key, nonce, counter);
-            let x = rounds::<false>(&init, &mut poly, core::ptr::null());
+            let x = rounds::<false>(&init, None, core::ptr::null());
             emit::<true>(&x, base.add(done));
             done += 512;
             counter += 8;
         }
         while len - done >= 512 {
             let init = setup(key, nonce, counter);
-            let x = rounds::<true>(&init, &mut poly, base.add(fed));
+            let x = rounds::<true>(&init, Some(&mut mac), base.add(fed));
             emit::<true>(&x, base.add(done));
             fed += 512;
             done += 512;
@@ -631,8 +629,9 @@ mod avx2 {
             let ks = keystream(key, nonce, counter);
             xor_into(&mut buf[done..], &ks[..len - done]);
         }
-        poly.update_padded(&buf[fed..]);
-        poly.finish(aad.len(), len)
+        mac.update_padded(&buf[fed..]);
+        mac.update_padded(&lengths(aad.len(), len));
+        mac.finalize().into()
     }
 
     #[target_feature(enable = "avx2,bmi2")]
@@ -645,31 +644,32 @@ mod avx2 {
     ) -> bool {
         let len = buf.len();
         let ks = keystream(key, nonce, 0);
-        let mut poly = Poly::new(&ks[..32]);
-        poly.update_padded(aad);
+        let mut mac = new_mac(&ks[..32]);
+        mac.update_padded(aad);
 
         let first = len.min(448);
-        poly.update_padded(&buf[..first]);
+        mac.update_padded(&buf[..first]);
         xor_into(&mut buf[..first], &ks[64..64 + first]);
         let mut done = first;
         let mut counter = 8u32;
 
         let base = buf.as_mut_ptr();
         while len - done >= 512 {
-            // the MAC reads this chunk's ciphertext while its keystream is
-            // computed; the XOR that overwrites it comes after
+            // the MAC reads this window's ciphertext at the top of the call;
+            // the XOR that overwrites it comes after the rounds
             let init = setup(key, nonce, counter);
-            let x = rounds::<true>(&init, &mut poly, base.add(done));
+            let x = rounds::<true>(&init, Some(&mut mac), base.add(done));
             emit::<true>(&x, base.add(done));
             done += 512;
             counter += 8;
         }
         if done < len {
-            poly.update_padded(&buf[done..]);
+            mac.update_padded(&buf[done..]);
             let ks = keystream(key, nonce, counter);
             xor_into(&mut buf[done..], &ks[..len - done]);
         }
-        let want = poly.finish(aad.len(), len);
+        mac.update_padded(&lengths(aad.len(), len));
+        let want: [u8; 16] = mac.finalize().into();
         let mut diff = 0u8;
         for (a, b) in want.iter().zip(tag) {
             diff |= a ^ b;
@@ -690,8 +690,8 @@ mod avx2 {
 )]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
     use aead::AeadInPlace;
+    use alloc::vec::Vec;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
     fn pattern(n: usize, seed: u8) -> Vec<u8> {
@@ -705,8 +705,8 @@ mod tests {
         let key = pattern(32, 3);
         let fast = ChaChaPoly::new(&key);
         let soft = ChaCha20Poly1305::new(key.as_slice().into());
-        let lens = (0..1400usize)
-            .chain([2047, 2048, 4095, 4096, 16384, 16385, 16399, 65535, 65536]);
+        let lens =
+            (0..1400usize).chain([2047, 2048, 4095, 4096, 16384, 16385, 16399, 65535, 65536]);
         for len in lens {
             for aad_len in [0usize, 5, 16, 33] {
                 let nonce: [u8; 12] = pattern(12, len as u8).try_into().unwrap();
@@ -760,6 +760,19 @@ mod tests {
         let key = [3u32; 8];
         let nonce = [1u8; 12];
         let n = 400_000usize;
+
+        // what Poly1305::new alone costs: every keystream call pays it now
+        {
+            let g: poly1305::Key =
+                poly1305::universal_hash::generic_array::GenericArray::clone_from_slice(&[0u8; 32]);
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(poly1305::Poly1305::new(&g));
+            }
+            let secs = start.elapsed().as_secs_f64();
+            println!("poly1305::new: {:.1} ns/op", secs * 1e9 / n as f64);
+        }
+
         let start = std::time::Instant::now();
         let mut sink = 0u8;
         for i in 0..n {
@@ -768,7 +781,10 @@ mod tests {
         }
         let secs = start.elapsed().as_secs_f64();
         std::hint::black_box(sink);
-        println!("keystream: {:.2} GiB/s", (n * 512) as f64 / (1u64 << 30) as f64 / secs);
+        println!(
+            "keystream: {:.2} GiB/s",
+            (n * 512) as f64 / (1u64 << 30) as f64 / secs
+        );
 
         let data = pattern(16384, 4);
         let mut poly = poly::Poly::new(&[0x55u8; 32]);
@@ -779,7 +795,10 @@ mod tests {
         }
         let secs = start.elapsed().as_secs_f64();
         std::hint::black_box(poly.finish(0, 0));
-        println!("poly1305 scalar: {:.2} GiB/s", (40_000 * 16384) as f64 / (1u64 << 30) as f64 / secs);
+        println!(
+            "poly1305 scalar: {:.2} GiB/s",
+            (40_000 * 16384) as f64 / (1u64 << 30) as f64 / secs
+        );
     }
 
     /// `cargo test -p core-crypto --release --features std fastchacha -- --ignored --nocapture`
@@ -794,34 +813,41 @@ mod tests {
         use poly1305::Poly1305;
 
         let key = [3u8; 32];
-        let buf = vec![9u8; 64 * 1024];
-        let n = 2000usize;
 
-        let run = |label: &str, f: &mut dyn FnMut()| {
-            for _ in 0..10 {
-                f();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..n {
-                f();
-            }
-            let secs = start.elapsed().as_secs_f64();
-            println!(
-                "{label:26} {:.2} GiB/s",
-                (n * buf.len()) as f64 / (1u64 << 30) as f64 / secs
-            );
-        };
+        for size in [64 * 1024usize, 1 << 20] {
+            let buf = vec![9u8; size];
+            let n = (1 << 30) / size;
 
-        run("poly1305 crate, 4 lanes", &mut || {
-            let mac = Poly1305::new(&key.into());
-            let tag = mac.compute_unpadded(&buf);
-            std::hint::black_box(tag);
-        });
-        run("ours, one chain", &mut || {
-            let mut mac = poly::Poly::new(&key);
-            mac.update_padded(&buf);
-            std::hint::black_box(mac.finish(0, buf.len()));
-        });
+            let run = |label: &str, f: &mut dyn FnMut()| {
+                for _ in 0..4 {
+                    f();
+                }
+                let start = std::time::Instant::now();
+                for _ in 0..n {
+                    f();
+                }
+                let secs = start.elapsed().as_secs_f64();
+                println!(
+                    "{label:30} size {size:8}  {:.2} GiB/s",
+                    (n * size) as f64 / (1u64 << 30) as f64 / secs
+                );
+            };
+
+            // the crate's streaming API: update batches four blocks at a
+            // time through proc_par_blocks, which compute_unpadded does not
+            run("poly1305 crate, 4 lanes", &mut || {
+                use poly1305::universal_hash::UniversalHash;
+                let mut mac = Poly1305::new(&key.into());
+                mac.update_padded(&buf);
+                let tag = mac.finalize();
+                std::hint::black_box(tag);
+            });
+            run("ours, one chain", &mut || {
+                let mut mac = poly::Poly::new(&key);
+                mac.update_padded(&buf);
+                std::hint::black_box(mac.finish(0, buf.len()));
+            });
+        }
     }
 
     #[test]
@@ -843,14 +869,79 @@ mod tests {
                 "fastchacha seal {size:>6}: {:.2} GiB/s",
                 (n * size) as f64 / (1u64 << 30) as f64 / secs
             );
-            let start = std::time::Instant::now();
+            // real open: the tag has to match, so restore the ciphertext by
+            // re-sealing outside each timed section -- the clock covers open only
+            let mut open_ns = 0u128;
             for _ in 0..n {
+                let t = std::time::Instant::now();
                 std::hint::black_box(fast.open(&nonce, &[], &mut buf, &tag));
+                open_ns += t.elapsed().as_nanos();
+                tag = fast.seal(&nonce, &[], &mut buf);
+            }
+            let secs = open_ns as f64 / 1e9;
+            println!(
+                "fastchacha open {size:>6}: {:.2} GiB/s (real, good tag)",
+                (n * size) as f64 / (1u64 << 30) as f64 / secs
+            );
+        }
+    }
+
+    /// The chacha20 crate's own AVX2 core over the same window sizes: the
+    /// number that says whether swapping cores is on the table. Our own core
+    /// runs the same loop shape for the comparison.
+    #[test]
+    #[ignore = "microbenchmark, run by hand"]
+    fn chacha20_crate_keystream() {
+        use std::time::Instant;
+        let size = 65535usize;
+        let mut buf = pattern(size, 1);
+        let key = pattern(32, 2);
+        let n = (1u64 << 30) / size as u64;
+
+        let mut c = ChaCha20Core::new_from_slices(&key, &[0u8; 12]).expect("key and nonce");
+        for _ in 0..64 {
+            c.apply_keystream(&mut buf);
+        }
+        let start = Instant::now();
+        for _ in 0..n {
+            c.apply_keystream(&mut buf);
+        }
+        let secs = start.elapsed().as_secs_f64();
+        std::hint::black_box(&buf);
+        println!(
+            "chacha20 crate keystream {size:>6}: {:.2} GiB/s ({:.3} s/GiB)",
+            (n * size as u64) as f64 / (1u64 << 30) as f64 / secs,
+            secs / ((n * size as u64) as f64 / (1u64 << 30) as f64),
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut kw = [0u32; 8];
+            for (w, c) in key.as_chunks::<4>().0.iter().enumerate() {
+                kw[w] = u32::from_le_bytes(*c);
+            }
+            let nonce = [0u8; 12];
+            let windows = size.div_ceil(512) as u64;
+            let mut sink = 0u8;
+            for _ in 0..8 {
+                for w in 0..windows {
+                    // SAFETY: only run on hosts with AVX2
+                    sink ^= unsafe { avx2::keystream(&kw, &nonce, w as u32) }[7];
+                }
+            }
+            let start = Instant::now();
+            for _ in 0..n {
+                for w in 0..windows {
+                    // SAFETY: same
+                    sink ^= unsafe { avx2::keystream(&kw, &nonce, w as u32) }[7];
+                }
             }
             let secs = start.elapsed().as_secs_f64();
+            std::hint::black_box(sink);
             println!(
-                "fastchacha open {size:>6}: {:.2} GiB/s (bad tag, buffer zeroed)",
-                (n * size) as f64 / (1u64 << 30) as f64 / secs
+                "ours keystream          {size:>6}: {:.2} GiB/s ({:.3} s/GiB)",
+                (n * size as u64) as f64 / (1u64 << 30) as f64 / secs,
+                secs / ((n * size as u64) as f64 / (1u64 << 30) as f64),
             );
         }
     }

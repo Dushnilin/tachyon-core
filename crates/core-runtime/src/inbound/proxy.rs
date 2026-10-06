@@ -151,10 +151,10 @@ impl Vless {
                         let local = stream.local_addr().unwrap_or(peer);
                         let result = match tls {
                             Some(tls) => match tls.accept(stream).await {
-                                Ok(stream) => serve_vless(
-                                    stream, transport, peer, local, users, tag, router,
-                                )
-                                .await,
+                                Ok(stream) => {
+                                    serve_vless(stream, transport, peer, local, users, tag, router)
+                                        .await
+                                }
                                 Err(err) => Err(err),
                             },
                             None => {

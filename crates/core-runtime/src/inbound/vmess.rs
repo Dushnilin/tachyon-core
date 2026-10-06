@@ -176,8 +176,10 @@ impl Vmess {
                         let result = match tls {
                             Some(tls) => match tls.accept(stream).await {
                                 Ok(stream) => {
-                                    wrapped(stream, transport, peer, local, users, replay, tag, router)
-                                        .await
+                                    wrapped(
+                                        stream, transport, peer, local, users, replay, tag, router,
+                                    )
+                                    .await
                                 }
                                 Err(err) => Err(err),
                             },

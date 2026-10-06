@@ -3,11 +3,11 @@
 
 use super::*;
 use std::future::poll_fn;
-use std::task::{Context, Poll};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use tokio::io::AsyncReadExt;
 
 /// Reads the upgrade request, replies 101 and hands the request head back.

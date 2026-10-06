@@ -3,8 +3,8 @@
 //! The session is a CONNECT request to the magic destination
 //! `sp.mux.sing-box.arpa:444`, in front of which sits the protocol handshake
 //! `[version][protocol]`, and each multiplexed stream is another CONNECT whose
-//! body is the tunnel. A stream's own request `[version][flags][addr][port]`
-//! and the one-byte response are handled transparently.
+//! body is the tunnel. A stream's own request `[flags][addr][port]` and the
+//! one-byte response are handled transparently.
 //!
 //! Only `h2mux` (the reference default) is implemented; `smux` and `yamux` are
 //! separate session formats and are refused rather than half-emulated.
@@ -13,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Mutex;
 
@@ -29,8 +29,6 @@ const PROTOCOL_YAMUX: u8 = 1;
 
 const VERSION0: u8 = 0;
 
-const FLAG_UDP: u16 = 1;
-const FLAG_ADDR: u16 = 2;
 const STATUS_SUCCESS: u8 = 0;
 
 /// `padConn` writes this many padded frames before going plain.
@@ -112,7 +110,6 @@ pub struct MuxStream {
     request: Option<Vec<u8>>,
     /// the one-byte response is consumed on the first read
     response_pending: bool,
-    buf: BytesMut,
     eof: bool,
     client: Arc<Client>,
     session: Arc<Session>,
@@ -132,7 +129,6 @@ impl MuxStream {
             inner,
             request: Some(request),
             response_pending: true,
-            buf: BytesMut::new(),
             eof: false,
             client,
             session,
@@ -148,55 +144,44 @@ impl AsyncRead for MuxStream {
         out: &mut ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         let this = &mut *self;
-        loop {
-            if this.response_pending {
-                let mut status = [0u8; 1];
-                match std::pin::Pin::new(&mut this.inner)
-                    .poll_read(cx, &mut ReadBuf::new(&mut status))
-                {
-                    std::task::Poll::Pending => return std::task::Poll::Pending,
-                    std::task::Poll::Ready(Err(e)) => {
-                        return std::task::Poll::Ready(Err(e));
-                    }
-                    std::task::Poll::Ready(Ok(())) => {
-                        if status[0] != STATUS_SUCCESS {
-                            // the reference reads a varbin message here and
-                            // only puts it in the error text
-                            return std::task::Poll::Ready(Err(io::Error::other(
-                                "mux: remote error",
-                            )));
-                        }
-                        this.response_pending = false;
-                    }
-                }
-            }
-            if !this.buf.is_empty() {
-                let n = out.remaining().min(this.buf.len());
-                out.put_slice(&this.buf[..n]);
-                this.buf.advance(n);
-                return std::task::Poll::Ready(Ok(()));
-            }
-            if this.eof {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            let mut scratch = [0u8; 8192];
-            match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut ReadBuf::new(&mut scratch))
-            {
+        if this.response_pending {
+            let mut status = [0u8; 1];
+            let mut read = ReadBuf::new(&mut status);
+            match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(e));
+                }
                 std::task::Poll::Ready(Ok(())) => {
-                    let filled = scratch
-                        .iter()
-                        .position(|byte| *byte != 0)
-                        .unwrap_or(scratch.len());
-                    let filled = filled.max(usize::from(scratch.iter().any(|b| *b != 0)));
-                    if filled == 0 {
+                    if read.filled().is_empty() {
                         this.eof = true;
-                    } else {
-                        this.buf.extend_from_slice(&scratch[..filled]);
+                        return std::task::Poll::Ready(Ok(()));
                     }
+                    if status[0] != STATUS_SUCCESS {
+                        // the reference reads a varbin message here and
+                        // only puts it in the error text
+                        return std::task::Poll::Ready(Err(io::Error::other(
+                            "mux: remote error",
+                        )));
+                    }
+                    this.response_pending = false;
                 }
             }
+        }
+        if this.eof {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let before = out.filled().len();
+        match std::pin::Pin::new(&mut this.inner).poll_read(cx, out) {
+            std::task::Poll::Ready(Ok(())) => {
+                // a zero-copy read: the h2 stream hands its bytes straight
+                // into the caller's buffer, and an empty fill is the end
+                if out.filled().len() == before {
+                    this.eof = true;
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
         }
     }
 }
@@ -321,13 +306,12 @@ impl AsyncRead for PadStream {
             if this.read_remaining > 0 {
                 let n = out.remaining().min(this.read_remaining);
                 let mut scratch = vec![0u8; n];
-                match std::pin::Pin::new(&mut this.inner)
-                    .poll_read(cx, &mut ReadBuf::new(&mut scratch))
-                {
+                let mut read = ReadBuf::new(&mut scratch);
+                match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                     std::task::Poll::Ready(Ok(())) => {
-                        let filled = scratch.iter().position(|byte| *byte != 0).unwrap_or(n);
+                        let filled = read.filled().len();
                         if filled == 0 {
                             return std::task::Poll::Ready(Ok(()));
                         }
@@ -339,13 +323,12 @@ impl AsyncRead for PadStream {
             }
             if this.padding_remaining > 0 {
                 let mut scratch = vec![0u8; this.padding_remaining.min(4096)];
-                match std::pin::Pin::new(&mut this.inner)
-                    .poll_read(cx, &mut ReadBuf::new(&mut scratch))
-                {
+                let mut read = ReadBuf::new(&mut scratch);
+                match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                     std::task::Poll::Ready(Ok(())) => {
-                        let filled = scratch.len();
+                        let filled = read.filled().len();
                         if filled == 0 {
                             return std::task::Poll::Ready(Ok(()));
                         }
@@ -361,13 +344,12 @@ impl AsyncRead for PadStream {
             let mut filled = 0;
             while filled < header.len() {
                 let mut scratch = [0u8; 1];
-                match std::pin::Pin::new(&mut this.inner)
-                    .poll_read(cx, &mut ReadBuf::new(&mut scratch))
-                {
+                let mut read = ReadBuf::new(&mut scratch);
+                match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                     std::task::Poll::Ready(Ok(())) => {
-                        if scratch[0] == 0 {
+                        if read.filled().is_empty() {
                             return std::task::Poll::Ready(Ok(()));
                         }
                         header[filled] = scratch[0];
@@ -428,19 +410,16 @@ impl AsyncWrite for PadStream {
 /// The multiplexed client: a session pool over the vmess stream.
 pub struct Client {
     options: MuxOptions,
-    /// `packet_encoding: packetaddr` names the destination per datagram
-    packet_addr: bool,
     /// dials the underlying stream, used to open a new session
     dialer: Mutex<Option<Arc<Dialer>>>,
     sessions: Mutex<Vec<Arc<Session>>>,
 }
 
 impl Client {
-    pub fn new(options: MuxOptions, packet_addr: bool) -> anyhow::Result<Arc<Self>> {
+    pub fn new(options: MuxOptions) -> anyhow::Result<Arc<Self>> {
         options.protocol_id()?;
         Ok(Arc::new(Self {
             options,
-            packet_addr,
             dialer: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
         }))
@@ -498,14 +477,18 @@ impl Client {
         };
         Ok(MuxStream::new(
             stream,
-            encode_stream_request(target, self.packet_addr),
+            encode_stream_request(target),
             Arc::clone(self),
             session,
             conn_task,
         ))
     }
 
-    /// `Client.selectSession`
+    /// `Client.selectSession`: the least-loaded session that can take a new
+    /// request. Without bounds a busy session does not take a second stream --
+    /// the reference only packs streams onto one session when
+    /// `max_connections` (and then `min_streams`) says so, which is why the
+    /// default opens one session per concurrent stream.
     fn select_session(&self, sessions: &[Arc<Session>]) -> Option<Arc<Session>> {
         let session = sessions
             .iter()
@@ -549,11 +532,13 @@ impl Client {
         }
         stream.write_all(&request).await?;
 
-        let (send_request, connection) =
-            tokio::time::timeout(TCP_TIMEOUT, h2::client::handshake(stream))
-                .await
-                .map_err(|_| io::Error::other("vmess: mux h2 handshake timeout"))?
-                .map_err(|e| io::Error::other(format!("vmess: mux h2 handshake: {e}")))?;
+        let (send_request, connection) = tokio::time::timeout(
+            TCP_TIMEOUT,
+            crate::outbound::transport::h2io::client_builder().handshake(stream),
+        )
+        .await
+        .map_err(|_| io::Error::other("vmess: mux h2 handshake timeout"))?
+        .map_err(|e| io::Error::other(format!("vmess: mux h2 handshake: {e}")))?;
         let conn_task = Arc::new(ConnectionTask::new(tokio::spawn(async move {
             let _ = connection.await;
         })));
@@ -577,23 +562,42 @@ impl Client {
     }
 }
 
-/// `EncodeStreamRequest`; a packetaddr stream names the mux magic address
-/// instead of the real one, so the server can demultiplex by destination.
-fn encode_stream_request(target: &Target, packet_addr: bool) -> Vec<u8> {
+/// `EncodeStreamRequest`: flags, then the destination. `ReadStreamRequest`
+/// starts straight at the flags -- the version byte belongs to the session
+/// handshake, not to a stream, and a TCP stream carries no flags at all.
+fn encode_stream_request(target: &Target) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 24);
-    out.push(VERSION0);
-    let mut flags = FLAG_UDP;
-    if packet_addr {
-        flags |= FLAG_ADDR;
-    }
-    out.extend_from_slice(&flags.to_be_bytes());
-    let named = if packet_addr {
-        mux_target()
-    } else {
-        target.clone()
-    };
-    out.extend_from_slice(&crate::outbound::packet::put_addr_port_bytes(&named));
+    out.extend_from_slice(&0u16.to_be_bytes());
+    put_sing_addr_port(&mut out, target);
     out
+}
+
+/// `M.SocksaddrSerializer.WriteAddrPort`: sing's own family bytes --
+/// 0x01 ipv4, 0x04 ipv6, 0x03 fqdn -- address first, port last. The
+/// vless-style codes in `packet::put_addr_port` (1/2/3) are a different
+/// serializer and would make the server read the address from the wrong
+/// offset.
+fn put_sing_addr_port(out: &mut Vec<u8>, target: &Target) {
+    match target {
+        Target::Domain(host, port) => {
+            out.push(0x03);
+            out.push(host.len() as u8);
+            out.extend_from_slice(host.as_bytes());
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+        Target::Ip(addr) => match addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                out.push(0x01);
+                out.extend_from_slice(&v4.octets());
+                out.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            std::net::IpAddr::V6(v6) => {
+                out.push(0x04);
+                out.extend_from_slice(&v6.octets());
+                out.extend_from_slice(&addr.port().to_be_bytes());
+            }
+        },
+    }
 }
 
 fn random_below(limit: usize) -> usize {
@@ -667,26 +671,17 @@ mod tests {
     #[test]
     fn the_stream_request_names_the_destination() {
         let target = Target::Domain("example.com".into(), 443);
-        let request = encode_stream_request(&target, false);
-        assert_eq!(request[0], VERSION0);
-        assert_eq!(u16::from_be_bytes([request[1], request[2]]), FLAG_UDP);
-        assert_eq!(&request[3..5], &[0x02, 11], "domain with its length");
-        assert_eq!(&request[5..16], b"example.com");
-        assert_eq!(&request[16..], &443u16.to_be_bytes());
+        let request = encode_stream_request(&target);
+        assert_eq!(&request[0..2], &0u16.to_be_bytes(), "a tcp stream carries no flags");
+        assert_eq!(&request[2..4], &[0x03, 11], "sing's fqdn family byte and the length");
+        assert_eq!(&request[4..15], b"example.com");
+        assert_eq!(&request[15..], &443u16.to_be_bytes());
 
-        // a packetaddr stream names the mux magic address instead
-        let request = encode_stream_request(&target, true);
-        assert_eq!(
-            u16::from_be_bytes([request[1], request[2]]),
-            FLAG_UDP | FLAG_ADDR
-        );
-        assert_eq!(
-            &request[3..5],
-            &[0x02, 20],
-            "the magic name's length: {}",
-            MUX_DESTINATION
-        );
-        assert_eq!(&request[5..25], b"sp.mux.sing-box.arpa");
+        let target = Target::Ip("10.0.0.1:80".parse().unwrap());
+        let request = encode_stream_request(&target);
+        assert_eq!(&request[2..3], &[0x01], "sing's ipv4 family byte");
+        assert_eq!(&request[3..7], &[10, 0, 0, 1]);
+        assert_eq!(&request[7..], &80u16.to_be_bytes());
     }
 
     #[tokio::test]
@@ -696,7 +691,7 @@ mod tests {
             "at",
         )
         .expect("ok");
-        let client = Client::new(options, false).expect("client");
+        let client = Client::new(options).expect("client");
         let err = match client
             .open(&Target::Domain("example.com".into(), 443))
             .await

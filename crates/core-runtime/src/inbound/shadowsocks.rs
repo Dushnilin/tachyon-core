@@ -24,8 +24,7 @@ use crate::inbound::{
 };
 use crate::logging;
 use crate::outbound::shadowsocks::crypto::{
-    AEAD_TAG,
-    Cipher, Method, derive_subkey, master_key, random_bytes,
+    AEAD_TAG, Cipher, Method, derive_subkey, master_key, random_bytes,
 };
 use crate::route::Router;
 
@@ -407,10 +406,12 @@ struct ChunkReader {
     read_buf: usize,
 }
 
-/// Read buffer of a connection, for a method whose records fit in it whole: two
-/// legacy chunks and the length blocks between them. It only grows to this when
-/// the first chunk is waited for, and a 2022 method outgrows it -- see `read_buf`.
-const READ_BUF: usize = 33 * 1024;
+/// Read buffer floor, several records deep: `poll_fill` reads as much as the
+/// buffer has room for in one syscall, so a bigger buffer means fewer syscalls
+/// per GiB -- with 33 KiB the steady state was one record per `recvfrom` while
+/// a peer with a large buffer drained four or five records per `read`. Grown
+/// to only when the first chunk is waited for.
+const READ_BUF: usize = 256 * 1024;
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
 /// block, the tag on that block and the tag on the payload.
 const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
@@ -427,18 +428,19 @@ const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
 fn read_buf(method: Method) -> usize {
     (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
 }
-/// Most plaintext one write turns into a frame: a couple of legacy chunks, one
-/// syscall.
-const WRITE_FRAME: usize = 64 * 1024;
+/// Most plaintext one write turns into a frame, sized to the relay's read so a
+/// frame of several records leaves as one syscall: at 64 KiB a 2022 frame was
+/// one record no matter how much the relay had read.
+const WRITE_FRAME: usize = 128 * 1024;
 
 /// How much of `avail` one frame takes: whole chunks, and as much of
 /// [`WRITE_FRAME`] as fits in them.
 ///
-/// `WRITE_FRAME` is a multiple of neither chunk size -- it is 64 KiB against
-/// `0x3FFF` and against `0xFFFF` -- so cutting a frame at it left a tail of one
-/// to three bytes that went out as a record of its own. That is two more AEAD
-/// invocations for nothing, 35 bytes of wire, and a peer that has to open a
-/// second record where it expected one. Cutting on a chunk boundary instead
+/// `WRITE_FRAME` is a multiple of neither chunk size -- it is 128 KiB against
+/// `0x3FFF` and against `0xFFFF` -- so cutting a frame at it left a tail that
+/// went out as a record of its own. That is two more AEAD invocations for
+/// nothing, a few bytes of wire, and a peer that has to open a second record
+/// where it expected one. Cutting on a chunk boundary instead
 /// leaves the remainder with the caller, and the relay -- which keeps what a
 /// partial write did not take -- coalesces it with the next read into a full
 /// chunk. A write that genuinely holds less than one chunk still goes out whole:
@@ -724,11 +726,15 @@ mod tests {
         let mut out = Vec::new();
         let head = out.len();
         out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        cipher.seal_at(*counter, &mut out, head).expect("seal length block");
+        cipher
+            .seal_at(*counter, &mut out, head)
+            .expect("seal length block");
         *counter += 1;
         let body = out.len();
         out.extend_from_slice(payload);
-        cipher.seal_at(*counter, &mut out, body).expect("seal payload");
+        cipher
+            .seal_at(*counter, &mut out, body)
+            .expect("seal payload");
         *counter += 1;
         out
     }
@@ -748,7 +754,11 @@ mod tests {
         let mut counter = 0u64;
         let mut wire = Vec::new();
         for round in 0..records {
-            wire.extend_from_slice(&record(&cipher, &mut counter, &vec![round as u8; max_chunk]));
+            wire.extend_from_slice(&record(
+                &cipher,
+                &mut counter,
+                &vec![round as u8; max_chunk],
+            ));
         }
         let mut slices = VecDeque::new();
         for chunk in wire.chunks(one) {
@@ -789,7 +799,9 @@ mod tests {
         for round in 0..records {
             let at = round * max_chunk;
             assert!(
-                got[at..at + max_chunk].iter().all(|byte| *byte == round as u8),
+                got[at..at + max_chunk]
+                    .iter()
+                    .all(|byte| *byte == round as u8),
                 "{method:?}: record {round} came back wrong, the framing slipped"
             );
         }
@@ -863,5 +875,330 @@ mod tests {
                 read_buf(method)
             );
         }
+    }
+
+    /// Not a test: what each layer of the write path costs per GiB against the
+    /// bare cipher, so a matrix cell's `user_s_per_gib` over the crypto floor
+    /// can be attributed instead of guessed at.
+    ///
+    ///     cargo test --release -p core-runtime --lib inbound::shadowsocks::tests::write_path_costs -- --ignored --nocapture
+    #[test]
+    #[ignore = "microbenchmark, run by hand"]
+    fn write_path_costs() {
+        use crate::fastchacha::ChaChaPoly;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Instant;
+
+        const PAYLOAD: usize = 65535;
+        const GIB: u64 = 1u64 << 30;
+        let payload = vec![0x5Au8; PAYLOAD];
+        let key = vec![7u8; 32];
+
+        let report = |label: &str, secs: f64, bytes: u64| {
+            let gib = bytes as f64 / GIB as f64;
+            println!("{label:34} {:7.3} s/GiB", secs / gib);
+        };
+
+        // 1. the bare cipher, seal in place, tag thrown away
+        {
+            let fast = ChaChaPoly::new(&key);
+            let nonce = [0u8; 12];
+            let mut buf = payload.clone();
+            let mut ctr = 0u64;
+            for _ in 0..32 {
+                fast.seal(&nonce, &[], &mut buf);
+                buf.truncate(PAYLOAD);
+                ctr += 1;
+            }
+            let n = GIB / PAYLOAD as u64;
+            let t = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(fast.seal(&nonce, &[], &mut buf));
+                buf.truncate(PAYLOAD);
+                ctr += 1;
+            }
+            std::hint::black_box(ctr);
+            report(
+                "raw ChaChaPoly::seal",
+                t.elapsed().as_secs_f64(),
+                n * PAYLOAD as u64,
+            );
+        }
+
+        let method = Method::Blake3ChaCha20Poly1305;
+        let mut cipher = Cipher::new(method, &key);
+
+        // 2. the ss wrapper: one chunk sealed where it lands in a frame
+        {
+            let mut counter = 0u64;
+            let mut frame = Vec::with_capacity(PAYLOAD + 128);
+            for _ in 0..32 {
+                frame.clear();
+                write_chunk(&mut cipher, &mut counter, &mut frame, &payload);
+            }
+            let n = GIB / PAYLOAD as u64;
+            let t = Instant::now();
+            for _ in 0..n {
+                frame.clear();
+                write_chunk(&mut cipher, &mut counter, &mut frame, &payload);
+            }
+            std::hint::black_box(&frame);
+            report(
+                "Cipher + write_chunk (copy)",
+                t.elapsed().as_secs_f64(),
+                n * PAYLOAD as u64,
+            );
+        }
+
+        // 3. the whole ServerWriter: frame_take, seal, drain to the socket
+        {
+            struct Sink;
+            impl AsyncWrite for Sink {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    buf: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    Poll::Ready(Ok(buf.len()))
+                }
+                fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            let mut writer = ServerWriter {
+                inner: Box::new(Sink) as AnyWrite,
+                method,
+                master_key: Arc::new(key.clone()),
+                request_salt: vec![9u8; method.salt_len()],
+                session: Some((Cipher::new(method, &key), 0)),
+                flushing: None,
+                spare: Vec::new(),
+                consumed: 0,
+            };
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut pin = Pin::new(&mut writer);
+            for _ in 0..32 {
+                let n = match AsyncWrite::poll_write(pin.as_mut(), &mut cx, &payload) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => panic!("write failed: {e}"),
+                    Poll::Pending => panic!("a ready sink went pending"),
+                };
+                std::hint::black_box(n);
+            }
+            let n = GIB / PAYLOAD as u64;
+            let t = Instant::now();
+            for _ in 0..n {
+                let got = match AsyncWrite::poll_write(pin.as_mut(), &mut cx, &payload) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => panic!("write failed: {e}"),
+                    Poll::Pending => panic!("a ready sink went pending"),
+                };
+                assert_eq!(got, PAYLOAD);
+            }
+            report(
+                "ServerWriter::poll_write",
+                t.elapsed().as_secs_f64(),
+                n * PAYLOAD as u64,
+            );
+        }
+    }
+
+    /// The read side of the same question: one opened record against the whole
+    /// ChunkReader (fill, open where it sits, hand out).
+    ///
+    ///     cargo test --release -p core-runtime --lib inbound::shadowsocks::tests::read_path_costs -- --ignored --nocapture
+    #[test]
+    #[ignore = "microbenchmark, run by hand"]
+    fn read_path_costs() {
+        use std::time::Instant;
+
+        const PAYLOAD: usize = 65535;
+        const GIB: u64 = 1u64 << 30;
+        let payload = vec![0x5Au8; PAYLOAD];
+        let key = vec![7u8; 32];
+        let method = Method::Blake3ChaCha20Poly1305;
+        let records = GIB / PAYLOAD as u64;
+
+        let report = |label: &str, secs: f64, bytes: u64| {
+            let gib = bytes as f64 / GIB as f64;
+            println!("{label:34} {:7.3} s/GiB", secs / gib);
+        };
+
+        // 1. one block opened where it sits: the open runs in full every time
+        // even against the already-plain buffer, so the loop needs no re-seal
+        // and no copy
+        {
+            let mut cipher = Cipher::new(method, &key);
+            let mut block = Vec::new();
+            let mut ctr = 0u64;
+            write_sealed(&mut cipher, &mut ctr, &mut block, &payload);
+            let n = GIB / PAYLOAD as u64;
+            let t = Instant::now();
+            for _ in 0..n {
+                // every open after the first fails the tag and runs the full
+                // path anyway, which is the cost being measured
+                let _ = cipher.open_slice(0, &mut block);
+                std::hint::black_box(&block);
+            }
+            report(
+                "Cipher::open_slice (in place)",
+                t.elapsed().as_secs_f64(),
+                n * PAYLOAD as u64,
+            );
+        }
+
+        // 2. the whole ChunkReader over the wire the peer would have sent:
+        // length block + payload per record
+        {
+            struct Slab {
+                data: Vec<u8>,
+                pos: usize,
+            }
+            impl AsyncRead for Slab {
+                fn poll_read(
+                    mut self: std::pin::Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    out: &mut ReadBuf<'_>,
+                ) -> Poll<io::Result<()>> {
+                    let n = out.remaining().min(self.data.len() - self.pos);
+                    out.put_slice(&self.data[self.pos..self.pos + n]);
+                    self.pos += n;
+                    Poll::Ready(Ok(()))
+                }
+            }
+            let mut wire = Vec::new();
+            {
+                let mut peer = Cipher::new(method, &key);
+                let mut ctr = 0u64;
+                let mut frame = Vec::new();
+                for _ in 0..records {
+                    frame.clear();
+                    write_chunk(&mut peer, &mut ctr, &mut frame, &payload);
+                    wire.extend_from_slice(&frame);
+                }
+            }
+            let run = |warm: bool| -> f64 {
+                let mut reader = ChunkReader {
+                    inner: Box::new(Slab {
+                        data: wire.clone(),
+                        pos: 0,
+                    }) as AnyRead,
+                    cipher: Cipher::new(method, &key),
+                    counter: 0,
+                    rbuf: Vec::new(),
+                    rpos: 0,
+                    rend: 0,
+                    pos: 0,
+                    pend: 0,
+                    want: 2 + AEAD_TAG,
+                    want_length: true,
+                    read_buf: read_buf(method),
+                };
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                let mut scratch = vec![0u8; 64 * 1024];
+                let target = records * PAYLOAD as u64;
+                let mut got = 0u64;
+                let t = Instant::now();
+                while got < target {
+                    let mut out = ReadBuf::new(&mut scratch);
+                    match std::pin::Pin::new(&mut reader).poll_read(&mut cx, &mut out) {
+                        Poll::Ready(Ok(())) => {
+                            let n = out.filled().len();
+                            assert!(n > 0, "the slab held less than the wire");
+                            got += n as u64;
+                        }
+                        Poll::Ready(Err(e)) => panic!("read failed: {e}"),
+                        Poll::Pending => panic!("a full slab went pending"),
+                    }
+                }
+                if warm {
+                    return 0.0;
+                }
+                t.elapsed().as_secs_f64()
+            };
+            let secs = run(true) + run(false);
+            report("ChunkReader::poll_read", secs, records * PAYLOAD as u64);
+        }
+    }
+
+    /// Both halves of the relay in one process over a real async channel: the
+    /// isolated layer costs plus tokio scheduling plus the copy each direction
+    /// does. Half of the total is what one side of a matrix cell should cost,
+    /// so a cell's user sitting above it is environment, not code.
+    ///
+    ///     cargo test --release -p core-runtime --lib inbound::shadowsocks::tests::duplex_relay_costs -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "microbenchmark, run by hand"]
+    async fn duplex_relay_costs() {
+        use std::time::Instant;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const PAYLOAD: usize = 65535;
+        const GIB: u64 = 1u64 << 30;
+        let payload = vec![0x5Au8; PAYLOAD];
+        let key = vec![7u8; 32];
+        let method = Method::Blake3ChaCha20Poly1305;
+        let records = GIB / PAYLOAD as u64;
+
+        async fn pass(method: Method, records: u64, payload: Vec<u8>, key: &[u8]) {
+            let (wr, rd) = tokio::io::duplex(256 * 1024);
+            let mut writer = ServerWriter {
+                inner: Box::new(wr) as AnyWrite,
+                method,
+                master_key: Arc::new(key.to_vec()),
+                request_salt: vec![9u8; method.salt_len()],
+                session: Some((Cipher::new(method, key), 0)),
+                flushing: None,
+                spare: Vec::new(),
+                consumed: 0,
+            };
+            let mut reader = ChunkReader {
+                inner: Box::new(rd) as AnyRead,
+                cipher: Cipher::new(method, key),
+                counter: 0,
+                rbuf: Vec::new(),
+                rpos: 0,
+                rend: 0,
+                pos: 0,
+                pend: 0,
+                want: 2 + AEAD_TAG,
+                want_length: true,
+                read_buf: read_buf(method),
+            };
+            let target = records * PAYLOAD as u64;
+            let w = tokio::spawn(async move {
+                for _ in 0..records {
+                    writer.write_all(&payload).await.expect("write");
+                }
+            });
+            let r = tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut got = 0u64;
+                while got < target {
+                    let n = reader.read(&mut buf).await.expect("read");
+                    assert!(n > 0, "the channel closed short");
+                    got += n as u64;
+                }
+            });
+            w.await.expect("writer task");
+            r.await.expect("reader task");
+        }
+
+        pass(method, 32, payload.clone(), &key).await;
+        let t = Instant::now();
+        pass(method, records, payload.clone(), &key).await;
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "duplex relay (seal + open + tokio) {:7.3} s/GiB total, {:7.3} per side",
+            secs,
+            secs / 2.0
+        );
     }
 }

@@ -7,9 +7,11 @@
 //! payload of a stream is the SOCKS-style destination address; UDP rides the
 //! same streams through the sing `uot` framing.
 //!
-//! Simplifications versus the reference client: one session per outbound
-//! (recreated on failure) instead of an idle-session pool, and no record
-//! padding (the server accepts a client without it).
+//! The session pool caps the number of live TLS sessions: below the cap every
+//! stream dials its own session (parallel TCP flows), and once the cap is hit
+//! new streams share the least-loaded live session -- 1000 idle connections
+//! cost a handful of sessions instead of one TLS handshake each. There is no
+//! record padding (the server accepts a client without it).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -45,11 +47,17 @@ const CMD_HEART_RESPONSE: u8 = 9;
 const CMD_SERVER_SETTINGS: u8 = 10;
 
 const FRAME_HEADER: usize = 7;
-/// frame payloads carry a u16 length, so writes are chunked below it
-const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
+/// frame payloads carry a u16 length, so the frame takes the whole field
+const MAX_FRAME_PAYLOAD: usize = u16::MAX as usize;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CLIENT_VERSION: &str = "tachyon-core/anytls";
-/// reference session-pool knobs; one live session replaces the pool
+/// Concurrent TLS sessions: below it a stream dials its own, at it streams
+/// share the least-loaded one. One session per connection made 1000 idle
+/// connections cost 1000 handshakes and ~1 GiB of RSS.
+const MAX_SESSIONS: usize = 8;
+/// Frames buffered per stream before the session reader waits on it.
+const STREAM_QUEUE: usize = 64;
+/// reference session-pool knobs; the cap above does that job here
 const POOL_FIELDS: &[&str] = &[
     "idle_session_check_interval",
     "idle_session_timeout",
@@ -91,11 +99,14 @@ fn settings_version(data: &[u8]) -> Option<u8> {
 /// One anytls session: the TLS connection plus its stream registry.
 struct Session {
     writer: AsyncMutex<WriteHalf<AnyStream>>,
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
     /// stream ids start at 1 (`session.OpenStream`)
     next_sid: AtomicU32,
     alive: AtomicBool,
     peer_version: AtomicU8,
+    /// recycled payload buffers: frames are handed to streams from here and
+    /// returned once fully read, so steady-state dispatch allocates nothing.
+    free: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Session {
@@ -141,6 +152,7 @@ impl Session {
             next_sid: AtomicU32::new(0),
             alive: AtomicBool::new(true),
             peer_version: AtomicU8::new(0),
+            free: Mutex::new(Vec::new()),
         });
         tokio::spawn(read_loop(reader, Arc::clone(&session), tag.to_string()));
         Ok(session)
@@ -150,13 +162,25 @@ impl Session {
         self.alive.load(Ordering::Acquire)
     }
 
+    /// An empty buffer for the next frame payload: recycled when a reader
+    /// has one to spare, fresh otherwise.
+    fn take_buf(&self) -> Vec<u8> {
+        self.free.lock().expect("free").pop().unwrap_or_default()
+    }
+
+    /// Hand a fully-read payload buffer back for reuse.
+    fn give_buf(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        self.free.lock().expect("free").push(buf);
+    }
+
     /// `SYN` a new stream and register its receive queue.
-    async fn open_stream(&self) -> io::Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
+    async fn open_stream(&self) -> io::Result<(u32, mpsc::Receiver<Vec<u8>>)> {
         if !self.is_alive() {
             return Err(io::Error::other("anytls: session is closed"));
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         self.streams.lock().expect("streams").insert(sid, tx);
         if let Err(e) = self.write_frame(CMD_SYN, sid, &[]).await {
             self.streams.lock().expect("streams").remove(&sid);
@@ -172,22 +196,30 @@ impl Session {
         writer.flush().await
     }
 
-    /// `PSH` payload, chunked to the frame length limit.
+    /// `PSH` payload, chunked to the frame length limit: one writer lock and
+    /// one flush for the whole write, not one per frame.
     async fn send_data(&self, sid: u32, data: &[u8]) -> io::Result<()> {
+        let mut writer = self.writer.lock().await;
         for chunk in data.chunks(MAX_FRAME_PAYLOAD) {
-            self.write_frame(CMD_PSH, sid, chunk).await?;
+            let frame = encode_frame(CMD_PSH, sid, chunk);
+            writer.write_all(&frame).await?;
         }
-        Ok(())
+        writer.flush().await
     }
 
     async fn send_fin(&self, sid: u32) -> io::Result<()> {
         self.write_frame(CMD_FIN, sid, &[]).await
     }
 
+    /// Unregister a stream, without touching the wire.
+    fn unregister(self: &Arc<Self>, sid: u32) {
+        self.streams.lock().expect("streams").remove(&sid);
+    }
+
     /// Teardown from `Drop`, where awaiting is not possible: hand the `FIN`
     /// frame to a detached task (the stream is unregistered right away).
     fn close_stream(self: &Arc<Self>, sid: u32) {
-        self.streams.lock().expect("streams").remove(&sid);
+        self.unregister(sid);
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
@@ -208,6 +240,24 @@ async fn read_loop(mut reader: tokio::io::ReadHalf<AnyStream>, session: Arc<Sess
             break;
         }
         let (cmd, sid, len) = parse_header(&header);
+        // a payload bound for a live stream reads straight into its recycled
+        // buffer: the scratch copy below is only for frames nobody takes
+        if cmd == CMD_PSH && len > 0 {
+            let sender = session.streams.lock().expect("streams").get(&sid).cloned();
+            if let Some(sender) = sender {
+                let mut buf = session.take_buf();
+                buf.resize(len, 0);
+                if let Err(e) = reader.read_exact(&mut buf[..len]).await {
+                    logging::debug(format_args!("anytls[{tag}]: session payload: {e}"));
+                    break;
+                }
+                if sender.send(buf).await.is_err() {
+                    // the stream is gone: the frame is dropped like an
+                    // unclaimed one
+                }
+                continue;
+            }
+        }
         if len > payload.len() {
             payload.resize(len, 0);
         }
@@ -224,11 +274,13 @@ async fn read_loop(mut reader: tokio::io::ReadHalf<AnyStream>, session: Arc<Sess
                 }
                 let sender = session.streams.lock().expect("streams").get(&sid).cloned();
                 if let Some(sender) = sender {
-                    let _ = sender.send(payload[..len].to_vec());
+                    let mut buf = session.take_buf();
+                    buf.extend_from_slice(&payload[..len]);
+                    let _ = sender.send(buf).await;
                 }
             }
             CMD_FIN => {
-                session.streams.lock().expect("streams").remove(&sid);
+                session.unregister(sid);
             }
             // the server confirms (or rejects) stream setup for protocol v2
             CMD_SYNACK => {
@@ -268,7 +320,7 @@ async fn read_loop(mut reader: tokio::io::ReadHalf<AnyStream>, session: Arc<Sess
 struct Stream {
     session: Arc<Session>,
     sid: u32,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
     pos: usize,
     /// in-flight write (frames are async), with its promised byte count
@@ -278,7 +330,7 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(session: Arc<Session>, sid: u32, rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+    fn new(session: Arc<Session>, sid: u32, rx: mpsc::Receiver<Vec<u8>>) -> Self {
         Self {
             session,
             sid,
@@ -328,7 +380,11 @@ impl AsyncRead for Stream {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if self.pos >= self.pending.len() {
-            self.pending.clear();
+            // fully read: recycle the buffer for the next dispatch
+            let spent = std::mem::take(&mut self.pending);
+            if !spent.is_empty() {
+                self.session.give_buf(spent);
+            }
             self.pos = 0;
             match self.rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -403,8 +459,16 @@ impl AsyncWrite for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        if !self.fin_sent {
+        if self.fin_sent {
+            // the FIN is already on the wire: just unregister so the session
+            // goes back to the pool
+            self.session.unregister(self.sid);
+        } else {
             self.session.close_stream(self.sid);
+        }
+        let spent = std::mem::take(&mut self.pending);
+        if !spent.is_empty() {
+            self.session.give_buf(spent);
         }
     }
 }
@@ -426,7 +490,10 @@ pub struct AnyTls {
     tls: TlsOptions,
     password_sha256: [u8; 32],
     client_metadata: Option<String>,
-    session: AsyncMutex<Option<Arc<Session>>>,
+    /// live sessions, at most `MAX_SESSIONS`: each takes streams once the
+    /// cap turns fresh dials into sharing (a single session serializes every
+    /// stream through one read loop and one TCP flow)
+    sessions: Mutex<Vec<Arc<Session>>>,
     dial: crate::outbound::dial::DialOptions,
 }
 
@@ -469,18 +536,28 @@ impl AnyTls {
             tls,
             password_sha256,
             client_metadata,
-            session: AsyncMutex::new(None),
+            sessions: Mutex::new(Vec::new()),
             dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
 
-    /// Reuse the live session, or dial a new one.
+    /// A session for the next stream: below the cap every stream gets its own
+    /// session for parallel TCP flows, at the cap the least-loaded live one
+    /// takes it. Dead sessions are pruned on the way.
     async fn session(&self) -> io::Result<Arc<Session>> {
-        let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_ref()
-            && session.is_alive()
-        {
-            return Ok(Arc::clone(session));
+        let shared = {
+            let mut pool = self.sessions.lock().expect("sessions");
+            pool.retain(|s| s.is_alive());
+            if pool.len() >= MAX_SESSIONS {
+                pool.iter()
+                    .min_by_key(|s| s.streams.lock().expect("streams").len())
+                    .cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(session) = shared {
+            return Ok(session);
         }
         let session = Session::open(
             &self.server,
@@ -492,19 +569,18 @@ impl AnyTls {
             &self.dial,
         )
         .await?;
-        *guard = Some(Arc::clone(&session));
+        let mut pool = self.sessions.lock().expect("sessions");
+        pool.retain(|s| s.is_alive());
+        pool.push(Arc::clone(&session));
         Ok(session)
     }
 
-    /// Drop the stored session so the next dial builds a fresh one.
+    /// Drop a session from the pool so the next dial builds a fresh one.
     async fn invalidate(&self, session: &Arc<Session>) {
-        let mut guard = self.session.lock().await;
-        if guard
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, session))
-        {
-            *guard = None;
-        }
+        self.sessions
+            .lock()
+            .expect("sessions")
+            .retain(|current| !Arc::ptr_eq(current, session));
     }
 
     /// One multiplexed stream carrying `address` as its first payload.

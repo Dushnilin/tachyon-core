@@ -523,8 +523,11 @@ impl GeckoReassembler {
             return None;
         }
         let entry = self.chunks.remove(&message_id)?;
-        self.bytes -= entry.chunks.iter().flatten().map(Vec::len).sum::<usize>();
-        let mut out = Vec::new();
+        let total_len: usize = entry.chunks.iter().flatten().map(Vec::len).sum();
+        self.bytes -= total_len;
+        // sized once: Vec::new() grew by reallocation as each fragment
+        // arrived, copying the message again on every doubling
+        let mut out = Vec::with_capacity(total_len);
         for chunk in entry.chunks.into_iter().flatten() {
             out.extend_from_slice(&chunk);
         }

@@ -1048,10 +1048,14 @@ impl Stack {
         else {
             return;
         };
-        let mut msg = buf[padding..].to_vec();
+        // Header protection unmasks the canonical header in place, so only
+        // that path takes an owned copy; plain wireguard classifies and
+        // decrypts straight out of the recv buffer.
+        let mut owned: Option<Vec<u8>> = None;
         if let Some(a) = self.cfg.awg.as_ref()
             && let Some(key) = &a.header_protection
         {
+            let mut msg = buf[padding..].to_vec();
             let canon = match msg_type {
                 noise::MSG_INITIATION => noise::INITIATION_LEN,
                 noise::MSG_RESPONSE => noise::RESPONSE_LEN,
@@ -1060,7 +1064,9 @@ impl Stack {
             };
             let end = canon.min(msg.len());
             awg::mask_header(key, &buf[..12], &mut msg[..end]);
+            owned = Some(msg);
         }
+        let mut msg: &[u8] = owned.as_deref().unwrap_or(&buf[padding..]);
         if msg_type != noise::MSG_TRANSPORT {
             // Fixed-size handshake kinds: drop the AWG 3.x random trailer.
             let canon = match msg_type {
@@ -1068,7 +1074,7 @@ impl Stack {
                 noise::MSG_RESPONSE => noise::RESPONSE_LEN,
                 _ => noise::COOKIE_REPLY_LEN,
             };
-            msg.truncate(canon.min(msg.len()));
+            msg = &msg[..canon.min(msg.len())];
         }
         if msg.len() < 8 {
             return;
@@ -1095,10 +1101,10 @@ impl Stack {
                     return;
                 }
                 let receiver = u32::from_le_bytes(msg[8..12].try_into().expect("4 bytes"));
-                self.on_response(&msg, receiver);
+                self.on_response(msg, receiver);
             }
-            noise::MSG_COOKIE_REPLY => self.on_cookie(&msg, recv_idx),
-            noise::MSG_TRANSPORT => self.on_transport(&msg, recv_idx),
+            noise::MSG_COOKIE_REPLY => self.on_cookie(msg, recv_idx),
+            noise::MSG_TRANSPORT => self.on_transport(msg, recv_idx),
             _ => {}
         }
     }
@@ -1180,32 +1186,57 @@ impl Stack {
         let Some(&pi) = self.index_peer.get(&recv_idx) else {
             return;
         };
-        let Some(padded) = self.peers[pi].session.as_mut().and_then(|s| s.open(msg)) else {
+        // Decrypt into a recycled buffer: the plaintext either leaves for the
+        // caller channel or goes into device.rx, so a per-packet malloc here
+        // would be pure churn — the pool behind device.free is the same one
+        // the tx path refills.
+        let mut plain = self.device.free.pop().unwrap_or_default();
+        let opened = self.peers[pi]
+            .session
+            .as_mut()
+            .is_some_and(|s| s.open_into(msg, &mut plain));
+        if !opened {
+            self.recycle(plain);
             return;
-        };
+        }
         self.peers[pi].last_recv = Some(Instant::now());
-        if padded.is_empty() {
+        if plain.is_empty() {
             return; // keepalive
         }
-        let Some((src, dst, proto, hdr_len)) = ipv4_info(&padded) else {
+        let Some((src, dst, proto, hdr_len)) = ipv4_info(&plain) else {
+            self.recycle(plain);
             return;
         };
         if dst != self.cfg.local_addr {
+            self.recycle(plain);
             return;
         }
-        if proto == 17 && padded.len() >= hdr_len + 8 {
-            let sport = u16::from_be_bytes([padded[hdr_len], padded[hdr_len + 1]]);
-            let dport = u16::from_be_bytes([padded[hdr_len + 2], padded[hdr_len + 3]]);
-            if let Some(sess) = self.udp.get(&dport)
-                && sess.target.ip() == IpAddr::V4(src)
-                && (sess.target.port() == sport || sess.target.port() == 0)
-            {
-                let payload = &padded[hdr_len + 8..];
-                let _ = sess.to_caller.try_send(payload.to_vec());
+        if proto == 17 && plain.len() >= hdr_len + 8 {
+            let sport = u16::from_be_bytes([plain[hdr_len], plain[hdr_len + 1]]);
+            let dport = u16::from_be_bytes([plain[hdr_len + 2], plain[hdr_len + 3]]);
+            let sender = match self.udp.get(&dport) {
+                Some(sess)
+                    if sess.target.ip() == IpAddr::V4(src)
+                        && (sess.target.port() == sport || sess.target.port() == 0) => {
+                    Some(sess.to_caller.clone())
+                }
+                _ => None,
+            };
+            if let Some(sender) = sender {
+                let out = plain[hdr_len + 8..].to_vec();
+                self.recycle(plain);
+                let _ = sender.try_send(out);
                 return;
             }
         }
-        self.device.rx.push_back(padded);
+        self.device.rx.push_back(plain);
+    }
+
+    /// Return a buffer to the pool, capped like the tx path's refill.
+    fn recycle(&mut self, buf: Vec<u8>) {
+        if self.device.free.len() < 64 {
+            self.device.free.push(buf);
+        }
     }
 
     async fn flush_device_tx(&mut self) {

@@ -240,12 +240,17 @@ pub struct FakeIpStore {
     state: Mutex<FakeIpState>,
 }
 
+/// Fake-ip maps are keyed by things that never stop arriving (names) or get
+/// overwritten on a pool wrap (addresses): capped, oldest first out, with the
+/// paired record dropped on either side so forward and reverse never disagree.
+const FAKEIP_MAP_CAPACITY: usize = 16384;
+
 struct FakeIpState {
     cur4: Option<Ipv4Addr>,
     cur6: Option<Ipv6Addr>,
     addr_to_domain: std::collections::HashMap<IpAddr, String>,
-    domain_to_v4: std::collections::HashMap<String, Ipv4Addr>,
-    domain_to_v6: std::collections::HashMap<String, Ipv6Addr>,
+    domain_to_v4: lru::LruCache<String, Ipv4Addr>,
+    domain_to_v6: lru::LruCache<String, Ipv6Addr>,
 }
 
 impl FakeIpStore {
@@ -277,8 +282,12 @@ impl FakeIpStore {
                 cur4,
                 cur6,
                 addr_to_domain: std::collections::HashMap::new(),
-                domain_to_v4: std::collections::HashMap::new(),
-                domain_to_v6: std::collections::HashMap::new(),
+                domain_to_v4: lru::LruCache::new(
+                    std::num::NonZeroUsize::new(FAKEIP_MAP_CAPACITY).expect("nonzero"),
+                ),
+                domain_to_v6: lru::LruCache::new(
+                    std::num::NonZeroUsize::new(FAKEIP_MAP_CAPACITY).expect("nonzero"),
+                ),
             }),
         }
     }
@@ -305,7 +314,7 @@ impl FakeIpStore {
     }
 
     pub fn lookup_address(&self, domain: &str, v6: bool) -> Option<IpAddr> {
-        let state = self.state.lock().expect("fakeip state");
+        let mut state = self.state.lock().expect("fakeip state");
         if v6 {
             state.domain_to_v6.get(domain).map(|a| IpAddr::V6(*a))
         } else {
@@ -327,10 +336,20 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet6 range"))?;
             let next = next_v6(cur, prefix);
             state.cur6 = Some(next);
-            state.domain_to_v6.insert(domain.to_string(), next);
-            state
+            state.domain_to_v6.put(domain.to_string(), next);
+            if state.domain_to_v6.len() > FAKEIP_MAP_CAPACITY
+                && let Some((_evicted, addr)) = state.domain_to_v6.pop_lru()
+            {
+                state.addr_to_domain.remove(&IpAddr::V6(addr));
+            }
+            if let Some(previous) = state
                 .addr_to_domain
-                .insert(IpAddr::V6(next), domain.to_string());
+                .insert(IpAddr::V6(next), domain.to_string())
+            {
+                // a pool wrap reissues an address an earlier domain still
+                // claims; drop that claim or forward and reverse disagree
+                let _ = state.domain_to_v6.pop(&previous);
+            }
             Ok(IpAddr::V6(next))
         } else {
             if let Some(existing) = state.domain_to_v4.get(domain) {
@@ -344,10 +363,20 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet4 range"))?;
             let next = next_v4(cur, prefix);
             state.cur4 = Some(next);
-            state.domain_to_v4.insert(domain.to_string(), next);
-            state
+            state.domain_to_v4.put(domain.to_string(), next);
+            if state.domain_to_v4.len() > FAKEIP_MAP_CAPACITY
+                && let Some((_evicted, addr)) = state.domain_to_v4.pop_lru()
+            {
+                state.addr_to_domain.remove(&IpAddr::V4(addr));
+            }
+            if let Some(previous) = state
                 .addr_to_domain
-                .insert(IpAddr::V4(next), domain.to_string());
+                .insert(IpAddr::V4(next), domain.to_string())
+            {
+                // a pool wrap reissues an address an earlier domain still
+                // claims; drop that claim or forward and reverse disagree
+                let _ = state.domain_to_v4.pop(&previous);
+            }
             Ok(IpAddr::V4(next))
         }
     }

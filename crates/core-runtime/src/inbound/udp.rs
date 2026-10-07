@@ -182,10 +182,13 @@ impl UdpHub {
             },
             frame,
         });
-        let sweeper = Arc::clone(&hub);
+        let sweeper = Arc::downgrade(&hub);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(SWEEP_INTERVAL).await;
+                let Some(sweeper) = sweeper.upgrade() else {
+                    return; // the connection this hub belongs to is gone
+                };
                 sweeper.sweep().await;
             }
         });

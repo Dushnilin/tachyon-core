@@ -952,14 +952,15 @@ fn prepare(ctx: &mut ConnContext, want_process: bool) {
         Target::Domain(..) => None,
     };
     if want_process && let Some(info) = process::find_owner(ctx.network, ctx.source, destination) {
-        logging::info(format_args!(
-            "found process path: {}{}",
-            info.path,
-            match &info.user_name {
-                Some(name) => format!(", user: {name}"),
-                None => String::new(),
-            }
-        ));
+        // per-connection, so debug: at the default level this costs nothing —
+        // and the user suffix is built inside the format, not before it
+        match &info.user_name {
+            Some(name) => logging::debug(format_args!(
+                "found process path: {}, user: {}",
+                info.path, name
+            )),
+            None => logging::debug(format_args!("found process path: {}", info.path)),
+        }
         ctx.process = Some(info);
     }
     ctx.ip_version = match ctx.destination {

@@ -651,6 +651,15 @@ async fn stream_logs(
         }
     };
     let (id, mut live) = logging::subscribe();
+    // every exit path — a failed upgrade, a broken socket — must drop the id,
+    // or the subscriber (and its buffer) stays registered forever
+    struct UnsubscribeOnDrop(u64);
+    impl Drop for UnsubscribeOnDrop {
+        fn drop(&mut self) {
+            logging::unsubscribe(self.0);
+        }
+    }
+    let _sub = UnsubscribeOnDrop(id);
     // the reference validates `level` before it upgrades: a bad level is a
     // plain 400, never a 101 followed by nothing
     let mut out = Live::open(stream, cors, ws_key).await?;
@@ -662,7 +671,6 @@ async fn stream_logs(
             out.send(&log_entry(level_raw, level, &line)).await?;
         }
     }
-    logging::unsubscribe(id);
     Ok(false)
 }
 

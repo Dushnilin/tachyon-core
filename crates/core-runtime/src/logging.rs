@@ -72,8 +72,11 @@ static TIMESTAMP: AtomicU8 = AtomicU8::new(0);
 /// Recent lines kept in memory for `GET /logs` (reference `log_buffer`).
 const RING_CAPACITY: usize = 1024;
 static RING: OnceLock<Mutex<VecDeque<(Level, String)>>> = OnceLock::new();
-/// `(level, message)` feed for one `/logs` subscriber.
-type Subscriber = mpsc::UnboundedSender<(Level, String)>;
+/// `(level, message)` feed for one `/logs` subscriber. Bounded: a reader that
+/// stopped draining its socket cannot make the process grow without limit —
+/// lines are dropped for it instead (`TrySendError::Full` keeps the id).
+const SUBSCRIBER_CAPACITY: usize = 512;
+type Subscriber = mpsc::Sender<(Level, String)>;
 static SUBSCRIBERS: OnceLock<Mutex<HashMap<u64, Subscriber>>> = OnceLock::new();
 static NEXT_SUBSCRIBER: AtomicU64 = AtomicU64::new(1);
 
@@ -98,8 +101,8 @@ pub fn recent(level: Level) -> Vec<String> {
 }
 
 /// Register a live `/logs` subscriber; drop the id to unsubscribe.
-pub fn subscribe() -> (u64, mpsc::UnboundedReceiver<(Level, String)>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+pub fn subscribe() -> (u64, mpsc::Receiver<(Level, String)>) {
+    let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
     let id = NEXT_SUBSCRIBER.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut guard) = subscribers().lock() {
         guard.insert(id, tx);
@@ -209,11 +212,16 @@ fn emit(level: Level, msg: fmt::Arguments) {
         guard.push_back((level, text.clone()));
     }
     if let Ok(mut guard) = subscribers().lock() {
-        guard.retain(|_, tx| tx.send((level, text.clone())).is_ok());
+        guard.retain(|_, tx| match tx.try_send((level, text.clone())) {
+            Ok(()) => true,
+            // a slow reader misses lines; it never stalls the emitter
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
     }
     let start = START.get_or_init(Instant::now);
     let stamp = if TIMESTAMP.load(Ordering::Relaxed) == 1 {
-        format!("{} ", humantime_prefix())
+        humantime_prefix()
     } else {
         String::new()
     };
@@ -258,8 +266,10 @@ fn humantime_prefix() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
+    // the trailing space is the separator `emit` puts after the stamp: one
+    // allocation instead of a String plus a format! around it
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} +0000",
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} +0000 ",
         y,
         m,
         d,

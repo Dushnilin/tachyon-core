@@ -13,7 +13,7 @@ pub mod transport;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{RData, RecordType};
@@ -74,7 +74,10 @@ pub struct DnsService {
     disable_expire: bool,
     optimistic_timeout: Option<Duration>,
     cache: RwLock<Cache>,
-    inflight: std::sync::Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// One lock per name that is being looked up right now; the value is a
+    /// `Weak` so a finished query stops keeping anything alive — dead entries
+    /// are purged on the next insert (the key itself owns an `Arc<str>`).
+    inflight: std::sync::Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>,
     refreshing: std::sync::Mutex<HashSet<CacheKey>>,
     /// Installed after the router exists, so `detour` can dial through it.
     router: RwLock<Option<Arc<crate::route::Router>>>,
@@ -517,11 +520,15 @@ impl DnsService {
 
         let lock = {
             let mut inflight = self.inflight.lock().expect("dns inflight");
-            Arc::clone(
-                inflight
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
+            inflight.retain(|_, weak| weak.strong_count() > 0);
+            match inflight.get(&key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    inflight.insert(key.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
         };
         let _guard = lock.lock().await;
         if use_cache && !skip_cache_read {
@@ -587,10 +594,29 @@ impl DnsService {
         }
         let service = Arc::clone(self);
         tokio::spawn(async move {
+            // the key is cleared from any exit: a panic inside exchange_inner
+            // would otherwise leave this name stuck as "refreshing" forever
+            struct ClearRefresh {
+                service: Arc<DnsService>,
+                key: CacheKey,
+            }
+            impl Drop for ClearRefresh {
+                fn drop(&mut self) {
+                    let mut refreshing = self
+                        .service
+                        .refreshing
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    refreshing.remove(&self.key);
+                }
+            }
+            let _clear = ClearRefresh {
+                service: Arc::clone(&service),
+                key,
+            };
             let _ = service
                 .exchange_inner(&meta, &query, allow_fakeip, true)
                 .await;
-            service.refreshing.lock().expect("refresh set").remove(&key);
         });
     }
 

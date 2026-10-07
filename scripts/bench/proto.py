@@ -766,6 +766,13 @@ def main():
                     help="fixed piece each cell must move, GiB (1 and 8 streams); 0 disables")
     args = ap.parse_args()
 
+    # live_refresh writes <out>.tmp up front and the hello sniffer drops
+    # hello-N.bin into PROTO_WORK before any cell dir exists, so create both
+    # here instead of trusting the caller to have mkdir'd them.
+    for d in (os.environ.get("PROTO_WORK"), os.path.dirname(args.out)):
+        if d:
+            os.makedirs(d, exist_ok=True)
+
     cpus = {"client": parse_cpus(args.client_cpus), "server": parse_cpus(args.server_cpus)}
     load = set(range(os.cpu_count())) - cpus["client"] - cpus["server"] or cpus["client"]
     os.sched_setaffinity(0, load)

@@ -182,6 +182,16 @@ def build_cases(certs, reality):
         {"type": "naive",
          "username": "naive-user", "password": "naive-secret",
          "tls": {"enabled": True, "server_name": "localhost", "certificate_path": certs["crt"]}})
+    # naive over HTTP/3: the reference inbound listens tcp+udp when `network` is
+    # unset, so only the outbound flips to QUIC; same port, now over UDP.
+    add("naive-quic", "B",
+        {"type": "naive",
+         "users": [{"username": "naive-user", "password": "naive-secret"}],
+         "tls": ref_tls},
+        {"type": "naive",
+         "username": "naive-user", "password": "naive-secret",
+         "quic": True,
+         "tls": {"enabled": True, "server_name": "localhost", "certificate_path": certs["crt"]}})
     add("anytls-tls", "B",
         {"type": "anytls", "users": [{"password": "bench-pass"}], "tls": ref_tls},
         {"type": "anytls", "password": "bench-pass", "tls": tls_client()})
@@ -346,7 +356,8 @@ def connect_times(n=20):
     return statistics.median(out)
 
 
-def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work, result):
+def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work, result,
+             bulk_gib):
     """Body of a forked child: one (client impl, server impl, case) cell."""
     client_impl, server_impl = tachyon_role
     proxy_port, server_port = ports
@@ -389,7 +400,7 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
                 s0 = bench.cpu_split(server.p.pid)
                 r = bench.measure_throughput(True, streams, seconds, client.p.pid)
                 s1 = bench.cpu_split(server.p.pid)
-                gib = r["gbit_s"] * 1e9 / 8 * seconds / (1 << 30)
+                gib = r["gib"]
                 total_gib += gib
                 if gib:
                     r["server_cpu_s_per_gib"] = ((s1[0] + s1[1]) - (s0[0] + s0[1])) / gib
@@ -403,6 +414,7 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
             cc, sc = m["proxy_cpu_s_per_gib"], m["server_cpu_s_per_gib"]
             res[f"tput_{streams}"] = {
                 "gbit_s": m["gbit_s"],
+                "gib": m["gib"],
                 "client_cpu_s_per_gib": cc,
                 "client_user_s_per_gib": m.get("proxy_user_s_per_gib"),
                 "client_sys_s_per_gib": m.get("proxy_sys_s_per_gib"),
@@ -419,6 +431,27 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
             res["client_majflt_per_gib"] = (cf1[1] - cf0[1]) / total_gib
             res["server_minflt_per_gib"] = (sf1[0] - sf0[0]) / total_gib
             res["server_majflt_per_gib"] = (sf1[1] - sf0[1]) / total_gib
+        if bulk_gib:
+            # a fixed piece the cell must actually move: faults above stay a
+            # window over the timed runs only, so bulk runs after them and
+            # before VmHWM -- the peak below still covers everything.
+            for streams in (1, 8):
+                b0 = bench.cpu_split(server.p.pid)
+                rb = bench.measure_bulk(True, streams, bulk_gib, client.p.pid)
+                b1 = bench.cpu_split(server.p.pid)
+                bgib = rb["gib"]
+                bcc = rb["proxy_cpu_s_per_gib"]
+                bsc = ((b1[0] + b1[1]) - (b0[0] + b0[1])) / bgib if bgib else None
+                res[f"bulk_{streams}"] = {
+                    "gbit_s": rb["gbit_s"],
+                    "seconds": rb["seconds"],
+                    "gib": bgib,
+                    "client_cpu_s_per_gib": bcc,
+                    "client_user_s_per_gib": rb.get("proxy_user_s_per_gib"),
+                    "client_sys_s_per_gib": rb.get("proxy_sys_s_per_gib"),
+                    "server_cpu_s_per_gib": bsc,
+                    "cpu_s_per_gib": (bcc + bsc) if bcc is not None and bsc is not None else None,
+                }
         res["client_rss_mib"] = bench.proc_status(client.p.pid)["VmHWM"]
         res["server_rss_mib"] = bench.proc_status(server.p.pid)["VmHWM"]
         res["status"] = "OK"
@@ -434,14 +467,40 @@ def run_cell(tachyon_role, case, bins, cpus, runs, seconds, rounds, ports, work,
         result.send(res)
 
 
-def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports):
+def kill_cell_proxies(work):
+    """Kill the cell's leftover proxies, found by the config path this cell
+    alone was given. pkill is not installed everywhere (busybox/OpenWrt), so
+    fall back to a /proc scan; cleanup must never raise."""
+    try:
+        subprocess.run(["pkill", "-9", "-f", work], check=False)
+        return
+    except FileNotFoundError:
+        pass
+    try:
+        me = str(os.getpid())
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit() or pid == me:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                if work in cmd:
+                    os.kill(int(pid), 9)
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+
+
+def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports, bulk_gib):
     ctx = multiprocessing.get_context("fork")
     # PROTO_WORK pins the cell dir outside the container's /tmp so server.err
     # survives the run; without it the logs die with --rm.
     work = os.environ.get("PROTO_WORK") or tempfile.mkdtemp()
     rx, tx = ctx.Pipe(duplex=False)
     child = ctx.Process(target=run_cell,
-                        args=(role, case, bins, cpus, runs, seconds, rounds, ports, work, tx))
+                        args=(role, case, bins, cpus, runs, seconds, rounds, ports, work, tx,
+                              bulk_gib))
     child.start()
     tx.close()
     child.join(CELL_TIMEOUT)
@@ -451,7 +510,7 @@ def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports):
         # more precise than a pattern over every `sing-box` in the container.
         child.kill()
         child.join()
-        subprocess.run(["pkill", "-9", "-f", work], check=False)
+        kill_cell_proxies(work)
         for port in ports:
             wait_port_free(port, timeout=5)
         return {"case": case["name"], "client": role[0], "server": role[1],
@@ -542,13 +601,18 @@ def verdict(t, r):
     if t["status"] != "OK" or r["status"] != "OK":
         return "n/a", False
     losses = []
-    for key in ("tput_1", "tput_8"):
-        sp = ratio(t[key]["gbit_s"], r[key]["gbit_s"])
+    # the same keys the table prints; bulk_* is absent when --bulk-gib 0
+    for key in ("tput_1", "tput_8", "bulk_1", "bulk_8"):
+        tk, rk = t.get(key), r.get(key)
+        if not tk or not rk:
+            continue
+        sp = ratio(tk.get("gbit_s"), rk.get("gbit_s"))
         if sp is not None and sp < MIN_SPEED_RATIO:
             losses.append(f"{key} {sp:.2f}x")
-        # CPU only matters when the proxies are not both maxed on the same wall
-        cp = ratio(t[key]["cpu_s_per_gib"], r[key]["cpu_s_per_gib"])
-        if cp is not None and cp > MAX_COST_RATIO and sp is not None and sp < 1.0:
+        # cost over the threshold counts even when we are faster: the standing
+        # goal is speed AND slimness, and report.py has always colored it this way
+        cp = ratio(tk.get("cpu_s_per_gib"), rk.get("cpu_s_per_gib"))
+        if cp is not None and cp > MAX_COST_RATIO:
             losses.append(f"{key} cpu {cp:.2f}x")
     pl = ratio(t["p50_us"], r["p50_us"])
     if pl is not None and pl > MAX_COST_RATIO:
@@ -572,13 +636,17 @@ def report(results, ref_name):
         lines += [f"\n### {title}\n"]
         if part == "A":
             lines += [
-                "| case | T->T 1s | T->T 8s | ref->ref 1s | ref->ref 8s | cpu T/ref (8s) | p50 us T/ref | connect ms T/ref | T->ref | ref->T | verdict |",
-                "|---|---|---|---|---|---|---|---|---|---|---|",
+                "| case | T->T 1s | T->T 8s | ref->ref 1s | ref->ref 8s | "
+                "кусок T 1s/8s | кусок ref 1s/8s | cpu T/ref (8s) | p50 us T/ref | "
+                "connect ms T/ref | T->ref | ref->T | verdict |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
             ]
         else:
             lines += [
-                "| case | T 1s | T 8s | ref 1s | ref 8s | cpu T/ref (8s) | p50 us T/ref | connect ms T/ref | verdict |",
-                "|---|---|---|---|---|---|---|---|---|",
+                "| case | T 1s | T 8s | ref 1s | ref 8s | "
+                "кусок T 1s/8s | кусок ref 1s/8s | cpu T/ref (8s) | p50 us T/ref | "
+                "connect ms T/ref | verdict |",
+                "|---|---|---|---|---|---|---|---|---|---|---|",
             ]
         for name, cells in by.items():
             if cells and next(iter(cells.values())).get("part") != part:
@@ -594,7 +662,13 @@ def report(results, ref_name):
             def pair(a, b, spec="{:.1f}"):
                 if tt["status"] != "OK" or rr["status"] != "OK":
                     return "-"
+                if a is None and b is None:
+                    return "-"
                 return f"{fmt(a, spec)}/{fmt(b, spec)}"
+
+            def bulk_pair(key):
+                return pair((tt.get(key) or {}).get("gbit_s"),
+                            (rr.get(key) or {}).get("gbit_s"))
 
             cost = "-"
             if tt["status"] == "OK" and rr["status"] == "OK":
@@ -603,6 +677,7 @@ def report(results, ref_name):
             if lost:
                 losses.append(f"{name}: {v}")
             row = [name, g(tt, "tput_1"), g(tt, "tput_8"), g(rr, "tput_1"), g(rr, "tput_8"),
+                   bulk_pair("bulk_1"), bulk_pair("bulk_8"),
                    cost,
                    pair(tt.get("p50_us"), rr.get("p50_us"), "{:.0f}"),
                    pair(tt.get("connect_ms"), rr.get("connect_ms")),
@@ -622,7 +697,8 @@ def report(results, ref_name):
               f" (logs in `{r['work']}`)"
               for r in failed] or ["none"]
     lines += ["\n### Verdict\n",
-              f"Reference: `{ref_name}`. A loss is speed under {MIN_SPEED_RATIO:.0%} of the reference, "
+              f"Reference: `{ref_name}`. A loss is speed (timed or the 2 GiB piece) "
+              f"under {MIN_SPEED_RATIO:.0%} of the reference, "
               f"or latency/CPU over {MAX_COST_RATIO:.0%}, or a slower connect.\n"]
     lines += [f"- {x}" for x in losses] or ["- no case loses to the reference"]
     return "\n".join(lines), losses, interop_bad
@@ -675,6 +751,8 @@ def main():
     ap.add_argument("--part", default="AB", help="A, B or AB")
     ap.add_argument("--no-cross", action="store_true", help="skip the crossed interop cells")
     ap.add_argument("--out", default="proto-result.json")
+    ap.add_argument("--bulk-gib", type=float, default=2.0,
+                    help="fixed piece each cell must move, GiB (1 and 8 streams); 0 disables")
     args = ap.parse_args()
 
     cpus = {"client": parse_cpus(args.client_cpus), "server": parse_cpus(args.server_cpus)}
@@ -713,7 +791,23 @@ def main():
                 "runs": args.runs,
                 "seconds": args.seconds,
                 "rounds": args.rounds,
-                "kernel": os.uname().release, "ref": args.ref_name}
+                "kernel": os.uname().release, "ref": args.ref_name,
+                "bulk_gib": args.bulk_gib}
+    # the ceiling of the harness itself: no proxy, the generator talking straight
+    # to the sink. Without it a cell pinned against the harness reads as a tie
+    # with nothing to tell it apart from a real parity.
+    print("direct ceiling (no proxy):", end=" ", flush=True)
+    direct = {
+        "latency": bench.measure_latency(False, args.rounds),
+        "tput_1": bench.measure_throughput(False, 1, args.seconds, None),
+        "tput_8": bench.measure_throughput(False, 8, args.seconds, None),
+    }
+    if args.bulk_gib:
+        direct["bulk_1"] = bench.measure_bulk(False, 1, args.bulk_gib, None)
+        direct["bulk_8"] = bench.measure_bulk(False, 8, args.bulk_gib, None)
+    run_meta["direct"] = direct
+    print(f"1s {direct['tput_1']['gbit_s']:.1f} 8s {direct['tput_8']['gbit_s']:.1f} Gbit/s "
+          f"p50 {direct['latency']['p50_us']:.0f} us", flush=True)
     results = []
     port_n = 0
     done = 0
@@ -724,7 +818,7 @@ def main():
             port_n += 1
             ports = (PROXY_PORT_BASE + port_n, SERVER_PORT_BASE + port_n)
             r = run_cell_guarded(role, case, bins, cpus, args.runs, args.seconds,
-                                 args.rounds, ports)
+                                 args.rounds, ports, args.bulk_gib)
             r["part"] = case["part"]
             results.append(r)
             done += 1

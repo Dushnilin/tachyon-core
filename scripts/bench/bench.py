@@ -191,6 +191,67 @@ def measure_throughput(proxy, streams, seconds, pid):
     per_gib = (lambda x: x / gib if pid and gib else None)
     return {
         "gbit_s": got * 8 / elapsed / 1e9,
+        "gib": gib,
+        "proxy_cpu_s_per_gib": per_gib((u1 + s1) - (u0 + s0)),
+        "proxy_user_s_per_gib": per_gib(u1 - u0),
+        "proxy_sys_s_per_gib": per_gib(s1 - s0),
+    }
+
+
+def measure_bulk(proxy, streams, gib, pid, timeout=200):
+    """Fixed piece of work: `gib` GiB split across `streams` connections, timed
+    from the first byte to the last.
+
+    measure_throughput answers "how fast does it go for N seconds"; this answers
+    "how long does a 2 GiB file take" -- the number a user actually waits on,
+    and it cannot hide a stall behind a short window. The transfer must complete:
+    an early EOF or a stuck stream is an error, never a partial result that
+    reads as slow.
+    """
+    each = int(gib * (1 << 30)) // streams
+    total = [0] * streams
+    errs = []
+
+    def worker(i):
+        try:
+            s = socks_connect(proxy, MODE_SOURCE)
+            view = memoryview(bytearray(CHUNK))
+            local, left = 0, each
+            while left:
+                n = s.recv_into(view, min(CHUNK, left))
+                if not n:
+                    break
+                local += n
+                left -= n
+                total[i] = local
+            s.close()
+            if left:
+                errs.append(f"stream {i}: eof after {each - left}/{each} bytes")
+        except Exception as e:  # noqa: BLE001 - every failure kills the cell
+            errs.append(f"stream {i}: {type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(streams)]
+    u0, s0 = cpu_split(pid) if pid else (0.0, 0.0)
+    t0 = time.perf_counter()
+    for t in threads:
+        t.start()
+    deadline = time.perf_counter() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.perf_counter()))
+    elapsed = time.perf_counter() - t0
+    u1, s1 = cpu_split(pid) if pid else (0.0, 0.0)
+    stuck = sum(1 for t in threads if t.is_alive())
+    if errs or stuck:
+        raise RuntimeError(
+            "bulk transfer incomplete: "
+            + ("; ".join(errs) if errs else f"{stuck} stream(s) stuck >{timeout}s")
+        )
+    got = sum(total)
+    per_gib = (lambda x: x / gib if pid and gib else None)
+    return {
+        "gbit_s": got * 8 / elapsed / 1e9,
+        "seconds": elapsed,
+        "gib": got / (1 << 30),
         "proxy_cpu_s_per_gib": per_gib((u1 + s1) - (u0 + s0)),
         "proxy_user_s_per_gib": per_gib(u1 - u0),
         "proxy_sys_s_per_gib": per_gib(s1 - s0),

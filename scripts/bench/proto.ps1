@@ -16,6 +16,11 @@
 # fast (runs 1, seconds 1, rounds 400); pass -Runs 2 -Seconds 2 -Rounds 2000
 # when a row has to hold up as a verdict.
 #
+# Every cell additionally moves a fixed piece (-BulkGib, default 2 GiB) over
+# 1 and 8 connections: the time a real file takes, not just a short window.
+# -Quick turns it off unless -BulkGib is given explicitly; a slow host (the
+# router) wants -BulkGib 1 to keep cells inside the 240 s guard.
+#
 # Needs target\bench\sing-box-lx (the reference) next to the tachyon binary.
 param(
     [string]$Only = "",
@@ -25,13 +30,15 @@ param(
     [int]$Runs = 1,
     [int]$Seconds = 1,
     [int]$Rounds = 400,
-    [string]$Part = "AB"
+    [string]$Part = "AB",
+    [double]$BulkGib = 2.0
 )
 
 if ($Quick) {
     $NoCross = $true
     if (-not $PSBoundParameters.ContainsKey("Seconds")) { $Seconds = 1 }
     if (-not $PSBoundParameters.ContainsKey("Rounds")) { $Rounds = 200 }
+    if (-not $PSBoundParameters.ContainsKey("BulkGib")) { $BulkGib = 0 }
 }
 
 $ErrorActionPreference = "Stop"
@@ -52,7 +59,7 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $name = "proto-$stamp"
 $filter = if ($Only) { "--only $Only" } else { "" }
 $cross = if ($NoCross) { "--no-cross" } else { "" }
-$cmd = "chmod +x /bench/tachyon-core /bench/sing-box*; python3 /bench/proto.py --tachyon /bench/tachyon-core --ref /bench/sing-box-lx --runs $Runs --seconds $Seconds --rounds $Rounds --part $Part $filter $cross --out /bench/$name.json 2>&1"
+$cmd = "chmod +x /bench/tachyon-core /bench/sing-box*; python3 /bench/proto.py --tachyon /bench/tachyon-core --ref /bench/sing-box-lx --runs $Runs --seconds $Seconds --rounds $Rounds --part $Part --bulk-gib $($BulkGib.ToString([cultureinfo]::InvariantCulture)) $filter $cross --out /bench/$name.json 2>&1"
 
 $size = [math]::Round((Get-Item "$bench\tachyon-core").Length / 1MB, 2)
 $mode = if ($Quick) { "quick debug mode" } elseif ($NoCross) { "no interop cells" } else { "full grid" }

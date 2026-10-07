@@ -128,25 +128,34 @@ mod linux {
     /// A few seconds of `inode → owner` and `pid → owner`, like the
     /// reference's `route/process_cache.go`: the fd walk and the
     /// `/proc/<pid>` reads per connection are the expensive halves, and a
-    /// pid is reused by every connection its process opens.
+    /// pid is reused by every connection its process opens. Keyed by things
+    /// that are fresh per socket and process, so the map is size-bounded as
+    /// well as TTL-bound — otherwise it only ever grows.
     fn process_for_inode(inode: u64) -> Option<ProcessInfo> {
-        use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock};
         use std::time::{Duration, Instant};
 
         const TTL: Duration = Duration::from_secs(3);
-        static CACHE: OnceLock<Mutex<HashMap<Key, (Instant, ProcessInfo)>>> = OnceLock::new();
+        const CAPACITY: usize = 4096;
+        static CACHE: OnceLock<Mutex<lru::LruCache<Key, (Instant, ProcessInfo)>>> =
+            OnceLock::new();
 
         fn fresh(
-            cache: &Mutex<HashMap<Key, (Instant, ProcessInfo)>>,
+            cache: &Mutex<lru::LruCache<Key, (Instant, ProcessInfo)>>,
             key: Key,
         ) -> Option<ProcessInfo> {
-            let map = cache.lock().expect("process cache");
-            let (at, info) = map.get(&key)?;
-            (at.elapsed() < TTL).then(|| info.clone())
+            let mut map = cache.lock().expect("process cache");
+            match map.get(&key) {
+                Some((at, info)) if at.elapsed() < TTL => Some(info.clone()),
+                _ => None,
+            }
         }
 
-        let cache = CACHE.get_or_init(Mutex::default);
+        let cache = CACHE.get_or_init(|| {
+            Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(CAPACITY).expect("nonzero"),
+            ))
+        });
         if let Some(info) = fresh(cache, Key::Inode(inode)) {
             return Some(info);
         }
@@ -158,14 +167,14 @@ mod linux {
                 cache
                     .lock()
                     .expect("process cache")
-                    .insert(Key::Pid(pid), (Instant::now(), info.clone()));
+                    .put(Key::Pid(pid), (Instant::now(), info.clone()));
                 info
             }
         };
         cache
             .lock()
             .expect("process cache")
-            .insert(Key::Inode(inode), (Instant::now(), info.clone()));
+            .put(Key::Inode(inode), (Instant::now(), info.clone()));
         Some(info)
     }
 

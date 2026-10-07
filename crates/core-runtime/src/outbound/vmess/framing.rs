@@ -264,6 +264,9 @@ impl BodyWriter {
         if pad_len > 0 {
             let at = out.len();
             out.resize(at + usize::from(pad_len), 0);
+            // Not the SHAKE stream: the reference skips padding without ever
+            // pulling it out of the shared keystream, so feeding padding from
+            // `shake` desyncs the chunk masking from the second frame on.
             random_bytes(&mut out[at..])?;
         }
         Ok(())
@@ -583,21 +586,19 @@ fn fill(
             // everything buffered has been consumed: start over, nothing to move
             frame.clear();
             *at = 0;
-        } else if *at > 0 {
-            // give the consumed prefix back before thinking of growing. The tail
-            // is at most one frame, so this is cheap and it is what keeps the
-            // buffer from having to grow at all.
-            let len = frame.len();
-            frame.copy_within(*at..len, 0);
-            frame.truncate(len - *at);
-            *at = 0;
         }
-        // enough room to make this read worth a syscall, and never past the
-        // ceiling. `reserve_exact`, because `reserve` rounds up to twice the
-        // capacity and that is what used to walk the buffer up with the stream.
-        let want = need.saturating_add(READ_CHUNK).min(FRAME_ROOM).max(need);
-        if frame.capacity() < want {
-            frame.reserve_exact(want - frame.len());
+        let needed = need - (frame.len() - *at);
+        if frame.capacity().saturating_sub(frame.len()) < needed {
+            if *at > 0 {
+                let len = frame.len();
+                frame.copy_within(*at..len, 0);
+                frame.truncate(len - *at);
+                *at = 0;
+            }
+            let want = need.saturating_add(READ_CHUNK).min(FRAME_ROOM).max(need);
+            if frame.capacity() < want {
+                frame.reserve_exact(want - frame.len());
+            }
         }
         let len = frame.len();
         let got = {

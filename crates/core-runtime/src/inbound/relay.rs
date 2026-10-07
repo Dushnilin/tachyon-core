@@ -27,12 +27,6 @@ const CHUNK: usize = 1024 * 1024;
 /// What a fresh pipe asks for: starts at 1 MiB so single-stream and short
 /// transfers immediately hit line rate without a 4-splice ramp.
 const PIPE_START: usize = 1024 * 1024;
-/// What the pipe actually holds when the kernel refuses `PIPE_START` (budget).
-const PIPE_DEFAULT: usize = 64 * 1024;
-/// A splice at least this big counts towards a pipe growing, and this many in a
-/// row do it.
-const BUSY_BYTES: usize = 16 * 1024;
-const BUSY_RUN: u32 = 4;
 /// Chunk of the buffered fallback, deliberately small: it only runs when fds
 /// are scarce, and so is memory.
 const FALLBACK_CHUNK: usize = 16 * 1024;
@@ -41,7 +35,6 @@ const FALLBACK_CHUNK: usize = 16 * 1024;
 struct Pipe {
     read: RawFd,
     write: RawFd,
-    size: usize,
 }
 
 impl Pipe {
@@ -50,27 +43,12 @@ impl Pipe {
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut pipe = Self {
+        let pipe = Self {
             read: fds[0],
             write: fds[1],
-            size: PIPE_DEFAULT,
         };
-        let r = unsafe { libc::fcntl(pipe.write, libc::F_SETPIPE_SZ, PIPE_START as libc::c_int) };
-        if r > 0 {
-            pipe.size = r as usize;
-        }
+        let _ = unsafe { libc::fcntl(pipe.write, libc::F_SETPIPE_SZ, PIPE_START as libc::c_int) };
         Ok(pipe)
-    }
-
-    /// Called with the pipe empty once the flow has shown itself to be bulk. Best
-    /// effort: the kernel refuses past the budget, and then the small pipe just
-    /// keeps needing more round trips.
-    fn grow(&mut self) {
-        if self.size >= CHUNK {
-            return;
-        }
-        let r = unsafe { libc::fcntl(self.write, libc::F_SETPIPE_SZ, CHUNK as libc::c_int) };
-        self.size = if r < 0 { CHUNK } else { r as usize };
     }
 }
 
@@ -161,11 +139,10 @@ async fn one_way(
     }
     // an idle connection takes no pipe: wait for the first byte
     from.readable().await?;
-    let Ok(mut pipe) = Pipe::new() else {
+    let Ok(pipe) = Pipe::new() else {
         return one_way_buffered(from, to, count).await;
     };
     let (from_fd, to_fd) = (from.as_raw_fd(), to.as_raw_fd());
-    let mut busy = 0u32;
     loop {
         let n = from
             .async_io(Interest::READABLE, || splice(from_fd, pipe.write, CHUNK))
@@ -174,8 +151,6 @@ async fn one_way(
             shutdown_write(to);
             return Ok(());
         }
-        // the pipe is empty before every refill, so `EAGAIN` above always
-        // means "the socket has nothing" and below "the socket buffer is full"
         let mut left = n;
         while left > 0 {
             let m = to
@@ -187,17 +162,6 @@ async fn one_way(
             left -= m;
         }
         count(n as u64);
-        // A splice cannot be told to "fill the pipe": its 16 slots take whatever
-        // page fragments the socket holds, so n rarely reaches the capacity. A
-        // run of big ones is the sign of a bulk flow, and that one gets room.
-        if n >= BUSY_BYTES {
-            busy += 1;
-            if busy == BUSY_RUN {
-                pipe.grow();
-            }
-        } else {
-            busy = 0;
-        }
     }
 }
 

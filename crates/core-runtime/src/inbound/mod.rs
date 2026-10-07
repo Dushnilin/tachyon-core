@@ -393,9 +393,16 @@ where
             if !prefix.is_empty() {
                 writer.write_chunk(prefix).await?;
             }
-            let (mut client_read, mut client_write) = tokio::io::split(client);
+            let chunk_size = usize::from(writer.max_chunk());
+            let ss_buf_size = match relay_buf().checked_div(chunk_size) {
+                Some(whole) => (whole * chunk_size).max(chunk_size),
+                None => relay_buf(),
+            };
             let mut up_buf = take_buf();
+            up_buf.resize(ss_buf_size, 0);
             let mut down_buf = take_buf();
+            down_buf.resize(ss_buf_size, 0);
+            let (mut client_read, mut client_write) = tokio::io::split(client);
             let up = async {
                 loop {
                     let n = client_read.read(&mut up_buf).await?;
@@ -465,7 +472,7 @@ fn relay_buf() -> usize {
         if online_cores().is_some_and(|cores| (1..=2).contains(&cores)) {
             16 * 1024
         } else {
-            128 * 1024
+            2 * 65535
         }
     })
 }

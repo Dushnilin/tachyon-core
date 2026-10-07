@@ -328,13 +328,6 @@ impl DnsService {
         (entry.expires > Instant::now()).then(|| entry.domain.clone())
     }
 
-    /// What the caller gets back: reverse-mapping bookkeeping, then the
-    /// client's own id stamped onto the response.
-    fn answer(&self, target: &ServerConfig, raw: &[u8], id: u16) -> std::io::Result<Vec<u8>> {
-        self.record_reverse(raw, target.is_fakeip());
-        codec::set_id(raw, id)
-    }
-
     /// Run the rule walk and produce the raw response for `query`.
     ///
     /// `allow_fakeip` is false for address lookups (outbound server
@@ -449,14 +442,16 @@ impl DnsService {
                 }
                 let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
                     .map_err(std::io::Error::other)?;
-                return self.answer(&target, &raw, info.id);
+                self.record_reverse(&raw, target.is_fakeip());
+                return codec::set_id(&raw, info.id);
             }
             Kind::Local => {
                 if mdns::is_local_domain(&info.name)
                     && let Some(mdns_result) = self.local_zone_mdns(query).await
                 {
                     let raw = mdns_result?;
-                    return self.answer(&target, &raw, info.id);
+                    self.record_reverse(&raw, target.is_fakeip());
+                    return codec::set_id(&raw, info.id);
                 }
                 let addrs = match self.neighbor_lookup(&target, &info.name) {
                     Some(addresses) => addresses,
@@ -467,7 +462,8 @@ impl DnsService {
                 }
                 let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
                     .map_err(std::io::Error::other)?;
-                return self.answer(&target, &raw, info.id);
+                self.record_reverse(&raw, target.is_fakeip());
+                return codec::set_id(&raw, info.id);
             }
             _ => {}
         }
@@ -477,7 +473,8 @@ impl DnsService {
             let service: Arc<DnsService> = Arc::clone(self);
             let members: Arc<dyn group::Members> = service;
             let raw = group.exchange(members, query).await?;
-            return self.answer(&target, &raw, info.id);
+            self.record_reverse(&raw, target.is_fakeip());
+            return codec::set_id(&raw, info.id);
         }
 
         if target.is_fakeip() {
@@ -503,11 +500,14 @@ impl DnsService {
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
             let hit = self.cache.read().expect("dns cache").get(&key, now);
+            // reverse mapping was already recorded when this answer went into
+            // the cache; re-recording identical bytes per hit cost a full
+            // message parse. Just stamp the client id.
             match hit {
-                Some(CacheHit::Fresh(raw)) => return self.answer(&target, &raw, info.id),
+                Some(CacheHit::Fresh(raw)) => return codec::set_id(&raw, info.id),
                 Some(CacheHit::Stale(raw)) => {
                     self.spawn_refresh(meta.clone(), query.to_vec(), allow_fakeip, key.clone());
-                    return self.answer(&target, &raw, info.id);
+                    return codec::set_id(&raw, info.id);
                 }
                 None => {}
             }
@@ -526,15 +526,18 @@ impl DnsService {
             let now = std::time::Instant::now();
             if let Some(CacheHit::Fresh(raw)) = self.cache.read().expect("dns cache").get(&key, now)
             {
-                return self.answer(&target, &raw, info.id);
+                return codec::set_id(&raw, info.id);
             }
         }
 
         let response = self.exchange_remote(&target, query).await?;
-        let rewritten = match opts.rewrite_ttl {
-            Some(ttl) => codec::rewrite_ttl(&response, ttl)?,
-            None => response,
+        let rewritten: Arc<[u8]> = match opts.rewrite_ttl {
+            Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
+            None => response.into(),
         };
+        // one reverse-map write per wire answer, here; the fakeip target has
+        // its own store and was answered above.
+        self.record_reverse(&rewritten, target.is_fakeip());
 
         if use_cache && let Ok(meta_resp) = codec::response_meta(&rewritten) {
             let cacheable = matches!(
@@ -553,10 +556,10 @@ impl DnsService {
                 } else {
                     meta_resp
                 };
-                cache.insert(key.clone(), rewritten.clone(), &meta_for_insert, optimistic);
+                cache.insert(key.clone(), Arc::clone(&rewritten), &meta_for_insert, optimistic);
             }
         }
-        self.answer(&target, &rewritten, info.id)
+        codec::set_id(&rewritten, info.id)
     }
 
     fn spawn_refresh(

@@ -66,6 +66,24 @@ fn corpus() -> Vec<Value> {
         ]}),
         json!({"type": "logical", "mode": "and", "rules": []}),
         json!({"type": "logical"}),
+        // The tree shapes: invert on the logical node itself, a logical rule
+        // inside a logical rule, an inverted sub-rule, and a sub-rule that is
+        // not an object at all.
+        json!({"type": "logical", "mode": "or", "invert": true, "rules": [
+            {"domain": ["inverted-logical.com"]},
+            {"port": [9999]}
+        ]}),
+        json!({"type": "logical", "mode": "and", "rules": [
+            {"type": "logical", "mode": "or", "rules": [
+                {"domain": ["nested.com"]},
+                {"port": [8443]}
+            ]},
+            {"invert": true, "domain": ["never-nested.com"]}
+        ]}),
+        json!({"type": "logical", "mode": "or", "rules": [
+            "not-an-object",
+            {"domain": ["sub-with-junk.com"]}
+        ]}),
         json!({}),
         json!({"unknown_field": ["ignored.com"]}),
         Value::String("not-an-object".into()),
@@ -135,6 +153,10 @@ fn contexts() -> Vec<ConnContext> {
         "ignored.com",
         "UPPER.COM",
         "MiXeD.example.com",
+        "inverted-logical.com",
+        "nested.com",
+        "never-nested.com",
+        "sub-with-junk.com",
     ] {
         out.push(context(Some(host), None, 443, "10.0.0.2:1234", "tcp"));
         out.push(context(Some(host), None, 80, "192.168.1.50:5000", "udp"));

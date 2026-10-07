@@ -44,8 +44,10 @@
 //! every simple rule in a set can contribute its entries to shared pools and the
 //! set can be tested pool by pool.
 //!
-//! What cannot be merged stays on the old path, unchanged: `logical` rules, and
-//! anything with `invert`, where flattening would invert the wrong thing.
+//! What cannot be merged still does not join the pools: `logical` rules, and
+//! anything with `invert`, where flattening would invert the wrong thing. They
+//! are compiled instead into `FallbackRule`, a tree of the same structures, so
+//! a connection costs comparisons rather than JSON walks.
 //!
 //! # Why not a trie
 //!
@@ -81,7 +83,8 @@ use serde_json::Value;
 
 use crate::inbound::Target;
 use crate::route::ConnContext;
-use crate::route::rule_set::{list, match_rule, ports};
+use crate::route::rule::{domain_host, domain_suffix_match};
+use crate::route::rule_set::{list, ports};
 
 /// Masking, without pulling `num_traits` in for two shifts.
 trait Network: Ord + Copy {
@@ -213,10 +216,22 @@ pub struct RuleSetIndex {
     empty: bool,
 }
 
-/// The rules `compile` could not flatten, which keep the old interpreter.
+/// The rules `compile` could not flatten, compiled into a tree that answers
+/// without touching JSON.
+///
+/// The interpreter behind them (`route::rule_set::match_rule`) re-derived
+/// everything per connection: a deep `Vec<Value>` clone for a `logical` rule,
+/// eight `list()`/`ports()` allocations across its fields, CIDRs re-parsed
+/// from strings, `domain_host` producing a `String`. On a real config with
+/// `{ "invert": true, "domain": [...] }` geo lists that was a dozen
+/// allocations and a parse per rule per connection. The tree keeps the
+/// *same* acceptance rules -- the shapes are built from the same `list()`
+/// and `ports()` calls, the same `insert_prefix` and `parse_ranges` the
+/// pools use -- and `rule_set_compiled` runs it against the interpreter as
+/// the oracle.
 #[derive(Debug, Default, Clone)]
 pub struct Fallbacks {
-    rules: Vec<Value>,
+    rules: Vec<FallbackRule>,
 }
 
 impl Fallbacks {
@@ -229,7 +244,181 @@ impl Fallbacks {
     }
 
     pub fn matches(&self, ctx: &ConnContext) -> bool {
-        self.rules.iter().any(|rule| match_rule(rule, ctx))
+        self.rules.iter().any(|rule| rule.matches(ctx))
+    }
+}
+
+/// One fallback rule. Both variants keep the interpreter's outer `invert`,
+/// applied to the node's own outcome.
+#[derive(Debug, Clone)]
+enum FallbackRule {
+    /// `type: logical`. `mode: or` is `any`, everything else -- including the
+    /// default -- is `all` over a *non-empty* list: the interpreter's
+    /// `!rules.is_empty() && rules.iter().all(..)` guard, kept because an
+    /// empty `and` answers false here, not vacuous truth.
+    Logical {
+        all: bool,
+        inverted: bool,
+        rules: Vec<FallbackRule>,
+    },
+    /// A rule with `invert`, or any rule sitting inside a logical tree. The
+    /// body is shaped like the pooled index, so matching is the same code
+    /// over the same acceptance rules. Boxed because the pools make it far
+    /// larger than the `Logical` arm, and a fallback rule is built once.
+    Plain(Box<PlainRule>),
+}
+
+impl FallbackRule {
+    fn compile(object: &serde_json::Map<String, Value>) -> Self {
+        if object.get("type").and_then(Value::as_str) == Some("logical") {
+            let subs = object
+                .get("rules")
+                .and_then(Value::as_array)
+                .map(|subs| {
+                    subs.iter()
+                        .map(|sub| match sub.as_object() {
+                            Some(object) => FallbackRule::compile(object),
+                            // the interpreter refuses a non-object before it
+                            // looks at invert, and an empty plain rule answers
+                            // exactly that false
+                            None => FallbackRule::Plain(Box::default()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return FallbackRule::Logical {
+                all: object.get("mode").and_then(Value::as_str) != Some("or"),
+                inverted: object.get("invert") == Some(&Value::Bool(true)),
+                rules: subs,
+            };
+        }
+        FallbackRule::Plain(Box::new(PlainRule::compile(object)))
+    }
+
+    fn matches(&self, ctx: &ConnContext) -> bool {
+        match self {
+            FallbackRule::Plain(rule) => rule.matches(ctx),
+            FallbackRule::Logical {
+                all,
+                inverted,
+                rules,
+            } => {
+                let matched = if *all {
+                    !rules.is_empty() && rules.iter().all(|rule| rule.matches(ctx))
+                } else {
+                    rules.iter().any(|rule| rule.matches(ctx))
+                };
+                matched != *inverted
+            }
+        }
+    }
+}
+
+/// One plain rule, folded the way `RuleSetIndex::add_rule` folds a simple
+/// rule, but kept to itself because `invert` would invert the wrong thing if
+/// it were merged into the shared pools.
+#[derive(Debug, Clone, Default)]
+struct PlainRule {
+    inverted: bool,
+    domains: HashSet<Box<str>>,
+    /// Kept as a list and tested with the interpreter's own
+    /// `domain_suffix_match`: the label boundary, the leading-dot form and
+    /// the degenerate empty suffix all behave exactly as before, which a
+    /// label-walk over a set would not for the last one.
+    suffixes: Vec<Box<str>>,
+    keywords: Vec<Box<str>>,
+    dest_v4: PrefixSet<u32>,
+    dest_v6: PrefixSet<u128>,
+    source_v4: PrefixSet<u32>,
+    source_v6: PrefixSet<u128>,
+    dest_ports: Vec<u16>,
+    dest_port_ranges: PortRanges,
+    source_ports: Vec<u16>,
+    source_port_ranges: PortRanges,
+    networks: Vec<Box<str>>,
+}
+
+impl PlainRule {
+    fn compile(object: &serde_json::Map<String, Value>) -> Self {
+        let mut rule = PlainRule {
+            inverted: object.get("invert") == Some(&Value::Bool(true)),
+            ..PlainRule::default()
+        };
+        for entry in list(object.get("domain")) {
+            rule.domains.insert(entry.into_boxed_str());
+        }
+        rule.suffixes
+            .extend(list(object.get("domain_suffix")).into_iter().map(String::into_boxed_str));
+        rule.keywords
+            .extend(list(object.get("domain_keyword")).into_iter().map(String::into_boxed_str));
+
+        for entry in list(object.get("ip_cidr")) {
+            insert_prefix(&mut rule.dest_v4, &mut rule.dest_v6, &entry);
+        }
+        for entry in list(object.get("source_ip_cidr")) {
+            insert_prefix(&mut rule.source_v4, &mut rule.source_v6, &entry);
+        }
+
+        rule.dest_ports.extend(ports(object.get("port")));
+        rule.dest_port_ranges
+            .0
+            .extend(parse_ranges(list(object.get("port_range"))));
+        rule.source_ports.extend(ports(object.get("source_port")));
+        rule.source_port_ranges
+            .0
+            .extend(parse_ranges(list(object.get("source_port_range"))));
+
+        for entry in list(object.get("network")) {
+            if !rule.networks.iter().any(|known| **known == *entry) {
+                rule.networks.push(entry.into_boxed_str());
+            }
+        }
+
+        rule.dest_ports.sort_unstable();
+        rule.dest_ports.dedup();
+        rule.source_ports.sort_unstable();
+        rule.source_ports.dedup();
+        rule.dest_port_ranges.build();
+        rule.source_port_ranges.build();
+        rule.dest_v4.build();
+        rule.dest_v6.build();
+        rule.source_v4.build();
+        rule.source_v6.build();
+        rule
+    }
+
+    fn matches(&self, ctx: &ConnContext) -> bool {
+        let mut matched = false;
+        if let Some(host) = domain_host(ctx) {
+            matched |= self.domains.contains(host.as_ref());
+            matched |= self
+                .suffixes
+                .iter()
+                .any(|entry| domain_suffix_match(&host, entry));
+            matched |= self
+                .keywords
+                .iter()
+                .any(|entry| host.contains(entry.as_ref()));
+        }
+        if let Target::Ip(addr) = &ctx.destination {
+            matched |= match addr.ip() {
+                IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
+                IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
+            };
+        }
+        let source = ctx.source.ip();
+        matched |= match source {
+            IpAddr::V4(v4) => self.source_v4.contains(v4.into()),
+            IpAddr::V6(v6) => self.source_v6.contains(v6.into()),
+        };
+        let port = ctx.destination.port();
+        matched |= self.dest_ports.binary_search(&port).is_ok()
+            || self.dest_port_ranges.contains(port);
+        let source_port = ctx.source.port();
+        matched |= self.source_ports.binary_search(&source_port).is_ok()
+            || self.source_port_ranges.contains(source_port);
+        matched |= self.networks.iter().any(|known| **known == *ctx.network);
+        matched != self.inverted
     }
 }
 
@@ -253,7 +442,7 @@ impl RuleSetIndex {
             let inverted = object.get("invert") == Some(&Value::Bool(true));
             let logical = object.get("type").and_then(Value::as_str) == Some("logical");
             if inverted || logical {
-                fallbacks.rules.push(rule.clone());
+                fallbacks.rules.push(FallbackRule::compile(object));
                 continue;
             }
             index.add_rule(object);

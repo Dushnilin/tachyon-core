@@ -452,7 +452,8 @@ impl ClientInstance {
                     raw: BytesMut::new(),
                     stage: Vec::new(),
                     rec: None,
-                    out_rest: None,
+                    out_buf: Vec::new(),
+                    out_pos: 0,
                     out_flush: false,
                     out_nonce: [0u8; 12],
                     in_nonce: [0u8; 12],
@@ -595,7 +596,8 @@ impl ClientInstance {
             raw: BytesMut::new(),
             stage: Vec::new(),
             rec: None,
-            out_rest: None,
+            out_buf: Vec::new(),
+            out_pos: 0,
             out_flush: false,
             out_nonce: [0u8; 12],
             in_nonce,
@@ -681,7 +683,8 @@ pub struct EncryptedConn {
     rec: Option<([u8; RECORD_HEADER], usize)>,
     /// record bytes the kernel has not taken yet, and whether an
     /// interrupted flush is what the conn still owes the caller
-    out_rest: Option<Vec<u8>>,
+    out_buf: Vec<u8>,
+    out_pos: usize,
     out_flush: bool,
     out_nonce: [u8; 12],
     in_nonce: [u8; 12],
@@ -695,7 +698,9 @@ pub struct EncryptedConn {
 const RECORD_MAX: usize = 8192;
 
 impl EncryptedConn {
-    fn poll_build_record(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
+    /// Append one encrypted record for `chunk` (capped at `RECORD_MAX`)
+    /// directly onto `out`, which may already hold the pre_write bytes.
+    fn poll_build_record_into(&mut self, buf: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         let chunk_len = buf.len().min(RECORD_MAX);
         let chunk = &buf[..chunk_len];
         let Some((_ctx, aead_opt)) = self.aead.as_mut() else {
@@ -708,15 +713,15 @@ impl EncryptedConn {
         let mut header = [0u8; RECORD_HEADER];
         encode_header(&mut header, l);
         increase_nonce(&mut self.out_nonce);
-        let mut out = Vec::with_capacity(RECORD_HEADER + l);
+        let start = out.len();
         out.extend_from_slice(&header);
         out.extend_from_slice(chunk);
-        let tag = aead.seal_region(&self.out_nonce, &header, &mut out[RECORD_HEADER..]);
+        let tag = aead.seal_region(&self.out_nonce, &header, &mut out[start + RECORD_HEADER..]);
         out.extend_from_slice(&tag);
         if let Some(ctr) = &mut self.xor_out_ctr {
-            xor_stream(ctr, &mut self.out_skip, &mut out);
+            xor_stream(ctr, &mut self.out_skip, &mut out[start..]);
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -751,36 +756,37 @@ impl AsyncWrite for EncryptedConn {
             this.out_flush = false;
             return Poll::Ready(Ok(consumed));
         }
-        // a record left over from a Pending call finishes first; the caller
-        // re-submits the same buffer until we report progress
-        let mut rest = match this.out_rest.take() {
-            Some(rest) => rest,
-            None => {
-                if this.aead.as_ref().and_then(|a| a.1.as_ref()).is_none() {
-                    return Poll::Ready(Err(io::Error::other("vless-enc: 0rtt aead not ready")));
-                }
-                let record = this.poll_build_record(buf)?;
-                let mut all = this.pre_write.take().unwrap_or_default();
-                all.extend_from_slice(&record);
-                all
+        if this.out_pos >= this.out_buf.len() {
+            // nothing staged: pre_write (0-RTT client hello) leads, then the
+            // record is built straight into the same buffer — no intermediate
+            // Vec, no second copy of the payload
+            if this.aead.as_ref().and_then(|a| a.1.as_ref()).is_none() {
+                return Poll::Ready(Err(io::Error::other("vless-enc: 0rtt aead not ready")));
             }
-        };
-        while !rest.is_empty() {
-            match Pin::new(&mut this.inner).poll_write(cx, &rest) {
-                Poll::Pending => {
-                    this.out_rest = Some(rest);
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(err)) => {
-                    this.out_rest = Some(rest);
-                    return Poll::Ready(Err(err));
-                }
+            let pre_write = this.pre_write.take();
+            let mut staged = std::mem::take(&mut this.out_buf);
+            staged.clear();
+            if let Some(pre) = &pre_write {
+                staged.extend_from_slice(pre);
+            }
+            if let Err(err) = this.poll_build_record_into(buf, &mut staged) {
+                this.pre_write = pre_write;
+                this.out_buf = staged;
+                return Poll::Ready(Err(err));
+            }
+            this.out_buf = staged;
+            this.out_pos = 0;
+        }
+        while this.out_pos < this.out_buf.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.out_buf[this.out_pos..]) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
-                Poll::Ready(Ok(n)) => {
-                    rest.drain(..n);
-                }
+                Poll::Ready(Ok(n)) => this.out_pos += n,
             }
         }
+        this.out_buf.clear();
+        this.out_pos = 0;
         this.out_flush = true;
         ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
         this.out_flush = false;

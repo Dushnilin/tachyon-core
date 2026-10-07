@@ -158,7 +158,8 @@ where
 {
     let mut salt = vec![0u8; method.salt_len()];
     stream.read_exact(&mut salt).await?;
-    let mut cipher = Cipher::new(method, &derive_subkey(method, &master_key, &salt));
+    let subkey = derive_subkey(method, &master_key, &salt);
+    let mut cipher = Cipher::new(method, &subkey.0[..subkey.1]);
     let mut counter = 0u64;
     let head = if method.is_2022() {
         read_2022_head(&mut stream, &mut cipher, &mut counter).await?
@@ -598,7 +599,7 @@ impl ServerWriter {
         let mut salt = vec![0u8; self.method.salt_len()];
         random_bytes(&mut salt)?;
         let subkey = derive_subkey(self.method, &self.master_key, &salt);
-        let mut cipher = Cipher::new(self.method, &subkey);
+        let mut cipher = Cipher::new(self.method, &subkey.0[..subkey.1]);
         let mut counter = 0u64;
         let mut out = salt;
         // the 2022 head goes out as a bare sealed block, the way the client

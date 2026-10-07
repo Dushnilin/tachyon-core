@@ -21,12 +21,14 @@ use crate::inbound::AnyStream;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
 
-/// One frame's worth of plaintext. The frame's length field is a `u16`
-/// covering ciphertext, tag and padding, so the ceiling is what still encodes
-/// with a full pad: 15 000 sat far below it, and every 15 KB paid a framing
-/// pass and a record-sized wake-up on the read side.
-pub(crate) const WRITE_CHUNK: usize =
-    u16::MAX as usize - CIPHER_OVERHEAD - (MAX_PADDING as usize - 1);
+/// One frame's worth of plaintext. The length field is a `u16`, but the chunk
+/// must also fit the far end's read buffer whole: the reference server reads
+/// an AEAD chunk in one piece into a fixed 16 KiB-class buffer and answers a
+/// bigger one with `short buffer: stream chunk need N` -- the length field is
+/// not the limit, the reader's buffer is. 16 305 + tag = 16 321, inside the
+/// 16 KiB window; the raise to a `u16`-sized chunk that once lived here broke
+/// every reference server, so it is not coming back.
+pub(crate) const WRITE_CHUNK: usize = 16 * 1024 - CIPHER_OVERHEAD - (MAX_PADDING as usize - 1);
 /// How much of one `write` is framed into one buffer and leaves in one syscall:
 /// several full chunks, at least the 128 KiB the relay hands over at a time.
 pub(crate) const WRITE_BATCH: usize = 4 * WRITE_CHUNK;
@@ -64,28 +66,24 @@ fn chunk_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
 
 /// Body cipher; chacha keys expand via `GenerateChacha20Poly1305Key`.
 pub(crate) enum BodyAead {
-    Aes(Box<Gcm>),
-    ChaCha(Box<ChaCha20Poly1305>),
+    Aes(Gcm),
+    ChaCha(ChaCha20Poly1305),
 }
 
 impl BodyAead {
     pub(crate) fn new(security: u8, key16: &[u8; 16]) -> Self {
         if security == super::SEC_CHACHA20_POLY1305 {
-            Self::ChaCha(Box::new(
+            Self::ChaCha(
                 ChaCha20Poly1305::new_from_slice(&chacha_key(key16)).expect("chacha key length"),
-            ))
+            )
         } else {
-            Self::Aes(Box::new(Gcm::new(key16)))
+            Self::Aes(Gcm::new(key16))
         }
     }
 
     /// Keyed with KDF16(key, "auth_len"); cipher type follows the body security.
     pub(crate) fn auth_len(security: u8, key16: &[u8; 16]) -> Self {
         Self::new(security, &kdf16(key16, &[b"auth_len"]))
-    }
-
-    pub(crate) fn seal(&self, counter: u16, iv: &[u8; 16], buf: &mut Vec<u8>) -> io::Result<()> {
-        self.seal_from(counter, iv, buf, 0)
     }
 
     /// Seal `buf[from..]` where it lies and append the tag: a frame is built in
@@ -240,12 +238,14 @@ impl BodyWriter {
             let stored = (ct_len as u16)
                 .wrapping_add(pad_len)
                 .wrapping_sub(CIPHER_OVERHEAD as u16);
-            let mut len_block = stored.to_be_bytes().to_vec();
-            if let Some(auth) = &mut self.auth {
-                auth.seal(self.auth_count, &self.auth_iv, &mut len_block)?;
+            // the two length bytes go straight into the frame and are sealed
+            // where they lie — no per-chunk Vec for the block
+            let from = out.len();
+            out.extend_from_slice(&stored.to_be_bytes());
+            if let Some(auth) = &self.auth {
+                auth.seal_from(self.auth_count, &self.auth_iv, out, from)?;
                 self.auth_count = self.auth_count.wrapping_add(1);
             }
-            out.extend_from_slice(&len_block);
         } else {
             let mut len16 = (ct_len as u16).wrapping_add(pad_len);
             if self.chunk_masking

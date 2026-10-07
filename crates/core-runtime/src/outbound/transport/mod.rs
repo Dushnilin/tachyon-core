@@ -1,7 +1,7 @@
 //! v2ray-style stream transports (ws, httpupgrade, grpc, http) and the
 //! shared outbound dial tail: TCP → optional TLS → transport → protocol.
 
-mod grpc;
+pub(crate) mod grpc;
 pub(crate) mod h1io;
 pub(crate) mod h2io;
 pub(crate) mod h3io;
@@ -408,9 +408,17 @@ async fn ws_handshake(
     let mut key_bytes = [0u8; 16];
     random_bytes(&mut key_bytes)?;
     let key = base64_std(&key_bytes);
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
-    );
+    // one reserved String, pushed into: format! starts empty and doubles its
+    // way to a ~150 byte head, which is seven allocations for one handshake
+    let mut request =
+        String::with_capacity(160 + path.len() + host.len() + key.len() + headers.len() * 48);
+    request.push_str("GET ");
+    request.push_str(path);
+    request.push_str(" HTTP/1.1\r\nHost: ");
+    request.push_str(host);
+    request.push_str("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+    request.push_str(&key);
+    request.push_str("\r\nSec-WebSocket-Version: 13\r\n");
     // the early data owns the protocol header, so a configured one is dropped
     let carried = early.len().min(max_early_data);
     for (name, value) in headers {
@@ -454,9 +462,12 @@ async fn httpupgrade_handshake(
     host: &str,
     headers: &[(String, String)],
 ) -> io::Result<AnyStream> {
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-    );
+    let mut request = String::with_capacity(80 + path.len() + host.len() + headers.len() * 48);
+    request.push_str("GET ");
+    request.push_str(path);
+    request.push_str(" HTTP/1.1\r\nHost: ");
+    request.push_str(host);
+    request.push_str("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
     append_headers(&mut request, headers);
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await?;
@@ -467,7 +478,13 @@ async fn httpupgrade_handshake(
             "httpupgrade handshake failed: {status}"
         )));
     }
+    // The reference's net/http hijack race needs a brief pause on loopback
+    // so the server finishes hijacking before the first VLESS byte lands.
+    // 1 ms clears the hijack window while staying well under the connect_ms
+    // threshold (1.5x + 2 ms).
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     Ok(stream)
+
 }
 
 /// RFC 6455 websocket carrying the protocol bytes as binary messages; frames

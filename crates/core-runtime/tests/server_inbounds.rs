@@ -920,6 +920,145 @@ async fn vless_server_over_tls_carries_our_own_client_traffic() {
     assert_eq!(String::from_utf8_lossy(&got), "through-tls");
 }
 
+/// gRPC is the h2 POST stream, plain TCP: prior knowledge, no upgrade.
+#[tokio::test]
+async fn vless_server_over_grpc_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "grpc", "service_name": "bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "grpc", "service_name": "bench"});
+    let got = through_our_own_client(server, client, b"through-grpc")
+        .await
+        .expect("vless over grpc round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-grpc");
+}
+
+/// The same over TLS, which is where the ALPN matters: the server has to
+/// offer and pick `h2`, or the client's h2 handshake never starts.
+#[tokio::test]
+async fn vless_server_over_grpc_and_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "grpc", "service_name": "bench"});
+    server["tls"] = server_tls();
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "grpc", "service_name": "bench"});
+    client["tls"] = client_tls();
+    let got = through_our_own_client(server, client, b"through-grpc-tls")
+        .await
+        .expect("vless over grpc and tls round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-grpc-tls");
+}
+
+/// The service name is part of the path the server compares: a client asking
+/// for another one gets the reference's 404 and no tunnel at all.
+#[tokio::test]
+async fn a_grpc_server_refuses_a_client_with_another_service_name() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "grpc", "service_name": "bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "grpc", "service_name": "other"});
+    let got = through_our_own_client(server, client, b"nope")
+        .await
+        .unwrap_or_default();
+    assert!(
+        got.is_empty(),
+        "a refused grpc stream must not carry the payload: {got:?}"
+    );
+}
+
+/// XHTTP is several connections stitched into one stream: a download GET and
+/// the sequenced upload POSTs. The default mode is packet-up, which is what
+/// `auto` resolves to.
+#[tokio::test]
+async fn vless_server_over_xhttp_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let got = through_our_own_client(server, client, b"through-xhttp")
+        .await
+        .expect("vless over xhttp round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-xhttp");
+}
+
+/// The same over TLS, where the ALPN matters the other way round from gRPC:
+/// the listener has to offer `http/1.1` or the two negotiate nothing.
+#[tokio::test]
+async fn vless_server_over_xhttp_and_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    server["tls"] = server_tls();
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    client["tls"] = client_tls();
+    let got = through_our_own_client(server, client, b"through-xhttp-tls")
+        .await
+        .expect("vless over xhttp and tls round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-xhttp-tls");
+}
+
+/// stream-one: the whole session on one bidirectional POST to the bare path.
+#[tokio::test]
+async fn vless_server_over_xhttp_stream_one_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "stream-one"});
+    let got = through_our_own_client(server, client, b"through-stream-one")
+        .await
+        .expect("vless over xhttp stream-one round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-stream-one");
+}
+
+/// stream-up: one streamed POST for the upload direction plus the download
+/// GET. The download goes out first here, but the server is built so that
+/// the other order -- the upload arriving on its own connection before the
+/// GET -- births the session just the same.
+#[tokio::test]
+async fn vless_server_over_xhttp_stream_up_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "stream-up"});
+    let got = through_our_own_client(server, client, b"through-stream-up")
+        .await
+        .expect("vless over xhttp stream-up round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-stream-up");
+}
+
+/// The path is the first thing the server compares: another one is a 404 and
+/// no tunnel at all.
+#[tokio::test]
+async fn a_xhttp_server_refuses_another_path() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/other"});
+    let got = through_our_own_client(server, client, b"nope")
+        .await
+        .unwrap_or_default();
+    assert!(
+        got.is_empty(),
+        "a refused xhttp session must not carry the payload: {got:?}"
+    );
+}
+
 #[tokio::test]
 async fn trojan_server_over_tls_carries_our_own_client_traffic() {
     let _guard = test_guard().await;

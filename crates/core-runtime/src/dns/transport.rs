@@ -655,7 +655,9 @@ pub struct Dialer {
 impl Dialer {
     async fn tcp(&self, cfg: &ServerConfig, addr: SocketAddr) -> io::Result<AnyStream> {
         let Some(router) = &self.router else {
-            return Ok(Box::new(TcpStream::connect(addr).await?));
+            let tcp = TcpStream::connect(addr).await?;
+            let _ = tcp.set_nodelay(true);
+            return Ok(Box::new(tcp));
         };
         let target = crate::inbound::Target::Ip(addr);
         match &cfg.detour {

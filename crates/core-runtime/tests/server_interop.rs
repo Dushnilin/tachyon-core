@@ -1,8 +1,9 @@
 //! Our server inbounds (F5) measured against the reference *as the client*.
 //! The other direction already has a test -- our client against the reference's
 //! server -- and between them they are the only thing that catches a wire
-//! format we got wrong. Everything here is plain TCP: Vision is left out on
-//! purpose, since its server side needs a TLS server we do not have.
+//! format we got wrong. Everything here is plain TCP except the grpc+tls case,
+//! which needs the listener's ALPN to be right: Vision is left out on purpose,
+//! since it wants more than a handshake from this side.
 
 use std::net::SocketAddr;
 use std::process::{Child, Command};
@@ -188,6 +189,65 @@ server_test!(
     "vless",
     json!({"users": [{"name": "u", "uuid": UUID}]}),
     |port| json!({"type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port, "uuid": UUID})
+);
+
+server_test!(
+    vless_grpc_server_serves_the_reference_client,
+    "vless+grpc",
+    "vless",
+    json!({"users": [{"name": "u", "uuid": UUID}],
+           "transport": {"type": "grpc", "service_name": "interop"}}),
+    |port| json!({"type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port, "uuid": UUID,
+                  "transport": {"type": "grpc", "service_name": "interop"}})
+);
+
+// The same over TLS: the reference's grpc client is grpc-go, which refuses a
+// connection where the server negotiated no `h2`, so this is the case that
+// proves the inbound put `h2` on the listener's ALPN.
+server_test!(
+    vless_grpc_tls_server_serves_the_reference_client,
+    "vless+grpc+tls",
+    "vless",
+    json!({"users": [{"name": "u", "uuid": UUID}],
+           "transport": {"type": "grpc", "service_name": "interop"},
+           "tls": {"enabled": true,
+                   "certificate_path": format!("{}/../../tests/golden/certs/localhost.crt", env!("CARGO_MANIFEST_DIR")),
+                   "key_path": format!("{}/../../tests/golden/certs/localhost.key", env!("CARGO_MANIFEST_DIR"))}}),
+    |port| json!({"type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port, "uuid": UUID,
+                  "transport": {"type": "grpc", "service_name": "interop"},
+                  "tls": {"enabled": true, "server_name": "localhost", "insecure": true}})
+);
+
+// XHTTP: the reference's own client (packet-up, which is what `auto` resolves
+// to without REALITY) over cleartext, which is where its decideHTTPVersion
+// falls back to HTTP/1.1 and the wire is this server's.
+server_test!(
+    vless_xhttp_server_serves_the_reference_client,
+    "vless+xhttp",
+    "vless",
+    json!({"users": [{"name": "u", "uuid": UUID}],
+           "transport": {"type": "xhttp", "path": "/bench"}}),
+    |port| json!({"type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port, "uuid": UUID,
+                  "transport": {"type": "xhttp", "path": "/bench"}})
+);
+
+// ...and the same over TLS, where the client has to be told to ask for
+// HTTP/1.1: on its own it would offer h2, and this server's XHTTP is HTTP/1.1
+// only. The listener puts http/1.1 in its own ALPN either way, so what this
+// case proves is that the two meet on the one protocol both speak.
+server_test!(
+    vless_xhttp_tls_server_serves_the_reference_client,
+    "vless+xhttp+tls",
+    "vless",
+    json!({"users": [{"name": "u", "uuid": UUID}],
+           "transport": {"type": "xhttp", "path": "/bench"},
+           "tls": {"enabled": true,
+                   "certificate_path": format!("{}/../../tests/golden/certs/localhost.crt", env!("CARGO_MANIFEST_DIR")),
+                   "key_path": format!("{}/../../tests/golden/certs/localhost.key", env!("CARGO_MANIFEST_DIR"))}}),
+    |port| json!({"type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port, "uuid": UUID,
+                  "transport": {"type": "xhttp", "path": "/bench"},
+                  "tls": {"enabled": true, "server_name": "localhost", "insecure": true,
+                          "alpn": ["http/1.1"]}})
 );
 
 server_test!(

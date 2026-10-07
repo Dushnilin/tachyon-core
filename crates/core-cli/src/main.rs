@@ -1,3 +1,9 @@
+// The router build runs on musl/aarch64 where the system allocator is the
+// one thing every packet allocation goes through.
+#[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod rule_set;
 
 use std::path::{Path, PathBuf};
@@ -67,12 +73,23 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // and is a lie the moment something pins the process afterwards: the worker
     // count is fixed by then, and a worker per host core on two pinned cores is
     // sixteen runtimes fighting over two CPUs.
+    //
+    // One worker means one core: there the multi-thread runtime keeps paying
+    // for machinery nothing can use — the steal queues, the cross-worker
+    // handoffs — while every task switch could have been a plain loop over the
+    // ready queue, so that case takes the current-thread runtime instead.
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()
-        .map_err(|e| format!("run: {e}"))?;
+    let runtime = if workers == 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+    }
+    .map_err(|e| format!("run: {e}"))?;
     runtime
         .block_on(async { core_runtime::run(&path).await })
         .map_err(|e| format!("run: {e:#}"))

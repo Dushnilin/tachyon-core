@@ -7,8 +7,8 @@
 use blake2::digest::typenum::U16;
 use blake2::digest::{KeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::aead::{Aead, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::aead::{Aead, AeadInPlace, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag, XChaCha20Poly1305, XNonce};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
@@ -67,12 +67,12 @@ fn hash(data: &[u8]) -> [u8; 32] {
     Blake2s256::digest(data).into()
 }
 
-/// `HASH(a || b)` without intermediate allocation juggling.
+/// `HASH(a || b)` — incremental, no intermediate buffer.
 fn hash_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
-    let mut v = Vec::with_capacity(a.len() + b.len());
-    v.extend_from_slice(a);
-    v.extend_from_slice(b);
-    hash(&v)
+    let mut h = Blake2s256::new();
+    h.update(a);
+    h.update(b);
+    h.finalize().into()
 }
 
 /// RFC 2104 HMAC over BLAKE2s-256 (block size 64); `hmac`-crate types built
@@ -90,14 +90,14 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
         ipad[i] ^= k[i];
         opad[i] ^= k[i];
     }
-    let mut inner = Vec::with_capacity(64 + data.len());
-    inner.extend_from_slice(&ipad);
-    inner.extend_from_slice(data);
-    let inner = hash(&inner);
-    let mut outer = Vec::with_capacity(96);
-    outer.extend_from_slice(&opad);
-    outer.extend_from_slice(&inner);
-    hash(&outer)
+    let mut inner_h = Blake2s256::new();
+    inner_h.update(ipad);
+    inner_h.update(data);
+    let inner: [u8; 32] = inner_h.finalize().into();
+    let mut outer_h = Blake2s256::new();
+    outer_h.update(opad);
+    outer_h.update(inner);
+    outer_h.finalize().into()
 }
 
 /// `MAC(key, input)`: keyed BLAKE2s truncated to 16 bytes.
@@ -363,8 +363,8 @@ pub fn process_response(
     Ok(Session {
         local_index: hs.sender_index,
         remote_index,
-        send_key,
-        recv_key,
+        send_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
+        recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key)),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -380,8 +380,8 @@ const RECV_WINDOW: u64 = 2048;
 pub struct Session {
     pub local_index: u32,
     pub remote_index: u32,
-    send_key: [u8; 32],
-    recv_key: [u8; 32],
+    send_cipher: ChaCha20Poly1305,
+    recv_cipher: ChaCha20Poly1305,
     send_counter: u64,
     /// Highest accepted receive counter; bit `i` = counter `recv_max - i`.
     recv_max: u64,
@@ -410,15 +410,25 @@ impl Session {
             return None;
         }
         debug_assert!(padded_len >= packet.len());
-        let mut padded = packet.to_vec();
-        padded.resize(padded_len, 0);
         let counter = self.send_counter;
         self.send_counter += 1;
-        let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded.len() + 16);
+        let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded_len + 16);
         msg.extend_from_slice(&gen_type(self.awg_transport).to_le_bytes());
         msg.extend_from_slice(&self.remote_index.to_le_bytes());
         msg.extend_from_slice(&counter.to_le_bytes());
-        msg.extend_from_slice(&aead_seal(&self.send_key, counter, &padded, &[]));
+        msg.extend_from_slice(packet);
+        msg.resize(TRANSPORT_HEADER_LEN + padded_len, 0);
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter.to_le_bytes());
+        let tag = self
+            .send_cipher
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &[],
+                &mut msg[TRANSPORT_HEADER_LEN..],
+            )
+            .ok()?;
+        msg.extend_from_slice(&tag);
         Some(msg)
     }
 
@@ -441,7 +451,20 @@ impl Session {
         if counter > REJECT_AFTER_MESSAGES || !self.accept_counter(counter) {
             return None;
         }
-        aead_open(&self.recv_key, counter, &msg[16..], &[])
+        let body = &msg[TRANSPORT_HEADER_LEN..];
+        let (ciphertext, tag) = body.split_at(body.len() - 16);
+        let mut plain = ciphertext.to_vec();
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter.to_le_bytes());
+        self.recv_cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &[],
+                &mut plain,
+                Tag::from_slice(tag),
+            )
+            .ok()?;
+        Some(plain)
     }
 
     fn accept_counter(&mut self, counter: u64) -> bool {
@@ -614,8 +637,8 @@ mod tests {
         let mut a = Session {
             local_index: 1,
             remote_index: 2,
-            send_key: [1u8; 32],
-            recv_key: [2u8; 32],
+            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[1u8; 32])),
+            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[2u8; 32])),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -625,8 +648,8 @@ mod tests {
         let mut b = Session {
             local_index: 2,
             remote_index: 1,
-            send_key: [2u8; 32],
-            recv_key: [1u8; 32],
+            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[2u8; 32])),
+            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[1u8; 32])),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -654,8 +677,8 @@ mod tests {
         let mut s = Session {
             local_index: 1,
             remote_index: 2,
-            send_key: [0; 32],
-            recv_key: [0; 32],
+            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[0u8; 32])),
+            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[0u8; 32])),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,

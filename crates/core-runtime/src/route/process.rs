@@ -116,7 +116,57 @@ mod linux {
     ) -> Option<ProcessInfo> {
         let (files, need_remote) = tables(network);
         let inode = socket_inode(files, source, destination, need_remote)?;
-        read_process(pid_for_inode(inode)?)
+        process_for_inode(inode)
+    }
+
+    #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+    enum Key {
+        Inode(u64),
+        Pid(u32),
+    }
+
+    /// A few seconds of `inode → owner` and `pid → owner`, like the
+    /// reference's `route/process_cache.go`: the fd walk and the
+    /// `/proc/<pid>` reads per connection are the expensive halves, and a
+    /// pid is reused by every connection its process opens.
+    fn process_for_inode(inode: u64) -> Option<ProcessInfo> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        const TTL: Duration = Duration::from_secs(3);
+        static CACHE: OnceLock<Mutex<HashMap<Key, (Instant, ProcessInfo)>>> = OnceLock::new();
+
+        fn fresh(
+            cache: &Mutex<HashMap<Key, (Instant, ProcessInfo)>>,
+            key: Key,
+        ) -> Option<ProcessInfo> {
+            let map = cache.lock().expect("process cache");
+            let (at, info) = map.get(&key)?;
+            (at.elapsed() < TTL).then(|| info.clone())
+        }
+
+        let cache = CACHE.get_or_init(Mutex::default);
+        if let Some(info) = fresh(cache, Key::Inode(inode)) {
+            return Some(info);
+        }
+        let pid = pid_for_inode(inode)?;
+        let info = match fresh(cache, Key::Pid(pid)) {
+            Some(info) => info,
+            None => {
+                let info = read_process(pid)?;
+                cache
+                    .lock()
+                    .expect("process cache")
+                    .insert(Key::Pid(pid), (Instant::now(), info.clone()));
+                info
+            }
+        };
+        cache
+            .lock()
+            .expect("process cache")
+            .insert(Key::Inode(inode), (Instant::now(), info.clone()));
+        Some(info)
     }
 
     /// The inode of the socket with this local endpoint, from one table.

@@ -604,6 +604,10 @@ impl PeerRt {
 struct WgDevice {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
+    /// Recycled tx buffers: the pool behind `WgTxToken::consume`, so the
+    /// per-packet `vec![0; len]` stops hitting the allocator on every IP
+    /// packet the stack hands us.
+    free: Vec<Vec<u8>>,
     mtu: usize,
 }
 
@@ -612,6 +616,7 @@ impl WgDevice {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
+            free: Vec::new(),
             mtu,
         }
     }
@@ -632,6 +637,7 @@ impl PhyRxToken for WgRxToken {
 
 struct WgTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
+    free: &'a mut Vec<Vec<u8>>,
 }
 
 impl PhyTxToken for WgTxToken<'_> {
@@ -639,7 +645,13 @@ impl PhyTxToken for WgTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0; len];
+        let mut buffer = match self.free.pop() {
+            Some(mut b) => {
+                b.resize(len, 0);
+                b
+            }
+            None => vec![0; len],
+        };
         let result = f(&mut buffer);
         self.queue.push_back(buffer);
         result
@@ -666,6 +678,7 @@ impl Device for WgDevice {
             let rx = WgRxToken { buffer };
             let tx = WgTxToken {
                 queue: &mut self.tx,
+                free: &mut self.free,
             };
             (rx, tx)
         })
@@ -674,6 +687,7 @@ impl Device for WgDevice {
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(WgTxToken {
             queue: &mut self.tx,
+            free: &mut self.free,
         })
     }
 }
@@ -813,13 +827,15 @@ impl Stack {
     }
 
     /// Queue an IP packet to a peer: seal via the session or buffer until the
-    /// handshake completes.
-    fn xmit_to_peer(&mut self, pi: usize, pkt: Vec<u8>) {
+    /// handshake completes. Returns the packet back when it was sent and the
+    /// caller may recycle it.
+    fn xmit_to_peer(&mut self, pi: usize, pkt: Vec<u8>) -> Option<Vec<u8>> {
         let sealed = self.seal_transport(pi, &pkt);
         match sealed {
             Some(msg) => {
                 self.send_raw(pi, &msg);
                 self.peers[pi].last_sent = Some(Instant::now());
+                Some(pkt)
             }
             None => {
                 // Session missing or counter exhausted — drop the session and
@@ -833,6 +849,7 @@ impl Stack {
                 }
                 self.peers[pi].pending.push_back(pkt);
                 self.peers[pi].kick = true;
+                None
             }
         }
     }
@@ -1015,7 +1032,7 @@ impl Stack {
                 let dport = sess.target.port();
                 let src = self.cfg.local_addr;
                 let pkt = build_ipv4_udp(src, target_ip, port, dport, &bytes);
-                self.xmit_to_peer(pi, pkt);
+                let _ = self.xmit_to_peer(pi, pkt);
             }
             Cmd::UdpClose { port } => {
                 self.udp.remove(&port);
@@ -1193,13 +1210,15 @@ impl Stack {
 
     async fn flush_device_tx(&mut self) {
         while let Some(pkt) = self.device.tx.pop_front() {
-            let Some(dst) = ipv4_dst(&pkt) else {
-                continue;
+            let pkt = match ipv4_dst(&pkt).and_then(|dst| self.lpm(dst)) {
+                Some(pi) => self.xmit_to_peer(pi, pkt),
+                None => Some(pkt),
             };
-            let Some(pi) = self.lpm(dst) else {
-                continue;
-            };
-            self.xmit_to_peer(pi, pkt);
+            if let Some(pkt) = pkt
+                && self.device.free.len() < 64
+            {
+                self.device.free.push(pkt);
+            }
         }
     }
 
@@ -1411,7 +1430,7 @@ impl Stack {
                     .into_iter()
                     .collect();
                 for pkt in pending {
-                    self.xmit_to_peer(pi, pkt);
+                    let _ = self.xmit_to_peer(pi, pkt);
                 }
             }
         }

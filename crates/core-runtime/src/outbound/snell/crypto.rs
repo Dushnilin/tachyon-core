@@ -3,7 +3,7 @@
 
 use std::io;
 
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::{AeadInPlace, Tag};
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 
@@ -43,7 +43,9 @@ pub(crate) fn increase_nonce(nonce: &mut [u8; NONCE_LEN]) {
     }
 }
 
-/// Seal `data` in place, appending the 16 byte tag (empty AAD).
+/// Seal `data` in place, appending the 16 byte tag (empty AAD). Kept for
+/// the tests that round-trip `open_in_place`.
+#[cfg(test)]
 pub(crate) fn seal_in_place(
     cipher: &Aes128Gcm,
     nonce: &[u8; NONCE_LEN],
@@ -65,34 +67,64 @@ pub(crate) fn open_in_place(
         .map_err(|_| io::Error::other("snell: open record"))
 }
 
-/// Seal `data` in place with AAD, appending the 16 byte tag (v6 shaped
-/// records bind the record prefix / padding regions as associated data).
-pub(crate) fn seal_in_place_aad(
-    cipher: &Aes128Gcm,
-    nonce: &[u8; NONCE_LEN],
-    data: &mut Vec<u8>,
-    aad: &[u8],
-) -> io::Result<()> {
-    cipher
-        .encrypt_in_place(Nonce::from_slice(nonce), aad, data)
-        .map_err(|_| io::Error::other("snell: seal record"))
-}
-
-/// Open `data` (ciphertext + tag) in place with AAD, truncating to the
-/// plaintext.
-pub(crate) fn open_in_place_aad(
-    cipher: &Aes128Gcm,
-    nonce: &[u8; NONCE_LEN],
-    data: &mut Vec<u8>,
-    aad: &[u8],
-) -> io::Result<()> {
-    cipher
-        .decrypt_in_place(Nonce::from_slice(nonce), aad, data)
-        .map_err(|_| io::Error::other("snell: open record"))
-}
-
 pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     getrandom::fill(buf).map_err(|e| io::Error::other(format!("snell: rng: {e}")))
+}
+
+/// Seal one region in place with the tag written to a separate slice —
+/// record headers and single-record payloads (the batch path schedules
+/// its own regions through `gcm::BatchSealer`).
+pub(crate) fn seal_region(
+    cipher: &Aes128Gcm,
+    nonce: &[u8; NONCE_LEN],
+    buf: &mut [u8],
+    tag: &mut [u8; AEAD_TAG_LEN],
+) -> io::Result<()> {
+    let t = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), &[], buf)
+        .map_err(|_| io::Error::other("snell: seal region"))?;
+    tag.copy_from_slice(&t);
+    Ok(())
+}
+
+/// [`seal_region`] with associated data (v6 shaped records bind the
+/// record prefix / padding regions).
+pub(crate) fn seal_region_aad(
+    cipher: &Aes128Gcm,
+    nonce: &[u8; NONCE_LEN],
+    buf: &mut [u8],
+    aad: &[u8],
+    tag: &mut [u8; AEAD_TAG_LEN],
+) -> io::Result<()> {
+    let t = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, buf)
+        .map_err(|_| io::Error::other("snell: seal region"))?;
+    tag.copy_from_slice(&t);
+    Ok(())
+}
+
+/// Open a region holding `ciphertext || tag` in place with AAD; the
+/// trailing tag bytes stay in the buffer as stale data (callers read only
+/// the decrypted header fields from the front).
+pub(crate) fn open_region_aad(
+    cipher: &Aes128Gcm,
+    nonce: &[u8; NONCE_LEN],
+    sealed: &mut [u8],
+    aad: &[u8],
+) -> io::Result<()> {
+    if sealed.len() < AEAD_TAG_LEN {
+        return Err(io::Error::other("snell: short sealed region"));
+    }
+    let split = sealed.len() - AEAD_TAG_LEN;
+    let (ct, tag) = sealed.split_at_mut(split);
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(nonce),
+            aad,
+            ct,
+            Tag::<Aes128Gcm>::from_slice(tag),
+        )
+        .map_err(|_| io::Error::other("snell: open region"))
 }
 
 /// Uniform 31-bit random (reference `randomInt31`: LE u32 masked to 31 bits).

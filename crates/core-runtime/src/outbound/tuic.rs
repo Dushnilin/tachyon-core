@@ -16,9 +16,8 @@ use crate::logging;
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::quic::{
     CongestionKind, Defragger, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN, PoolLease, QuicStream,
-    QuicTunnelDefaults, QuicTunnelOptions, TUIC_MAX_UDP,
-    bind_udp, io_from_datagram, io_from_quinn, put_sing_addr_empty, put_sing_addr_port,
-    resolve_host, sing_addr_port_len, udp_loopback_pair,
+    QuicTunnelDefaults, QuicTunnelOptions, TUIC_MAX_UDP, bind_udp, io_from_datagram, io_from_quinn,
+    put_sing_addr_empty, put_sing_addr_port, resolve_host, sing_addr_port_len, udp_loopback_pair,
 };
 use crate::outbound::uot::{UOT_DEFAULT_VERSION, magic_authority, request_header, spawn_bridge};
 use crate::outbound::urltest::parse_duration;
@@ -145,8 +144,9 @@ impl Tuic {
             .enumerate()
             .min_by_key(|(_, s)| s.leases.load(Ordering::Relaxed));
         let shared = match best {
-            Some((i, s)) if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
-                || pool.len() >= POOL_MAX_CONNS =>
+            Some((i, s))
+                if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
+                    || pool.len() >= POOL_MAX_CONNS =>
             {
                 Arc::clone(&pool[i])
             }
@@ -355,7 +355,7 @@ impl TuicShared {
                 let Ok(data) = shared.conn.read_datagram().await else {
                     break;
                 };
-                handle_tuic_message(&shared, &data);
+                handle_tuic_message(&shared, data);
             }
         });
         *self.demux.lock().expect("demux") = Some(handle);
@@ -377,7 +377,7 @@ impl TuicShared {
                             Ok(b) => b,
                             Err(_) => return,
                         };
-                        handle_tuic_packet_body(&shared2, &body).await;
+                        handle_tuic_packet_body(&shared2, bytes::Bytes::from(body)).await;
                     });
                 }
             });
@@ -451,16 +451,16 @@ fn spawn_heartbeat(conn: quinn::Connection, period: Duration) -> tokio::task::Jo
     })
 }
 
-fn handle_tuic_message(shared: &Arc<TuicShared>, data: &[u8]) {
+fn handle_tuic_message(shared: &Arc<TuicShared>, data: bytes::Bytes) {
     if data.len() < 2 || data[0] != TUIC_VERSION {
         return;
     }
     match data[1] {
         CMD_PACKET => {
             let shared = Arc::clone(shared);
-            let body = data[2..].to_vec();
+            let body = data.slice(2..);
             tokio::spawn(async move {
-                handle_tuic_packet_body(&shared, &body).await;
+                handle_tuic_packet_body(&shared, body).await;
             });
         }
         CMD_HEARTBEAT => {}
@@ -468,17 +468,23 @@ fn handle_tuic_message(shared: &Arc<TuicShared>, data: &[u8]) {
     }
 }
 
-async fn handle_tuic_packet_body(shared: &Arc<TuicShared>, body: &[u8]) {
-    let Some((sid, pid, frag_id, frag_total, payload)) = parse_tuic_packet(body) else {
+async fn handle_tuic_packet_body(shared: &Arc<TuicShared>, body: bytes::Bytes) {
+    let Some((sid, pid, frag_id, frag_total, payload)) = parse_tuic_packet(&body) else {
         return;
     };
     let session = shared.sessions.lock().expect("sessions").get(&sid).cloned();
     let Some(session) = session else {
         return;
     };
+    // share the message instead of copying the payload out of it — bounded
+    // by the parsed length: a datagram may carry trailing bytes the parser
+    // does not consider part of the fragment
+    let len = payload.len();
+    let offset = payload.as_ptr() as usize - body.as_ptr() as usize;
+    let payload = body.slice(offset..offset + len);
     let complete = {
         let mut defrag = session.defragger.lock().expect("defrag");
-        defrag.feed(pid, frag_id, frag_total, payload.to_vec())
+        defrag.feed(pid, frag_id, frag_total, payload)
     };
     if let Some(pkt) = complete {
         let _ = session.sock.send(&pkt).await;

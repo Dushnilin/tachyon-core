@@ -13,7 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// What the server saw on a stream after the request head.
 #[derive(Debug, Default)]
 struct Seen {
-    version: u8,
     flags: u16,
     destination: String,
     payload: Vec<u8>,
@@ -53,14 +52,17 @@ async fn serve(mut socket: tokio::net::TcpStream, seen: Arc<std::sync::Mutex<Vec
         Ok(Some(Ok(chunk))) => payload.extend_from_slice(&chunk),
         _ => return,
     }
-    // [version][flags:u16][addr type][len][addr][port:u16][payload]
+    // [flags:u16][addr type][len][addr][port:u16][payload] — the version
+    // byte belongs to the session handshake, not to a stream request
     if payload.len() > 8 {
-        let flags = u16::from_be_bytes([payload[1], payload[2]]);
-        let name_len = usize::from(payload[4]);
-        let end = 5 + name_len;
-        let destination = String::from_utf8_lossy(&payload[5..end]).into_owned();
+        let flags = u16::from_be_bytes([payload[0], payload[1]]);
+        let name_len = usize::from(payload[3]);
+        let end = 4 + name_len;
+        if payload.len() < end + 2 {
+            return;
+        }
+        let destination = String::from_utf8_lossy(&payload[4..end]).into_owned();
         seen.lock().expect("seen").push(Seen {
-            version: payload[0],
             flags,
             destination,
             payload: payload[end + 2..].to_vec(),
@@ -92,7 +94,7 @@ async fn a_multiplexed_stream_carries_its_request_and_the_reply() {
 
     let options = mux::MuxOptions::parse(&serde_json::json!({"enabled": true}), "multiplex")
         .expect("options");
-    let client = mux::Client::new(options, false).expect("client");
+    let client = mux::Client::new(options).expect("client");
     client
         .set_dialer(Arc::new(move || {
             Box::pin(async move {
@@ -117,8 +119,7 @@ async fn a_multiplexed_stream_carries_its_request_and_the_reply() {
     let seen = seen.lock().expect("seen");
     assert_eq!(seen.len(), 1, "the server saw one stream request");
     let record = &seen[0];
-    assert_eq!(record.version, 0);
-    assert_eq!(record.flags & 1, 1, "the udp flag is set");
+    assert_eq!(record.flags, 0, "a tcp stream carries no flags");
     assert_eq!(record.destination, "example.com");
     assert_eq!(record.payload, b"ping", "the request rode with the payload");
     server.abort();

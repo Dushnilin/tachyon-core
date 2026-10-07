@@ -220,7 +220,10 @@ impl<W> V6Writer<W> {
             let salt_start = out.len();
             out.resize(salt_start + salt_block_len, 0u8);
             profile.fill_padding(u32::MAX, &mut out[salt_start..salt_start + salt_block_len]);
-            profile.write_salt_block(&self.salt, &mut out[salt_start..salt_start + salt_block_len]);
+            profile.write_salt_block(
+                &self.salt,
+                &mut out[salt_start..salt_start + salt_block_len],
+            );
             self.salt_sent = true;
         }
         let prefix_start = out.len();
@@ -877,9 +880,7 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
                     increase_nonce(&mut self.nonce);
                     self.body_filled = 0;
                     out.clear();
-                    out.extend_from_slice(
-                        &self.body[padding_len..padding_len + self.payload_len],
-                    );
+                    out.extend_from_slice(&self.body[padding_len..padding_len + self.payload_len]);
                     if let Err(e) = self.rearm_header() {
                         return Poll::Ready(Err(e));
                     }
@@ -891,12 +892,10 @@ impl<R: AsyncRead + Unpin> V6Reader<R> {
 
     pub(crate) async fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut out = Vec::new();
-        let found = std::future::poll_fn(|cx| {
-            match self.poll_read_record_inner(cx, &mut out) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Ready(Ok(found)) => Poll::Ready(Ok(found.is_some())),
-            }
+        let found = std::future::poll_fn(|cx| match self.poll_read_record_inner(cx, &mut out) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(found)) => Poll::Ready(Ok(found.is_some())),
         })
         .await?;
         Ok(found.then_some(out))

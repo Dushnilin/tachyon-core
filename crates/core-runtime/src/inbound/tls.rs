@@ -55,7 +55,31 @@ impl ServerTls {
         {
             return Ok(None);
         }
-        Ok(Some(Arc::new(Self::from_config(tls, at)?)))
+        let mut this = Self::from_config(tls, at)?;
+        // The transport type is part of the handshake, both ways: gRPC over
+        // TLS is HTTP/2, and the reference appends `h2` to the listener's
+        // ALPN before it serves (transport/v2ray/grpc.go), because a grpc-go
+        // client that negotiates nothing refuses the connection outright. XHTTP
+        // is the mirror image: this server speaks its HTTP/1.1 wire only, and
+        // a reference XHTTP client left to itself asks for `h2`, so the
+        // listener has to answer with `http/1.1` for the two to meet on one
+        // protocol at all.
+        let ty = obj
+            .get("transport")
+            .and_then(|t| t.get("type"))
+            .and_then(Value::as_str);
+        match ty {
+            Some("grpc") if !this.alpn.iter().any(|p| p == b"h2") => {
+                this.alpn.push(b"h2".to_vec());
+            }
+            // in front, not appended: the listener picks by its own order, and
+            // an `h2` this server cannot serve must not win the negotiation
+            Some("xhttp") if !this.alpn.iter().any(|p| p == b"http/1.1") => {
+                this.alpn.insert(0, b"http/1.1".to_vec());
+            }
+            _ => {}
+        }
+        Ok(Some(Arc::new(this)))
     }
 
     /// Read the block the way the reference's `common/tls.NewSTDServer` does:

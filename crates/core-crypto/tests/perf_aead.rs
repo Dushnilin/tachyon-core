@@ -63,7 +63,7 @@ fn perf_aead_shapes() {
         for size in [16usize, 18, 128, 15000, 16384, 65535] {
             let mut buf = vec![0x5Au8; size];
             let tag = gcm128.seal(&nonce, &[], &mut buf);
-            let mut iters = if size >= 1024 {
+            let iters = if size >= 1024 {
                 (1.5e8 / (size as f64 * 3.0)).max(64.0) as u64
             } else {
                 200_000

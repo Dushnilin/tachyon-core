@@ -167,27 +167,28 @@ pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
     out
 }
 
-fn hkdf_sha1_subkey(key: &[u8], salt: &[u8]) -> Vec<u8> {
-    let hk = Hkdf::<Sha1>::new(Some(salt), key);
-    let mut okm = vec![0u8; key.len()];
-    hk.expand(b"ss-subkey", &mut okm)
-        .expect("hkdf length is valid");
-    okm
+fn blake3_subkey(key: &[u8], salt: &[u8]) -> ([u8; 32], usize) {
+    let mut hash = blake3::Hasher::new_derive_key("shadowsocks 2022 session subkey");
+    hash.update(key);
+    hash.update(salt);
+    let derived = hash.finalize();
+    let derived = derived.as_bytes();
+    let mut out = [0u8; 32];
+    out[..key.len()].copy_from_slice(&derived[..key.len()]);
+    (out, key.len())
 }
 
-fn blake3_subkey(key: &[u8], salt: &[u8]) -> Vec<u8> {
-    let mut material = Vec::with_capacity(key.len() + salt.len());
-    material.extend_from_slice(key);
-    material.extend_from_slice(salt);
-    let derived = blake3::derive_key("shadowsocks 2022 session subkey", &material);
-    derived[..key.len()].to_vec()
-}
-
-pub fn derive_subkey(method: Method, master_key: &[u8], salt: &[u8]) -> Vec<u8> {
+/// The session subkey on the stack — 16 to 32 bytes, so a connection setup
+/// allocates nothing. Returns `(key, len)`; keys never exceed 32 bytes.
+pub fn derive_subkey(method: Method, master_key: &[u8], salt: &[u8]) -> ([u8; 32], usize) {
     if method.is_2022() {
         blake3_subkey(master_key, salt)
     } else {
-        hkdf_sha1_subkey(master_key, salt)
+        let hk = Hkdf::<Sha1>::new(Some(salt), master_key);
+        let mut out = [0u8; 32];
+        hk.expand(b"ss-subkey", &mut out[..master_key.len()])
+            .expect("hkdf length is valid");
+        (out, master_key.len())
     }
 }
 

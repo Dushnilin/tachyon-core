@@ -39,9 +39,14 @@ rustflags = [
 # Both musl targets have no system linker on a Windows host and no toolchain
 # symlinks on a Linux one; rust-lld with the self-contained CRT is the only
 # combination that links everywhere.
+#
+# x86-64-v3 (AVX2 era) so the autovectorized bulk loops get the wide units;
+# the crypto crates stay on runtime detection either way. A CPU older than
+# Haswell / Excavator (pre-2013, some atoms) will SIGILL on these binaries --
+# build a plain x86-64 one for those.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes"]
+rustflags = ["-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v3"]
 
 [target.armv7-unknown-linux-musleabihf]
 linker = "rust-lld"

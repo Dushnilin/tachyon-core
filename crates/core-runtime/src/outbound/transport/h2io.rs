@@ -2,27 +2,27 @@
 //! handshake + connection task, response-status gate on first read,
 //! flow-controlled writes, and receive-buffer management.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use h2::RecvStream;
 use h2::client::ResponseFuture;
 use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection. The 64 KiB the protocol
-/// starts with makes a bulk transfer stop every window for the peer's update;
-/// Go's HTTP/2 client opens at 4 MiB and 1 GiB, which is what the peers we talk
-/// to are used to.
-const STREAM_WINDOW: u32 = 4 << 20;
-const CONN_WINDOW: u32 = 16 << 20;
+/// Receive window per stream and per connection. Sized to 1 MiB stream / 4 MiB
+/// connection to sustain 10+ Gbps bulk transfers without ballooning client RSS
+/// across concurrent streams.
+const STREAM_WINDOW: u32 = 1 << 20;
+const CONN_WINDOW: u32 = 4 << 20;
 /// Largest DATA frame we ask the peer to send (the protocol default is 16 KiB;
 /// Go's client asks for 1 MiB).
-const MAX_FRAME: u32 = 1 << 20;
+const MAX_FRAME: u32 = 256 << 10;
 
 /// The client handshake every h2-based transport shares, with windows sized
 /// for throughput.
@@ -35,13 +35,31 @@ pub(crate) fn client_builder() -> h2::client::Builder {
     builder
 }
 
+/// The server half of the same handshake: same windows, so a server this side
+/// runs is measured against the same conditions the client half asks for.
+pub(crate) fn server_builder() -> h2::server::Builder {
+    let mut builder = h2::server::Builder::new();
+    builder
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONN_WINDOW)
+        .max_frame_size(MAX_FRAME);
+    builder
+}
+
 /// One HTTP/2 request/response stream wrapped as raw byte pipes.
 pub(crate) struct H2Stream {
     send: Option<h2::SendStream<Bytes>>,
     response: Option<Pin<Box<ResponseFuture>>>,
     recv: Option<RecvStream>,
-    /// Received bytes not yet handed to the caller.
-    pub(crate) pending: Bytes,
+    /// Received bytes not yet handed to the caller, chunk by chunk. A new
+    /// h2 DATA chunk is pushed as it arrives: the receive path never joins
+    /// chunks into one buffer, which used to allocate and copy both sides
+    /// of the join whenever a frame header straddled two chunks -- on a
+    /// bulk transfer that is a megabyte copied and freed per boundary.
+    pub(crate) pending: VecDeque<Bytes>,
+    /// Total bytes across `pending`; kept so the readers do not walk the
+    /// deque for a length.
+    pub(crate) pending_len: usize,
     /// Encoded bytes waiting on flow-control capacity.
     out: Bytes,
     report: usize,
@@ -78,12 +96,24 @@ impl H2Stream {
             send: Some(send),
             response: None,
             recv: Some(response.into_body()),
-            pending: Bytes::new(),
+            pending: VecDeque::new(),
+            pending_len: 0,
             out: Bytes::new(),
             report: 0,
             eof: false,
             conn_task: Some(conn_task),
         }
+    }
+
+    /// The server side of a stream: the request body arrived with the request
+    /// and the response side is already open, so there is no response future to
+    /// wait for -- the status gate in [`H2Stream::poll_recv_more`] never runs.
+    pub(crate) fn server(
+        recv: RecvStream,
+        send: h2::SendStream<Bytes>,
+        conn_task: JoinHandle<()>,
+    ) -> Self {
+        Self::from_response(Response::new(recv), send, conn_task)
     }
 
     fn build(
@@ -95,7 +125,8 @@ impl H2Stream {
             send: Some(send),
             response: Some(Box::pin(response)),
             recv: None,
-            pending: Bytes::new(),
+            pending: VecDeque::new(),
+            pending_len: 0,
             out: Bytes::new(),
             report: 0,
             eof: false,
@@ -105,6 +136,42 @@ impl H2Stream {
 
     pub(crate) fn has_out(&self) -> bool {
         !self.out.is_empty()
+    }
+
+    /// Copy up to `max` pending bytes into `out` and return how many went.
+    pub(crate) fn serve(&mut self, out: &mut ReadBuf<'_>, max: usize) -> usize {
+        let mut left = out.remaining().min(max).min(self.pending_len);
+        let want = left;
+        while left > 0 {
+            let Some(front) = self.pending.front_mut() else {
+                break;
+            };
+            let take = front.len().min(left);
+            out.put_slice(&front[..take]);
+            front.advance(take);
+            self.pending_len -= take;
+            left -= take;
+            if front.is_empty() {
+                self.pending.pop_front();
+            }
+        }
+        want - left
+    }
+
+    /// Drop `n` pending bytes without copying them.
+    pub(crate) fn skip_pending(&mut self, mut n: usize) {
+        while n > 0 {
+            let Some(front) = self.pending.front_mut() else {
+                break;
+            };
+            let take = front.len().min(n);
+            front.advance(take);
+            self.pending_len -= take;
+            n -= take;
+            if front.is_empty() {
+                self.pending.pop_front();
+            }
+        }
     }
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
@@ -177,14 +244,9 @@ impl H2Stream {
             Some(Ok(chunk)) => {
                 let len = chunk.len();
                 let _ = recv.flow_control().release_capacity(len);
-                if self.pending.is_empty() {
-                    self.pending = chunk;
-                } else {
-                    let mut joined = BytesMut::with_capacity(self.pending.len() + len);
-                    joined.extend_from_slice(&self.pending);
-                    joined.extend_from_slice(&chunk);
-                    self.pending = joined.freeze();
-                }
+                // pushed as it arrived: no join, no copy of either side
+                self.pending.push_back(chunk);
+                self.pending_len += len;
                 Poll::Ready(Ok(true))
             }
             Some(Err(e)) => Poll::Ready(Err(io::Error::other(format!("h2: recv: {e}")))),
@@ -236,9 +298,7 @@ impl AsyncRead for H2Io {
     ) -> Poll<io::Result<()>> {
         loop {
             if !self.h2.pending.is_empty() {
-                let n = out.remaining().min(self.h2.pending.len());
-                out.put_slice(&self.h2.pending[..n]);
-                self.h2.pending.advance(n);
+                self.h2.serve(out, usize::MAX);
                 return Poll::Ready(Ok(()));
             }
             if self.h2.is_eof() {

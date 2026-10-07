@@ -16,8 +16,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::crypto::{
     AEAD_TAG_LEN, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, HEADER_VERSION, MAX_PAYLOAD_LEN, NONCE_LEN,
-    SALT_LEN, derive_key, increase_nonce, new_aead, open_in_place, random_bytes,
-    random_int31, seal_region,
+    SALT_LEN, derive_key, increase_nonce, new_aead, open_in_place, random_bytes, random_int31,
+    seal_region,
 };
 use super::gcm::{BATCH_MAX, BatchSealer, FastOpener};
 
@@ -243,11 +243,7 @@ impl<W> RecordWriter<W> {
     /// and the padding follows per record. Wire order, nonces and padding
     /// bytes match serial [`Self::write_record`] calls exactly — the batch
     /// only changes how the hash chains are scheduled.
-    fn write_records(
-        &mut self,
-        out: &mut Vec<u8>,
-        items: &[(&[u8], usize)],
-    ) -> io::Result<()> {
+    fn write_records(&mut self, out: &mut Vec<u8>, items: &[(&[u8], usize)]) -> io::Result<()> {
         debug_assert!(!items.is_empty() && items.len() <= BATCH_MAX);
         self.initialize()?;
         for (payload, padding_len) in items {
@@ -706,8 +702,7 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                                 self.stage = ReadStage::Header;
                                 return Poll::Ready(Ok(None));
                             }
-                            let need =
-                                self.padding_len + self.payload_len + AEAD_TAG_LEN;
+                            let need = self.padding_len + self.payload_len + AEAD_TAG_LEN;
                             if self.body.len() != need {
                                 // Resize, not replace: the capacity survives
                                 // the shrink and the next record reuses it.
@@ -743,10 +738,7 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                                 .opener
                                 .as_ref()
                                 .expect("snell: reader initialized")
-                                .open(
-                                    &self.nonce,
-                                    &mut self.body[self.padding_len..payload_end],
-                                );
+                                .open(&self.nonce, &mut self.body[self.padding_len..payload_end]);
                             if opened.is_err() {
                                 let e = self.fail(
                                     io::ErrorKind::InvalidData,
@@ -774,12 +766,10 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
 impl<R: AsyncRead + Unpin> RecordReader<R> {
     pub(crate) async fn read_record(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut out = Vec::new();
-        let found = std::future::poll_fn(|cx| {
-            match self.poll_read_record(cx, &mut out) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Ready(Ok(found)) => Poll::Ready(Ok(found.is_some())),
-            }
+        let found = std::future::poll_fn(|cx| match self.poll_read_record(cx, &mut out) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(found)) => Poll::Ready(Ok(found.is_some())),
         })
         .await?;
         Ok(found.then_some(out))
@@ -1012,7 +1002,9 @@ mod tests {
             let serial = serial_w.emit(now, payload).expect("serial emit");
             let serial_wire = serial.concat();
             let before = wire.len();
-            batch_w.emit_into(&mut wire, now, payload).expect("batch emit");
+            batch_w
+                .emit_into(&mut wire, now, payload)
+                .expect("batch emit");
             let batched = &wire[before..];
             assert_eq!(batched.len(), serial_wire.len(), "length diverged");
             assert!(batched == serial_wire, "wire diverged after {} bytes", {

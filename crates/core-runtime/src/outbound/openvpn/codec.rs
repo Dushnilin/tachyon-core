@@ -8,6 +8,7 @@ use std::cell::RefCell;
 
 use cipher::generic_array::GenericArray;
 use cipher::{BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit as KeyInit04};
+use hmac::Hmac;
 // aria / camellia / cast5 / des / sm4 ship the inout-era `cipher` 0.5 API.
 use cipher05::common::{Block as Block05, BlockSizeUser as BlockSizeUser05, KeyInit as KeyInit05};
 use cipher05::{BlockCipherDecrypt as BlockDecrypt05, BlockCipherEncrypt as BlockEncrypt05};
@@ -61,42 +62,63 @@ impl AuthKind {
             Self::None => 0,
         }
     }
+}
 
-    fn compute(self, key: &[u8], data: &[u8]) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
-        match self {
-            Self::Sha1 => Self::finish(
-                <Hmac<sha1::Sha1> as Mac>::new_from_slice(key).unwrap(),
-                data,
-            ),
-            Self::Sha224 => Self::finish(
-                <Hmac<sha2::Sha224> as Mac>::new_from_slice(key).unwrap(),
-                data,
-            ),
-            Self::Sha256 => Self::finish(
-                <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).unwrap(),
-                data,
-            ),
-            Self::Sha384 => Self::finish(
-                <Hmac<sha2::Sha384> as Mac>::new_from_slice(key).unwrap(),
-                data,
-            ),
-            Self::Sha512 => Self::finish(
-                <Hmac<sha2::Sha512> as Mac>::new_from_slice(key).unwrap(),
-                data,
-            ),
-            Self::Ripemd160 => Self::finish(
-                <Hmac<ripemd::Ripemd160> as Mac>::new_from_slice(key).unwrap(),
-                data,
-            ),
-            Self::Md5 => Self::finish(<Hmac<md5::Md5> as Mac>::new_from_slice(key).unwrap(), data),
-            Self::None => Vec::new(),
+/// A keyed HMAC kept across packets: `new_from_slice` does the ipad/opad
+/// hashing once per session instead of once per packet, and only the
+/// message is fed in on each use.
+pub enum CachedMac {
+    Sha1(Hmac<sha1::Sha1>),
+    Sha224(Hmac<sha2::Sha224>),
+    Sha256(Hmac<sha2::Sha256>),
+    Sha384(Hmac<sha2::Sha384>),
+    Sha512(Hmac<sha2::Sha512>),
+    Ripemd160(Hmac<ripemd::Ripemd160>),
+    Md5(Hmac<md5::Md5>),
+    None,
+}
+
+impl CachedMac {
+    pub fn new(auth: AuthKind, key: &[u8]) -> Self {
+        fn keyed<M: hmac::digest::KeyInit>(key: &[u8]) -> M {
+            <M as hmac::digest::KeyInit>::new_from_slice(key).expect("hmac key length")
+        }
+        match auth {
+            AuthKind::Sha1 => Self::Sha1(keyed(key)),
+            AuthKind::Sha224 => Self::Sha224(keyed(key)),
+            AuthKind::Sha256 => Self::Sha256(keyed(key)),
+            AuthKind::Sha384 => Self::Sha384(keyed(key)),
+            AuthKind::Sha512 => Self::Sha512(keyed(key)),
+            AuthKind::Ripemd160 => Self::Ripemd160(keyed(key)),
+            AuthKind::Md5 => Self::Md5(keyed(key)),
+            AuthKind::None => Self::None,
         }
     }
 
-    fn finish<M: hmac::Mac>(mut mac: M, data: &[u8]) -> Vec<u8> {
-        mac.update(data);
-        mac.finalize().into_bytes().to_vec()
+    /// HMAC `data`, writing the tag into `out` and returning its length
+    /// (0 for `AuthKind::None`). The tag lands on the caller's stack buffer
+    /// — no per-packet `Vec`.
+    pub fn compute_into(&mut self, data: &[u8], out: &mut [u8; 64]) -> usize {
+        use hmac::digest::FixedOutputReset;
+        fn go<M>(mac: &mut M, data: &[u8], out: &mut [u8; 64]) -> usize
+        where
+            M: hmac::Mac + FixedOutputReset,
+        {
+            hmac::digest::Update::update(mac, data);
+            let tag = mac.finalize_reset().into_bytes();
+            out[..tag.len()].copy_from_slice(&tag);
+            tag.len()
+        }
+        match self {
+            Self::Sha1(m) => go(m, data, out),
+            Self::Sha224(m) => go(m, data, out),
+            Self::Sha256(m) => go(m, data, out),
+            Self::Sha384(m) => go(m, data, out),
+            Self::Sha512(m) => go(m, data, out),
+            Self::Ripemd160(m) => go(m, data, out),
+            Self::Md5(m) => go(m, data, out),
+            Self::None => 0,
+        }
     }
 }
 
@@ -477,9 +499,9 @@ struct DecodeCandidate {
 
 pub struct StaticCodec {
     send_cipher: BlockCipher,
-    send_hmac_key: Vec<u8>,
+    send_mac: CachedMac,
     receive_candidates: Vec<DecodeCandidate>,
-    auth: AuthKind,
+    receive_macs: Vec<CachedMac>,
     hmac_size: usize,
     send_timestamp: u32,
     replay: ReplayWindow,
@@ -512,6 +534,7 @@ impl StaticCodec {
         } else {
             Vec::new()
         };
+        let send_mac = CachedMac::new(auth, &send_hmac_key);
         let mut receive_candidates = vec![DecodeCandidate {
             cipher: receive_cipher,
             hmac_key: if hmac_size > 0 {
@@ -536,15 +559,19 @@ impl StaticCodec {
         }
         let (window_size, window_time) =
             replay_window_parameters(replay_window_size, replay_window_time);
+        let receive_macs = receive_candidates
+            .iter()
+            .map(|c| CachedMac::new(auth, &c.hmac_key))
+            .collect();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
         Ok(Self {
             send_cipher,
-            send_hmac_key,
+            send_mac,
             receive_candidates,
-            auth,
+            receive_macs,
             hmac_size,
             send_timestamp: now,
             replay: ReplayWindow::new(window_size, window_time),
@@ -573,7 +600,7 @@ impl StaticCodec {
     }
 
     /// `Encode`.
-    pub fn encode(&self, packet_id: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn encode(&mut self, packet_id: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
         if packet_id == 0 {
             return Err("invalid static key packet id".to_string());
         }
@@ -593,8 +620,12 @@ impl StaticCodec {
             protected_payload = with_iv;
         }
         if self.hmac_size > 0 {
-            let mac = self.auth.compute(&self.send_hmac_key, &protected_payload);
-            let mut encoded = mac;
+            // one buffer for the whole packet: tag and payload written in,
+            // no intermediate `Vec` from the mac and no regrowth past it
+            let mut tag = [0u8; 64];
+            let n = self.send_mac.compute_into(&protected_payload, &mut tag);
+            let mut encoded = Vec::with_capacity(n + protected_payload.len());
+            encoded.extend_from_slice(&tag[..n]);
             encoded.extend_from_slice(&protected_payload);
             return Ok(encoded);
         }
@@ -619,36 +650,52 @@ impl StaticCodec {
     }
 
     fn decode_with_candidate(
-        &self,
+        &mut self,
         payload: &[u8],
         candidate_index: usize,
     ) -> Result<(u32, u32, Vec<u8>), String> {
-        let candidate = &self.receive_candidates[candidate_index];
-        let mut protected_payload = payload;
         if self.hmac_size > 0 {
-            if protected_payload.len() < self.hmac_size {
+            if payload.len() < self.hmac_size {
                 return Err("invalid static key payload".to_string());
             }
-            let (received_mac, rest) = protected_payload.split_at(self.hmac_size);
-            protected_payload = rest;
-            let expected_mac = self.auth.compute(&candidate.hmac_key, protected_payload);
-            if !constant_time_eq(received_mac, &expected_mac) {
+            let (received_mac, rest) = payload.split_at(self.hmac_size);
+            let mut tag = [0u8; 64];
+            let n = self.receive_macs[candidate_index].compute_into(rest, &mut tag);
+            if !constant_time_eq(received_mac, &tag[..n]) {
                 return Err("invalid static key payload hmac".to_string());
             }
+            let mut plain_payload = rest.to_vec();
+            let block_size = self.receive_candidates[candidate_index].cipher.block_size();
+            if block_size > 0 {
+                if rest.len() < block_size * 2 || !rest.len().is_multiple_of(block_size) {
+                    return Err("invalid static key payload".to_string());
+                }
+                let iv = &rest[..block_size];
+                plain_payload = rest[block_size..].to_vec();
+                self.receive_candidates[candidate_index]
+                    .cipher
+                    .cbc_decrypt(iv, &mut plain_payload);
+                plain_payload = pkcs7_unpad(&plain_payload, block_size)?;
+            }
+            return Self::finish_decode(plain_payload);
         }
-        let mut plain_payload = protected_payload.to_vec();
-        let block_size = candidate.cipher.block_size();
+        let mut plain_payload = payload.to_vec();
+        let block_size = self.receive_candidates[candidate_index].cipher.block_size();
         if block_size > 0 {
-            if protected_payload.len() < block_size * 2
-                || !protected_payload.len().is_multiple_of(block_size)
-            {
+            if payload.len() < block_size * 2 || !payload.len().is_multiple_of(block_size) {
                 return Err("invalid static key payload".to_string());
             }
-            let iv = &protected_payload[..block_size];
-            plain_payload = protected_payload[block_size..].to_vec();
-            candidate.cipher.cbc_decrypt(iv, &mut plain_payload);
+            let iv = &payload[..block_size];
+            plain_payload = payload[block_size..].to_vec();
+            self.receive_candidates[candidate_index]
+                .cipher
+                .cbc_decrypt(iv, &mut plain_payload);
             plain_payload = pkcs7_unpad(&plain_payload, block_size)?;
         }
+        Self::finish_decode(plain_payload)
+    }
+
+    fn finish_decode(plain_payload: Vec<u8>) -> Result<(u32, u32, Vec<u8>), String> {
         if plain_payload.len() < 8 {
             return Err("invalid static key payload".to_string());
         }
@@ -857,7 +904,7 @@ mod tests {
     #[test]
     fn direction_both_decodes_both_slots() {
         let material = hex_key(0x33);
-        let a = StaticCodec::new(
+        let mut a = StaticCodec::new(
             &material,
             -1,
             "AES-128-CBC",
@@ -881,7 +928,7 @@ mod tests {
         assert_eq!((id, payload.as_slice()), (7, &b"payload"[..]));
 
         // Peer sending from slot1 also decodes via the fallback candidate.
-        let peer = StaticCodec::new(
+        let mut peer = StaticCodec::new(
             &material,
             1,
             "AES-128-CBC",
@@ -898,7 +945,7 @@ mod tests {
     #[test]
     fn none_cipher_roundtrip() {
         let material = hex_key(0x01);
-        let a = StaticCodec::new(
+        let mut a = StaticCodec::new(
             &material,
             -1,
             "NONE",
@@ -946,7 +993,7 @@ mod tests {
             "NONE",
         ] {
             for auth in ["", "SHA224", "SHA384", "SHA512", "RIPEMD160", "MD5", "NONE"] {
-                let a = StaticCodec::new(
+                let mut a = StaticCodec::new(
                     &material,
                     -1,
                     name,
@@ -1017,7 +1064,7 @@ mod tests {
     #[test]
     fn packet_id_zero_rejected() {
         let material = hex_key(0x11);
-        let codec = StaticCodec::new(
+        let mut codec = StaticCodec::new(
             &material,
             -1,
             "AES-128-CBC",

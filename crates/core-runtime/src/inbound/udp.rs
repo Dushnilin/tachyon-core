@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
 use crate::dns::QueryMeta;
 use crate::inbound::{AnyWrite, Target};
@@ -104,7 +104,7 @@ impl Reply {
 
 pub(crate) struct UdpHub {
     router: Arc<Router>,
-    flows: Mutex<HashMap<FlowKey, Arc<Flow>>>,
+    flows: RwLock<HashMap<FlowKey, Arc<Flow>>>,
     timeout: Duration,
     /// how replies are framed before they go back
     frame: DatagramFrame,
@@ -114,7 +114,7 @@ impl UdpHub {
     pub fn new(router: Arc<Router>, timeout: Duration, frame: DatagramFrame) -> Arc<Self> {
         let hub = Arc::new(Self {
             router,
-            flows: Mutex::new(HashMap::new()),
+            flows: RwLock::new(HashMap::new()),
             timeout: if timeout.is_zero() {
                 DEFAULT_UDP_TIMEOUT
             } else {
@@ -133,9 +133,49 @@ impl UdpHub {
     }
 
     async fn sweep(&self) {
-        let mut flows = self.flows.lock().await;
+        let mut flows = self.flows.write().expect("flows");
         let timeout = self.timeout;
         flows.retain(|_, flow| flow.idle() < timeout);
+    }
+
+    /// Fast path for the receive loops: an already-open outbound flow is fed
+    /// straight from the reader — `try_send` with no copy and no per-packet
+    /// task. Returns `false` when the flow is unknown (or is a DNS hijack,
+    /// which needs the async exchange), and the caller should fall back to
+    /// spawning the full [`UdpHub::handle`].
+    pub fn try_existing(&self, source: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        let flow = self
+            .flows
+            .read()
+            .expect("flows")
+            .get(&(source, dest))
+            .cloned();
+        let Some(flow) = flow else {
+            return false;
+        };
+        let FlowKind::Outbound { sock } = &flow.kind else {
+            return false;
+        };
+        match sock.try_send(payload) {
+            Ok(_) => {
+                flow.touch();
+                true
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                let sock = Arc::clone(sock);
+                let owned = payload.to_vec();
+                tokio::spawn(async move {
+                    let _ = sock.send(&owned).await;
+                });
+                flow.touch();
+                true
+            }
+            Err(err) => {
+                logging::debug(format_args!("udp fast path send: {err}"));
+                flow.touch();
+                true
+            }
+        }
     }
 
     /// Handle one datagram received from `source` toward `dest`, and answer it
@@ -149,16 +189,19 @@ impl UdpHub {
         tag: &str,
     ) -> std::io::Result<()> {
         let key = (source, dest);
-        let flow = {
-            let map = self.flows.lock().await;
-            if let Some(flow) = map.get(&key) {
+        let found = {
+            let map = self.flows.read().expect("flows");
+            map.get(&key).cloned()
+        };
+        let flow = match found {
+            Some(flow) => {
                 flow.touch();
-                Arc::clone(flow)
-            } else {
-                drop(map);
+                flow
+            }
+            None => {
                 let flow = self.open_flow(reply.clone(), source, dest, tag).await?;
                 flow.touch();
-                let mut map = self.flows.lock().await;
+                let mut map = self.flows.write().expect("flows");
                 // Another packet may have won the race — keep the first.
                 if let Some(existing) = map.get(&key) {
                     Arc::clone(existing)
@@ -242,7 +285,7 @@ impl UdpHub {
     }
 
     async fn remove_flow(&self, key: FlowKey) {
-        self.flows.lock().await.remove(&key);
+        self.flows.write().expect("flows").remove(&key);
     }
 }
 

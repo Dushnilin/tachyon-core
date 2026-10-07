@@ -150,6 +150,77 @@ async fn splice_moves_every_byte_both_ways_and_counts_them() {
     );
 }
 
+/// Without a registry to feed there still must be a relay: a build (or a run)
+/// with the connection view off must not fall back to the userspace loop.
+#[tokio::test]
+async fn splice_runs_without_a_tracker_and_moves_every_byte() {
+    let (relay_client, caller) = pair().await;
+    let (relay_upstream, server) = pair().await;
+
+    const UP: usize = 4 * 1024 * 1024 + 5;
+    const DOWN: usize = 4 * 1024 * 1024 + 9;
+    let up = pattern(UP, 7);
+    let down = pattern(DOWN, 8);
+
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(
+            relay_client,
+            Conn::Plain(Box::new(relay_upstream)),
+            &[],
+            None,
+        )
+        .await
+    });
+
+    let (mut server_r, mut server_w) = server.into_split();
+    let server_task = tokio::spawn({
+        let down = down.clone();
+        async move {
+            let write = async move {
+                server_w.write_all(&down).await.expect("server write");
+                server_w.shutdown().await.expect("server shutdown");
+            };
+            let read = async move {
+                let mut got = Vec::new();
+                server_r.read_to_end(&mut got).await.expect("server read");
+                got
+            };
+            let ((), got) = tokio::join!(write, read);
+            got
+        }
+    });
+
+    let (mut caller_r, mut caller_w) = caller.into_split();
+    let write = {
+        let up = up.clone();
+        async move {
+            caller_w.write_all(&up).await.expect("caller write");
+            caller_w.shutdown().await.expect("caller shutdown");
+        }
+    };
+    let read = async move {
+        let mut got = Vec::new();
+        caller_r.read_to_end(&mut got).await.expect("caller read");
+        got
+    };
+    let ((), got_down) = tokio::time::timeout(LIMIT, async { tokio::join!(write, read) })
+        .await
+        .expect("caller side timed out");
+    let got_up = tokio::time::timeout(LIMIT, server_task)
+        .await
+        .expect("server side timed out")
+        .expect("server task");
+
+    assert_eq!(got_up, up, "upload corrupted");
+    assert_eq!(got_down, down, "download corrupted");
+
+    tokio::time::timeout(LIMIT, relay)
+        .await
+        .expect("relay finished")
+        .expect("relay task")
+        .expect("relay result");
+}
+
 #[tokio::test]
 async fn splice_propagates_half_close_without_losing_the_tail() {
     let (relay_client, mut caller) = pair().await;

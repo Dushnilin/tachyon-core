@@ -10,6 +10,7 @@
 //! (`00` = uncompressed, `len` = protobuf payload size, `0A` = protobuf
 //! field 1 length-delimited, varint = byte length of the payload bytes.)
 
+use std::collections::VecDeque;
 use std::io;
 use std::task::{Context, Poll, ready};
 
@@ -72,6 +73,23 @@ pub(crate) struct GrpcStream {
     skip: usize,
 }
 
+/// The server half of the same stream: the request body is the downlink, the
+/// response side the uplink, and the framing is the one Hunk codec above -- the
+/// reference's `GunConn` writes and reads exactly these bytes from either end.
+pub(crate) fn server(
+    recv: h2::RecvStream,
+    send: h2::SendStream<Bytes>,
+    conn_task: tokio::task::JoinHandle<()>,
+) -> AnyStream {
+    Box::new(GrpcStream {
+        io: H2Io {
+            h2: H2Stream::server(recv, send, conn_task),
+        },
+        data_left: 0,
+        skip: 0,
+    })
+}
+
 impl GrpcStream {
     fn encode_frame(data: &[u8]) -> Vec<u8> {
         let mut varint = [0u8; 10];
@@ -95,23 +113,22 @@ impl AsyncRead for GrpcStream {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         loop {
-            let pending = &mut this.io.h2.pending;
             if this.data_left > 0 {
-                if !pending.is_empty() {
-                    let n = out.remaining().min(this.data_left).min(pending.len());
-                    out.put_slice(&pending[..n]);
-                    pending.advance(n);
+                if !this.io.h2.pending.is_empty() {
+                    let n = this.io.h2.serve(out, this.data_left);
                     this.data_left -= n;
                     return Poll::Ready(Ok(()));
                 }
             } else if this.skip > 0 {
-                let n = this.skip.min(pending.len());
+                let n = this.skip.min(this.io.h2.pending_len);
                 if n > 0 {
-                    pending.advance(n);
+                    this.io.h2.skip_pending(n);
                     this.skip -= n;
                     continue;
                 }
-            } else if let Some((data, skip)) = start_hunk(pending)? {
+            } else if let Some((data, skip)) =
+                start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?
+            {
                 this.data_left = data;
                 this.skip = skip;
                 continue;
@@ -190,7 +207,54 @@ fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
 /// length varint) and return `(payload_len, trailing_len)`: the payload bytes
 /// that follow in the buffer, and any bytes of the message after them. Only
 /// the header has to be buffered; the payload is served as it arrives.
-fn start_hunk(raw: &mut Bytes) -> io::Result<Option<(usize, usize)>> {
+///
+/// A header needs at most 16 bytes (`5 + tag + 10-byte varint`), so it is
+/// read out of the deque into a stack scratch no matter how the chunks cut
+/// it, and only the consumed bytes -- the header itself -- are dropped from
+/// the front. Chunks are never joined.
+fn start_hunk(
+    pending: &mut VecDeque<Bytes>,
+    pending_len: &mut usize,
+) -> io::Result<Option<(usize, usize)>> {
+    if *pending_len < 5 {
+        return Ok(None);
+    }
+    let mut scratch = [0u8; 16];
+    let have = (*pending_len).min(scratch.len());
+    {
+        let mut at = 0usize;
+        for chunk in pending.iter() {
+            let take = chunk.len().min(have - at);
+            scratch[at..at + take].copy_from_slice(&chunk[..take]);
+            at += take;
+            if at == have {
+                break;
+            }
+        }
+    }
+    let Some((payload, trailing, consumed)) = parse_hunk_head(&scratch[..have])? else {
+        return Ok(None);
+    };
+    let mut left = consumed;
+    while left > 0 {
+        let Some(front) = pending.front_mut() else {
+            return Err(io::Error::other("grpc: hunk header ran past the stream"));
+        };
+        let take = front.len().min(left);
+        front.advance(take);
+        *pending_len -= take;
+        left -= take;
+        if front.is_empty() {
+            pending.pop_front();
+        }
+    }
+    Ok(Some((payload, trailing)))
+}
+
+/// The wire decision on the first `have` (5..16) bytes of a Hunk:
+/// `Ok(None)` when there is not enough yet, otherwise
+/// `(payload_len, trailing_len, header_bytes_consumed)`.
+fn parse_hunk_head(raw: &[u8]) -> io::Result<Option<(usize, usize, usize)>> {
     if raw.len() < 5 {
         return Ok(None);
     }
@@ -222,66 +286,119 @@ fn start_hunk(raw: &mut Bytes) -> io::Result<Option<(usize, usize)>> {
         .ok()
         .filter(|v| used.checked_add(*v).is_some_and(|end| end <= len))
         .ok_or_else(|| io::Error::other("grpc: truncated Hunk payload"))?;
-    raw.advance(5 + used);
-    Ok(Some((vlen, len - used - vlen)))
+    Ok(Some((vlen, len - used - vlen, 5 + used)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Everything still buffered, as one contiguous copy (test view only).
+    fn buffered(pending: &VecDeque<Bytes>) -> Vec<u8> {
+        pending.iter().flat_map(|b| b.iter()).copied().collect()
+    }
+
+    fn solo(bytes: &[u8]) -> (VecDeque<Bytes>, usize) {
+        let len = bytes.len();
+        (VecDeque::from([Bytes::copy_from_slice(bytes)]), len)
+    }
+
+    /// Consume `n` bytes from the front the way the reader does.
+    fn drain(pending: &mut VecDeque<Bytes>, len: &mut usize, mut n: usize) {
+        while n > 0 {
+            let mut front = pending.pop_front().expect("drain past the end");
+            let take = front.len().min(n);
+            front.advance(take);
+            *len -= take;
+            n -= take;
+            if !front.is_empty() {
+                pending.push_front(front);
+            }
+        }
+    }
+
     #[test]
     fn hunk_roundtrip() {
         let mut both = GrpcStream::encode_frame(b"hello");
         both.extend_from_slice(&GrpcStream::encode_frame(&[0x5A; 40000]));
-        let mut raw = Bytes::from(both);
-        let (n, skip) = start_hunk(&mut raw).unwrap().expect("first hunk");
+        let mut pending = VecDeque::from([Bytes::from(both)]);
+        let mut len = pending.front().expect("chunk").len();
+        let (n, skip) = start_hunk(&mut pending, &mut len)
+            .unwrap()
+            .expect("first hunk");
         assert_eq!((n, skip), (5, 0));
-        assert_eq!(&raw[..n], &b"hello"[..]);
-        raw.advance(n);
-        let (n, skip) = start_hunk(&mut raw).unwrap().expect("second hunk");
+        assert_eq!(&buffered(&pending)[..n], &b"hello"[..]);
+        drain(&mut pending, &mut len, n);
+        let (n, skip) = start_hunk(&mut pending, &mut len)
+            .unwrap()
+            .expect("second hunk");
         assert_eq!((n, skip), (40000, 0));
-        assert!(raw[..n].iter().all(|b| *b == 0x5A));
-        raw.advance(n);
-        assert!(raw.is_empty());
-        assert!(start_hunk(&mut raw).unwrap().is_none());
+        assert!(buffered(&pending)[..n].iter().all(|b| *b == 0x5A));
+        // the body has to be read out before the next header: leftover 0x5A
+        // bytes would be parsed as a fresh frame's compression flag
+        drain(&mut pending, &mut len, n);
+        assert!(start_hunk(&mut pending, &mut len).unwrap().is_none());
+        assert!(pending.is_empty());
+    }
+
+    /// The header cut across two chunks -- the shape the join used to copy
+    /// a whole chunk for. It must parse from the scratch and consume only
+    /// the header bytes from the front.
+    #[test]
+    fn hunk_header_straddles_chunks() {
+        let frame = GrpcStream::encode_frame(b"straddle");
+        for split in 1..frame.len() {
+            let (mut pending, mut len) = (
+                VecDeque::from([
+                    Bytes::copy_from_slice(&frame[..split]),
+                    Bytes::copy_from_slice(&frame[split..]),
+                ]),
+                frame.len(),
+            );
+            let got = start_hunk(&mut pending, &mut len)
+                .unwrap()
+                .unwrap_or_else(|| panic!("parse at split {split}"));
+            assert_eq!(got, (8, 0), "split {split}");
+            assert_eq!(&buffered(&pending)[..8], &b"straddle"[..], "split {split}");
+        }
     }
 
     #[test]
     fn hunk_partial_buffer() {
         let frame = GrpcStream::encode_frame(b"partial");
-        let mut raw = Bytes::copy_from_slice(&frame[..4]);
-        assert!(start_hunk(&mut raw).unwrap().is_none());
-        let mut raw = Bytes::from(frame);
-        assert_eq!(start_hunk(&mut raw).unwrap().unwrap(), (7, 0));
-        assert_eq!(&raw[..], &b"partial"[..]);
+        let (mut pending, mut len) = solo(&frame[..4]);
+        assert!(start_hunk(&mut pending, &mut len).unwrap().is_none());
+        let (mut pending, mut len) = solo(&frame);
+        assert_eq!(start_hunk(&mut pending, &mut len).unwrap().unwrap(), (7, 0));
+        assert_eq!(&buffered(&pending)[..], &b"partial"[..]);
     }
 
     #[test]
     fn hunk_header_only_is_enough() {
         let frame = GrpcStream::encode_frame(&[7u8; 1000]);
-        let mut raw = Bytes::copy_from_slice(&frame[..8]);
-        assert_eq!(start_hunk(&mut raw).unwrap().unwrap(), (1000, 0));
-        assert!(raw.is_empty());
+        let (mut pending, mut len) = solo(&frame[..8]);
+        assert_eq!(
+            start_hunk(&mut pending, &mut len).unwrap().unwrap(),
+            (1000, 0)
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]
     fn hunk_trailing_fields_are_skipped() {
         // Payload: data field (3 bytes) followed by 2 bytes of an unknown field.
-        let mut raw = Bytes::copy_from_slice(&b"\x00\x00\x00\x00\x07\x0a\x03abc\x10\x01"[..]);
-        assert_eq!(start_hunk(&mut raw).unwrap().unwrap(), (3, 2));
+        let raw = b"\x00\x00\x00\x00\x07\x0a\x03abc\x10\x01";
+        assert_eq!(parse_hunk_head(raw).unwrap().unwrap(), (3, 2, 5 + 1 + 1));
     }
 
     #[test]
     fn hunk_rejects_compression_flag() {
-        let mut raw = Bytes::copy_from_slice(&b"\x01\x00\x00\x00\x01\x0a\x01x"[..]);
-        assert!(start_hunk(&mut raw).is_err());
+        assert!(parse_hunk_head(b"\x01\x00\x00\x00\x01\x0a\x01x").is_err());
     }
 
     #[test]
     fn hunk_rejects_overlong_data() {
-        let mut raw = Bytes::copy_from_slice(&b"\x00\x00\x00\x00\x03\x0a\x09x"[..]);
-        assert!(start_hunk(&mut raw).is_err());
+        assert!(parse_hunk_head(b"\x00\x00\x00\x00\x03\x0a\x09x").is_err());
     }
 
     #[test]

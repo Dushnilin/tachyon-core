@@ -26,6 +26,7 @@
 
 use std::io;
 
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::AnyStream;
@@ -79,9 +80,9 @@ pub struct VisionStream {
     remaining_padding: i64,
     current_command: u8,
     /// bytes read from `inner` but not framed yet
-    raw: Vec<u8>,
+    raw: BytesMut,
     /// framed payload waiting for the caller
-    payload: Vec<u8>,
+    payload: BytesMut,
     eof: bool,
 }
 
@@ -100,8 +101,8 @@ impl VisionStream {
             remaining_content: -1,
             remaining_padding: -1,
             current_command: 0,
-            raw: Vec::new(),
-            payload: Vec::new(),
+            raw: BytesMut::new(),
+            payload: BytesMut::new(),
             eof: false,
         }
     }
@@ -219,7 +220,7 @@ impl VisionStream {
                 if self.raw.len() < index + 5 {
                     break;
                 }
-                let header = self.raw[index..index + 5].to_vec();
+                let header = &self.raw[index..index + 5];
                 self.current_command = header[0];
                 self.remaining_content = i64::from(u16::from_be_bytes([header[1], header[2]]));
                 self.remaining_padding = i64::from(u16::from_be_bytes([header[3], header[4]]));
@@ -236,7 +237,11 @@ impl VisionStream {
                 index += end;
             }
         }
-        self.raw.drain(..index);
+        // split_to moves the consumption point instead of memmoving the
+        // remainder to the front of the buffer on every unpad
+        if index > 0 {
+            let _ = self.raw.split_to(index);
+        }
     }
 }
 
@@ -252,7 +257,7 @@ impl AsyncRead for VisionStream {
             if !this.payload.is_empty() {
                 let take = this.payload.len().min(out.remaining());
                 out.put_slice(&this.payload[..take]);
-                this.payload.drain(..take);
+                let _ = this.payload.split_to(take);
                 return std::task::Poll::Ready(Ok(()));
             }
             if this.eof {
@@ -380,7 +385,7 @@ mod tests {
     }
 
     /// A frame built by hand, the way the reference puts it on the wire.
-    fn wire_frame(with_uuid: bool, command: u8, content: &[u8], padding: usize) -> Vec<u8> {
+    fn wire_frame(with_uuid: bool, command: u8, content: &[u8], padding: usize) -> BytesMut {
         let mut out = Vec::new();
         if with_uuid {
             out.extend_from_slice(&uuid());
@@ -390,7 +395,7 @@ mod tests {
         out.extend_from_slice(&(padding as u16).to_be_bytes());
         out.extend_from_slice(content);
         out.resize(out.len() + padding, 0);
-        out
+        BytesMut::from(out.as_slice())
     }
 
     /// A frame as it goes on the wire, always with the uuid prefix so the header
@@ -462,7 +467,7 @@ mod tests {
     #[test]
     fn the_padding_phase_is_transient_and_then_writes_are_raw() {
         let (mut source, _) = pair();
-        let mut wire = Vec::new();
+        let mut wire = BytesMut::new();
         let mut commands = Vec::new();
         let mut writes = 0usize;
         while source.padding && writes < PACKETS_TO_FILTER + 2 {
@@ -512,7 +517,8 @@ mod tests {
             sink.raw = wire;
             sink.unpad();
             assert_eq!(
-                sink.payload, b"framedlastraw tail",
+                &sink.payload[..],
+                &b"framedlastraw tail"[..],
                 "command {command} must end the framing"
             );
             assert!(sink.raw.is_empty());
@@ -614,7 +620,7 @@ mod tests {
         let (mut sink, _) = pair();
         sink.raw = bytes;
         sink.unpad();
-        assert_eq!(&sink.payload, b"firstsecond");
+        assert_eq!(&sink.payload[..], &b"firstsecond"[..]);
         assert!(sink.raw.is_empty(), "the framing is fully consumed");
     }
 
@@ -624,16 +630,16 @@ mod tests {
         let (mut sink, _) = pair();
         sink.raw = framed;
         sink.unpad();
-        assert_eq!(&sink.payload, b"payload");
+        assert_eq!(&sink.payload[..], &b"payload"[..]);
     }
 
     #[test]
     fn unframed_traffic_passes_through() {
         let (mut sink, _) = pair();
-        sink.raw = b"plain bytes".to_vec();
+        sink.raw = BytesMut::from(&b"plain bytes"[..]);
         sink.eof = true;
         sink.unpad();
-        assert_eq!(&sink.payload, b"plain bytes");
+        assert_eq!(&sink.payload[..], &b"plain bytes"[..]);
     }
 
     #[test]

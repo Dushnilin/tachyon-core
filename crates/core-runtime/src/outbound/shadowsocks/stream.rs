@@ -8,11 +8,9 @@ use super::crypto::{AEAD_TAG, Cipher, Method, derive_subkey, master_key, random_
 use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 
 /// Read buffer floor, several records deep: `need` reads as much as the buffer
-/// has room for in one syscall, so a bigger buffer means fewer syscalls per GiB
-/// -- with 33 KiB the steady state was one record per `recvfrom` while a peer
-/// with a large buffer drained four or five records per `read`. Allocated only
-/// when the first byte of the response is about to be read.
+/// has room for in one syscall, so a bigger buffer means fewer syscalls per GiB.
 const READ_BUF: usize = 256 * 1024;
+
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
 /// block, the tag on that block and the tag on the payload.
 const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
@@ -21,8 +19,8 @@ const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
 /// well under this and the buffer is never dropped.
 const WRITE_BUF_KEEP: usize = 256 * 1024;
 
-/// Read buffer big enough for one whole record of `method` plus the length block
-/// of the next one.
+/// Read buffer floor for `method`: enough for one whole record of `method`
+/// plus the length block of the next one, and at least `READ_START`.
 ///
 /// The reader asks for a *payload* (`payload_len + AEAD_TAG`), but what it needs
 /// is room for the record that payload belongs to. Sizing to the payload leaves a
@@ -31,9 +29,13 @@ const WRITE_BUF_KEEP: usize = 256 * 1024;
 /// payload to the front before it can read them -- a full copy of every byte, every
 /// record, plus a syscall and a wakeup it would not have needed. Legacy records are
 /// small enough that two of them fit, which is why only 2022 paid it.
+///
+/// Read buffer floor for `method`: enough for one whole record of `method`
+/// plus the length block of the next one, and at least `READ_BUF`.
 fn read_buf(method: Method) -> usize {
     (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
 }
+
 
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {
@@ -94,6 +96,7 @@ impl Shadowsocks {
         let mut salt = vec![0u8; self.method.salt_len()];
         random_bytes(&mut salt)?;
         let subkey = derive_subkey(self.method, &self.master_key, &salt);
+        let subkey = &subkey.0[..subkey.1];
         let is_2022 = self.method.is_2022();
 
         let mut out = Vec::with_capacity(salt.len() + 256);
@@ -119,7 +122,7 @@ impl Shadowsocks {
                 &(u16::try_from(var_len).map_err(|_| io::Error::other("header too large"))?)
                     .to_be_bytes(),
             );
-            let request_cipher = Cipher::new(self.method, &subkey);
+            let request_cipher = Cipher::new(self.method, subkey);
             request_cipher.seal(writer_counter, &mut fixed)?;
             writer_counter += 1;
             out.extend_from_slice(&fixed);
@@ -135,7 +138,7 @@ impl Shadowsocks {
         let (read_half, write_half) = tokio::io::split(stream);
         let mut writer = SsWriter {
             inner: Box::new(write_half) as AnyWrite,
-            cipher: Cipher::new(self.method, &subkey),
+            cipher: Cipher::new(self.method, subkey),
             counter: writer_counter,
             max_chunk: self.method.max_chunk(),
             buf: Vec::new(),
@@ -158,6 +161,7 @@ impl Shadowsocks {
             request_salt: salt,
             read_buf: read_buf(self.method),
             state: if is_2022 {
+
                 ReaderState::ResponseSalt
             } else {
                 ReaderState::ChunksAfterSalt
@@ -219,6 +223,7 @@ pub struct SsReader<R> {
     /// what `rbuf` is grown to when the first record is waited for
     read_buf: usize,
     /// Bytes off the wire that nothing has consumed yet: `rbuf[rpos..rend]`.
+
     rbuf: Vec<u8>,
     rpos: usize,
     rend: usize,
@@ -265,11 +270,13 @@ impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
             self.rend += got;
         }
         Ok(())
+
     }
 
     fn establish_response_cipher(&mut self, salt: &[u8]) {
         let subkey = derive_subkey(self.method, &self.master_key, salt);
-        self.cipher = Some(Cipher::new(self.method, &subkey));
+        let subkey = &subkey.0[..subkey.1];
+        self.cipher = Some(Cipher::new(self.method, subkey));
         self.counter = 0;
     }
 
@@ -545,6 +552,7 @@ mod tests {
                 read_buf: read_buf(method),
                 state: ReaderState::Chunks,
             };
+
             let mut buf = vec![0u8; 64 * 1024];
             let mut got = 0u64;
             let warm = 2 * PAYLOAD as u64;

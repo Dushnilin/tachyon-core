@@ -347,10 +347,16 @@ impl PlainRule {
         for entry in list(object.get("domain")) {
             rule.domains.insert(entry.into_boxed_str());
         }
-        rule.suffixes
-            .extend(list(object.get("domain_suffix")).into_iter().map(String::into_boxed_str));
-        rule.keywords
-            .extend(list(object.get("domain_keyword")).into_iter().map(String::into_boxed_str));
+        rule.suffixes.extend(
+            list(object.get("domain_suffix"))
+                .into_iter()
+                .map(String::into_boxed_str),
+        );
+        rule.keywords.extend(
+            list(object.get("domain_keyword"))
+                .into_iter()
+                .map(String::into_boxed_str),
+        );
 
         for entry in list(object.get("ip_cidr")) {
             insert_prefix(&mut rule.dest_v4, &mut rule.dest_v6, &entry);
@@ -412,8 +418,8 @@ impl PlainRule {
             IpAddr::V6(v6) => self.source_v6.contains(v6.into()),
         };
         let port = ctx.destination.port();
-        matched |= self.dest_ports.binary_search(&port).is_ok()
-            || self.dest_port_ranges.contains(port);
+        matched |=
+            self.dest_ports.binary_search(&port).is_ok() || self.dest_port_ranges.contains(port);
         let source_port = ctx.source.port();
         matched |= self.source_ports.binary_search(&source_port).is_ok()
             || self.source_port_ranges.contains(source_port);

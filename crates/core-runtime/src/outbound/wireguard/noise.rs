@@ -471,12 +471,7 @@ impl Session {
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
         self.recv_cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &[],
-                out,
-                Tag::from_slice(tag),
-            )
+            .decrypt_in_place_detached(Nonce::from_slice(&nonce), &[], out, Tag::from_slice(tag))
             .is_ok()
     }
 

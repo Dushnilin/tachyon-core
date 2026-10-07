@@ -68,15 +68,19 @@ pub(crate) enum DatagramFrame {
 }
 
 impl DatagramFrame {
-    fn apply(self, dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    /// Frame `payload` for `dest` into `out` (cleared first).
+    ///
+    /// `Raw` needs no framing at all, so the send loops skip this entirely
+    /// and hand `send` the recv-buffer slice — a `to_vec()` per datagram
+    /// for a header of zero bytes.
+    fn apply_into(self, dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
+        out.clear();
         match self {
-            DatagramFrame::Raw => payload.to_vec(),
-            DatagramFrame::Socks => socks_udp_datagram(dest, payload),
+            DatagramFrame::Raw => out.extend_from_slice(payload),
+            DatagramFrame::Socks => socks_udp_datagram(dest, payload, out),
             DatagramFrame::LengthPrefixed => {
-                let mut out = Vec::with_capacity(2 + payload.len());
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
-                out
             }
         }
     }
@@ -91,12 +95,12 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    async fn send(&self, framed: Vec<u8>, source: SocketAddr) -> std::io::Result<()> {
+    async fn send(&self, framed: &[u8], source: SocketAddr) -> std::io::Result<()> {
         match self {
-            Reply::Socket(socket) => socket.send_to(&framed, source).await.map(|_| ()),
+            Reply::Socket(socket) => socket.send_to(framed, source).await.map(|_| ()),
             Reply::Stream(writer) => {
                 let mut writer = writer.lock().await;
-                writer.write_all(&framed).await
+                writer.write_all(framed).await
             }
         }
     }
@@ -280,7 +284,13 @@ impl UdpHub {
             "udp hijack-dns {tag} {source} -> {dest}: {}B reply",
             resp.len()
         ));
-        reply.send(self.frame.apply(dest, &resp), source).await?;
+        if self.frame == DatagramFrame::Raw {
+            reply.send(&resp, source).await?;
+        } else {
+            let mut framed = Vec::new();
+            self.frame.apply_into(dest, &resp, &mut framed);
+            reply.send(&framed, source).await?;
+        }
         Ok(())
     }
 
@@ -342,9 +352,10 @@ pub(crate) fn udp_destination(destination: &Target) -> std::io::Result<SocketAdd
     }
 }
 
-/// SOCKS5 UDP datagram header `[RSV][RSV][FRAG][ATYP][ADDR][PORT]` + payload.
-fn socks_udp_datagram(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + payload.len());
+/// SOCKS5 UDP datagram header `[RSV][RSV][FRAG][ATYP][ADDR][PORT]` + payload,
+/// appended to `out` (cleared by the caller through `apply_into`).
+fn socks_udp_datagram(dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
+    out.reserve(10 + payload.len());
     out.extend_from_slice(&[0, 0, 0]);
     match dest.ip() {
         IpAddr::V4(ip) => {
@@ -358,7 +369,6 @@ fn socks_udp_datagram(dest: SocketAddr, payload: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(&dest.port().to_be_bytes());
     out.extend_from_slice(payload);
-    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,11 +385,20 @@ fn spawn_reverse(
     let tag = tag.to_string();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
+        // framing buffer for non-Raw frames, kept across datagrams so the
+        // capacity survives; Raw replies borrow `buf` directly and never
+        // touch it
+        let mut out = Vec::new();
         loop {
             match tokio::time::timeout(idle, outbound.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    let packet = frame.apply(key.1, &buf[..n]);
-                    if let Err(err) = reply.send(packet, source).await {
+                    let framed: &[u8] = if frame == DatagramFrame::Raw {
+                        &buf[..n]
+                    } else {
+                        frame.apply_into(key.1, &buf[..n], &mut out);
+                        &out
+                    };
+                    if let Err(err) = reply.send(framed, source).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
                         hub.remove_flow(key).await;
                         return;
@@ -428,14 +447,14 @@ mod tests {
     #[test]
     fn length_prefixed_frames_carry_no_address() {
         let dest = "10.0.0.1:53".parse::<SocketAddr>().expect("addr");
-        assert_eq!(
-            DatagramFrame::LengthPrefixed.apply(dest, b"hello"),
-            b"\x00\x05hello".to_vec()
-        );
-        assert_eq!(DatagramFrame::Raw.apply(dest, b"hello"), b"hello".to_vec());
-        let socks = DatagramFrame::Socks.apply(dest, b"hello");
-        assert_eq!(&socks[..3], &[0, 0, 0]);
-        assert_eq!(&socks[3..], b"\x01\x0a\x00\x00\x01\x00\x35hello");
+        let mut out = Vec::new();
+        DatagramFrame::LengthPrefixed.apply_into(dest, b"hello", &mut out);
+        assert_eq!(out, b"\x00\x05hello".to_vec());
+        DatagramFrame::Raw.apply_into(dest, b"hello", &mut out);
+        assert_eq!(out, b"hello".to_vec());
+        DatagramFrame::Socks.apply_into(dest, b"hello", &mut out);
+        assert_eq!(&out[..3], &[0, 0, 0]);
+        assert_eq!(&out[3..], b"\x01\x0a\x00\x00\x01\x00\x35hello");
     }
 
     /// A datagram the length describes has to arrive whole and nothing else:
@@ -446,7 +465,8 @@ mod tests {
         let dest = "10.0.0.1:53".parse::<SocketAddr>().expect("addr");
         for len in [1usize, 2, 255, 1400, 65_535] {
             let payload = vec![(len % 251) as u8; len];
-            let framed = DatagramFrame::LengthPrefixed.apply(dest, &payload);
+            let mut framed = Vec::new();
+            DatagramFrame::LengthPrefixed.apply_into(dest, &payload, &mut framed);
             assert_eq!(framed.len(), len + 2, "{len}");
             assert_eq!(
                 u16::from_be_bytes([framed[0], framed[1]]) as usize,

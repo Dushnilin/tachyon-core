@@ -5,20 +5,24 @@
 //! `send_data`, and `finish` is the half-close. The response head is awaited
 //! before the first read, and its status gates it, exactly like the h2 path.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use h3::client::RequestStream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// One h3 request stream wrapped as raw byte pipes.
 pub(crate) struct H3Stream {
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    /// Received bytes not yet handed to the caller.
-    pending: BytesMut,
+    /// Received bytes not yet handed to the caller, chunk by chunk — the
+    /// same shape as `h2io`: a chunk is queued as it arrives instead of
+    /// being copied into one join buffer (the mistake h2io.rs:54-58
+    /// documents). quinn hands `Bytes` over with no copy already.
+    pending: VecDeque<Bytes>,
     eof: bool,
     response_read: bool,
 }
@@ -42,7 +46,7 @@ impl H3Stream {
         }
         Ok(Self {
             stream,
-            pending: BytesMut::new(),
+            pending: VecDeque::new(),
             eof: false,
             response_read: true,
         })
@@ -60,18 +64,28 @@ impl AsyncRead for H3Stream {
             return Poll::Ready(Err(io::Error::other("naive: h3: no response")));
         }
         loop {
-            if !this.pending.is_empty() {
-                let n = out.remaining().min(this.pending.len());
-                out.put_slice(&this.pending[..n]);
-                this.pending.advance(n);
+            if let Some(front) = this.pending.front_mut() {
+                let n = out.remaining().min(front.len());
+                out.put_slice(&front[..n]);
+                front.advance(n);
+                if front.is_empty() {
+                    this.pending.pop_front();
+                }
                 return Poll::Ready(Ok(()));
             }
             if this.eof {
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut this.stream).poll_recv_data(cx) {
-                Poll::Ready(Ok(Some(chunk))) => {
-                    this.pending.extend_from_slice(chunk.chunk());
+                Poll::Ready(Ok(Some(mut chunk))) => {
+                    let n = chunk.remaining();
+                    if n > 0 {
+                        // the concrete h3 payload is `Bytes`
+                        // (FrameStream::take_chunk hands out a split, no
+                        // copy), so copy_to_bytes resolves to Bytes' own
+                        // zero-copy split under static dispatch
+                        this.pending.push_back(chunk.copy_to_bytes(n));
+                    }
                 }
                 Poll::Ready(Ok(None)) => this.eof = true,
                 Poll::Ready(Err(e)) => {
@@ -92,6 +106,9 @@ impl AsyncWrite for H3Stream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        // The copy here is the borrowed `AsyncWrite` boundary itself, not a
+        // join: dropping it needs an owned `send_bytes` path through every
+        // relay, like A8. Do not "optimize" this one in isolation.
         let mut future = std::pin::pin!(self.stream.send_data(Bytes::copy_from_slice(buf)));
         match Future::poll(future.as_mut(), cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),

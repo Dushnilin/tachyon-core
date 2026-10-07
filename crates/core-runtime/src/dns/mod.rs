@@ -487,8 +487,8 @@ impl DnsService {
 
         let use_cache = !self.disable_cache && !opts.disable_cache;
         let key = CacheKey {
-            tag: target.tag.clone(),
-            name: info.name.clone(),
+            tag: target.tag.clone().into(),
+            name: info.name.clone().into(),
             qtype: u16::from(info.qtype),
         };
         let optimistic = if self.optimistic_timeout.is_some() && use_cache {
@@ -499,7 +499,9 @@ impl DnsService {
 
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            let hit = self.cache.read().expect("dns cache").get(&key, now);
+            // write, not read: a hit bumps the entry's place in the eviction
+            // order (see dns::cache)
+            let hit = self.cache.write().expect("dns cache").get(&key, now);
             // reverse mapping was already recorded when this answer went into
             // the cache; re-recording identical bytes per hit cost a full
             // message parse. Just stamp the client id.
@@ -524,7 +526,7 @@ impl DnsService {
         let _guard = lock.lock().await;
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            if let Some(CacheHit::Fresh(raw)) = self.cache.read().expect("dns cache").get(&key, now)
+            if let Some(CacheHit::Fresh(raw)) = self.cache.write().expect("dns cache").get(&key, now)
             {
                 return codec::set_id(&raw, info.id);
             }

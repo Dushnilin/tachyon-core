@@ -1,16 +1,26 @@
 //! Response cache for the DNS client: TTL-bounded LRU with optional
 //! optimistic serving (return stale + background refresh).
+//!
+//! LRU, not first-in-first-out: eviction used to scan the whole map for the
+//! smallest `inserted` (4096 iterations plus a key clone on every insert at
+//! capacity) and, worse, a hot entry that was only *read* aged towards the
+//! exit while unknown names churned past it. A hit now bumps the entry, and
+//! eviction is the LRU crate's own O(1) pop.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
+
 use super::codec::ResponseMeta;
 
+/// Arc'd fields: the key is cloned into the inflight map, the refresh set
+/// and the cache itself, and a `String` clone per hop is what that costs.
 #[derive(Clone)]
 pub struct CacheKey {
-    pub tag: String,
-    pub name: String,
+    pub tag: Arc<str>,
+    pub name: Arc<str>,
     pub qtype: u16,
 }
 
@@ -44,19 +54,20 @@ pub enum CacheHit {
 }
 
 pub struct Cache {
-    entries: HashMap<CacheKey, CacheEntry>,
-    capacity: usize,
+    entries: LruCache<CacheKey, CacheEntry>,
 }
 
 impl Cache {
     pub fn new(capacity: usize) -> Self {
         Self {
-            entries: HashMap::new(),
-            capacity: capacity.max(16),
+            entries: LruCache::new(NonZeroUsize::new(capacity.max(16)).expect("max(16)")),
         }
     }
 
-    pub fn get(&self, key: &CacheKey, now: Instant) -> Option<CacheHit> {
+    /// The read that keeps a hot name alive: it bumps the entry to the front
+    /// of the eviction order, so unknown names churning through the cache
+    /// cannot push out a name that is being asked for.
+    pub fn get(&mut self, key: &CacheKey, now: Instant) -> Option<CacheHit> {
         let entry = self.entries.get(key)?;
         let age = now.duration_since(entry.inserted);
         if age < entry.ttl {
@@ -76,12 +87,9 @@ impl Cache {
         optimistic_timeout: Option<Duration>,
     ) {
         let ttl_secs = meta.min_answer_ttl.unwrap_or(60).max(1);
-        if self.entries.len() >= self.capacity {
-            self.evict_oldest();
-        }
         let inserted = Instant::now();
         let optimistic_until = optimistic_timeout.map(|window| inserted + window);
-        self.entries.insert(
+        self.entries.put(
             key,
             CacheEntry {
                 raw: raw.into(),
@@ -90,18 +98,6 @@ impl Cache {
                 optimistic_until,
             },
         );
-    }
-
-    fn evict_oldest(&mut self) {
-        let Some(oldest) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, e)| e.inserted)
-            .map(|(k, _)| k.clone())
-        else {
-            return;
-        };
-        self.entries.remove(&oldest);
     }
 }
 
@@ -163,7 +159,7 @@ mod tests {
         let mut cache = Cache::new(16);
         for i in 0..17 {
             let mut k = key();
-            k.name = format!("h{i}.test");
+            k.name = format!("h{i}.test").into();
             std::thread::sleep(Duration::from_millis(2));
             cache.insert(k, vec![i as u8], &meta(Some(60)), None);
         }
@@ -174,5 +170,39 @@ mod tests {
             qtype: 1,
         };
         assert!(cache.get(&oldest, Instant::now()).is_none());
+    }
+
+    /// The behaviour the scan did not have: reading an entry keeps it, and
+    /// the eviction takes the least recently *used* one, not the least
+    /// recently inserted.
+    #[test]
+    fn a_read_keeps_an_entry_alive_across_eviction() {
+        let mut cache = Cache::new(16);
+        for i in 0..16 {
+            let mut k = key();
+            k.name = format!("h{i}.test").into();
+            cache.insert(k, vec![i as u8], &meta(Some(60)), None);
+        }
+        let probe = |name: &str| CacheKey {
+            tag: "t".into(),
+            name: name.into(),
+            qtype: 1,
+        };
+        // touch the oldest insert
+        assert!(matches!(
+            cache.get(&probe("h0.test"), Instant::now()),
+            Some(CacheHit::Fresh(_))
+        ));
+        let mut newest = key();
+        newest.name = "h16.test".into();
+        cache.insert(newest, vec![16], &meta(Some(60)), None);
+        assert!(
+            cache.get(&probe("h0.test"), Instant::now()).is_some(),
+            "the touched entry survives"
+        );
+        assert!(
+            cache.get(&probe("h1.test"), Instant::now()).is_none(),
+            "the untouched one took the eviction"
+        );
     }
 }

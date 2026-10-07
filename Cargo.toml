@@ -51,6 +51,8 @@ http = "1"
 # interface addresses for the mDNS transport's per-interface sockets
 if-addrs = "0.15"
 md-5 = "0.10"
+# true LRU for the dns response cache: eviction was a full scan of the map
+lru = "0.12"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "log"] }
 regex = "1"
 # Already in the tree through `regex`, so linking it directly costs no extra

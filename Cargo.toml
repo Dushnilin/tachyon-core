@@ -27,6 +27,10 @@ aes = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
 # pure-Rust backend: the C implementation would need a cross cc for musl
+# (build.rs + cc, no toolchain by the no-c rule). Audited 2026-10-07: all
+# four blake3 call sites are connection setup -- vless-enc ClientHello and
+# tickets, shadowsocks-2022 subkey -- never a packet, so the SIMD backend
+# would only touch handshakes. Deliberately left alone.
 blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
 brotli = "9"
 bytes = "1"

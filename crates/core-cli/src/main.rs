@@ -78,7 +78,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // for machinery nothing can use — the steal queues, the cross-worker
     // handoffs — while every task switch could have been a plain loop over the
     // ready queue, so that case takes the current-thread runtime instead.
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // TACHYON_WORKERS overrides the guess (benchmarks, cpu-restricted cgroups).
+    let workers = std::env::var("TACHYON_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let runtime = if workers == 1 {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -16,10 +16,10 @@ use crate::logging;
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
-    PoolLease, QuicStream, QuicTunnelDefaults,
-    QuicTunnelOptions, SalamanderRelay, VarintReader, bind_udp, bind_udp_loopback, dest_string,
-    io_from_datagram, io_from_quinn, put_varint, random_padding, read_varint, resolve_host,
-    spawn_gecko_relay, spawn_salamander_relay, udp_loopback_pair,
+    PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay, VarintReader,
+    bind_udp, bind_udp_loopback, dest_string, io_from_datagram, io_from_quinn, put_varint,
+    random_padding, read_varint, resolve_host, spawn_gecko_relay, spawn_salamander_relay,
+    udp_loopback_pair,
 };
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
@@ -186,8 +186,9 @@ impl Hysteria2 {
             .enumerate()
             .min_by_key(|(_, s)| s.leases.load(Ordering::Relaxed));
         let shared = match best {
-            Some((i, s)) if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
-                || pool.len() >= POOL_MAX_CONNS =>
+            Some((i, s))
+                if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
+                    || pool.len() >= POOL_MAX_CONNS =>
             {
                 Arc::clone(&pool[i])
             }
@@ -422,9 +423,11 @@ impl Hy2Shared {
                 let Some(session) = session else {
                     continue;
                 };
+                // share the datagram instead of copying the payload out of it
+                let payload = data.slice(payload.as_ptr() as usize - data.as_ptr() as usize..);
                 let complete = {
                     let mut defrag = session.defragger.lock().expect("defrag");
-                    defrag.feed(pid, fid, ftot, payload.to_vec())
+                    defrag.feed(pid, fid, ftot, payload)
                 };
                 if let Some(pkt) = complete {
                     let _ = session.sock.send(&pkt).await;

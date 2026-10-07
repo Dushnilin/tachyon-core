@@ -34,6 +34,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::inbound::AnyStream;
 
 use aes::cipher::KeyInit as AeadKeyInit;
+use core_crypto::fastgcm::Gcm;
 use ml_kem::kem::EncapsulationKey;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
@@ -63,7 +64,6 @@ impl RngCore for OsRngCore {
 }
 impl rand_core::CryptoRng for OsRngCore {}
 
-type Aes128Gcm = aes_gcm::AesGcm<aes::Aes128, aes_gcm::aead::consts::U12>;
 type ChaCha20Poly1305 = chacha20poly1305::ChaCha20Poly1305;
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes256>;
 
@@ -123,7 +123,7 @@ fn new_ctr(key: &[u8], iv: &[u8]) -> Aes128Ctr {
 // --- record AEAD ------------------------------------------------------------
 
 enum RecordAead {
-    Aes(Box<Aes128Gcm>),
+    Aes(Gcm),
     Cha(Box<ChaCha20Poly1305>),
 }
 
@@ -132,57 +132,107 @@ impl RecordAead {
         let k = derive_key_aead(ctx, key);
         if use_aes {
             // AES-128-GCM: the first 16 bytes of the 32-byte derived key.
-            RecordAead::Aes(Box::new(Aes128Gcm::new_from_slice(&k[..16]).expect("key")))
+            RecordAead::Aes(Gcm::new(&k[..16]))
         } else {
             RecordAead::Cha(Box::new(ChaCha20Poly1305::new_from_slice(&k).expect("key")))
         }
     }
 
     fn seal(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
-        use aes_gcm::aead::{Aead, Payload};
         match self {
-            RecordAead::Aes(a) => a
-                .encrypt(
+            RecordAead::Aes(a) => {
+                let mut buf = plaintext.to_vec();
+                let tag = a.seal(nonce, aad, &mut buf);
+                buf.extend_from_slice(&tag);
+                buf
+            }
+            RecordAead::Cha(c) => {
+                use chacha20poly1305::aead::{Aead, Payload};
+                c.encrypt(
                     nonce.into(),
                     Payload {
                         msg: plaintext,
                         aad,
                     },
                 )
-                .expect("seal"),
-            RecordAead::Cha(a) => a
-                .encrypt(
-                    nonce.into(),
-                    Payload {
-                        msg: plaintext,
-                        aad,
-                    },
-                )
-                .expect("seal"),
+                .expect("seal")
+            }
         }
     }
 
-    fn open(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, ()> {
-        use aes_gcm::aead::{Aead, Payload};
+    /// Seal `buf` in place, returning the tag — the record write path
+    /// stages header + payload in one buffer and seals the payload half.
+    fn seal_region(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         match self {
-            RecordAead::Aes(a) => a
-                .decrypt(
+            RecordAead::Aes(a) => a.seal(nonce, aad, buf),
+            RecordAead::Cha(c) => {
+                use chacha20poly1305::aead::AeadInPlace;
+                let t = c
+                    .encrypt_in_place_detached(nonce.into(), aad, buf)
+                    .expect("seal");
+                let mut out = [0u8; 16];
+                out.copy_from_slice(&t);
+                out
+            }
+        }
+    }
+
+    /// Open `sealed` (`ciphertext || tag`) in place, truncating to the
+    /// plaintext. One buffer through the hot path instead of seal→copy.
+    fn open_region(&self, nonce: &[u8; 12], aad: &[u8], sealed: &mut Vec<u8>) -> Result<(), ()> {
+        if sealed.len() < 16 {
+            return Err(());
+        }
+        let split = sealed.len() - 16;
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&sealed[split..]);
+        let ok = match self {
+            RecordAead::Aes(a) => {
+                let (ct, _) = sealed.split_at_mut(split);
+                a.open(nonce, aad, ct, &tag)
+            }
+            RecordAead::Cha(c) => {
+                use chacha20poly1305::aead::AeadInPlace;
+                let (ct, _) = sealed.split_at_mut(split);
+                c.decrypt_in_place_detached(
+                    nonce.into(),
+                    aad,
+                    ct,
+                    chacha20poly1305::Tag::from_slice(&tag),
+                )
+                .is_ok()
+            }
+        };
+        if !ok {
+            return Err(());
+        }
+        sealed.truncate(split);
+        Ok(())
+    }
+
+    fn open(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, ()> {
+        match self {
+            RecordAead::Aes(a) => {
+                if ciphertext.len() < 16 {
+                    return Err(());
+                }
+                let split = ciphertext.len() - 16;
+                let mut tag = [0u8; 16];
+                tag.copy_from_slice(&ciphertext[split..]);
+                let mut buf = ciphertext[..split].to_vec();
+                a.open(nonce, aad, &mut buf, &tag).then_some(buf).ok_or(())
+            }
+            RecordAead::Cha(c) => {
+                use chacha20poly1305::aead::{Aead, Payload};
+                c.decrypt(
                     nonce.into(),
                     Payload {
                         msg: ciphertext,
                         aad,
                     },
                 )
-                .map_err(|_| ()),
-            RecordAead::Cha(a) => a
-                .decrypt(
-                    nonce.into(),
-                    Payload {
-                        msg: ciphertext,
-                        aad,
-                    },
-                )
-                .map_err(|_| ()),
+                .map_err(|_| ())
+            }
         }
     }
 }
@@ -400,6 +450,10 @@ impl ClientInstance {
                     peer_padding: None,
                     pre_write: Some(client_hello[..pre_write_len].to_vec()),
                     raw: BytesMut::new(),
+                    stage: Vec::new(),
+                    rec: None,
+                    out_rest: None,
+                    out_flush: false,
                     out_nonce: [0u8; 12],
                     in_nonce: [0u8; 12],
                     is_0rtt: true,
@@ -530,14 +584,19 @@ impl ClientInstance {
         };
 
         let our_aead_ready = RecordAead::new(&our_ctx, &united_key, use_aes);
+        let peer_aead_ready = RecordAead::new(&peer_ctx, &united_key, use_aes);
         Ok(Box::new(EncryptedConn {
             inner: conn,
             united_key,
             aead: Some((our_ctx, Some(our_aead_ready))),
-            peer_aead: Some(peer_ctx),
+            peer_aead: Some(peer_aead_ready),
             peer_padding: Some(peer_padding_len),
             pre_write: None,
             raw: BytesMut::new(),
+            stage: Vec::new(),
+            rec: None,
+            out_rest: None,
+            out_flush: false,
             out_nonce: [0u8; 12],
             in_nonce,
             is_0rtt: false,
@@ -607,10 +666,23 @@ pub struct EncryptedConn {
     /// `(ctx, aead)` — our uplink AEAD; the 0-RTT path builds it from the
     /// sealed ticket record.
     aead: Option<(Vec<u8>, Option<RecordAead>)>,
-    peer_aead: Option<Vec<u8>>,
+    /// downlink AEAD, derived once per connection — rebuilding it per
+    /// record cost a blake3 derive on every read
+    peer_aead: Option<RecordAead>,
     peer_padding: Option<usize>,
     pre_write: Option<Vec<u8>>,
     raw: BytesMut,
+    /// wire bytes staged toward the current read target. It lives in the
+    /// conn, not in `poll_read`'s frame: a local buffer would be dropped
+    /// when the poll returns Pending and the partially read bytes are gone.
+    stage: Vec<u8>,
+    /// header of the record whose body is still arriving — parsed once so
+    /// a resumed read does not de-xor it with an already-advanced keystream
+    rec: Option<([u8; RECORD_HEADER], usize)>,
+    /// record bytes the kernel has not taken yet, and whether an
+    /// interrupted flush is what the conn still owes the caller
+    out_rest: Option<Vec<u8>>,
+    out_flush: bool,
     out_nonce: [u8; 12],
     in_nonce: [u8; 12],
     is_0rtt: bool,
@@ -636,10 +708,11 @@ impl EncryptedConn {
         let mut header = [0u8; RECORD_HEADER];
         encode_header(&mut header, l);
         increase_nonce(&mut self.out_nonce);
-        let sealed = aead.seal(&self.out_nonce, chunk, &header);
-        let mut out = Vec::with_capacity(RECORD_HEADER + sealed.len());
+        let mut out = Vec::with_capacity(RECORD_HEADER + l);
         out.extend_from_slice(&header);
-        out.extend_from_slice(&sealed);
+        out.extend_from_slice(chunk);
+        let tag = aead.seal_region(&self.out_nonce, &header, &mut out[RECORD_HEADER..]);
+        out.extend_from_slice(&tag);
         if let Some(ctr) = &mut self.xor_out_ctr {
             xor_stream(ctr, &mut self.out_skip, &mut out);
         }
@@ -670,20 +743,48 @@ impl AsyncWrite for EncryptedConn {
             return Poll::Ready(Ok(0));
         }
         let this = &mut *self;
-        if this.aead.as_ref().and_then(|a| a.1.as_ref()).is_none() {
-            return Poll::Ready(Err(io::Error::other("vless-enc: 0rtt aead not ready")));
+        let consumed = buf.len().min(RECORD_MAX);
+        // an interrupted flush is answered before anything new is built —
+        // rebuilding here would put a duplicate record on the wire
+        if this.out_flush {
+            ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+            this.out_flush = false;
+            return Poll::Ready(Ok(consumed));
         }
-        let record = this.poll_build_record(buf)?;
-        let pre = this.pre_write.take();
-        let fut = async {
-            if let Some(pre) = pre {
-                this.inner.write_all(&pre).await?;
+        // a record left over from a Pending call finishes first; the caller
+        // re-submits the same buffer until we report progress
+        let mut rest = match this.out_rest.take() {
+            Some(rest) => rest,
+            None => {
+                if this.aead.as_ref().and_then(|a| a.1.as_ref()).is_none() {
+                    return Poll::Ready(Err(io::Error::other("vless-enc: 0rtt aead not ready")));
+                }
+                let record = this.poll_build_record(buf)?;
+                let mut all = this.pre_write.take().unwrap_or_default();
+                all.extend_from_slice(&record);
+                all
             }
-            this.inner.write_all(&record).await?;
-            this.inner.flush().await?;
-            Ok(buf.len().min(RECORD_MAX))
         };
-        Box::pin(fut).as_mut().poll(cx)
+        while !rest.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &rest) {
+                Poll::Pending => {
+                    this.out_rest = Some(rest);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(err)) => {
+                    this.out_rest = Some(rest);
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(n)) => {
+                    rest.drain(..n);
+                }
+            }
+        }
+        this.out_flush = true;
+        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+        this.out_flush = false;
+        Poll::Ready(Ok(consumed))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -705,9 +806,11 @@ impl AsyncRead for EncryptedConn {
         // 0-RTT: the first read carries the 16-byte server random, which
         // seeds the downlink AEAD (and the XOR stream for `random`).
         if this.is_0rtt && this.peer_aead.is_none() {
+            ready!(fill_stage(this, cx, 16))?;
             let mut server_random = [0u8; 16];
-            ready!(poll_read_exact(&mut this.inner, cx, &mut server_random))?;
-            this.peer_aead = Some(server_random.to_vec());
+            server_random.copy_from_slice(&this.stage[..16]);
+            this.stage.clear();
+            this.peer_aead = Some(RecordAead::new(&server_random, &this.united_key, true));
             if this.xor_in_ctr.is_none() {
                 this.xor_in_ctr = Some(new_ctr(&this.united_key, &server_random));
             }
@@ -715,34 +818,41 @@ impl AsyncRead for EncryptedConn {
         }
         // 1-RTT: a padded `[len]AEAD` record precedes the data.
         if let Some(peer_padding_len) = this.peer_padding {
-            let mut pad = vec![0u8; peer_padding_len];
-            ready!(poll_read_exact(&mut this.inner, cx, &mut pad))?;
-            if let Some(ctx) = this.peer_aead.as_ref() {
+            ready!(fill_stage(this, cx, peer_padding_len))?;
+            if let Some(aead) = this.peer_aead.as_ref() {
                 increase_nonce(&mut this.in_nonce);
-                RecordAead::new(ctx, &this.united_key, true)
-                    .open(&this.in_nonce, &pad, &[])
+                aead.open_region(&this.in_nonce, &[], &mut this.stage)
                     .map_err(|_| io::Error::other("vless-enc: padding decrypt failed"))?;
             }
+            this.stage.clear();
             this.peer_padding = None;
         }
         if this.raw.is_empty() {
-            let mut header = [0u8; RECORD_HEADER];
-            ready!(poll_read_exact(&mut this.inner, cx, &mut header))?;
-            if let Some(ctr) = &mut this.xor_in_ctr {
-                xor_stream(ctr, &mut this.in_skip, &mut header);
+            if this.rec.is_none() {
+                ready!(fill_stage(this, cx, RECORD_HEADER))?;
+                let mut header = [0u8; RECORD_HEADER];
+                header.copy_from_slice(&this.stage[..RECORD_HEADER]);
+                if let Some(ctr) = &mut this.xor_in_ctr {
+                    xor_stream(ctr, &mut this.in_skip, &mut header);
+                }
+                let l = decode_header(&header)
+                    .map_err(|_| io::Error::other("vless-enc: invalid record header"))?;
+                this.rec = Some((header, l));
+                // the header now lives in `rec`; the stage is free to hold
+                // the body, which may arrive over several polls
+                this.stage.clear();
             }
-            let l = decode_header(&header)
-                .map_err(|_| io::Error::other("vless-enc: invalid record header"))?;
-            let mut data = vec![0u8; l];
-            ready!(poll_read_exact(&mut this.inner, cx, &mut data))?;
-            let Some(ctx) = this.peer_aead.as_ref() else {
+            let (header, l) = this.rec.expect("record header parsed above");
+            ready!(fill_stage(this, cx, l))?;
+            let Some(aead) = this.peer_aead.as_ref() else {
                 return Poll::Ready(Err(io::Error::other("vless-enc: peer aead missing")));
             };
             increase_nonce(&mut this.in_nonce);
-            let opened = RecordAead::new(ctx, &this.united_key, true)
-                .open(&this.in_nonce, &data, &header)
+            aead.open_region(&this.in_nonce, &header, &mut this.stage)
                 .map_err(|_| io::Error::other("vless-enc: record decrypt failed"))?;
-            this.raw.extend_from_slice(&opened);
+            this.raw.extend_from_slice(&this.stage);
+            this.stage.clear();
+            this.rec = None;
         }
         let n = out.remaining().min(this.raw.len());
         out.put_slice(&this.raw.split_to(n));
@@ -752,21 +862,36 @@ impl AsyncRead for EncryptedConn {
 
 use std::task::ready;
 
-/// `AsyncReadExt::read_exact` as a poll fn over a boxed stream.
-fn poll_read_exact(
-    inner: &mut AnyStream,
+/// Stage `target` bytes from `inner` into the conn's persistent `stage`
+/// buffer, resuming where an earlier Pending call stopped. Staging in a
+/// per-call local would lose the bytes read before the poll returned.
+fn fill_stage(
+    this: &mut EncryptedConn,
     cx: &mut Context<'_>,
-    mut buf: &mut [u8],
+    target: usize,
 ) -> Poll<io::Result<()>> {
-    let mut inner = Pin::new(inner);
-    while !buf.is_empty() {
-        let mut chunk = ReadBuf::new(buf);
-        ready!(inner.as_mut().poll_read(cx, &mut chunk))?;
-        let n = chunk.filled().len();
-        if n == 0 {
-            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+    let EncryptedConn { inner, stage, .. } = this;
+    while stage.len() < target {
+        let have = stage.len();
+        stage.resize(target, 0);
+        let mut chunk = ReadBuf::new(&mut stage[have..]);
+        match Pin::new(&mut *inner).poll_read(cx, &mut chunk) {
+            Poll::Pending => {
+                stage.truncate(have);
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(err)) => {
+                stage.truncate(have);
+                return Poll::Ready(Err(err));
+            }
+            Poll::Ready(Ok(())) => {
+                let n = chunk.filled().len();
+                stage.truncate(have + n);
+                if n == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                }
+            }
         }
-        buf = &mut buf[n..];
     }
     Poll::Ready(Ok(()))
 }
@@ -809,8 +934,7 @@ mod tests {
         *x25519_dalek::PublicKey::from(sk).as_bytes()
     }
 
-    #[tokio::test]
-    async fn handshake_full_and_record_echo() {
+    async fn echo_roundtrip(client_io: AnyStream, server_io: AnyStream) {
         // Client config: a single x25519 key (the server's public).
         let server = TestServer {
             x_sk: x25519_dalek::StaticSecret::from([0x11u8; 32]),
@@ -842,8 +966,7 @@ mod tests {
         .expect("parse");
         let instance = ClientInstance::new(&spec).expect("init");
 
-        let (client_io, server_io) = tokio::io::duplex(1 << 16);
-        let client = tokio::spawn(async move { instance.handshake(Box::new(client_io)).await });
+        let client = tokio::spawn(async move { instance.handshake(client_io).await });
 
         // --- server handshake (sync, native, no 0rtt) ---
         let mut conn = server_io;
@@ -971,5 +1094,93 @@ mod tests {
         let mut back = vec![0u8; 4];
         client_conn.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"pong");
+    }
+
+    #[tokio::test]
+    async fn handshake_full_and_record_echo() {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        echo_roundtrip(Box::new(client_io), Box::new(server_io)).await;
+    }
+
+    /// Hands out a few bytes per call and alternates with a Pending, so
+    /// every exact-read and every record write has to resume mid-stream.
+    struct Chunked<S> {
+        inner: S,
+        per: usize,
+        r_ok: bool,
+        w_ok: bool,
+    }
+
+    impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Chunked<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let this = &mut *self;
+            if !this.r_ok {
+                this.r_ok = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            this.r_ok = false;
+            let mut tmp = vec![0u8; buf.remaining().min(this.per)];
+            let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+            match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
+                std::task::Poll::Ready(Ok(())) => {
+                    buf.put_slice(rb.filled());
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Chunked<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let this = &mut *self;
+            if !this.w_ok {
+                this.w_ok = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            this.w_ok = false;
+            let n = buf.len().min(this.per);
+            std::pin::Pin::new(&mut this.inner).poll_write(cx, &buf[..n])
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn records_survive_fragmented_io() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let client_io = Box::new(Chunked {
+            inner: a,
+            per: 7,
+            r_ok: true,
+            w_ok: true,
+        });
+        let server_io = Box::new(Chunked {
+            inner: b,
+            per: 5,
+            r_ok: true,
+            w_ok: true,
+        });
+        echo_roundtrip(client_io, server_io).await;
     }
 }

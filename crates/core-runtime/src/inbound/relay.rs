@@ -24,9 +24,10 @@ use crate::clash_state::ConnHandle;
 /// stream needs this much in flight to keep both sockets fed: 256 KiB measured
 /// 15-21 Gbit/s on a single stream, 1 MiB measured 51.
 const CHUNK: usize = 1024 * 1024;
-/// What a fresh pipe holds. Pipe capacity counts against the per-user
-/// `pipe-user-pages-soft` budget whether or not it is full, so only a direction
-/// that actually fills it gets the big one.
+/// What a fresh pipe asks for: starts at 1 MiB so single-stream and short
+/// transfers immediately hit line rate without a 4-splice ramp.
+const PIPE_START: usize = 1024 * 1024;
+/// What the pipe actually holds when the kernel refuses `PIPE_START` (budget).
 const PIPE_DEFAULT: usize = 64 * 1024;
 /// A splice at least this big counts towards a pipe growing, and this many in a
 /// row do it.
@@ -49,11 +50,16 @@ impl Pipe {
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self {
+        let mut pipe = Self {
             read: fds[0],
             write: fds[1],
             size: PIPE_DEFAULT,
-        })
+        };
+        let r = unsafe { libc::fcntl(pipe.write, libc::F_SETPIPE_SZ, PIPE_START as libc::c_int) };
+        if r > 0 {
+            pipe.size = r as usize;
+        }
+        Ok(pipe)
     }
 
     /// Called with the pipe empty once the flow has shown itself to be bulk. Best
@@ -212,29 +218,44 @@ async fn one_way_buffered(from: &TcpStream, to: &TcpStream, count: impl Fn(u64))
 }
 
 /// Relay both directions of an established connection until both sides are
-/// done, counting into the Clash view as the userspace loop does and honouring
-/// `DELETE /connections/{id}`. `prefix` is what the sniffer already read off the
-/// client: it goes upstream first. `vless_head` says the upstream still owes a
-/// vless response head.
+/// done. `prefix` is what the sniffer already read off the client: it goes
+/// upstream first. `vless_head` says the upstream still owes a vless response
+/// head. A `tracker` feeds the Clash view and makes `DELETE
+/// /connections/{id}` end the relay; without one the loop just moves the bytes
+/// — the kernel path must not cost the connection its `splice(2)` because the
+/// connection registry happens to be off.
 pub(crate) async fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
     prefix: &[u8],
-    tracker: &ConnHandle,
+    tracker: Option<&ConnHandle>,
     vless_head: bool,
 ) -> io::Result<()> {
     if !prefix.is_empty() {
         write_all(upstream, prefix).await?;
-        tracker.add_upload(prefix.len() as u64);
+        if let Some(tracker) = tracker {
+            tracker.add_upload(prefix.len() as u64);
+        }
     }
-    let signal = tracker.close_signal();
     let both = async {
         tokio::try_join!(
-            one_way(client, upstream, false, |n| tracker.add_upload(n)),
-            one_way(upstream, client, vless_head, |n| tracker.add_download(n)),
+            one_way(client, upstream, false, |n| {
+                if let Some(tracker) = tracker {
+                    tracker.add_upload(n)
+                }
+            }),
+            one_way(upstream, client, vless_head, |n| {
+                if let Some(tracker) = tracker {
+                    tracker.add_download(n)
+                }
+            }),
         )
         .map(|_| ())
     };
+    let Some(tracker) = tracker else {
+        return both.await;
+    };
+    let signal = tracker.close_signal();
     tokio::select! {
         result = both => result,
         _ = signal.wait() => Err(super::closed_by_api()),

@@ -347,10 +347,12 @@ where
 {
     match conn {
         Conn::Plain(mut upstream) => {
+            // A tracker is not a precondition here: the kernel path is what
+            // the plain relay exists for, and in a bench (or a build with the
+            // connection view off) it used to be skipped entirely because
+            // nothing to count meant no splice at all.
             #[cfg(target_os = "linux")]
-            if let Some(tracker) = tracker
-                && let Some(client_tcp) = client_raw_tcp(&client)
-            {
+            if let Some(client_tcp) = client_raw_tcp(&client) {
                 let up = &*upstream as &dyn std::any::Any;
                 if let Some(upstream_tcp) = up.downcast_ref::<TcpStream>() {
                     return relay::relay(client_tcp, upstream_tcp, prefix, tracker, false).await;
@@ -379,8 +381,8 @@ where
                     tokio::io::copy_bidirectional_with_sizes(
                         &mut client,
                         &mut upstream,
-                        RELAY_BUF,
-                        RELAY_BUF,
+                        relay_buf(),
+                        relay_buf(),
                     )
                     .await?;
                 }
@@ -392,8 +394,8 @@ where
                 writer.write_chunk(prefix).await?;
             }
             let (mut client_read, mut client_write) = tokio::io::split(client);
-            let mut up_buf = vec![0u8; RELAY_BUF];
-            let mut down_buf = vec![0u8; RELAY_BUF];
+            let mut up_buf = take_buf();
+            let mut down_buf = take_buf();
             let up = async {
                 loop {
                     let n = client_read.read(&mut up_buf).await?;
@@ -423,7 +425,7 @@ where
                     }
                 }
             };
-            match tracker {
+            let result = match tracker {
                 Some(tracker) => {
                     let signal = tracker.close_signal();
                     let relay = async { tokio::try_join!(up, down).map(|_| ()) };
@@ -434,7 +436,10 @@ where
                     }
                 }
                 None => tokio::try_join!(up, down).map(|_| ()),
-            }
+            };
+            give_buf(up_buf);
+            give_buf(down_buf);
+            result
         }
     }
 }
@@ -448,7 +453,65 @@ fn closed_by_api() -> io::Error {
 /// tokio picks by default means eight times the syscalls and, for the shadowsocks
 /// 2022 chunks (up to 64 KiB), a frame cut into pieces; at 128 KiB one read also
 /// covers two whole records, so a steady download costs one write per two of them.
-const RELAY_BUF: usize = 128 * 1024;
+///
+/// On a small machine 128 KiB is poison rather than a win: eight connections
+/// times two buffers is 2 MiB, four times a Cortex-A53's 512 KiB L2, so every
+/// stream evicts the next one's hot bytes and the core sits in memory stalls.
+/// There the relay gets 16 KiB instead — 8 conns x 2 x 16 KiB = 256 KiB, half
+/// the L2 — which is where the 8-stream router numbers were bleeding.
+fn relay_buf() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        if online_cores().is_some_and(|cores| (1..=2).contains(&cores)) {
+            16 * 1024
+        } else {
+            128 * 1024
+        }
+    })
+}
+
+/// Physical online cores — deliberately not `available_parallelism()`: the bench
+/// pins a client to two CPUs of a sixteen-core host, and the relay must stay at
+/// 128 KiB there because the cache it is sized for is still all of it.
+fn online_cores() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if n > 0 {
+            return Some(n as usize);
+        }
+    }
+    std::thread::available_parallelism().ok().map(|n| n.get())
+}
+
+/// Relay buffers waiting for the next connection. A connection takes two and
+/// gives them back on close: at 128 KiB each is an mmap/munmap pair on glibc,
+/// and a steady connection rate pays that per connection. Capped so a burst
+/// cannot pin memory (16 x 128 KiB = 2 MiB, 16 x 16 KiB = 256 KiB).
+static BUF_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+const POOL_CAP: usize = 16;
+
+fn take_buf() -> Vec<u8> {
+    let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    match pool.pop() {
+        Some(mut buf) => {
+            buf.resize(relay_buf(), 0);
+            buf
+        }
+        None => vec![0u8; relay_buf()],
+    }
+}
+
+fn give_buf(mut buf: Vec<u8>) {
+    if buf.capacity() != relay_buf() {
+        return;
+    }
+    buf.clear();
+    let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < POOL_CAP {
+        pool.push(buf);
+    }
+}
 
 /// The client side of a relay, counting what crosses it for the connection
 /// view: bytes read from it are upload, bytes written to it are download.
@@ -523,8 +586,8 @@ where
         result = tokio::io::copy_bidirectional_with_sizes(
             &mut counted,
             upstream,
-            RELAY_BUF,
-            RELAY_BUF,
+            relay_buf(),
+            relay_buf(),
         ) => result.map(|_| ()),
         _ = signal.wait() => Err(closed_by_api()),
     }

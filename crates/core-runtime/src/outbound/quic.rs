@@ -930,12 +930,17 @@ impl VarintReader {
 }
 
 /// Per-session fragment reassembler (hy2 / tuic PACKET frames).
+///
+/// Fragments are `Bytes`: a slice of the datagram is shared by reference
+/// count, so a single-fragment packet -- the overwhelmingly common case --
+/// travels through without a copy at all; only the multi-fragment reassembly
+/// copies, and then once, into the contiguous output.
 pub(crate) struct Defragger {
     // packet_id → (total, slots)
     items: std::collections::HashMap<u16, FragSlots>,
 }
 
-type FragSlots = (u8, Vec<Option<Vec<u8>>>);
+type FragSlots = (u8, Vec<Option<bytes::Bytes>>);
 
 impl Defragger {
     pub fn new() -> Self {
@@ -950,8 +955,8 @@ impl Defragger {
         packet_id: u16,
         frag_id: u8,
         frag_total: u8,
-        data: Vec<u8>,
-    ) -> Option<Vec<u8>> {
+        data: bytes::Bytes,
+    ) -> Option<bytes::Bytes> {
         if frag_total <= 1 {
             return Some(data);
         }
@@ -968,11 +973,11 @@ impl Defragger {
         entry.1[frag_id as usize] = Some(data);
         if entry.1.iter().all(Option::is_some) {
             let (_, slots) = self.items.remove(&packet_id)?;
-            let mut out = Vec::new();
+            let mut out = bytes::BytesMut::new();
             for slot in slots {
-                out.extend(slot?);
+                out.extend_from_slice(&slot?);
             }
-            return Some(out);
+            return Some(out.freeze());
         }
         None
     }
@@ -1147,8 +1152,14 @@ mod tests {
     #[test]
     fn defragger_reassembles() {
         let mut d = Defragger::new();
-        assert_eq!(d.feed(1, 0, 1, b"one".to_vec()), Some(b"one".to_vec()));
-        assert_eq!(d.feed(2, 0, 2, b"ab".to_vec()), None);
-        assert_eq!(d.feed(2, 1, 2, b"cd".to_vec()), Some(b"abcd".to_vec()));
+        assert_eq!(
+            d.feed(1, 0, 1, bytes::Bytes::from_static(b"one")),
+            Some(bytes::Bytes::from_static(b"one"))
+        );
+        assert_eq!(d.feed(2, 0, 2, bytes::Bytes::from_static(b"ab")), None);
+        assert_eq!(
+            d.feed(2, 1, 2, bytes::Bytes::from_static(b"cd")),
+            Some(bytes::Bytes::from_static(b"abcd"))
+        );
     }
 }

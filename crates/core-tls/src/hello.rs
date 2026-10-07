@@ -165,7 +165,7 @@ pub fn build(
     let mut grease_used = Vec::new();
     for e in &template.extensions {
         if let Ext::Static(0x000a, body) = e {
-            for w in body.chunks_exact(2) {
+            for w in body.as_chunks::<2>().0 {
                 let v = u16::from_be_bytes([w[0], w[1]]);
                 if keyshare::is_grease(v) {
                     grease_used.push(v);

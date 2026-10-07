@@ -178,6 +178,9 @@ impl Tproxy {
                             };
                             *a
                         });
+                        if hub.try_existing(source, dest, &buf[..n]) {
+                            continue;
+                        }
                         let hub = Arc::clone(&hub);
                         let reply = Reply::Socket(Arc::clone(&sock));
                         let tag = tag.clone();

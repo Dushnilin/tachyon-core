@@ -656,7 +656,9 @@ mod tests {
         let i = 5 + 4 + 2 + 32 + 1 + 32;
         let n = u16::from_be_bytes([raw[i], raw[i + 1]]) as usize;
         let on_wire: Vec<u16> = raw[i + 2..i + 2 + n]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|w| u16::from_be_bytes([w[0], w[1]]))
             .collect();
         assert_eq!(hs.offered, on_wire);

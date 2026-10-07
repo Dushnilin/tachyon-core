@@ -980,10 +980,14 @@ pub(super) fn domain_host(ctx: &ConnContext) -> Option<String> {
 /// Label-boundary suffix match; a leading-dot suffix is a pure string suffix.
 pub(super) fn domain_suffix_match(host: &str, suffix: &str) -> bool {
     if suffix.starts_with('.') {
-        host.ends_with(suffix)
-    } else {
-        host == suffix || host.ends_with(&format!(".{suffix}"))
+        return host.ends_with(suffix);
     }
+    let Some(rest) = host.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    // equal length is the exact match; otherwise the byte in front of the
+    // suffix has to be the label dot — no `format!` on the match path
+    host.ends_with(suffix) && (rest == 0 || host.as_bytes()[rest - 1] == b'.')
 }
 
 /// sing `network.IsPublicAddr`: not private/loopback/multicast/link-local/

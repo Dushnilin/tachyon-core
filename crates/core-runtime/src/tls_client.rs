@@ -284,25 +284,13 @@ impl TlsOptions {
         } else {
             rustls::ALL_VERSIONS
         };
-
-        let builder = rustls::ClientConfig::builder_with_protocol_versions(versions);
-        let mut config = if self.insecure {
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAny))
-                .with_no_client_auth()
+        let alpn: Vec<Vec<u8>> = if !self.alpn.is_empty() {
+            self.alpn.clone()
         } else {
-            builder
-                .with_root_certificates(self.root_store()?)
-                .with_no_client_auth()
+            default_alpn.iter().map(|a| a.to_vec()).collect()
         };
-        if !self.alpn.is_empty() {
-            config.alpn_protocols = self.alpn.clone();
-        } else if !default_alpn.is_empty() {
-            config.alpn_protocols = default_alpn.iter().map(|a| a.to_vec()).collect();
-        }
 
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(self.client_config(versions, &alpn)?);
         let name = if self.disable_sni {
             rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::V4(
                 std::net::Ipv4Addr::UNSPECIFIED.into(),
@@ -323,6 +311,58 @@ impl TlsOptions {
                 .map_err(|e| io::Error::other(format!("bad CA certificate: {e}")))?;
         }
         Ok(roots)
+    }
+
+    /// The `ClientConfig` for these options, shared across connects. Building
+    /// one re-parses every CA certificate, which does not belong on the
+    /// connect path — the cache key is everything that changes the result.
+    fn client_config(
+        &self,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        alpn: &[Vec<u8>],
+    ) -> io::Result<Arc<rustls::ClientConfig>> {
+        use std::collections::HashMap;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher as _};
+        use std::sync::{Mutex, OnceLock};
+
+        type Key = (bool, bool, bool, Vec<Vec<u8>>, u64);
+        static CACHE: OnceLock<Mutex<HashMap<Key, Arc<rustls::ClientConfig>>>> = OnceLock::new();
+
+        let mut ca = DefaultHasher::new();
+        for cert in &self.ca_certs {
+            cert.as_ref().hash(&mut ca);
+        }
+        let key = (
+            self.min_tls13,
+            self.max_tls12,
+            self.insecure,
+            alpn.to_vec(),
+            ca.finish(),
+        );
+        let cache = CACHE.get_or_init(Mutex::default);
+        if let Some(config) = cache.lock().expect("tls config cache").get(&key) {
+            return Ok(Arc::clone(config));
+        }
+
+        let builder = rustls::ClientConfig::builder_with_protocol_versions(versions);
+        let mut config = if self.insecure {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth()
+        } else {
+            builder
+                .with_root_certificates(self.root_store()?)
+                .with_no_client_auth()
+        };
+        config.alpn_protocols = alpn.to_vec();
+        let config = Arc::new(config);
+        cache
+            .lock()
+            .expect("tls config cache")
+            .insert(key, Arc::clone(&config));
+        Ok(config)
     }
 
     /// QUIC client config for quinn (hysteria2 / tuic): TLS 1.3 only, early

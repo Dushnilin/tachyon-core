@@ -17,3 +17,8 @@ core-runtime = { path = "../core-runtime" }
 serde_json.workspace = true
 anyhow.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# The router build runs on musl/aarch64 where the system allocator is the
+# one thing every packet allocation goes through.
+[target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

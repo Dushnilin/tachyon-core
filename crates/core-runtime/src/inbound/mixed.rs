@@ -475,6 +475,9 @@ async fn socks_udp_associate(
                 match relay.recv_from(&mut buf).await {
                     Ok((n, source)) => match parse_socks_udp_datagram(&buf[..n]).await {
                         Some((dest, offset)) => {
+                            if hub.try_existing(source, dest, &buf[offset..n]) {
+                                continue;
+                            }
                             if let Err(err) = hub
                                 .handle(
                                     Reply::Socket(Arc::clone(&relay)),

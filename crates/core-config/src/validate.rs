@@ -3193,7 +3193,7 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
     reject_unknown_fields(obj, &allowed, &at)?;
     // `transport` and `multiplex` are in the allowed lists because the reference
     // has them on a server inbound, and a migrated xray config is mostly those
-    // two fields. `ws` and `httpupgrade` are answered by
+    // two fields. `ws`, `httpupgrade`, `grpc` and `xhttp` are answered by
     // `core_runtime::inbound::transport`; the rest of the transport types and
     // every server-side mux are read by nothing on this side, so a listener
     // started with one binds the port, answers nothing, and the failure arrives
@@ -3218,9 +3218,10 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
             .or_else(|| value.get("protocol"))
             .and_then(Value::as_str)
             .unwrap_or("enabled");
-        if field == "transport" && matches!(kind, "ws" | "httpupgrade") {
-            // these two are served, by `core_runtime::inbound::transport`: a
-            // websocket handshake and an httpupgrade 101, then the protocol bytes
+        if field == "transport" && matches!(kind, "ws" | "httpupgrade" | "grpc" | "xhttp") {
+            // these four are served, by `core_runtime::inbound::transport`: a
+            // websocket handshake, an httpupgrade 101, one HTTP/2 POST stream,
+            // or the XHTTP download/upload requests, then the protocol bytes
             continue;
         }
         return Err(format!(
@@ -10192,8 +10193,8 @@ mod tests {
                 "{ty}: {err}"
             );
             assert!(err.contains("outbounds[].transport"), "{ty}: {err}");
-            // ws and httpupgrade are served now, on the inbound
-            for ok_ty in ["ws", "httpupgrade"] {
+            // ws, httpupgrade, grpc and xhttp are served now, on the inbound
+            for ok_ty in ["ws", "httpupgrade", "grpc", "xhttp"] {
                 let served = json!({
                     "inbounds": [{
                         "type": ty,

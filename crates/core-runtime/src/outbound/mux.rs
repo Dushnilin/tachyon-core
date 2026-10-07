@@ -160,9 +160,7 @@ impl AsyncRead for MuxStream {
                     if status[0] != STATUS_SUCCESS {
                         // the reference reads a varbin message here and
                         // only puts it in the error text
-                        return std::task::Poll::Ready(Err(io::Error::other(
-                            "mux: remote error",
-                        )));
+                        return std::task::Poll::Ready(Err(io::Error::other("mux: remote error")));
                     }
                     this.response_pending = false;
                 }
@@ -672,8 +670,16 @@ mod tests {
     fn the_stream_request_names_the_destination() {
         let target = Target::Domain("example.com".into(), 443);
         let request = encode_stream_request(&target);
-        assert_eq!(&request[0..2], &0u16.to_be_bytes(), "a tcp stream carries no flags");
-        assert_eq!(&request[2..4], &[0x03, 11], "sing's fqdn family byte and the length");
+        assert_eq!(
+            &request[0..2],
+            &0u16.to_be_bytes(),
+            "a tcp stream carries no flags"
+        );
+        assert_eq!(
+            &request[2..4],
+            &[0x03, 11],
+            "sing's fqdn family byte and the length"
+        );
         assert_eq!(&request[4..15], b"example.com");
         assert_eq!(&request[15..], &443u16.to_be_bytes());
 

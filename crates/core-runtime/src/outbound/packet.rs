@@ -223,7 +223,12 @@ impl PacketReader {
                     let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
                     stream.read_exact(&mut body).await?;
                     let (_target, rest) = take_addr_port(&body)?;
-                    return Ok(rest.to_vec());
+                    // drop the address in place: the payload is already in
+                    // `body`, and a second Vec for it was one alloc per
+                    // datagram for a memmove's worth of work
+                    let at = body.len() - rest.len();
+                    body.drain(..at);
+                    return Ok(body);
                 }
                 PacketEncoding::Xudp => {
                     let mut len = [0u8; 2];

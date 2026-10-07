@@ -18,6 +18,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// One h3 request stream wrapped as raw byte pipes.
 pub(crate) struct H3Stream {
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    /// The connection's last `SendRequest` must stay alive for as long as the
+    /// tunnel does: dropping it trips h3's `Connection closed by client`
+    /// internal error, and every later write on this stream fails. The same
+    /// hold-the-handle shape lives in `hysteria2::_send_request`.
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     /// Received bytes not yet handed to the caller, chunk by chunk — the
     /// same shape as `h2io`: a chunk is queued as it arrives instead of
     /// being copied into one join buffer (the mistake h2io.rs:54-58
@@ -30,6 +35,7 @@ pub(crate) struct H3Stream {
 impl H3Stream {
     pub(crate) async fn new(
         mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
         conn_task: tokio::task::JoinHandle<()>,
     ) -> io::Result<Self> {
         let response = stream
@@ -46,6 +52,7 @@ impl H3Stream {
         }
         Ok(Self {
             stream,
+            _send_request: send_request,
             pending: VecDeque::new(),
             eof: false,
             response_read: true,

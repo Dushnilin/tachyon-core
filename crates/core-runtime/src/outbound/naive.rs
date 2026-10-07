@@ -470,9 +470,17 @@ impl Naive {
             // the h3 connection is polled by hand; `wait_idle` never returns
             let _ = h3_connection.wait_idle().await;
         });
+        // The h3 crate always writes :scheme and :path, and RFC 9114 4.3.1
+        // says both must be absent on a plain CONNECT — the reference server
+        // rejects that shape with H3_MESSAGE_ERROR before ServeHTTP ever
+        // sees it. Carrying a :protocol makes the request an extended
+        // CONNECT (4.4), where :scheme/:path are required; the server's
+        // handler only reads method and headers, so the token itself is
+        // ignored on the other end.
         let mut builder = http::Request::builder()
             .method("CONNECT")
             .uri(format!("https://{authority}"))
+            .extension(h3::ext::Protocol::CONNECT_UDP)
             .header("padding", padding_header())
             .header("-connect-authority", authority);
         if let Some(authorization) = &self.authorization {
@@ -490,7 +498,8 @@ impl Naive {
                 .map_err(|_| io::Error::other("naive: h3 request timeout"))?
                 .map_err(|e| io::Error::other(format!("naive: h3 request: {e}")))?;
         let inner =
-            crate::outbound::transport::h3io::H3Stream::new(request_stream, conn_task).await?;
+            crate::outbound::transport::h3io::H3Stream::new(request_stream, send_request, conn_task)
+                .await?;
         Ok(Box::new(Padded::new(inner)))
     }
 

@@ -184,6 +184,10 @@ def build_cases(certs, reality):
          "tls": {"enabled": True, "server_name": "localhost", "certificate_path": certs["crt"]}})
     # naive over HTTP/3: the reference inbound listens tcp+udp when `network` is
     # unset, so only the outbound flips to QUIC; same port, now over UDP.
+    # server_name is the IP here on purpose: the reference's cronet h3 client
+    # dials the *host* of its serverURL, so "localhost" gets resolved afresh
+    # and lands on [::1], which the v4-only listener never bound (the dial
+    # then dies with EINVAL). With the IP literal there is nothing to resolve.
     add("naive-quic", "B",
         {"type": "naive",
          "users": [{"username": "naive-user", "password": "naive-secret"}],
@@ -191,7 +195,7 @@ def build_cases(certs, reality):
         {"type": "naive",
          "username": "naive-user", "password": "naive-secret",
          "quic": True,
-         "tls": {"enabled": True, "server_name": "localhost", "certificate_path": certs["crt"]}})
+         "tls": {"enabled": True, "server_name": "127.0.0.1", "certificate_path": certs["crt"]}})
     add("anytls-tls", "B",
         {"type": "anytls", "users": [{"password": "bench-pass"}], "tls": ref_tls},
         {"type": "anytls", "password": "bench-pass", "tls": tls_client()})
@@ -495,8 +499,15 @@ def kill_cell_proxies(work):
 def run_cell_guarded(role, case, bins, cpus, runs, seconds, rounds, ports, bulk_gib):
     ctx = multiprocessing.get_context("fork")
     # PROTO_WORK pins the cell dir outside the container's /tmp so server.err
-    # survives the run; without it the logs die with --rm.
-    work = os.environ.get("PROTO_WORK") or tempfile.mkdtemp()
+    # survives the run; without it the logs die with --rm. One directory per
+    # cell, otherwise the second cell of a case overwrites the first one's
+    # logs and the failures report quotes an empty c:[].
+    base = os.environ.get("PROTO_WORK")
+    if base:
+        work = os.path.join(base, f"{case['name']}-{role[0]}-{role[1]}")
+        os.makedirs(work, exist_ok=True)
+    else:
+        work = tempfile.mkdtemp()
     rx, tx = ctx.Pipe(duplex=False)
     child = ctx.Process(target=run_cell,
                         args=(role, case, bins, cpus, runs, seconds, rounds, ports, work, tx,

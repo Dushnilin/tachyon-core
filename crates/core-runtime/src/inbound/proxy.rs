@@ -198,10 +198,26 @@ where
     // ever saw it.
     match transport {
         None => handle_vless(stream, peer, local, users, tag, router).await,
-        Some(transport) => match transport.accept(Box::new(stream) as AnyStream).await {
-            Ok(stream) => handle_vless(stream, peer, local, users, tag, router).await,
-            Err(err) => Err(io::Error::other(err)),
-        },
+        Some(transport) => {
+            let stream = Box::new(stream) as AnyStream;
+            let accepted = transport.accept(stream).await.map_err(io::Error::other)?;
+            // A gRPC connection carries a session per stream and drives itself
+            // while waiting for the next, so its sessions run as tasks; every
+            // other transport carries exactly one, awaited here. The session's
+            // own error is logged where it happens, so the outer log only ever
+            // sees the connection's.
+            crate::inbound::transport::serve_sessions(accepted, move |stream| {
+                let users = users.clone();
+                let tag = tag.clone();
+                let router = router.clone();
+                async move {
+                    if let Err(err) = handle_vless(stream, peer, local, users, tag, router).await {
+                        logging::debug(format_args!("vless {peer}: {err}"));
+                    }
+                }
+            })
+            .await
+        }
     }
 }
 
@@ -425,10 +441,24 @@ where
 {
     match transport {
         None => handle_trojan(stream, peer, local, keys, tag, router).await,
-        Some(transport) => match transport.accept(Box::new(stream) as AnyStream).await {
-            Ok(stream) => handle_trojan(stream, peer, local, keys, tag, router).await,
-            Err(err) => Err(io::Error::other(err)),
-        },
+        Some(transport) => {
+            let stream = Box::new(stream) as AnyStream;
+            let accepted = transport.accept(stream).await.map_err(io::Error::other)?;
+            // Same shape as vless above: a gRPC connection hands out a session
+            // per stream over a connection that outlives them, everything else
+            // exactly one session. Session errors log in their own closure.
+            crate::inbound::transport::serve_sessions(accepted, move |stream| {
+                let keys = keys.clone();
+                let tag = tag.clone();
+                let router = router.clone();
+                async move {
+                    if let Err(err) = handle_trojan(stream, peer, local, keys, tag, router).await {
+                        logging::debug(format_args!("trojan {peer}: {err}"));
+                    }
+                }
+            })
+            .await
+        }
     }
 }
 

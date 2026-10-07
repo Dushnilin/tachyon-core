@@ -165,19 +165,19 @@ impl Transport {
     }
 
     /// Unwrap the request off `stream`, leaving protocol bytes behind.
-    pub(crate) async fn accept(&self, stream: AnyStream) -> anyhow::Result<AnyStream> {
+    pub(crate) async fn accept(&self, stream: AnyStream) -> anyhow::Result<Accepted> {
         // gRPC does not read an HTTP/1.1 request head at all: the stream
         // already IS the HTTP/2 request, preface and all, so everything
         // happens inside the h2 handshake.
         if self.kind == Kind::Grpc {
-            return grpc_serve(stream, &self.service).await;
+            return Accepted::grpc(stream, &self.service).await;
         }
         // XHTTP reads the head itself: which request this is -- the download,
         // an upload packet, or a whole stream-one session -- decides what
         // happens to the connection, and a connection that is only attaching
         // to a session never hands a stream over at all.
         if self.kind == Kind::Xhttp {
-            return self.xhttp_accept(stream).await;
+            return self.xhttp_accept(stream).await.map(Accepted::Once);
         }
         let mut stream = stream;
         let head = read_head(&mut stream).await?;
@@ -200,7 +200,7 @@ impl Transport {
                 };
                 let _ = method;
                 crate::ws::accept(&mut stream, &key).await?;
-                Ok(Box::new(WsStream::server(stream)))
+                Ok(Accepted::Once(Box::new(WsStream::server(stream))))
             }
             Kind::HttpUpgrade => {
                 use tokio::io::AsyncWriteExt as _;
@@ -214,7 +214,7 @@ impl Transport {
                     )
                     .await?;
                 stream.flush().await?;
-                Ok(stream)
+                Ok(Accepted::Once(stream))
             }
             // returned before the request head above
             Kind::Grpc => unreachable!("grpc returns before the request head"),
@@ -287,63 +287,152 @@ fn path_matches(target: &str, configured: &str) -> bool {
     }
 }
 
-/// Serve one gRPC connection: handshake, the one request, the 200, and hand
-/// the request body and the response side over as byte pipes. This is the wire
-/// the reference serves with `transport/v2raygrpclite/server.go` (and, when
-/// `force_lite` is off, with its grpc-go server) -- same checks, same status,
-/// same framing.
-async fn grpc_serve(stream: AnyStream, service: &str) -> anyhow::Result<AnyStream> {
-    let mut conn = crate::outbound::transport::h2io::server_builder()
-        .handshake(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("grpc: h2 handshake: {e}"))?;
-    let (request, mut responder) = match conn.accept().await {
-        Some(Ok(pair)) => pair,
-        Some(Err(err)) => anyhow::bail!("grpc: h2 accept: {err}"),
-        None => anyhow::bail!("grpc: the connection ended before a request"),
-    };
-    let path = request.uri().path().to_string();
-    let method = request.method().as_str().to_string();
-    let content_type = request
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    if let Some(reason) = grpc_rejection(&path, &method, &content_type, service) {
-        // The status the reference answers a bad request with, so a scanner
-        // sees the same thing it would from sing-box. The connection task has
-        // to run for it to leave.
-        let _ = responder.send_response(grpc_rejection_response(), true);
-        // The connection task has to run for the rejection to leave: the
-        // status is queued on the connection and only the drive flushes it.
-        let _ = grpc_drive(conn).await;
-        anyhow::bail!("grpc: {reason} (path {path:?}, method {method})");
-    }
-    // The 200 goes out before the protocol reads a byte of the body, the same
-    // way `ServeHTTP` writes its header before it hands the connection over:
-    // the far end waits for initial metadata before it will deliver messages.
-    let send = responder
-        .send_response(grpc_accept_response(), false)
-        .map_err(|e| anyhow::anyhow!("grpc: response: {e}"))?;
-    let recv = request.into_body();
-    let conn_task = grpc_drive(conn);
-    Ok(crate::outbound::transport::grpc::server(
-        recv, send, conn_task,
-    ))
+/// What [`Transport::accept`] hands to the protocol: one session, or a
+/// connection that hands out a session per stream.
+pub(crate) enum Accepted {
+    /// The single session this connection carries -- every transport except
+    /// gRPC. When the session ends, so does the connection.
+    Once(AnyStream),
+    /// A gRPC connection: one session per stream, the connection outliving
+    /// them. Clients pool these -- sing-box reuses the TCP a finished session
+    /// ran on for the next one -- so closing the connection together with the
+    /// first session breaks every later session: the client writes into the
+    /// pooled corpse and fails with a closed pipe before it ever reaches us.
+    /// Boxed: an h2 `Connection` is far bigger than the pipe it wraps.
+    Grpc(Box<GrpcAccept>),
 }
 
-/// Keep the connection running. `accept` drives the whole state machine while
-/// it waits -- flow control, window updates and everything already queued go
-/// out under it -- so this loop is what keeps the stream we handed over alive.
-/// Streams past the first get the reference's 404: one session here is one
-/// stream, which is all the clients send.
+impl Accepted {
+    /// The gRPC half: the h2 handshake, preface and all, once per connection.
+    async fn grpc(stream: AnyStream, service: &str) -> anyhow::Result<Self> {
+        let conn = crate::outbound::transport::h2io::server_builder()
+            .handshake(stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("grpc: h2 handshake: {e}"))?;
+        Ok(Self::Grpc(Box::new(GrpcAccept {
+            conn: Some(conn),
+            service: service.to_string(),
+            first: true,
+        })))
+    }
+}
+
+/// The accept half of a gRPC connection: one stream at a time, each on the
+/// reference's wire -- `transport/v2raygrpclite/server.go` (and, when
+/// `force_lite` is off, its grpc-go server): same checks, same status, same
+/// framing, and like grpc-go every stream is a session of the one connection.
+pub(crate) struct GrpcAccept {
+    conn: Option<h2::server::Connection<AnyStream, Bytes>>,
+    service: String,
+    /// No stream handed out yet. The failures that can still happen before
+    /// the first one belong to the connection itself and to the caller's log;
+    /// after the first stream a dead connection just ends the loop, and the
+    /// sessions already running go down with their own stream.
+    first: bool,
+}
+
+impl GrpcAccept {
+    /// The next stream, as protocol bytes. `None` means the connection is
+    /// over.
+    async fn next(&mut self) -> anyhow::Result<Option<AnyStream>> {
+        loop {
+            let Some(conn) = self.conn.as_mut() else {
+                return Ok(None);
+            };
+            let (request, mut responder) =
+                match crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await {
+                    Some(Ok(pair)) => pair,
+                    Some(Err(err)) if self.first => anyhow::bail!("grpc: h2 accept: {err}"),
+                    Some(Err(_)) => return Ok(None),
+                    None if self.first => {
+                        anyhow::bail!("grpc: the connection ended before a request")
+                    }
+                    None => return Ok(None),
+                };
+            let first = std::mem::replace(&mut self.first, false);
+            let path = request.uri().path().to_string();
+            let method = request.method().as_str().to_string();
+            let content_type = request
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(reason) = grpc_rejection(&path, &method, &content_type, &self.service) {
+                // The status the reference answers a bad request with, so a scanner
+                // sees the same thing it would from sing-box.
+                let _ = responder.send_response(grpc_rejection_response(), true);
+                if first {
+                    // The status is queued on the connection and only a driver
+                    // flushes it, and the reference lets the client hang up on a
+                    // rejection: drive the connection until it does, 404ing
+                    // anything else that gets asked in the meantime.
+                    let conn = self
+                        .conn
+                        .take()
+                        .expect("grpc: the connection is there before the first stream");
+                    let _ = grpc_drive(conn).await;
+                    anyhow::bail!("grpc: {reason} (path {path:?}, method {method})");
+                }
+                // Past the first stream a bad request is one 404'd stream, not
+                // the end of the connection: the next one may still be good.
+                continue;
+            }
+            // The 200 goes out before the protocol reads a byte of the body, the same
+            // way `ServeHTTP` writes its header before it hands the connection over:
+            // the far end waits for initial metadata before it will deliver messages.
+            let send = responder
+                .send_response(grpc_accept_response(), false)
+                .map_err(|e| anyhow::anyhow!("grpc: response: {e}"))?;
+            let recv = request.into_body();
+            return Ok(Some(crate::outbound::transport::grpc::server(recv, send)));
+        }
+    }
+}
+
+/// Run the sessions [`Transport::accept`] gave out. Everything but gRPC
+/// carries one session and awaits it right here; a gRPC connection is driven
+/// by `accept` itself -- flow control, window updates and everything already
+/// queued go out under it -- so its sessions run as tasks while the loop keeps
+/// taking the next stream off the connection.
+pub(crate) async fn serve_sessions<F, Fut>(accepted: Accepted, make: F) -> io::Result<()>
+where
+    F: Fn(AnyStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    match accepted {
+        Accepted::Once(stream) => {
+            make(stream).await;
+            Ok(())
+        }
+        Accepted::Grpc(mut grpc) => {
+            let mut sessions = Vec::new();
+            while let Some(stream) = grpc.next().await.map_err(io::Error::other)? {
+                sessions.push(tokio::spawn(make(stream)));
+            }
+            for session in sessions {
+                let _ = session.await;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Keep a rejected connection running until the far end gives up on it.
+/// `accept` drives the whole state machine while it waits -- flow control,
+/// window updates and everything already queued go out under it -- so the
+/// queued 404 leaves under this loop, and anything else asked for on the way
+/// gets the same answer.
 fn grpc_drive(mut conn: h2::server::Connection<AnyStream, Bytes>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await
         {
             match next {
-                Ok((_request, mut responder)) => {
+                Ok((request, mut responder)) => {
+                    crate::logging::debug(format_args!(
+                        "grpc: rejected connection, {} -> 404",
+                        request.uri().path()
+                    ));
                     let _ = responder.send_response(grpc_rejection_response(), true);
                 }
                 Err(_) => return,

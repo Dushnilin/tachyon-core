@@ -545,7 +545,7 @@ impl Naive {
             )));
         }
         Ok(Box::new(Padded::new(H2Io {
-            h2: H2Stream::from_response(response, send, conn_task),
+            h2: H2Stream::from_response(response, send, Some(conn_task)),
         })))
     }
 }

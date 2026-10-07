@@ -526,7 +526,8 @@ impl DnsService {
         let _guard = lock.lock().await;
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            if let Some(CacheHit::Fresh(raw)) = self.cache.write().expect("dns cache").get(&key, now)
+            if let Some(CacheHit::Fresh(raw)) =
+                self.cache.write().expect("dns cache").get(&key, now)
             {
                 return codec::set_id(&raw, info.id);
             }
@@ -558,7 +559,12 @@ impl DnsService {
                 } else {
                     meta_resp
                 };
-                cache.insert(key.clone(), Arc::clone(&rewritten), &meta_for_insert, optimistic);
+                cache.insert(
+                    key.clone(),
+                    Arc::clone(&rewritten),
+                    &meta_for_insert,
+                    optimistic,
+                );
             }
         }
         codec::set_id(&rewritten, info.id)

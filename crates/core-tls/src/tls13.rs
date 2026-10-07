@@ -376,10 +376,13 @@ mod tests {
             unhex("9f02283b6c9c07efc26bb9f2ac92e356"),
             "application write key"
         );
-        assert_eq!(app.iv, unhex12("cf782b88dd83549aadf1e984"), "application iv");
+        assert_eq!(
+            app.iv,
+            unhex12("cf782b88dd83549aadf1e984"),
+            "application iv"
+        );
 
-        let client_ap =
-            KeySchedule::traffic_keys(&schedule.client_application_traffic(), hash, 16);
+        let client_ap = KeySchedule::traffic_keys(&schedule.client_application_traffic(), hash, 16);
         assert_eq!(
             client_ap.key,
             unhex("17422dda596ed5d9acd890e3c63f5051"),

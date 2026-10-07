@@ -1217,7 +1217,8 @@ impl Stack {
             let sender = match self.udp.get(&dport) {
                 Some(sess)
                     if sess.target.ip() == IpAddr::V4(src)
-                        && (sess.target.port() == sport || sess.target.port() == 0) => {
+                        && (sess.target.port() == sport || sess.target.port() == 0) =>
+                {
                     Some(sess.to_caller.clone())
                 }
                 _ => None,

@@ -392,7 +392,10 @@ pub fn response_meta(raw: &[u8]) -> io::Result<ResponseMeta> {
 /// record vectors per hit.
 pub fn set_id(raw: &[u8], id: u16) -> io::Result<Vec<u8>> {
     if raw.len() < 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "dns: short response"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns: short response",
+        ));
     }
     let mut out = raw.to_vec();
     out[..2].copy_from_slice(&id.to_be_bytes());

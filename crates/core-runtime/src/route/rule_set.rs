@@ -236,7 +236,9 @@ pub fn match_rule(rule: &Value, ctx: &ConnContext) -> bool {
 fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bool {
     let mut matched = false;
     if let Some(domain) = super::rule::domain_host(ctx) {
-        matched |= list(rule.get("domain")).iter().any(|entry| entry == domain.as_ref());
+        matched |= list(rule.get("domain"))
+            .iter()
+            .any(|entry| entry == domain.as_ref());
         matched |= list(rule.get("domain_suffix"))
             .iter()
             .any(|entry| super::rule::domain_suffix_match(&domain, entry));

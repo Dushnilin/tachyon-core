@@ -1,8 +1,19 @@
 // The router build runs on musl/aarch64 where the system allocator is the
 // one thing every packet allocation goes through.
-#[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_env = "msvc"),
+    not(feature = "allocstat")
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
+#[global_allocator]
+static GLOBAL: allocstat::Counting = allocstat::Counting;
+
+#[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
+mod allocstat;
 
 mod rule_set;
 
@@ -60,6 +71,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let path = config_path_from(args).ok_or("run: missing -c/--config <path>")?;
+    #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
+    allocstat::start();
     if let Ok(raw) = std::fs::read_to_string(&path)
         && let Ok(warnings) = core_config::check_str_warnings(&raw)
     {

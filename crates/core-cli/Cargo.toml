@@ -11,6 +11,10 @@ rust-version.workspace = true
 name = "tachyon-core"
 path = "src/main.rs"
 
+[features]
+# counting allocator + per-second heap dump, see src/allocstat.rs
+allocstat = []
+
 [dependencies]
 core-config = { path = "../core-config" }
 core-runtime = { path = "../core-runtime" }

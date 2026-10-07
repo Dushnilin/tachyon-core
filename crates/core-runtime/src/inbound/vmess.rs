@@ -21,7 +21,7 @@ use super::transport::Transport;
 use super::udp::{relay_stream_datagrams, udp_destination};
 use crate::inbound::{AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
-use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_BATCH, WRITE_CHUNK};
+use crate::outbound::vmess::framing::{BodyWriter, FrameAssembler, WRITE_CHUNK, write_batch};
 use crate::outbound::vmess::kdf::{cmd_key, crc32_ieee, kdf, kdf16, parse_uuid};
 use crate::outbound::vmess::wire::{derive_response_keys, gcm_open, gcm_seal};
 use crate::route::Router;
@@ -583,7 +583,7 @@ impl AsyncWrite for ServerStream {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let batch = buf.len().min(WRITE_BATCH);
+            let batch = buf.len().min(write_batch());
             let mut frame = std::mem::take(&mut this.write.spare);
             frame.clear();
             let mut taken = 0;

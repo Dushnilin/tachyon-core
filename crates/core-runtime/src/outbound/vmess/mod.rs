@@ -23,7 +23,7 @@ use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::transport::Transport;
 use crate::outbound::vmess::framing::{
-    BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_BATCH, WRITE_CHUNK,
+    BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_CHUNK, write_batch,
 };
 use crate::outbound::vmess::wire::{
     derive_response_keys, legacy_header_hash, legacy_response_keys, legacy_time_iv,
@@ -552,7 +552,7 @@ impl AsyncWrite for VmessStream {
                 }
                 // everything the caller handed over, up to one batch, leaves in
                 // one frame buffer and one write
-                let batch = buf.len().min(WRITE_BATCH);
+                let batch = buf.len().min(write_batch());
                 let mut frame = std::mem::take(&mut state.spare);
                 frame.clear();
                 let mut taken = 0;

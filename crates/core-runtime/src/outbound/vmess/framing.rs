@@ -30,8 +30,28 @@ use crate::outbound::vmess::kdf::{chacha_key, fnv1a32, kdf16};
 /// every reference server, so it is not coming back.
 pub(crate) const WRITE_CHUNK: usize = 16 * 1024 - CIPHER_OVERHEAD - (MAX_PADDING as usize - 1);
 /// How much of one `write` is framed into one buffer and leaves in one syscall:
-/// several full chunks, at least the 128 KiB the relay hands over at a time.
-pub(crate) const WRITE_BATCH: usize = 4 * WRITE_CHUNK;
+/// the 128 KiB the relay hands over at a time, whole. The batch used to be four
+/// chunks -- 65 220 bytes -- so every relay read left as two stage/write pairs
+/// and a single-connection transfer ran on one stage's worth of in-flight data,
+/// 64 KiB against the stream's round trip: vmess-grpc capped at 1.7 Gbit/s
+/// where the reference with its bigger pipeline ran at 2.9. Batch, hunk and
+/// in-flight are the same number now.
+pub(crate) const WRITE_BATCH: usize = 128 * 1024;
+
+/// [`WRITE_BATCH`], with `TACHYON_VMESS_BATCH` as a diagnostic override: the
+/// batch sets how many bytes one vmess frame -- and therefore one grpc message
+/// downstream -- carries, so shrinking it lets the bench reproduce the
+/// reference's message size against our own server.
+pub(crate) fn write_batch() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("TACHYON_VMESS_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 4096)
+            .unwrap_or(WRITE_BATCH)
+    })
+}
 const CIPHER_OVERHEAD: usize = 16;
 const MAX_PADDING: u16 = 64;
 

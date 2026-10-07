@@ -385,10 +385,18 @@ pub fn response_meta(raw: &[u8]) -> io::Result<ResponseMeta> {
 }
 
 /// Rewrite the response ID to match the client query (cache hits).
+///
+/// The id is the first 16 bits of the wire format (hickory writes
+/// `metadata.id` first), so this is a two-byte patch: parsing and
+/// re-encoding the message here used to cost a full round through the
+/// record vectors per hit.
 pub fn set_id(raw: &[u8], id: u16) -> io::Result<Vec<u8>> {
-    let mut msg = parse_message(raw)?;
-    msg.metadata.id = id;
-    encode(&msg)
+    if raw.len() < 2 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "dns: short response"));
+    }
+    let mut out = raw.to_vec();
+    out[..2].copy_from_slice(&id.to_be_bytes());
+    Ok(out)
 }
 
 /// Attach the configured client subnet to a query, the shape the reference
@@ -479,5 +487,27 @@ mod tests {
         let resp = synth_address(&query, "10.0.0.1".parse().unwrap(), 600).unwrap();
         let rewritten = rewrite_ttl(&resp, 60).unwrap();
         assert_eq!(response_meta(&rewritten).unwrap().min_answer_ttl, Some(60));
+    }
+
+    #[test]
+    fn set_id_matches_reencode_path() {
+        let raw = build_query(7, "four.test", RecordType::A).unwrap();
+        let (query, _) = parse_query(&raw).unwrap();
+        let addrs = [
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.3".parse().unwrap(),
+            "10.0.0.4".parse().unwrap(),
+        ];
+        let resp = synth_addresses(&query, &addrs, 600).unwrap();
+        let out = set_id(&resp, 0xBEEF).unwrap();
+        // the patch leaves everything but the id untouched, byte for byte
+        assert_eq!(&out[2..], &resp[2..]);
+        assert_eq!(&out[..2], &0xBEEFu16.to_be_bytes());
+        // and the same id the old parse → set → encode path produced
+        let mut msg = parse_message(&resp).unwrap();
+        msg.metadata.id = 0xBEEF;
+        assert_eq!(out, encode(&msg).unwrap());
+        assert!(set_id(&[0u8], 1).is_err());
     }
 }

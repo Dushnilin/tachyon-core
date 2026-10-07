@@ -2,6 +2,7 @@
 //! optimistic serving (return stale + background refresh).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::codec::ResponseMeta;
@@ -28,7 +29,7 @@ impl std::hash::Hash for CacheKey {
 }
 
 pub struct CacheEntry {
-    pub raw: Vec<u8>,
+    pub raw: Arc<[u8]>,
     pub inserted: Instant,
     /// Seconds the entry stays fresh (derived from the smallest TTL).
     pub ttl: Duration,
@@ -37,9 +38,9 @@ pub struct CacheEntry {
 }
 
 pub enum CacheHit {
-    Fresh(Vec<u8>),
+    Fresh(Arc<[u8]>),
     /// Stale-but-servable: caller must trigger a background refresh.
-    Stale(Vec<u8>),
+    Stale(Arc<[u8]>),
 }
 
 pub struct Cache {
@@ -59,10 +60,10 @@ impl Cache {
         let entry = self.entries.get(key)?;
         let age = now.duration_since(entry.inserted);
         if age < entry.ttl {
-            return Some(CacheHit::Fresh(entry.raw.clone()));
+            return Some(CacheHit::Fresh(Arc::clone(&entry.raw)));
         }
         if entry.optimistic_until.is_some_and(|until| now < until) {
-            return Some(CacheHit::Stale(entry.raw.clone()));
+            return Some(CacheHit::Stale(Arc::clone(&entry.raw)));
         }
         None
     }
@@ -70,7 +71,7 @@ impl Cache {
     pub fn insert(
         &mut self,
         key: CacheKey,
-        raw: Vec<u8>,
+        raw: impl Into<Arc<[u8]>>,
         meta: &ResponseMeta,
         optimistic_timeout: Option<Duration>,
     ) {
@@ -83,7 +84,7 @@ impl Cache {
         self.entries.insert(
             key,
             CacheEntry {
-                raw,
+                raw: raw.into(),
                 inserted,
                 ttl: Duration::from_secs(ttl_secs as u64),
                 optimistic_until,

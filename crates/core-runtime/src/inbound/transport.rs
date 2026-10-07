@@ -340,7 +340,8 @@ async fn grpc_serve(stream: AnyStream, service: &str) -> anyhow::Result<AnyStrea
 /// stream, which is all the clients send.
 fn grpc_drive(mut conn: h2::server::Connection<AnyStream, Bytes>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(next) = conn.accept().await {
+        while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await
+        {
             match next {
                 Ok((_request, mut responder)) => {
                     let _ = responder.send_response(grpc_rejection_response(), true);

@@ -7,6 +7,7 @@
 use std::io;
 use std::task::{Context, Poll};
 
+use crate::outbound::transport::h2io::rdbg;
 use aes::Aes128;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use cfb_mode::cipher::KeyIvInit;
@@ -405,6 +406,8 @@ impl FrameAssembler {
                 out.put_slice(&self.frame[self.pos..self.pos + n]);
                 self.pos += n;
                 if out.remaining() == 0 {
+                    rdbg::bump(rdbg::A_READY, 1);
+                    rdbg::bump(rdbg::A_BYTES, (out.filled().len() - had) as u64);
                     return Poll::Ready(Ok(()));
                 }
                 continue;
@@ -458,8 +461,11 @@ impl FrameAssembler {
                             // caller's buffer: hand them over now, a `Pending`
                             // with data in hand would strand them
                             if out.filled().len() > had {
+                                rdbg::bump(rdbg::A_READY, 1);
+                                rdbg::bump(rdbg::A_BYTES, (out.filled().len() - had) as u64);
                                 return Poll::Ready(Ok(()));
                             }
+                            rdbg::bump(rdbg::A_PARK, 1);
                             return Poll::Pending;
                         }
                     }
@@ -519,8 +525,11 @@ impl FrameAssembler {
                         Poll::Pending => {
                             *state = AssembleState::Data { total, pad };
                             if out.filled().len() > had {
+                                rdbg::bump(rdbg::A_READY, 1);
+                                rdbg::bump(rdbg::A_BYTES, (out.filled().len() - had) as u64);
                                 return Poll::Ready(Ok(()));
                             }
+                            rdbg::bump(rdbg::A_PARK, 1);
                             return Poll::Pending;
                         }
                     }

@@ -133,15 +133,15 @@ pub fn derive_secret(hash: Hash, secret: &[u8], label: &[u8], transcript: &[u8])
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficKeys {
     pub key: Vec<u8>,
-    pub iv: Vec<u8>,
+    pub iv: [u8; 12],
 }
 
 impl TrafficKeys {
     /// The per-record nonce: the iv with the sequence number XORed into its
     /// tail.
-    pub fn nonce(&self, sequence: u64) -> Vec<u8> {
-        let mut nonce = self.iv.clone();
-        let start = nonce.len().saturating_sub(8);
+    pub fn nonce(&self, sequence: u64) -> [u8; 12] {
+        let mut nonce = self.iv;
+        let start = nonce.len() - 8;
         for (offset, byte) in sequence.to_be_bytes().iter().enumerate() {
             nonce[start + offset] ^= byte;
         }
@@ -265,11 +265,13 @@ impl KeySchedule {
         hash.hmac(&Self::finished_key(secret, hash), transcript)
     }
 
-    /// The traffic keys for one direction.
-    pub fn traffic_keys(secret: &[u8], hash: Hash, key_len: usize, iv_len: usize) -> TrafficKeys {
+    /// The traffic keys for one direction. RFC 8446 fixes the iv at 12 bytes
+    /// for every suite, so the length is not a parameter.
+    pub fn traffic_keys(secret: &[u8], hash: Hash, key_len: usize) -> TrafficKeys {
+        let iv = expand_label(hash, secret, b"iv", &[], 12);
         TrafficKeys {
             key: expand_label(hash, secret, b"key", &[], key_len),
-            iv: expand_label(hash, secret, b"iv", &[], iv_len),
+            iv: iv.try_into().expect("TLS 1.3 iv is 12 bytes"),
         }
     }
 }
@@ -283,6 +285,10 @@ mod tests {
         (0..clean.len() / 2)
             .map(|i| u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).expect("hex"))
             .collect()
+    }
+
+    fn unhex12(text: &str) -> [u8; 12] {
+        unhex(text).try_into().expect("12 bytes")
     }
 
     /// RFC 8448 §3: SHA-256, AES-128-GCM, one X25519 exchange. The RFC prints
@@ -328,13 +334,13 @@ mod tests {
         );
 
         // the handshake write keys the server would use for AES-128-GCM
-        let write = KeySchedule::traffic_keys(&server_hs, hash, 16, 12);
+        let write = KeySchedule::traffic_keys(&server_hs, hash, 16);
         assert_eq!(
             write.key,
             unhex("3fce516009c21727d0f2e4e86ee403bc"),
             "handshake write key"
         );
-        assert_eq!(write.iv, unhex("5d313eb2671276ee13000b30"), "write iv");
+        assert_eq!(write.iv, unhex12("5d313eb2671276ee13000b30"), "write iv");
         assert_eq!(
             KeySchedule::finished_key(&server_hs, hash),
             unhex("008d3b66f816ea559f96b537e885c3 1fc068bf492c652f01f288a1d8cdc19fc8"),
@@ -342,13 +348,13 @@ mod tests {
         );
 
         // and the client side reads the same keys, so a swap is a failure
-        let read = KeySchedule::traffic_keys(&client_hs, hash, 16, 12);
+        let read = KeySchedule::traffic_keys(&client_hs, hash, 16);
         assert_eq!(
             read.key,
             unhex("dbfaa693d1762c5b666af5d950258d01"),
             "handshake read key"
         );
-        assert_eq!(read.iv, unhex("5bd3c71b836e0b76bb73265f"), "read iv");
+        assert_eq!(read.iv, unhex12("5bd3c71b836e0b76bb73265f"), "read iv");
 
         schedule.enter_application(&unhex(
             "9608102a0f1ccc6db6250b7b7e417b1a 000eaada3daae4777a7686c9ff83df13",
@@ -364,16 +370,16 @@ mod tests {
             unhex("a11af9f05531f856ad47116b45a95032 8204b4f44bfb6b3a4b4f1f3fcb631643"),
             "server application traffic secret"
         );
-        let app = KeySchedule::traffic_keys(&server_ap, hash, 16, 12);
+        let app = KeySchedule::traffic_keys(&server_ap, hash, 16);
         assert_eq!(
             app.key,
             unhex("9f02283b6c9c07efc26bb9f2ac92e356"),
             "application write key"
         );
-        assert_eq!(app.iv, unhex("cf782b88dd83549aadf1e984"), "application iv");
+        assert_eq!(app.iv, unhex12("cf782b88dd83549aadf1e984"), "application iv");
 
         let client_ap =
-            KeySchedule::traffic_keys(&schedule.client_application_traffic(), hash, 16, 12);
+            KeySchedule::traffic_keys(&schedule.client_application_traffic(), hash, 16);
         assert_eq!(
             client_ap.key,
             unhex("17422dda596ed5d9acd890e3c63f5051"),
@@ -387,7 +393,7 @@ mod tests {
     fn the_nonce_carries_the_record_sequence() {
         let keys = TrafficKeys {
             key: vec![0; 16],
-            iv: unhex("5d313eb2671276ee13000b30"),
+            iv: unhex12("5d313eb2671276ee13000b30"),
         };
         assert_eq!(keys.nonce(0), keys.iv, "record 0 leaves the iv alone");
         let one = keys.nonce(1);
@@ -408,7 +414,7 @@ mod tests {
         let hash = Hash::Sha384;
         let schedule = KeySchedule::new(hash, &[]);
         assert_eq!(schedule.early_secret.len(), 48);
-        let keys = KeySchedule::traffic_keys(&schedule.early_secret, hash, 32, 12);
+        let keys = KeySchedule::traffic_keys(&schedule.early_secret, hash, 32);
         assert_eq!(keys.key.len(), 32, "AES-256-GCM key length");
         assert_eq!(keys.iv.len(), 12, "every TLS 1.3 suite has a 12-byte iv");
     }

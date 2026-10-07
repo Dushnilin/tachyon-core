@@ -223,13 +223,11 @@ impl Handshake {
             &self.schedule.client_handshake_traffic(),
             self.hash,
             self.key_len,
-            12,
         );
         let server = KeySchedule::traffic_keys(
             &self.schedule.server_handshake_traffic(),
             self.hash,
             self.key_len,
-            12,
         );
         self.opener = Some(Opener::new(self.suite_id(), client));
         self.sealer = Some(Sealer::new(self.suite_id(), server));
@@ -349,13 +347,11 @@ impl Handshake {
             &self.schedule.server_application_traffic(),
             self.hash,
             self.key_len,
-            12,
         );
         let client_application = KeySchedule::traffic_keys(
             &self.schedule.client_application_traffic(),
             self.hash,
             self.key_len,
-            12,
         );
 
         let mut flight = Vec::new();

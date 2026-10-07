@@ -356,7 +356,13 @@ impl Stream {
             self.write_report = data.len();
             let session = Arc::clone(&self.session);
             let sid = self.sid;
-            self.write_fut = Some(Box::pin(async move { session.send_data(sid, &data).await }));
+            self.write_fut = Some(Box::pin(async move {
+                let result = session.send_data(sid, &data).await;
+                // the payload buffer came from the pool; hand it back the
+                // moment the bytes are on the wire
+                session.give_buf(data);
+                result
+            }));
         }
         let result = {
             let fut = self.write_fut.as_mut().expect("future set above");
@@ -416,7 +422,12 @@ impl AsyncWrite for Stream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        self.poll_frame_write(cx, Some(buf.to_vec()))
+        // the same pool the read side uses: one alloc per connection, not
+        // per write
+        let mut owned = self.session.take_buf();
+        owned.clear();
+        owned.extend_from_slice(buf);
+        self.poll_frame_write(cx, Some(owned))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {

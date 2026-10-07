@@ -169,7 +169,7 @@
     </g>
 
     <!-- Speed Readout -->
-    <text y="64" font-family="ui-monospace, monospace" font-size="11" font-weight="700" fill="#00F0FF" text-anchor="middle" letter-spacing="1">10 Gbps LINE-SPEED</text>
+    <text y="64" font-family="ui-monospace, monospace" font-size="11" font-weight="700" fill="#00F0FF" text-anchor="middle" letter-spacing="1">44 Gbps LINE-SPEED</text>
   </g>
 
   <!-- ================================================================= -->
@@ -198,11 +198,11 @@
       <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#10B981" stroke-opacity="0.35" stroke-width="1.2"/>
       <g transform="translate(16, 16)">
         <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">Throughput</text>
+        <text x="28" y="15" class="metric-hdr">Peak Throughput</text>
       </g>
-      <text x="16" y="66" class="metric-num" fill="#34D399">10 Gbps+</text>
-      <text x="145" y="62" class="metric-tag" fill="#10B981">ZERO-COPY</text>
-      <text x="145" y="75" class="metric-tag" fill="#64748B">Splicing</text>
+      <text x="16" y="66" class="metric-num" fill="#34D399">44.0 Gbps</text>
+      <text x="165" y="62" class="metric-tag" fill="#10B981">ZERO-COPY</text>
+      <text x="165" y="75" class="metric-tag" fill="#64748B">VLESS Splice</text>
     </g>
 
     <!-- Pod 2: Packet Forwarding Rate -->
@@ -222,7 +222,7 @@
       <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#8B5CF6" stroke-opacity="0.35" stroke-width="1.2"/>
       <g transform="translate(16, 16)">
         <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">Tail Jitter</text>
+        <text x="28" y="15" class="metric-hdr">Tail Jitter (GC)</text>
       </g>
       <text x="16" y="66" class="metric-num" fill="#C084FC">0.00 ms</text>
       <text x="145" y="62" class="metric-tag" fill="#C084FC">ZERO-GC</text>
@@ -234,11 +234,11 @@
       <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#F59E0B" stroke-opacity="0.35" stroke-width="1.2"/>
       <g transform="translate(16, 16)">
         <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">Router CPU Cycles</text>
+        <text x="28" y="15" class="metric-hdr">CPU Efficiency</text>
       </g>
-      <text x="16" y="66" class="metric-num" fill="#FBBF24">&lt; 3% CPU</text>
-      <text x="145" y="62" class="metric-tag" fill="#FBBF24">MIPS / ARM</text>
-      <text x="145" y="75" class="metric-tag" fill="#64748B">Low Footprint</text>
+      <text x="16" y="66" class="metric-num" fill="#FBBF24">0.38 s/GiB</text>
+      <text x="160" y="62" class="metric-tag" fill="#FBBF24">-40% CPU</text>
+      <text x="160" y="75" class="metric-tag" fill="#64748B">vs sing-box</text>
     </g>
   </g>
 </svg>

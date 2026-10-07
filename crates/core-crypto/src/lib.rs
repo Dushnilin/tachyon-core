@@ -364,6 +364,8 @@ static ALL_CIPHER_SUITES: &[SupportedCipherSuite] = misc::const_concat_slices!(
     TLS13_SUITES,
 );
 
+#[cfg(all(target_os = "linux", feature = "std"))]
+pub mod afalg;
 mod aead;
 pub mod fastchacha;
 pub mod fastgcm;

@@ -178,6 +178,15 @@ impl H2Stream {
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
     /// AsyncWrite caller once the whole frame has been accepted.
+    ///
+    /// The `Vec -> Bytes` here is the borrowed-to-owned boundary of
+    /// `AsyncWrite`, not a join: `poll_write` receives `&[u8]` and the h2
+    /// layer needs an owned `Bytes` for `SendStream`. Taking `Bytes` in
+    /// this signature would save nothing (the caller would build the same
+    /// `Bytes` at the same cost); removing the copy altogether needs an
+    /// owned `send_bytes` path through the relay layer, which is a relay
+    /// rewrite for about one percent of CPU. Keep this comment honest
+    /// instead of "optimizing" the call site.
     pub(crate) fn stage(&mut self, frame: Vec<u8>, report: usize) {
         debug_assert!(!self.has_out());
         self.out = Bytes::from(frame);
@@ -336,6 +345,8 @@ impl AsyncWrite for H2Io {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
+            // one alloc + one copy, and both are the AsyncWrite boundary
+            // itself — see the note on `stage`
             self.h2.stage(buf.to_vec(), buf.len());
         }
         ready!(self.h2.poll_flush_out(cx))?;

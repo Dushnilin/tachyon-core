@@ -151,6 +151,9 @@ impl AsyncWrite for GrpcStream {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
+            // one owned frame per write — the borrowed AsyncWrite boundary
+            // (the gRPC framing needs its own bytes, so unlike plain h2
+            // there is not even a variant of this that copies less)
             let frame = Self::encode_frame(buf);
             self.io.h2.stage(frame, buf.len());
         }

@@ -15,6 +15,11 @@ static GLOBAL: allocstat::Counting = allocstat::Counting;
 #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
 mod allocstat;
 
+#[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+unsafe extern "C" {
+    fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
+}
+
 mod rule_set;
 
 use std::path::{Path, PathBuf};
@@ -223,12 +228,13 @@ fn usage() -> String {
 fn main() -> ExitCode {
     // mimalloc v3 leaves freed pages dirty for a whole second by default; on
     // a proxy that saw a burst that is tens of MiB of RSS nobody asked for.
-    // The operator's own mimalloc_purge_delay wins if they set one.
+    // The option is initialized before main (the runtime allocates), so an
+    // env var would be read too late -- set it straight. Index of
+    // `mi_option_purge_delay` in mimalloc v3 (== v2 up to use_numa_nodes);
+    // mimalloc_purge_delay in the environment still wins over this.
     #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
     unsafe {
-        if std::env::var_os("mimalloc_purge_delay").is_none() {
-            std::env::set_var("mimalloc_purge_delay", "0");
-        }
+        mi_option_set(15, 0);
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_else(|| "help".into());

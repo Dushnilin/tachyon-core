@@ -226,15 +226,22 @@ fn usage() -> String {
 }
 
 fn main() -> ExitCode {
-    // mimalloc v3 leaves freed pages dirty for a whole second by default; on
-    // a proxy that saw a burst that is tens of MiB of RSS nobody asked for.
-    // The option is initialized before main (the runtime allocates), so an
-    // env var would be read too late -- set it straight. Index of
-    // `mi_option_purge_delay` in mimalloc v3 (== v2 up to use_numa_nodes);
-    // mimalloc_purge_delay in the environment still wins over this.
+    // mimalloc options RSS lives or dies by, set here because the defaults
+    // are desktop defaults, not proxy defaults:
+    //   15 purge_delay -- freed pages stay dirty for a whole second by
+    //       default; after a burst that is tens of MiB of RSS nobody asked
+    //       for.
+    //   43 allow_thp -- mimalloc marks its arena MADV_HUGEPAGE, khugepaged
+    //       merges it into 2MiB pages, and RSS then grows in 2MiB
+    //       granules: AnonHugePages alone reached 33 MiB and VmHWM swung
+    //       ±20 MiB from run to run. Small pages cost nothing measurable.
+    // Indices are `mi_option_t` of mimalloc v3 (== v2 up to use_numa_nodes).
+    // The same-named env vars are read once at the option's first access,
+    // which the runtime does before main -- these two calls are what stands.
     #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
     unsafe {
         mi_option_set(15, 0);
+        mi_option_set(43, 0);
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_else(|| "help".into());

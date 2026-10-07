@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::AnyStream;
 
-use super::h2io::{Frame, H2Io, H2Stream, rdbg};
+use super::h2io::{H2Io, H2Stream, rdbg};
 
 pub(super) async fn connect(
     stream: AnyStream,
@@ -91,11 +91,11 @@ pub(crate) fn server(
 }
 
 impl GrpcStream {
-    fn encode_frame(data: &[u8]) -> Frame {
+    fn encode_frame(data: &[u8]) -> Vec<u8> {
         let mut varint = [0u8; 10];
         let vl = write_varint(data.len() as u64, &mut varint);
         let inner_len = 1 + vl + data.len();
-        let mut out = Frame::with_capacity(5 + inner_len);
+        let mut out = Vec::with_capacity(5 + inner_len);
         out.push(0);
         out.extend_from_slice(&(inner_len as u32).to_be_bytes());
         out.push(0x0A);

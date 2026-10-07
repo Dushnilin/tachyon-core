@@ -5,7 +5,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
@@ -45,97 +44,6 @@ pub(crate) fn server_builder() -> h2::server::Builder {
         .initial_connection_window_size(CONN_WINDOW)
         .max_frame_size(MAX_FRAME);
     builder
-}
-
-/// A staged frame's bytes. h2 only takes `Bytes`, and it lets go of them piece
-/// by piece as flow control drains the frame -- so the owner handed to
-/// [`Bytes::from_owner`] is the one place a buffer can come home from: when the
-/// last piece hits the socket and the `Bytes` drop, this drops with it and the
-/// allocation goes back to the pool instead of to the allocator. One message
-/// frame used to be one `Vec` allocation and free; that was pure churn.
-pub(crate) struct Frame(Vec<u8>);
-
-impl Frame {
-    /// A buffer with room for `need` bytes: pooled when one that size fits,
-    /// fresh otherwise.
-    pub(crate) fn with_capacity(need: usize) -> Self {
-        Frame(framepool::take(need))
-    }
-
-    pub(crate) fn push(&mut self, byte: u8) {
-        self.0.push(byte);
-    }
-
-    pub(crate) fn extend_from_slice(&mut self, more: &[u8]) {
-        self.0.extend_from_slice(more);
-    }
-}
-
-impl Deref for Frame {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for Frame {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<Frame> for Bytes {
-    fn from(frame: Frame) -> Bytes {
-        Bytes::from_owner(frame)
-    }
-}
-
-impl Drop for Frame {
-    fn drop(&mut self) {
-        framepool::give(std::mem::take(&mut self.0));
-    }
-}
-
-/// Recycled frame buffers. `take` matches on capacity so a 5-byte handshake
-/// frame never picks up a 128 KiB data one, and `give` holds only a handful
-/// under a cap, so the pool cannot turn into a hoard of dead memory.
-mod framepool {
-    use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
-
-    const HELD_MAX: usize = 8;
-    const CAP_MAX: usize = 1 << 20;
-
-    fn queue() -> &'static Mutex<VecDeque<Vec<u8>>> {
-        static Q: OnceLock<Mutex<VecDeque<Vec<u8>>>> = OnceLock::new();
-        Q.get_or_init(|| Mutex::new(VecDeque::new()))
-    }
-
-    pub(super) fn take(need: usize) -> Vec<u8> {
-        let Ok(mut q) = queue().lock() else {
-            return Vec::with_capacity(need);
-        };
-        while let Some(mut v) = q.pop_front() {
-            if (need..=need.saturating_mul(2).max(64 << 10)).contains(&v.capacity()) {
-                v.clear();
-                return v;
-            }
-        }
-        Vec::with_capacity(need)
-    }
-
-    pub(super) fn give(mut v: Vec<u8>) {
-        v.clear();
-        if v.capacity() > CAP_MAX {
-            return;
-        }
-        if let Ok(mut q) = queue().lock()
-            && q.len() < HELD_MAX
-        {
-            q.push_back(v);
-        }
-    }
 }
 
 /// One HTTP/2 request/response stream wrapped as raw byte pipes.
@@ -270,9 +178,9 @@ impl H2Stream {
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
     /// AsyncWrite caller once the whole frame has been accepted.
-    pub(crate) fn stage(&mut self, frame: Frame, report: usize) {
+    pub(crate) fn stage(&mut self, frame: Vec<u8>, report: usize) {
         debug_assert!(!self.has_out());
-        self.out = frame.into();
+        self.out = Bytes::from(frame);
         self.report = report;
     }
 
@@ -428,9 +336,7 @@ impl AsyncWrite for H2Io {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let mut frame = Frame::with_capacity(buf.len());
-            frame.extend_from_slice(buf);
-            self.h2.stage(frame, buf.len());
+            self.h2.stage(buf.to_vec(), buf.len());
         }
         ready!(self.h2.poll_flush_out(cx))?;
         Poll::Ready(Ok(self.h2.take_report()))

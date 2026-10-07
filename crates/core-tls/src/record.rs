@@ -26,12 +26,6 @@ fn aes_gcm(suite: CipherSuite, keys: &TrafficKeys) -> Option<Gcm> {
     }
 }
 
-fn nonce12(keys: &TrafficKeys, seq: u64) -> io::Result<[u8; 12]> {
-    keys.nonce(seq)
-        .try_into()
-        .map_err(|_| err("the record nonce is not 12 bytes"))
-}
-
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
@@ -159,7 +153,7 @@ impl Sealer {
         }
         let length = (payload.len() + 1 + 16) as u16;
         let aad = header(ContentType::ApplicationData, length);
-        let nonce = nonce12(&self.keys, self.seq)?;
+        let nonce = self.keys.nonce(self.seq);
         let start = out.len();
         out.reserve(5 + usize::from(length));
         out.extend_from_slice(&aad);
@@ -240,7 +234,7 @@ impl Opener {
         if self.seq == u64::MAX {
             return Err(err("record sequence number exhausted"));
         }
-        let nonce = nonce12(&self.keys, self.seq)?;
+        let nonce = self.keys.nonce(self.seq);
         let (aad, body) = record.split_at_mut(5);
         let inner = if let Some(gcm) = &self.gcm {
             let (data, tag) = body.split_at_mut(body.len() - 16);
@@ -310,7 +304,7 @@ mod tests {
             _ => Hash::Sha256,
         };
         let key_len = core_crypto::tls13_key_len(suite).expect("a TLS 1.3 suite");
-        KeySchedule::traffic_keys(b"a traffic secret we made up", hash, key_len, 12)
+        KeySchedule::traffic_keys(b"a traffic secret we made up", hash, key_len)
     }
 
     /// A message survives the round trip in every suite, at every sequence
@@ -367,7 +361,7 @@ mod tests {
     #[test]
     fn a_wrong_key_length_is_refused() {
         let suite = CipherSuite::TLS13_AES_128_GCM_SHA256;
-        let short = KeySchedule::traffic_keys(b"secret", Hash::Sha256, 8, 12);
+        let short = KeySchedule::traffic_keys(b"secret", Hash::Sha256, 8);
         let mut sealer = Sealer::new(suite, short);
         assert!(sealer.seal(ContentType::Handshake, b"x").is_err());
     }

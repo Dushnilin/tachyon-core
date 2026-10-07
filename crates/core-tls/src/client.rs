@@ -299,11 +299,11 @@ impl<'a> Handshake<'a> {
             .enter_handshake(&secret, &self.transcript_hash());
         self.opener = Some(Opener::new(
             suite,
-            KeySchedule::traffic_keys(&self.schedule.server_handshake_traffic(), hash, key_len, 12),
+            KeySchedule::traffic_keys(&self.schedule.server_handshake_traffic(), hash, key_len),
         ));
         self.sealer = Some(Sealer::new(
             suite,
-            KeySchedule::traffic_keys(&self.schedule.client_handshake_traffic(), hash, key_len, 12),
+            KeySchedule::traffic_keys(&self.schedule.client_handshake_traffic(), hash, key_len),
         ));
         Ok(())
     }
@@ -502,11 +502,11 @@ impl Connection {
         Ok(Connection {
             sealer: Sealer::new(
                 suite,
-                KeySchedule::traffic_keys(&client_secret, hash, key_len, 12),
+                KeySchedule::traffic_keys(&client_secret, hash, key_len),
             ),
             opener: Opener::new(
                 suite,
-                KeySchedule::traffic_keys(&server_secret, hash, key_len, 12),
+                KeySchedule::traffic_keys(&server_secret, hash, key_len),
             ),
             closed: false,
         })

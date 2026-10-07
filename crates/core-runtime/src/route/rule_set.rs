@@ -58,9 +58,9 @@ impl RuleSet {
         self.tags.iter().any(|known| known == tag)
     }
 
-    /// `adapter.RuleSet.Match`: any headless rule of the set matches. The simple
-    /// rules answer from the compiled pools; `logical` and `invert` rules still
-    /// go through `match_rule`.
+    /// `adapter.RuleSet.Match`: any headless rule of the set matches. The
+    /// simple rules answer from the compiled pools; `logical` and `invert`
+    /// rules from the compiled fallback tree.
     pub fn matches(&self, ctx: &ConnContext) -> bool {
         self.with(|body| body.index.matches(ctx) || body.fallbacks.matches(ctx))
     }
@@ -236,7 +236,7 @@ pub fn match_rule(rule: &Value, ctx: &ConnContext) -> bool {
 fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bool {
     let mut matched = false;
     if let Some(domain) = super::rule::domain_host(ctx) {
-        matched |= list(rule.get("domain")).contains(&domain);
+        matched |= list(rule.get("domain")).iter().any(|entry| entry == domain.as_ref());
         matched |= list(rule.get("domain_suffix"))
             .iter()
             .any(|entry| super::rule::domain_suffix_match(&domain, entry));

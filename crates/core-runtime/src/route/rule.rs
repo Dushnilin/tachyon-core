@@ -1,6 +1,7 @@
 //! Route rule build + match: default/logical rules, group semantics,
 //! all matchers used by real configs, and rule actions.
 
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -937,7 +938,7 @@ impl DomainItem {
             None => return false,
         };
         match self {
-            DomainItem::Exact(list) => list.iter().any(|d| d == &host),
+            DomainItem::Exact(list) => list.iter().any(|d| d.as_str() == host.as_ref()),
             DomainItem::Suffix(list) => list.iter().any(|s| domain_suffix_match(&host, s)),
             DomainItem::Keyword(list) => list.iter().any(|k| host.contains(k.as_str())),
             DomainItem::Regex(list) => list.iter().any(|re| re.is_match(&host)),
@@ -967,14 +968,21 @@ impl IpCidrItem {
     }
 }
 
-pub(super) fn domain_host(ctx: &ConnContext) -> Option<String> {
-    if let Some(d) = &ctx.domain {
-        return Some(d.to_ascii_lowercase());
-    }
-    match &ctx.destination {
-        super::Target::Domain(h, _) => Some(h.to_ascii_lowercase()),
-        super::Target::Ip(_) => None,
-    }
+/// The connection's host, lowercased. Borrowed when the case is already down,
+/// which is the common case: the scan is free and the `String` is not.
+pub(super) fn domain_host<'a>(ctx: &'a ConnContext) -> Option<Cow<'a, str>> {
+    let raw = match &ctx.domain {
+        Some(d) => d.as_str(),
+        None => match &ctx.destination {
+            super::Target::Domain(h, _) => h.as_str(),
+            super::Target::Ip(_) => return None,
+        },
+    };
+    Some(if raw.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(raw.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(raw)
+    })
 }
 
 /// Label-boundary suffix match; a leading-dot suffix is a pure string suffix.

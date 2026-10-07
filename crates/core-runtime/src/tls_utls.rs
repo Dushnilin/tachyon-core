@@ -39,8 +39,12 @@ pub struct FingerprintStream<S> {
     plain_at: usize,
     plain_end: usize,
     record_end: usize,
-    /// a record waiting to go out, and how much of it has been written
-    out: Option<(Vec<u8>, usize)>,
+    /// the sealed record waiting to go out, kept from record to record:
+    /// sealing used to allocate a fresh Vec per record, which on the hot
+    /// path is steady churn for bytes that land in the same 16 KiB slot
+    wbuf: Vec<u8>,
+    /// how far into `wbuf` the socket has taken; `None` between records
+    out: Option<usize>,
     eof: bool,
 }
 
@@ -55,6 +59,7 @@ impl<S> FingerprintStream<S> {
             plain_at: 0,
             plain_end: 0,
             record_end: 0,
+            wbuf: Vec::new(),
             out: None,
             eof: false,
         }
@@ -180,21 +185,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         // back has to be what really left.
         let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
         loop {
-            let Some((record, written)) = me.out.as_mut() else {
-                let record = match me.connection.write_record(&buf[..take]) {
-                    Ok(record) => record,
-                    Err(e) => return Poll::Ready(Err(e)),
-                };
-                me.out = Some((record, 0));
+            let Some(pos) = me.out else {
+                me.wbuf.clear();
+                if let Err(e) = me.connection.write_record_into(&buf[..take], &mut me.wbuf) {
+                    return Poll::Ready(Err(e));
+                }
+                me.out = Some(0);
                 continue;
             };
-            match Pin::new(&mut me.inner).poll_write(cx, &record[*written..]) {
+            match Pin::new(&mut me.inner).poll_write(cx, &me.wbuf[pos..]) {
                 Poll::Ready(Ok(n)) => {
-                    *written += n;
-                    if *written == record.len() {
+                    let pos = pos + n;
+                    if pos == me.wbuf.len() {
                         me.out = None;
                         return Poll::Ready(Ok(take));
                     }
+                    me.out = Some(pos);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,

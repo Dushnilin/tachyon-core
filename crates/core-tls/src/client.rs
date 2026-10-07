@@ -512,11 +512,20 @@ impl Connection {
         })
     }
 
-    /// Wrap `data` into one record, ready for the transport to send. A caller
-    /// with more than a record's worth writes it in pieces; the sequence number
-    /// moves with each.
+    /// Wrap `data` into one record appended to `out`, ready for the transport
+    /// to send. A caller with more than a record's worth writes it in pieces;
+    /// the sequence number moves with each.
+    pub fn write_record_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        out.clear();
+        self.sealer
+            .seal_into(ContentType::ApplicationData, data, out)
+    }
+
+    /// The same, into a buffer the caller owns: one sealed record.
     pub fn write_record(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
-        self.sealer.seal(ContentType::ApplicationData, data)
+        let mut out = Vec::new();
+        self.write_record_into(data, &mut out)?;
+        Ok(out)
     }
 
     /// Decrypt whatever whole records `raw` holds and hand the application data

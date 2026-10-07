@@ -221,6 +221,15 @@ fn usage() -> String {
 }
 
 fn main() -> ExitCode {
+    // mimalloc v3 leaves freed pages dirty for a whole second by default; on
+    // a proxy that saw a burst that is tens of MiB of RSS nobody asked for.
+    // The operator's own mimalloc_purge_delay wins if they set one.
+    #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+    unsafe {
+        if std::env::var_os("mimalloc_purge_delay").is_none() {
+            std::env::set_var("mimalloc_purge_delay", "0");
+        }
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_else(|| "help".into());
     args.remove(0);

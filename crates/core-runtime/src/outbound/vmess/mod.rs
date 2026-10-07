@@ -447,9 +447,9 @@ impl AsyncRead for VmessStream {
                             return Poll::Pending;
                         }
                     }
-                    wire::gcm_open(&this.hdr_key, &this.hdr_nonce, &[], &mut buf)
+                    let plain = wire::gcm_open(&this.hdr_key, &this.hdr_nonce, &[], &mut buf)
                         .map_err(|e| io::Error::other(format!("resp-payload: {e}")))?;
-                    if buf.first() != Some(&this.response_header) {
+                    if buf[..plain].first() != Some(&this.response_header) {
                         return Poll::Ready(Err(io::Error::other(
                             "vmess: unexpected response header",
                         )));

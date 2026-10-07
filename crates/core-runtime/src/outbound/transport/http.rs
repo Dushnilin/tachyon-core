@@ -14,7 +14,7 @@ use crate::inbound::AnyStream;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 
 use super::authority;
-use super::h2io::{H2Io, H2Stream};
+use super::h2io::{H2Io, H2Stream, rdbg};
 
 /// Headers that must not be forwarded on HTTP/2 (connection-scoped + host
 /// comes from the request authority).
@@ -71,7 +71,7 @@ async fn connect_h2(
         .await
         .map_err(|e| io::Error::other(format!("http: h2 handshake: {e}")))?;
     let conn_task = tokio::spawn(async move {
-        let _ = connection.await;
+        let _ = rdbg::counted(connection).await;
     });
     let mut send_request = send_request
         .ready()

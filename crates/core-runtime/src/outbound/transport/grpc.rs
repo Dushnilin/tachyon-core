@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::AnyStream;
 
-use super::h2io::{H2Io, H2Stream};
+use super::h2io::{H2Io, H2Stream, rdbg};
 
 pub(super) async fn connect(
     stream: AnyStream,
@@ -32,7 +32,7 @@ pub(super) async fn connect(
         .await
         .map_err(|e| io::Error::other(format!("grpc: h2 handshake: {e}")))?;
     let conn_task = tokio::spawn(async move {
-        let _ = connection.await;
+        let _ = rdbg::counted(connection).await;
     });
     let mut send_request = send_request
         .ready()
@@ -129,6 +129,7 @@ impl AsyncRead for GrpcStream {
             } else if let Some((data, skip)) =
                 start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?
             {
+                rdbg::bump(rdbg::MSG, 1);
                 this.data_left = data;
                 this.skip = skip;
                 continue;

@@ -501,6 +501,13 @@ async fn connect_one(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpS
     // the reference sets TCP_NODELAY on every dial; without it a small header
     // write waits out the peer's delayed ACK (a 40 ms stall per connection)
     let _ = stream.set_nodelay(true);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        crate::outbound::transport::h2io::rdbg::note_fd(stream.as_raw_fd());
+    }
+    #[cfg(not(unix))]
+    crate::outbound::transport::h2io::rdbg::note_fd(-1);
     Ok(stream)
 }
 

@@ -22,6 +22,7 @@ use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::transport::Transport;
+use crate::outbound::transport::h2io::rdbg;
 use crate::outbound::vmess::framing::{
     BodyWriter, CfbDecrypt, CfbEncrypt, FrameAssembler, WRITE_CHUNK, write_batch,
 };
@@ -384,7 +385,12 @@ impl AsyncRead for VmessStream {
         let this = &mut *self;
         loop {
             if matches!(this.read, ReadPhase::Raw) {
-                return Pin::new(&mut this.inner).poll_read(cx, out);
+                let t0 = rdbg::now_ns();
+                let poll = Pin::new(&mut this.inner).poll_read(cx, out);
+                if matches!(poll, Poll::Ready(_)) {
+                    rdbg::note_srv(t0);
+                }
+                return poll;
             }
             let step = match std::mem::replace(&mut this.read, ReadPhase::Raw) {
                 ReadPhase::Raw => unreachable!("raw handled above"),
@@ -396,7 +402,12 @@ impl AsyncRead for VmessStream {
                     let ReadPhase::Body(assembler) = &mut this.read else {
                         unreachable!("just stored")
                     };
-                    return assembler.poll_read(&mut this.inner, cx, out);
+                    let t0 = rdbg::now_ns();
+                    let poll = assembler.poll_read(&mut this.inner, cx, out);
+                    if matches!(poll, Poll::Ready(_)) {
+                        rdbg::note_srv(t0);
+                    }
+                    return poll;
                 }
             };
             match step {

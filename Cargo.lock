@@ -387,6 +387,7 @@ dependencies = [
  "ecdsa",
  "ed25519-dalek",
  "hmac",
+ "libc",
  "ml-kem",
  "p256",
  "p384",

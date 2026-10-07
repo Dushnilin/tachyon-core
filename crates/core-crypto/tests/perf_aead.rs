@@ -51,6 +51,11 @@ fn seal_shapes(name: &str, seal: &dyn Fn(&mut [u8]), sizes: &[usize]) {
 #[test]
 #[ignore = "microbenchmark, run by hand"]
 fn perf_aead_shapes() {
+    // Which backend this run is actually measuring — the kernel path only
+    // exists when the AF_ALG probe won its calibration.
+    #[cfg(all(target_os = "linux", feature = "std"))]
+    println!("afalg threshold: {}", core_crypto::afalg::threshold());
+
     let gcm128 = Gcm::new(&[1u8; 16]);
     let gcm256 = Gcm::new(&[2u8; 32]);
     let chacha = ChaChaPoly::new(&[3u8; 32]);

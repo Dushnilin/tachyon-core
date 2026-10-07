@@ -34,11 +34,35 @@ pub enum Gcm {
     V8(Box<v8::V8>),
     Soft128(Box<Aes128Gcm>),
     Soft256(Box<Aes256Gcm>),
+    /// The kernel Crypto API path with the software cipher underneath:
+    /// payloads at or above the calibrated cutoff go to `AF_ALG` (so a board
+    /// with a DMA crypto engine can offload the block cipher), smaller ones
+    /// stay here. The variant only exists when the process-wide probe in
+    /// [`crate::afalg`] passed, so on a machine without a usable `AF_ALG`
+    /// `Gcm::new` never produces it.
+    #[cfg(all(target_os = "linux", feature = "std"))]
+    Alg(crate::afalg::AfalgGcm),
 }
 
 impl Gcm {
     /// `key` is 16 or 32 bytes; the callers derive it with a fixed length.
     pub fn new(key: &[u8]) -> Gcm {
+        // The probe self-tests and calibrates exactly once per process; a
+        // kernel without AF_ALG, a seccomp filter that blocks it, or a
+        // driver that loses the race to our own SIMD all answer 0 = off.
+        #[cfg(all(target_os = "linux", feature = "std"))]
+        {
+            let thr = crate::afalg::threshold();
+            if thr > 0 && let Ok(a) = crate::afalg::AfalgGcm::new(key, thr) {
+                return Gcm::Alg(a);
+            }
+        }
+        Gcm::new_software(key)
+    }
+
+    /// The SIMD and RustCrypto path with no `AF_ALG` probe: what [`Gcm::new`]
+    /// falls back to, and what the kernel path's tests compare against.
+    pub(crate) fn new_software(key: &[u8]) -> Gcm {
         #[cfg(target_arch = "x86_64")]
         if ni::available() {
             return Gcm::Ni(Box::new(ni::Ni::new(key)));
@@ -69,6 +93,8 @@ impl Gcm {
                 .encrypt_in_place_detached(nonce.into(), aad, buf)
                 .expect("gcm length is in range")
                 .into(),
+            #[cfg(all(target_os = "linux", feature = "std"))]
+            Gcm::Alg(a) => a.seal(nonce, aad, buf),
         }
     }
 
@@ -86,6 +112,8 @@ impl Gcm {
             Gcm::Soft256(c) => c
                 .decrypt_in_place_detached(nonce.into(), aad, buf, Tag::from_slice(tag))
                 .is_ok(),
+            #[cfg(all(target_os = "linux", feature = "std"))]
+            Gcm::Alg(a) => a.open(nonce, aad, buf, tag),
         }
     }
 }

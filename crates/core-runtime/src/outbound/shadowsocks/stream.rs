@@ -36,7 +36,6 @@ fn read_buf(method: Method) -> usize {
     (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
 }
 
-
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
 pub struct Shadowsocks {
     server: String,
@@ -161,7 +160,6 @@ impl Shadowsocks {
             request_salt: salt,
             read_buf: read_buf(self.method),
             state: if is_2022 {
-
                 ReaderState::ResponseSalt
             } else {
                 ReaderState::ChunksAfterSalt
@@ -212,6 +210,10 @@ impl<W: tokio::io::AsyncWrite + Unpin> SsWriter<W> {
         }
         Ok(())
     }
+
+    pub fn max_chunk(&self) -> u16 {
+        self.max_chunk
+    }
 }
 
 pub struct SsReader<R> {
@@ -223,7 +225,6 @@ pub struct SsReader<R> {
     /// what `rbuf` is grown to when the first record is waited for
     read_buf: usize,
     /// Bytes off the wire that nothing has consumed yet: `rbuf[rpos..rend]`.
-
     rbuf: Vec<u8>,
     rpos: usize,
     rend: usize,
@@ -248,21 +249,30 @@ enum ReaderState {
 impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
     /// Make `rbuf[rpos..rend]` at least `n` bytes long, reading as much as the
     /// buffer has room for in each call so several chunks arrive per syscall.
-    /// Only called once the previous payload has been handed out whole, so
-    /// moving the unread bytes to the front disturbs nothing.
+    /// Unread bytes are only shifted to the front when the remaining buffer
+    /// capacity cannot fit the missing bytes, avoiding costly copies on every
+    /// record.
     async fn need(&mut self, n: usize, eof: &'static str) -> io::Result<()> {
         if self.rend - self.rpos >= n {
             return Ok(());
         }
-        if self.rpos > 0 {
-            self.rbuf.copy_within(self.rpos..self.rend, 0);
-            self.rend -= self.rpos;
+        if self.rpos == self.rend {
             self.rpos = 0;
+            self.rend = 0;
         }
-        if self.rbuf.len() < n {
-            self.rbuf.resize((n + 2 + AEAD_TAG).max(self.read_buf), 0);
+        let needed = n - (self.rend - self.rpos);
+        if self.rbuf.len() < self.rend + needed {
+            if self.rpos > 0 {
+                self.rbuf.copy_within(self.rpos..self.rend, 0);
+                self.rend -= self.rpos;
+                self.rpos = 0;
+            }
+            if self.rbuf.len() < self.rend + needed {
+                self.rbuf
+                    .resize((self.rend + needed + 2 + AEAD_TAG).max(self.read_buf), 0);
+            }
         }
-        while self.rend < n {
+        while self.rend - self.rpos < n {
             let got = self.inner.read(&mut self.rbuf[self.rend..]).await?;
             if got == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, eof));
@@ -270,7 +280,6 @@ impl<R: tokio::io::AsyncRead + Unpin> SsReader<R> {
             self.rend += got;
         }
         Ok(())
-
     }
 
     fn establish_response_cipher(&mut self, salt: &[u8]) {

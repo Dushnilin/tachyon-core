@@ -484,7 +484,6 @@ async fn httpupgrade_handshake(
     // threshold (1.5x + 2 ms).
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     Ok(stream)
-
 }
 
 /// RFC 6455 websocket carrying the protocol bytes as binary messages; frames

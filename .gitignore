@@ -14,8 +14,10 @@ ROADMAP.md
 ROADMAP.ru.md
 TELEGRAM.md
 долгий ящик.md
+PERF_OPTIMIZATION_ROADMAP.md
 
 # bench artifacts, run-local
 scripts/bench/__pycache__/
 proto-result.json
 proto-result.md
+PONYTAIL_AUDIT.md

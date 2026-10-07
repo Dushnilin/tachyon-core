@@ -515,15 +515,22 @@ fn poll_fill(
     if *rend - *rpos >= want {
         return Poll::Ready(Ok(()));
     }
-    if *rpos > 0 {
-        rbuf.copy_within(*rpos..*rend, 0);
-        *rend -= *rpos;
+    if *rpos == *rend {
         *rpos = 0;
+        *rend = 0;
     }
-    if rbuf.len() < want {
-        rbuf.resize((want + 2 + AEAD_TAG).max(read_buf), 0);
+    let needed = want - (*rend - *rpos);
+    if rbuf.len() < *rend + needed {
+        if *rpos > 0 {
+            rbuf.copy_within(*rpos..*rend, 0);
+            *rend -= *rpos;
+            *rpos = 0;
+        }
+        if rbuf.len() < *rend + needed {
+            rbuf.resize((*rend + needed + 2 + AEAD_TAG).max(read_buf), 0);
+        }
     }
-    while *rend < want {
+    while *rend - *rpos < want {
         let mut read_buf = ReadBuf::new(&mut rbuf[*rend..]);
         match std::pin::Pin::new(&mut **inner).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {

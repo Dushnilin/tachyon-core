@@ -32,12 +32,17 @@ pub(crate) fn gcm_seal(key16: &[u8], nonce12: &[u8], aad: &[u8], plaintext: &[u8
         .expect("gcm seal cannot fail for valid key/nonce")
 }
 
+/// Opens a sealed buffer in place and returns the plaintext length: the tag
+/// stays at the tail of `ciphertext` (untouched memory is free to keep), and
+/// the caller slices to `..plain` when it needs the plaintext's own shape.
+/// Taking `&mut [u8]` instead of `&mut Vec<u8>` is what lets an `[u8; 18]`
+/// handshake length decrypt without a heap copy.
 pub(crate) fn gcm_open(
     key16: &[u8],
     nonce12: &[u8],
     aad: &[u8],
-    ciphertext: &mut Vec<u8>,
-) -> io::Result<()> {
+    ciphertext: &mut [u8],
+) -> io::Result<usize> {
     if ciphertext.len() < 16 {
         return Err(io::Error::other("ciphertext too short"));
     }
@@ -56,8 +61,7 @@ pub(crate) fn gcm_open(
             Tag::from_slice(&tag),
         )
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "gcm auth failed"))?;
-    ciphertext.truncate(split);
-    Ok(())
+    Ok(split)
 }
 
 pub(crate) fn unix_now() -> io::Result<u64> {

@@ -408,7 +408,7 @@ where
 
     let len_key = kdf16(&user.key, &[SALT_HDR_LEN_KEY, &auth_id, &conn_nonce]);
     let len_nonce = nonce(&user.key, SALT_HDR_LEN_IV, &auth_id, &conn_nonce);
-    let mut length = sealed_len.to_vec();
+    let mut length = sealed_len;
     gcm_open(&len_key, &len_nonce, &auth_id, &mut length)?;
     let header_len = usize::from(u16::from_be_bytes([length[0], length[1]]));
     if header_len < 38 {
@@ -418,8 +418,8 @@ where
     stream.read_exact(&mut sealed_header).await?;
     let hdr_key = kdf16(&user.key, &[SALT_HDR_KEY, &auth_id, &conn_nonce]);
     let hdr_nonce = nonce(&user.key, SALT_HDR_IV, &auth_id, &conn_nonce);
-    gcm_open(&hdr_key, &hdr_nonce, &auth_id, &mut sealed_header)?;
-    parse_header(&user, &sealed_header)
+    let plain = gcm_open(&hdr_key, &hdr_nonce, &auth_id, &mut sealed_header)?;
+    parse_header(&user, &sealed_header[..plain])
 }
 
 fn nonce(key: &[u8; 16], salt: &[u8], auth_id: &[u8; 16], conn_nonce: &[u8; 8]) -> [u8; 12] {

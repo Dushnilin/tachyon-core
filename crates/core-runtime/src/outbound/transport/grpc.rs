@@ -76,14 +76,10 @@ pub(crate) struct GrpcStream {
 /// The server half of the same stream: the request body is the downlink, the
 /// response side the uplink, and the framing is the one Hunk codec above -- the
 /// reference's `GunConn` writes and reads exactly these bytes from either end.
-pub(crate) fn server(
-    recv: h2::RecvStream,
-    send: h2::SendStream<Bytes>,
-    conn_task: tokio::task::JoinHandle<()>,
-) -> AnyStream {
+pub(crate) fn server(recv: h2::RecvStream, send: h2::SendStream<Bytes>) -> AnyStream {
     Box::new(GrpcStream {
         io: H2Io {
-            h2: H2Stream::server(recv, send, conn_task),
+            h2: H2Stream::server(recv, send),
         },
         data_left: 0,
         skip: 0,

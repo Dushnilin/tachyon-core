@@ -164,6 +164,7 @@ impl Vmess {
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
+                    logging::debug(format_args!("vmess accept from {peer}"));
                     let _ = stream.set_nodelay(true);
                     let users = Arc::clone(&self.users);
                     let replay = Arc::clone(&self.replay);
@@ -223,10 +224,25 @@ where
         None => handle(stream, peer, local, users, replay, tag, router).await,
         Some(transport) => {
             let stream: AnyStream = Box::new(stream);
-            match transport.accept(stream).await {
-                Ok(stream) => handle(stream, peer, local, users, replay, tag, router).await,
-                Err(err) => Err(io::Error::other(err)),
-            }
+            let accepted = transport.accept(stream).await.map_err(io::Error::other)?;
+            // gRPC hands out a session per stream and drives the connection
+            // while it waits for the next one, so the sessions run as tasks;
+            // anything else here carries exactly one session. The session's
+            // own error is the one line that describes it, logged here
+            // whatever the shape.
+            crate::inbound::transport::serve_sessions(accepted, move |stream| {
+                let users = users.clone();
+                let replay = replay.clone();
+                let tag = tag.clone();
+                let router = router.clone();
+                async move {
+                    if let Err(err) = handle(stream, peer, local, users, replay, tag, router).await
+                    {
+                        logging::debug(format_args!("vmess {peer}: {err}"));
+                    }
+                }
+            })
+            .await
         }
     }
 }

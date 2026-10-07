@@ -90,7 +90,7 @@ impl H2Stream {
     pub(crate) fn from_response(
         response: Response<RecvStream>,
         send: h2::SendStream<Bytes>,
-        conn_task: JoinHandle<()>,
+        conn_task: Option<JoinHandle<()>>,
     ) -> Self {
         Self {
             send: Some(send),
@@ -101,19 +101,19 @@ impl H2Stream {
             out: Bytes::new(),
             report: 0,
             eof: false,
-            conn_task: Some(conn_task),
+            conn_task,
         }
     }
 
     /// The server side of a stream: the request body arrived with the request
     /// and the response side is already open, so there is no response future to
     /// wait for -- the status gate in [`H2Stream::poll_recv_more`] never runs.
-    pub(crate) fn server(
-        recv: RecvStream,
-        send: h2::SendStream<Bytes>,
-        conn_task: JoinHandle<()>,
-    ) -> Self {
-        Self::from_response(Response::new(recv), send, conn_task)
+    /// There is no connection task to own either: the connection outlives the
+    /// stream (a client that pools connections comes back for the next one), and
+    /// the accept loop that hands these out is what drives it, so dropping a
+    /// session must not take the connection down with it.
+    pub(crate) fn server(recv: RecvStream, send: h2::SendStream<Bytes>) -> Self {
+        Self::from_response(Response::new(recv), send, None)
     }
 
     fn build(

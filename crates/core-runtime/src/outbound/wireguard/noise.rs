@@ -435,36 +435,49 @@ impl Session {
     /// Open a transport message addressed to us; enforces the replay window.
     /// Returns the padded plaintext — trim via the inner IP header.
     pub fn open(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        let mut plain = Vec::new();
+        self.open_into(msg, &mut plain).then_some(plain)
+    }
+
+    /// Same as [`Self::open`], but decrypts into a caller-provided scratch
+    /// buffer so a hot path can recycle instead of allocating per packet.
+    /// On success `out` holds the plaintext; on failure it is untouched.
+    pub fn open_into(&mut self, msg: &[u8], out: &mut Vec<u8>) -> bool {
         if msg.len() < TRANSPORT_HEADER_LEN + 16 {
-            return None;
+            return false;
         }
-        let word = type_word(msg)?;
+        let word = match type_word(msg) {
+            Some(word) => word,
+            None => return false,
+        };
         let (lo, hi) = self.awg_transport;
         if word < lo || word > hi {
-            return None;
+            return false;
         }
         let receiver = u32::from_le_bytes(msg[4..8].try_into().unwrap());
         if receiver != self.local_index {
-            return None;
+            return false;
         }
         let counter = u64::from_le_bytes(msg[8..16].try_into().unwrap());
         if counter > REJECT_AFTER_MESSAGES || !self.accept_counter(counter) {
-            return None;
+            return false;
         }
         let body = &msg[TRANSPORT_HEADER_LEN..];
         let (ciphertext, tag) = body.split_at(body.len() - 16);
-        let mut plain = ciphertext.to_vec();
+        // The one copy that is not going away: the plaintext must outlive
+        // the recv buffer, and the AEAD opens in place.
+        out.clear();
+        out.extend_from_slice(ciphertext);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
         self.recv_cipher
             .decrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
                 &[],
-                &mut plain,
+                out,
                 Tag::from_slice(tag),
             )
-            .ok()?;
-        Some(plain)
+            .is_ok()
     }
 
     fn accept_counter(&mut self, counter: u64) -> bool {

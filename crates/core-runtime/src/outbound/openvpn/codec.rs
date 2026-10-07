@@ -295,13 +295,15 @@ impl BlockCipher {
         if block_size == 0 {
             return;
         }
-        let mut previous = iv.to_vec();
+        debug_assert!(block_size <= 16, "every cipher here has a <=16 byte block");
+        let mut previous = [0u8; 16];
+        previous[..block_size].copy_from_slice(&iv[..block_size]);
         for chunk in data.chunks_exact_mut(block_size) {
-            for (byte, prev) in chunk.iter_mut().zip(previous.iter()) {
+            for (byte, prev) in chunk.iter_mut().zip(previous[..block_size].iter()) {
                 *byte ^= *prev;
             }
             self.encrypt_block(chunk);
-            previous.copy_from_slice(chunk);
+            previous[..block_size].copy_from_slice(chunk);
         }
     }
 
@@ -311,14 +313,17 @@ impl BlockCipher {
         if block_size == 0 {
             return;
         }
-        let mut previous = iv.to_vec();
+        debug_assert!(block_size <= 16, "every cipher here has a <=16 byte block");
+        let mut previous = [0u8; 16];
+        previous[..block_size].copy_from_slice(&iv[..block_size]);
+        let mut ciphertext = [0u8; 16];
         for chunk in data.chunks_exact_mut(block_size) {
-            let ciphertext = chunk.to_vec();
+            ciphertext[..block_size].copy_from_slice(chunk);
             self.decrypt_block(chunk);
-            for (byte, prev) in chunk.iter_mut().zip(previous.iter()) {
+            for (byte, prev) in chunk.iter_mut().zip(previous[..block_size].iter()) {
                 *byte ^= *prev;
             }
-            previous = ciphertext;
+            previous[..block_size].copy_from_slice(&ciphertext[..block_size]);
         }
     }
 }

@@ -3,11 +3,10 @@
 //! (one exchange per datagram) or forwards through a connected outbound UDP
 //! socket with an idle-timeout reverse reader (reference `udpnat.Service`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
@@ -25,9 +24,21 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 type FlowKey = (SocketAddr, SocketAddr);
 
+/// Packets held back while the outbound socket is not writable. The old
+/// code spent one `to_vec()` plus one `tokio::spawn` per packet here, which
+/// turns a temporary full send buffer into a task-and-memory avalanche.
+/// Now one writer task drains a bounded backlog and the newest packet is
+/// dropped at the cap -- a UDP proxy loses datagrams under pressure anyway,
+/// the difference is only whether it also loses its budget.
+const UDP_BACKLOG_MAX: usize = 64;
+
 struct Flow {
     kind: FlowKind,
     last_ms: AtomicU64,
+    /// datagrams `try_send` refused; drained in order by the writer task
+    backlog: Mutex<VecDeque<Vec<u8>>>,
+    /// exactly one writer task is (or will be) draining `backlog`
+    writing: AtomicBool,
 }
 
 enum FlowKind {
@@ -45,6 +56,51 @@ impl Flow {
     fn idle(&self) -> Duration {
         let last = self.last_ms.load(Ordering::Relaxed);
         Duration::from_millis(now_ms().saturating_sub(last))
+    }
+
+    /// Hold a datagram the socket would not take and make sure one writer
+    /// task will send it. The swap only wins when no writer is running, so
+    /// there is never a second one; the writer's own re-check covers the
+    /// race where it exits between this push and that swap.
+    fn hold_back(self: &Arc<Self>, payload: &[u8]) {
+        {
+            let mut backlog = self.backlog.lock().expect("backlog");
+            if backlog.len() < UDP_BACKLOG_MAX {
+                backlog.push_back(payload.to_vec());
+            }
+        }
+        if !self.writing.swap(true, Ordering::AcqRel) {
+            let flow = Arc::clone(self);
+            tokio::spawn(async move {
+                flow.drain_backlog().await;
+            });
+        }
+    }
+
+    /// Send the backlog in order; release the flag once empty, re-checking
+    /// once so a push that raced the release cannot be stranded with no
+    /// writer looking at it.
+    async fn drain_backlog(self: Arc<Self>) {
+        loop {
+            loop {
+                let next = self.backlog.lock().expect("backlog").pop_front();
+                let Some(pkt) = next else {
+                    break;
+                };
+                if let FlowKind::Outbound { sock } = &self.kind {
+                    let _ = sock.send(&pkt).await;
+                }
+            }
+            self.writing.store(false, Ordering::Release);
+            if self.backlog.lock().expect("backlog").is_empty() {
+                return;
+            }
+            if self.writing.swap(true, Ordering::AcqRel) {
+                // a pusher beat us to the flag and spawned its own writer
+                return;
+            }
+            // we reclaimed the racing push ourselves
+        }
     }
 }
 
@@ -160,17 +216,20 @@ impl UdpHub {
         let FlowKind::Outbound { sock } = &flow.kind else {
             return false;
         };
+        // while a writer is draining the backlog, new packets go behind it:
+        // a lucky try_send must not overtake the queued datagrams
+        if flow.writing.load(Ordering::Acquire) {
+            flow.hold_back(payload);
+            flow.touch();
+            return true;
+        }
         match sock.try_send(payload) {
             Ok(_) => {
                 flow.touch();
                 true
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                let sock = Arc::clone(sock);
-                let owned = payload.to_vec();
-                tokio::spawn(async move {
-                    let _ = sock.send(&owned).await;
-                });
+                flow.hold_back(payload);
                 flow.touch();
                 true
             }
@@ -241,6 +300,8 @@ impl UdpHub {
             Decision::HijackDns => Flow {
                 kind: FlowKind::Dns,
                 last_ms: AtomicU64::new(now_ms()),
+                backlog: Mutex::new(VecDeque::new()),
+                writing: AtomicBool::new(false),
             },
             Decision::Outbound(idx) => {
                 let sock = self.router.connect_udp_index(idx, &ctx.destination).await?;
@@ -258,6 +319,8 @@ impl UdpHub {
                 Flow {
                     kind: FlowKind::Outbound { sock },
                     last_ms: AtomicU64::new(now_ms()),
+                    backlog: Mutex::new(VecDeque::new()),
+                    writing: AtomicBool::new(false),
                 }
             }
         };

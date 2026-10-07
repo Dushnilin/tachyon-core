@@ -480,15 +480,50 @@ fn relay_buf() -> usize {
 /// Physical online cores — deliberately not `available_parallelism()`: the bench
 /// pins a client to two CPUs of a sixteen-core host, and the relay must stay at
 /// 128 KiB there because the cache it is sized for is still all of it.
+///
+/// The count comes from `/sys`, not from `sysconf(_SC_NPROCESSORS_ONLN)`:
+/// musl's `sysconf` reports the affinity mask, not the machine — pinned to
+/// two CPUs it answers 2 and every pinned process then took the 16 KiB
+/// small-machine relay and cut the shadowsocks cells to one record per
+/// syscall. glibc reads `/sys` for the same call, which is where the old
+/// belief that `sysconf` differs from `available_parallelism` came from.
 fn online_cores() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
+        if let Some(n) = sysfs_online_cores() {
+            return Some(n);
+        }
         let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
         if n > 0 {
             return Some(n as usize);
         }
     }
     std::thread::available_parallelism().ok().map(|n| n.get())
+}
+
+/// `0-15` (or `0,2-3`): how many cpus the machine has, independent of the
+/// ones this process is allowed to run on.
+#[cfg(target_os = "linux")]
+fn sysfs_online_cores() -> Option<usize> {
+    let s = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    let mut total = 0;
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (
+                a.trim().parse::<usize>().ok()?,
+                b.trim().parse::<usize>().ok()?,
+            ),
+            None => {
+                let v = part.parse::<usize>().ok()?;
+                (v, v)
+            }
+        };
+        if hi < lo {
+            return None;
+        }
+        total += hi - lo + 1;
+    }
+    (total > 0).then_some(total)
 }
 
 /// Relay buffers waiting for the next connection. A connection takes two and

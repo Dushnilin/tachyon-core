@@ -181,14 +181,14 @@
       <rect width="36" height="36" rx="8" fill="#0284C7" fill-opacity="0.2"/>
       <use href="#tachyon-mini-logo" x="8" y="8"/>
       <text x="46" y="22" class="node-title">Inbounds</text>
-      <text x="46" y="34" class="node-sub">Linux Kernel</text>
+      <text x="46" y="34" class="node-sub">Kernel &amp; Server</text>
     </g>
 
     <!-- Inbound Items -->
     <g transform="translate(15, 68)">
       <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#1E293B" stroke-width="1"/>
       <text x="10" y="20" class="node-title" font-size="12">Linux TProxy</text>
-      <text x="10" y="34" class="tag-mono" fill="#38BDF8">IP_TRANSPARENT</text>
+      <text x="10" y="34" class="tag-mono" fill="#38BDF8">IP_TRANSPARENT (v4/v6)</text>
     </g>
     <g transform="translate(15, 118)">
       <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#1E293B" stroke-width="1"/>
@@ -198,12 +198,12 @@
     <g transform="translate(15, 168)">
       <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#1E293B" stroke-width="1"/>
       <text x="10" y="20" class="node-title" font-size="12">Mixed SOCKS5 / HTTP</text>
-      <text x="10" y="34" class="tag-mono" fill="#38BDF8">CONNECT + 407 AUTH</text>
+      <text x="10" y="34" class="tag-mono" fill="#38BDF8">CONNECT + 407 + UDP</text>
     </g>
     <g transform="translate(15, 218)">
-      <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#1E293B" stroke-width="1"/>
-      <text x="10" y="20" class="node-title" font-size="12">Kernel TUN</text>
-      <text x="10" y="34" class="tag-mono" fill="#38BDF8">SYSTEM / SMOLTCP</text>
+      <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="1"/>
+      <text x="10" y="20" class="node-title" font-size="12" fill="#38BDF8">Server Inbounds</text>
+      <text x="10" y="34" class="tag-mono" fill="#34D399">VLESS · TROJAN · VMESS</text>
     </g>
   </g>
 
@@ -227,7 +227,7 @@
         <rect width="204" height="52" rx="8" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
         <circle cx="14" cy="26" r="4" fill="#10B981" class="led-dot"/>
         <text x="26" y="22" class="node-title" font-size="12">Zero-Alloc Router</text>
-        <text x="26" y="38" class="tag-mono" fill="#34D399">CIDR, SUFFIX, GEOIP</text>
+        <text x="26" y="38" class="tag-mono" fill="#34D399">CIDR, SUFFIX, DHCP, SRS v5</text>
       </g>
 
       <!-- 2. PeekStream Sniffer -->
@@ -235,7 +235,7 @@
         <rect width="204" height="52" rx="8" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
         <circle cx="14" cy="26" r="4" fill="#38BDF8" class="led-dot"/>
         <text x="26" y="22" class="node-title" font-size="12">PeekStream Sniffer</text>
-        <text x="26" y="38" class="tag-mono" fill="#38BDF8">TLS SNI, HTTP, DNS</text>
+        <text x="26" y="38" class="tag-mono" fill="#38BDF8">TLS SNI, HTTP, QUIC, DNS</text>
       </g>
 
       <!-- 3. Tokio Splicer -->
@@ -243,7 +243,7 @@
         <rect width="204" height="52" rx="8" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
         <circle cx="14" cy="26" r="4" fill="#A855F7" class="led-dot"/>
         <text x="26" y="22" class="node-title" font-size="12">Tokio Splicer</text>
-        <text x="26" y="38" class="tag-mono" fill="#C084FC">ZERO-COPY PIPE</text>
+        <text x="26" y="38" class="tag-mono" fill="#C084FC">ZERO-COPY PIPE &amp; NETNS</text>
       </g>
 
       <!-- 4. RustCrypto Provider -->
@@ -254,12 +254,12 @@
         <text x="26" y="38" class="tag-mono" fill="#FBBF24">PURE RUST (NO RING/CGO)</text>
       </g>
 
-      <!-- 5. Flood Protection -->
+      <!-- 5. Clash API & bbolt DB -->
       <g transform="translate(0, 240)">
         <rect width="204" height="42" rx="8" fill="#1E1B4B" stroke="#EC4899" stroke-opacity="0.4" stroke-width="1"/>
         <circle cx="14" cy="21" r="4" fill="#EC4899" class="led-dot"/>
-        <text x="26" y="20" class="node-title" font-size="11" fill="#F472B6">Flood Drop Protection</text>
-        <text x="26" y="34" class="tag-mono" fill="#EC4899">RATE-LIMIT DROP</text>
+        <text x="26" y="20" class="node-title" font-size="11" fill="#F472B6">Clash API &amp; bbolt DB</text>
+        <text x="26" y="34" class="tag-mono" fill="#EC4899">REST UI · CACHE.DB BBOLT</text>
       </g>
     </g>
   </g>
@@ -310,10 +310,10 @@
     <g transform="translate(14, 14)">
       <circle cx="16" cy="16" r="14" fill="#F59E0B" fill-opacity="0.15"/>
       <use href="#tachyon-mini-logo" x="6" y="6"/>
-      <text x="38" y="16" class="node-title" fill="#FBBF24">XHTTP &amp; Hysteria2</text>
-      <text x="38" y="30" class="tag-mono" fill="#F59E0B">HTTP/2 XMUX · QUINN UDP</text>
+      <text x="38" y="16" class="node-title" fill="#FBBF24">XHTTP · TUIC · Hy2</text>
+      <text x="38" y="30" class="tag-mono" fill="#F59E0B">HTTP/1.1 XMUX · QUIC V5</text>
     </g>
-    <text x="16" y="62" class="node-sub">H2 мультиплексирование потоков</text>
+    <text x="16" y="62" class="node-sub">Xray 26.9 interop · Quinn · Naive · Snell</text>
   </g>
 
   <!-- DESTINATION 5: SMART DNS & FAKEIP (PINK) y=475..555, center=515 -->

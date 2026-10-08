@@ -108,6 +108,7 @@ impl Tproxy {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
                         let router = Arc::clone(&tcp_router);
                         let tag = tcp_tag.clone();
                         let destination = match stream.local_addr() {

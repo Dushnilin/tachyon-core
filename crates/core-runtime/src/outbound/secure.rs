@@ -395,6 +395,7 @@ impl Trojan {
             .connect(tcp, Some(tls), &self.server, self.port, &header, &self.dial)
             .await?;
         stream.write_all(&header[consumed..]).await?;
+        stream.flush().await?;
         Ok(stream)
     }
 }

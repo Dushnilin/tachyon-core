@@ -29,6 +29,10 @@ pub(crate) const TUIC_MAX_UDP: usize = 0xffff;
 
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
+/// Default socket buffer size for UDP/QUIC (4 MiB).
+/// Prevents kernel-level packet drops during high-throughput bursts.
+pub(crate) const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
 /// Pool bounds for the per-outbound QUIC connection pool: one shared QUIC
 /// connection serializes every stream through a single quinn driver task and
 /// one UDP socket, which loses to the reference at 8 streams.
@@ -179,8 +183,8 @@ impl QuicTunnelOptions {
         if self.disable_path_mtu_discovery {
             transport.mtu_discovery_config(None);
         }
-        transport.datagram_receive_buffer_size(datagram_rx.then_some(65_536));
-        transport.datagram_send_buffer_size(65_536);
+        transport.datagram_receive_buffer_size(datagram_rx.then_some(2 * 1024 * 1024));
+        transport.datagram_send_buffer_size(2 * 1024 * 1024);
         // Acking every second ack-eliciting packet, and every out-of-order arrival
         // on top of it, is quinn's default when no ack-frequency policy is set. On a
         // saturated loopback path with several streams that is an ACK-only packet
@@ -717,6 +721,8 @@ pub(crate) async fn spawn_salamander_relay(
         "[::1]:0"
     };
     let sock_ep = Arc::new(tokio::net::UdpSocket::bind(ep_bind).await?);
+    let _ = socket2::SockRef::from(&*sock_ep).set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = socket2::SockRef::from(&*sock_ep).set_send_buffer_size(UDP_SOCKET_BUFFER);
     sock_ep.connect(endpoint_local).await?;
     let local = sock_ep.local_addr()?;
 
@@ -726,6 +732,8 @@ pub(crate) async fn spawn_salamander_relay(
         "[::]:0"
     };
     let sock_srv = Arc::new(tokio::net::UdpSocket::bind(srv_bind).await?);
+    let _ = socket2::SockRef::from(&*sock_srv).set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = socket2::SockRef::from(&*sock_srv).set_send_buffer_size(UDP_SOCKET_BUFFER);
     sock_srv.connect(server).await?;
 
     let pw_up = password.clone();
@@ -809,7 +817,7 @@ pub(crate) async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr
         .ok_or_else(|| io::Error::other(format!("no address for {host}")))
 }
 
-/// Bind a nonblocking UDP socket for a quinn endpoint.
+/// Bind a nonblocking UDP socket for a quinn endpoint with tuned buffers.
 pub(crate) fn bind_udp(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
     let bind = if local.is_ipv4() {
         SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
@@ -818,6 +826,9 @@ pub(crate) fn bind_udp(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
     };
     let sock = std::net::UdpSocket::bind(bind)?;
     sock.set_nonblocking(true)?;
+    let sock_ref = socket2::SockRef::from(&sock);
+    let _ = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = sock_ref.set_send_buffer_size(UDP_SOCKET_BUFFER);
     Ok(sock)
 }
 
@@ -830,6 +841,9 @@ pub(crate) fn bind_udp_loopback(is_ipv4: bool) -> io::Result<std::net::UdpSocket
     };
     let sock = std::net::UdpSocket::bind(bind)?;
     sock.set_nonblocking(true)?;
+    let sock_ref = socket2::SockRef::from(&sock);
+    let _ = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = sock_ref.set_send_buffer_size(UDP_SOCKET_BUFFER);
     Ok(sock)
 }
 
@@ -992,6 +1006,10 @@ pub(crate) async fn udp_loopback_pair() -> io::Result<(tokio::net::UdpSocket, to
 {
     let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
     let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let _ = socket2::SockRef::from(&a).set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = socket2::SockRef::from(&a).set_send_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = socket2::SockRef::from(&b).set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = socket2::SockRef::from(&b).set_send_buffer_size(UDP_SOCKET_BUFFER);
     a.connect(b.local_addr()?).await?;
     b.connect(a.local_addr()?).await?;
     Ok((a, b))

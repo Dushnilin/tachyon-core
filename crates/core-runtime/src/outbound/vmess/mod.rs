@@ -195,12 +195,9 @@ impl Vmess {
             response_header[0],
         )?;
         let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
-        let tcp =
-            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         let (mut stream, consumed) = self
             .transport
-            .connect(
-                tcp,
+            .connect_or_dial(
                 self.tls.as_ref(),
                 &self.server,
                 self.port,
@@ -256,13 +253,10 @@ impl Vmess {
             &request_iv,
             response_header[0],
         )?;
-        let tcp =
-            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         // a ws transport with early data carries the request in the upgrade head
         let (mut stream, consumed) = self
             .transport
-            .connect(
-                tcp,
+            .connect_or_dial(
                 self.tls.as_ref(),
                 &self.server,
                 self.port,

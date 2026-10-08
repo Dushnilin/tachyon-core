@@ -1420,7 +1420,6 @@ const URLTEST_OUT_FIELDS: &[&str] = &[
     "interrupt_exist_connections",
     "mode",
     "balancer",
-    "passive_check",
 ];
 const CHAIN_OUT_FIELDS: &[&str] = &[
     "type",
@@ -7276,10 +7275,13 @@ fn validate_group_out_decode(i: usize, ty: &str, obj: &Map<String, Value>) -> Re
             if let Some(v) = obj.get("tolerance") {
                 check_u16(v).map_err(|m| format!("{at}.tolerance: {m}"))?;
             }
-            for f in ["interrupt_exist_connections", "passive_check"] {
-                if let Some(v) = obj.get(f) {
-                    ep_bool(v, &format!("{at}.{f}"), "URLTestOutboundOptions", f)?;
-                }
+            if let Some(v) = obj.get("interrupt_exist_connections") {
+                ep_bool(
+                    v,
+                    &format!("{at}.interrupt_exist_connections"),
+                    "URLTestOutboundOptions",
+                    "interrupt_exist_connections",
+                )?;
             }
             if let Some(bal) = obj.get("balancer")
                 && !bal.is_null()

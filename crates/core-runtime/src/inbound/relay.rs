@@ -89,9 +89,15 @@ fn shutdown_write(stream: &TcpStream) {
 /// Write all of `data` to a non-blocking socket without needing `&mut`.
 async fn write_all(stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
-        let n = stream
-            .async_io(Interest::WRITABLE, || stream.try_write(data))
-            .await?;
+        let n = match stream.try_write(data) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                stream
+                    .async_io(Interest::WRITABLE, || stream.try_write(data))
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
@@ -107,9 +113,14 @@ async fn skip_vless_head(from: &TcpStream) -> io::Result<()> {
     async fn fill(from: &TcpStream, buf: &mut [u8]) -> io::Result<()> {
         let mut got = 0;
         while got < buf.len() {
-            let n = from
-                .async_io(Interest::READABLE, || from.try_read(&mut buf[got..]))
-                .await?;
+            let n = match from.try_read(&mut buf[got..]) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    from.async_io(Interest::READABLE, || from.try_read(&mut buf[got..]))
+                        .await?
+                }
+                Err(e) => return Err(e),
+            };
             if n == 0 {
                 return Err(io::Error::other("vless: connection closed before response"));
             }
@@ -144,18 +155,28 @@ async fn one_way(
     };
     let (from_fd, to_fd) = (from.as_raw_fd(), to.as_raw_fd());
     loop {
-        let n = from
-            .async_io(Interest::READABLE, || splice(from_fd, pipe.write, CHUNK))
-            .await?;
+        let n = match splice(from_fd, pipe.write, CHUNK) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                from.async_io(Interest::READABLE, || splice(from_fd, pipe.write, CHUNK))
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             shutdown_write(to);
             return Ok(());
         }
         let mut left = n;
         while left > 0 {
-            let m = to
-                .async_io(Interest::WRITABLE, || splice(pipe.read, to_fd, left))
-                .await?;
+            let m = match splice(pipe.read, to_fd, left) {
+                Ok(m) => m,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    to.async_io(Interest::WRITABLE, || splice(pipe.read, to_fd, left))
+                        .await?
+                }
+                Err(e) => return Err(e),
+            };
             if m == 0 {
                 return Err(io::ErrorKind::WriteZero.into());
             }
@@ -169,9 +190,14 @@ async fn one_way(
 async fn one_way_buffered(from: &TcpStream, to: &TcpStream, count: impl Fn(u64)) -> io::Result<()> {
     let mut buf = vec![0u8; FALLBACK_CHUNK];
     loop {
-        let n = from
-            .async_io(Interest::READABLE, || from.try_read(&mut buf))
-            .await?;
+        let n = match from.try_read(&mut buf) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                from.async_io(Interest::READABLE, || from.try_read(&mut buf))
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             shutdown_write(to);
             return Ok(());

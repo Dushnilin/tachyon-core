@@ -1,8 +1,9 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -196,8 +197,6 @@ impl ClientConn {
     }
 }
 
-use std::pin::Pin;
-
 impl AsyncRead for ClientConn {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -379,11 +378,9 @@ where
                         .await?;
                 }
                 None => {
-                    tokio::io::copy_bidirectional_with_sizes(
+                    copy_bidirectional_pooled(
                         &mut Timed { inner: &mut client },
                         &mut upstream,
-                        relay_buf(),
-                        relay_buf(),
                     )
                     .await?;
                 }
@@ -458,16 +455,12 @@ fn closed_by_api() -> io::Error {
     io::Error::other("connection closed by clash api")
 }
 
-/// Each direction of a userspace relay moves up to this much per read. The 8 KiB
-/// tokio picks by default means eight times the syscalls and, for the shadowsocks
-/// 2022 chunks (up to 64 KiB), a frame cut into pieces; at 128 KiB one read also
-/// covers two whole records, so a steady download costs one write per two of them.
+/// Each direction of a userspace relay moves up to this much per read. Sized
+/// to two whole shadowsocks 2022 chunks (2 * 65535 ~ 128 KiB) so a steady transfer
+/// costs one write per two chunks or eight TLS records, halving syscalls on routers.
 ///
-/// On a small machine 128 KiB is poison rather than a win: eight connections
-/// times two buffers is 2 MiB, four times a Cortex-A53's 512 KiB L2, so every
-/// stream evicts the next one's hot bytes and the core sits in memory stalls.
-/// There the relay gets 16 KiB instead — 8 conns x 2 x 16 KiB = 256 KiB, half
-/// the L2 — which is where the 8-stream router numbers were bleeding.
+/// Buffers are recycled through `BUF_POOL`, so active connections allocate zero heap
+/// slices and peak memory is bounded to `POOL_CAP * relay_buf()` (2 MiB).
 fn relay_buf() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -477,67 +470,14 @@ fn relay_buf() -> usize {
         {
             return n;
         }
-        if online_cores().is_some_and(|cores| (1..=2).contains(&cores)) {
-            64 * 1024
-        } else {
-            2 * 65535
-        }
+        2 * 65535
     })
-}
-
-/// Physical online cores — deliberately not `available_parallelism()`: the bench
-/// pins a client to two CPUs of a sixteen-core host, and the relay must stay at
-/// 128 KiB there because the cache it is sized for is still all of it.
-///
-/// The count comes from `/sys`, not from `sysconf(_SC_NPROCESSORS_ONLN)`:
-/// musl's `sysconf` reports the affinity mask, not the machine — pinned to
-/// two CPUs it answers 2 and every pinned process then took the 16 KiB
-/// small-machine relay and cut the shadowsocks cells to one record per
-/// syscall. glibc reads `/sys` for the same call, which is where the old
-/// belief that `sysconf` differs from `available_parallelism` came from.
-fn online_cores() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(n) = sysfs_online_cores() {
-            return Some(n);
-        }
-        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-        if n > 0 {
-            return Some(n as usize);
-        }
-    }
-    std::thread::available_parallelism().ok().map(|n| n.get())
-}
-
-/// `0-15` (or `0,2-3`): how many cpus the machine has, independent of the
-/// ones this process is allowed to run on.
-#[cfg(target_os = "linux")]
-fn sysfs_online_cores() -> Option<usize> {
-    let s = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
-    let mut total = 0;
-    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
-        let (lo, hi) = match part.split_once('-') {
-            Some((a, b)) => (
-                a.trim().parse::<usize>().ok()?,
-                b.trim().parse::<usize>().ok()?,
-            ),
-            None => {
-                let v = part.parse::<usize>().ok()?;
-                (v, v)
-            }
-        };
-        if hi < lo {
-            return None;
-        }
-        total += hi - lo + 1;
-    }
-    (total > 0).then_some(total)
 }
 
 /// Relay buffers waiting for the next connection. A connection takes two and
 /// gives them back on close: at 128 KiB each is an mmap/munmap pair on glibc,
 /// and a steady connection rate pays that per connection. Capped so a burst
-/// cannot pin memory (16 x 128 KiB = 2 MiB, 16 x 16 KiB = 256 KiB).
+/// cannot pin memory (16 x 128 KiB = 2 MiB).
 static BUF_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 const POOL_CAP: usize = 16;
 
@@ -553,7 +493,7 @@ fn take_buf() -> Vec<u8> {
 }
 
 fn give_buf(mut buf: Vec<u8>) {
-    if buf.capacity() < relay_buf() || buf.capacity() > relay_buf() * 2 {
+    if buf.capacity() < relay_buf() / 2 || buf.capacity() > relay_buf() * 2 {
         return;
     }
     buf.clear();
@@ -664,6 +604,191 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Timed<'_, S> {
     }
 }
 
+struct PooledBuffer {
+    buf: Option<Vec<u8>>,
+    read_done: bool,
+    need_flush: bool,
+    pos: usize,
+    cap: usize,
+    amt: u64,
+}
+
+impl PooledBuffer {
+    fn new(buf: Vec<u8>) -> Self {
+        Self {
+            buf: Some(buf),
+            read_done: false,
+            need_flush: false,
+            pos: 0,
+            cap: 0,
+            amt: 0,
+        }
+    }
+
+    #[inline]
+    fn buffer(&mut self) -> &mut [u8] {
+        self.buf.as_deref_mut().expect("pooled buffer present")
+    }
+
+    fn poll_fill_buf<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut reader: Pin<&mut R>,
+    ) -> Poll<io::Result<()>>
+    where
+        R: AsyncRead + ?Sized,
+    {
+        let cap = self.cap;
+        let mut read_buf = ReadBuf::new(self.buffer());
+        read_buf.set_filled(cap);
+
+        let res = reader.as_mut().poll_read(cx, &mut read_buf);
+        if let Poll::Ready(Ok(())) = res {
+            let filled_len = read_buf.filled().len();
+            self.read_done = self.cap == filled_len;
+            self.cap = filled_len;
+        }
+        res
+    }
+
+    fn poll_write_buf<R, W>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<io::Result<usize>>
+    where
+        R: AsyncRead + ?Sized,
+        W: AsyncWrite + ?Sized,
+    {
+        let (pos, cap) = (self.pos, self.cap);
+        let buf_len = self.buffer().len();
+        match writer.as_mut().poll_write(cx, &self.buffer()[pos..cap]) {
+            Poll::Pending => {
+                if !self.read_done && cap < buf_len {
+                    ready!(self.poll_fill_buf(cx, reader.as_mut()))?;
+                }
+                Poll::Pending
+            }
+            res => res,
+        }
+    }
+
+    pub fn poll_copy<R, W>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<io::Result<u64>>
+    where
+        R: AsyncRead + ?Sized,
+        W: AsyncWrite + ?Sized,
+    {
+        loop {
+            let buf_len = self.buffer().len();
+            if self.cap < buf_len && !self.read_done {
+                match self.poll_fill_buf(cx, reader.as_mut()) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => {
+                        if self.pos == self.cap {
+                            if self.need_flush {
+                                ready!(writer.as_mut().poll_flush(cx))?;
+                                self.need_flush = false;
+                            }
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+
+            while self.pos < self.cap {
+                let i = ready!(self.poll_write_buf(cx, reader.as_mut(), writer.as_mut()))?;
+                if i == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero byte into writer",
+                    )));
+                } else {
+                    self.pos += i;
+                    self.amt += i as u64;
+                    self.need_flush = true;
+                }
+            }
+
+            self.pos = 0;
+            self.cap = 0;
+
+            if self.read_done {
+                ready!(writer.as_mut().poll_flush(cx))?;
+                return Poll::Ready(Ok(self.amt));
+            }
+        }
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            give_buf(buf);
+        }
+    }
+}
+
+enum TransferState {
+    Running(PooledBuffer),
+    ShuttingDown(u64),
+    Done(u64),
+}
+
+fn transfer_one_direction<A, B>(
+    cx: &mut Context<'_>,
+    state: &mut TransferState,
+    r: &mut A,
+    w: &mut B,
+) -> Poll<io::Result<u64>>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut r = Pin::new(r);
+    let mut w = Pin::new(w);
+
+    loop {
+        match state {
+            TransferState::Running(buf) => {
+                let count = ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
+                *state = TransferState::ShuttingDown(count);
+            }
+            TransferState::ShuttingDown(count) => {
+                ready!(w.as_mut().poll_shutdown(cx))?;
+                *state = TransferState::Done(*count);
+            }
+            TransferState::Done(count) => return Poll::Ready(Ok(*count)),
+        }
+    }
+}
+
+async fn copy_bidirectional_pooled<A, B>(
+    a: &mut A,
+    b: &mut B,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut a_to_b = TransferState::Running(PooledBuffer::new(take_buf()));
+    let mut b_to_a = TransferState::Running(PooledBuffer::new(take_buf()));
+    std::future::poll_fn(|cx| {
+        let res_a = transfer_one_direction(cx, &mut a_to_b, a, b)?;
+        let res_b = transfer_one_direction(cx, &mut b_to_a, b, a)?;
+        let amt_a = ready!(res_a);
+        let amt_b = ready!(res_b);
+        Poll::Ready(Ok((amt_a, amt_b)))
+    })
+    .await
+}
+
 /// Counted bidirectional relay that aborts when the API closes the entry.
 ///
 /// Both directions are driven by one poll-based copy, so a write that cannot
@@ -684,11 +809,9 @@ where
     };
     tokio::select! {
         biased;
-        result = tokio::io::copy_bidirectional_with_sizes(
+        result = copy_bidirectional_pooled(
             &mut counted,
             upstream,
-            relay_buf(),
-            relay_buf(),
         ) => result.map(|_| ()),
         _ = signal.wait() => Err(closed_by_api()),
     }

@@ -50,6 +50,7 @@ impl Redirect {
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     let router = Arc::clone(&self.router);
                     let tag = self.tag.clone();
                     tokio::spawn(async move {

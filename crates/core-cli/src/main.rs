@@ -130,11 +130,15 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let runtime = if workers == 1 {
         tokio::runtime::Builder::new_current_thread()
+            .event_interval(31)
+            .max_blocking_threads(16)
             .enable_all()
             .build()
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
+            .event_interval(31)
+            .max_blocking_threads(16 * workers.max(1))
             .enable_all()
             .build()
     }

@@ -15,11 +15,11 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection. Sized to 1 MiB stream / 4 MiB
+/// Receive window per stream and per connection. Sized to 4 MiB stream / 16 MiB
 /// connection to sustain 10+ Gbps bulk transfers without ballooning client RSS
 /// across concurrent streams.
-const STREAM_WINDOW: u32 = 1 << 20;
-const CONN_WINDOW: u32 = 4 << 20;
+const STREAM_WINDOW: u32 = 4 << 20;
+const CONN_WINDOW: u32 = 16 << 20;
 /// Largest DATA frame we ask the peer to send (the protocol default is 16 KiB;
 /// Go's client asks for 1 MiB).
 const MAX_FRAME: u32 = 256 << 10;

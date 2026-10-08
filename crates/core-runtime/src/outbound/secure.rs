@@ -157,13 +157,10 @@ impl Vless {
 
     async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
         let header = request_head(&self.uuid, command, target, self.vision)?;
-        let tcp =
-            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         // a ws transport with early data carries the request in the upgrade head
         let (mut stream, consumed) = self
             .transport
-            .connect(
-                tcp,
+            .connect_or_dial(
                 self.tls.as_ref(),
                 &self.server,
                 self.port,
@@ -388,11 +385,9 @@ impl Trojan {
         // SOCKS ones: 1 = IPv4, 4 = IPv6, 3 = domain
         header.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x03)?);
         header.extend_from_slice(b"\r\n");
-        let tcp =
-            crate::outbound::dial::connect_tcp(self.server.as_str(), self.port, &self.dial).await?;
         let (mut stream, consumed) = self
             .transport
-            .connect(tcp, Some(tls), &self.server, self.port, &header, &self.dial)
+            .connect_or_dial(Some(tls), &self.server, self.port, &header, &self.dial)
             .await?;
         stream.write_all(&header[consumed..]).await?;
         stream.flush().await?;

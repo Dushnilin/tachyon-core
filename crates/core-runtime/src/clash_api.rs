@@ -1298,14 +1298,28 @@ async fn delay_test(
         let (tls, host, port, authority, path) = parse_link(url)?;
         let target = Target::Domain(host.clone(), port);
         let mut start = Instant::now();
-        let Ok(crate::inbound::Conn::Plain(conn)) = router.connect_index(index, &target).await
-        else {
-            return None;
+        let dialled = router.connect_index(index, &target).await;
+        let conn = match dialled {
+            Ok(crate::inbound::Conn::Plain(conn)) => conn,
+            Ok(_) => {
+                crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: non-plain connection"));
+                return None;
+            }
+            Err(e) => {
+                crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: {e}"));
+                return None;
+            }
         };
         let mut stream: crate::inbound::AnyStream = if tls {
             // Reference resets the clock after the dial, before the handshake.
             start = Instant::now();
-            tls_client::wrap_probe(conn, &host).await.ok()?
+            match tls_client::wrap_probe(conn, &host).await {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::logging::debug(format_args!("delay[{index}]: tls {host}: {e}"));
+                    return None;
+                }
+            }
         } else {
             conn
         };

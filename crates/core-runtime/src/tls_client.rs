@@ -538,6 +538,12 @@ impl TlsOptions {
     ) -> io::Result<AnyStream> {
         self.establish(stream, default_alpn).await
     }
+
+    /// Replace whatever `tls.alpn` said: a transport that knows which protocol
+    /// it will speak on this connection narrows the offer itself.
+    pub(crate) fn set_alpn(&mut self, alpn: &[&[u8]]) {
+        self.alpn = alpn.iter().map(|a| a.to_vec()).collect();
+    }
 }
 
 /// A REALITY public key: 32 bytes of X25519, base64url without padding.

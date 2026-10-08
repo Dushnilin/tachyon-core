@@ -233,6 +233,22 @@ impl Transport {
         }
     }
 
+    /// XHTTP's packet-up / stream-up paths write HTTP/1.1 by hand, so whatever
+    /// `tls.alpn` asked for is narrowed to `http/1.1` here: a server that picks
+    /// `h2` from `[h2, http/1.1]` hangs up on the HTTP/1.1 bytes instead of
+    /// answering them (`xhttp: download: the server sent alert 0`). Returns the
+    /// narrowed copy, or `None` when the config can be used as-is.
+    fn h1_forced_tls(&self, tls: Option<&TlsOptions>) -> Option<TlsOptions> {
+        match &self.kind {
+            Kind::Xhttp(cfg) if cfg.h1_only(tls.is_some()) => {
+                let mut t = tls?.clone();
+                t.set_alpn(&[b"http/1.1"]);
+                Some(t)
+            }
+            _ => None,
+        }
+    }
+
     /// Dial the full outbound stream: TCP → optional TLS → transport.
     /// `early` is the first protocol write; a transport that can carry it in
     /// its handshake (ws early data) takes as much as it declared and reports
@@ -243,6 +259,27 @@ impl Transport {
     /// connection per concurrent request — and ALPN, which decides what a
     /// connection speaks, is chosen per connection, so it cannot be settled once
     /// for the whole transport.
+    /// Connect the outbound stream: if the transport supports connection pooling
+    /// (e.g. HTTP/2 XHTTP stream-one), reuses a pooled connection without dialing TCP
+    /// or negotiating TLS; otherwise dials TCP and connects.
+    pub(crate) async fn connect_or_dial(
+        &self,
+        tls: Option<&TlsOptions>,
+        server: &str,
+        port: u16,
+        early: &[u8],
+        dial: &crate::outbound::dial::DialOptions,
+    ) -> io::Result<(AnyStream, usize)> {
+        if let Kind::Xhttp(cfg) = &self.kind {
+            if let Some(stream) = cfg.connect_h2_stream(tls, server, port, dial).await? {
+                return Ok((stream, 0));
+            }
+        }
+
+        let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
+        self.connect(tcp, tls, server, port, early, dial).await
+    }
+
     pub(crate) async fn connect(
         &self,
         tcp: TcpStream,
@@ -252,6 +289,8 @@ impl Transport {
         early: &[u8],
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<(AnyStream, usize)> {
+        let tls_forced = self.h1_forced_tls(tls);
+        let tls = tls_forced.as_ref().or(tls);
         let default_alpn = self.default_alpn(tls.is_some());
         let stream: AnyStream = match tls {
             Some(tls) => tls.wrap_with_defaults(tcp, default_alpn).await?,
@@ -325,7 +364,7 @@ impl Transport {
     ) -> Arc<xhttp::Dialer> {
         let server = server.to_string();
         let dial = dial.clone();
-        let tls = tls.cloned();
+        let tls = self.h1_forced_tls(tls).or_else(|| tls.cloned());
         let alpn = self.default_alpn(tls.is_some());
         Arc::new(move || {
             let server = server.clone();

@@ -42,10 +42,10 @@
 )]
 
 use alloc::boxed::Box;
+use alloc::vec;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::{Mutex, OnceLock};
-use alloc::vec;
 
 /// `AF_ALG` in linux's socket family table (38, stable since v4.10) — libc
 /// does not name it on every target this crate builds for.
@@ -96,8 +96,16 @@ impl Conn {
 
         let mut sa: libc::sockaddr_alg = unsafe { core::mem::zeroed() };
         sa.salg_family = AF_ALG as libc::sa_family_t;
-        put_name(sa.salg_type.as_mut_ptr().cast(), sa.salg_type.len(), b"aead");
-        put_name(sa.salg_name.as_mut_ptr().cast(), sa.salg_name.len(), b"gcm(aes)");
+        put_name(
+            sa.salg_type.as_mut_ptr().cast(),
+            sa.salg_type.len(),
+            b"aead",
+        );
+        put_name(
+            sa.salg_name.as_mut_ptr().cast(),
+            sa.salg_name.len(),
+            b"gcm(aes)",
+        );
         let rc = unsafe {
             libc::bind(
                 parent,
@@ -124,7 +132,15 @@ impl Conn {
 
         // The kernel takes the authsize from `optlen`, not from the value:
         // `type->setauthsize(ask->private, optlen)` in af_alg.c.
-        let rc = unsafe { libc::setsockopt(parent, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, core::ptr::null(), 16) };
+        let rc = unsafe {
+            libc::setsockopt(
+                parent,
+                SOL_ALG,
+                ALG_SET_AEAD_AUTHSIZE,
+                core::ptr::null(),
+                16,
+            )
+        };
         if rc < 0 {
             return Err(close_err(parent, io::Error::last_os_error()));
         }
@@ -149,14 +165,27 @@ impl Conn {
     /// Decrypt `buf` in place; `Err` is either the kernel saying EBADMSG or
     /// something going wrong with the socket — the caller turns both into
     /// "no plaintext".
-    fn decrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> io::Result<()> {
+    fn decrypt(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8; 16],
+    ) -> io::Result<()> {
         self.send(false, nonce, aad, buf, tag)?;
         recv_payload(self.child, aad.len(), buf, None)
     }
 
     /// One sendmsg: control messages (op, assoclen, iv) plus the payload as
     /// scatter iovecs so aad and data are never concatenated in userspace.
-    fn send(&self, enc: bool, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8]) -> io::Result<()> {
+    fn send(
+        &self,
+        enc: bool,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8],
+    ) -> io::Result<()> {
         let expect = aad.len() + buf.len() + tag.len();
 
         // op(4) + assoc(4) + iv(4 + 12) — all three, always: af_alg_sendmsg
@@ -172,7 +201,10 @@ impl Conn {
             unsafe { libc::CMSG_SPACE(4) + libc::CMSG_SPACE(4) + libc::CMSG_SPACE(4 + 12) } as _;
         unsafe { fill_cmsgs(&mut msg, enc, aad.len() as u32, nonce)? };
 
-        let mut iov = [libc::iovec { iov_base: core::ptr::null_mut(), iov_len: 0 }; 3];
+        let mut iov = [libc::iovec {
+            iov_base: core::ptr::null_mut(),
+            iov_len: 0,
+        }; 3];
         let mut n = 0;
         push_iov_const(&mut iov, &mut n, aad);
         push_iov_const(&mut iov, &mut n, buf);
@@ -186,7 +218,10 @@ impl Conn {
                 return if sent as usize == expect {
                     Ok(())
                 } else {
-                    Err(io::Error::new(io::ErrorKind::WriteZero, "short afalg sendmsg"))
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short afalg sendmsg",
+                    ))
                 };
             }
             let e = io::Error::last_os_error();
@@ -314,37 +349,42 @@ fn push_iov_const(iov: &mut [libc::iovec], n: &mut usize, data: &[u8]) {
 /// Build OP, ASSOCLEN and IV control messages inside `msg`'s already-set
 /// control buffer, in that order. Every pointer here is derived from `msg`,
 /// which the caller owns for the duration.
-unsafe fn fill_cmsgs(msg: &mut libc::msghdr, enc: bool, assoc: u32, nonce: &[u8; 12]) -> io::Result<()> {
+unsafe fn fill_cmsgs(
+    msg: &mut libc::msghdr,
+    enc: bool,
+    assoc: u32,
+    nonce: &[u8; 12],
+) -> io::Result<()> {
     unsafe {
-    let mut c = libc::CMSG_FIRSTHDR(msg);
-    if c.is_null() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cmsg"));
-    }
-    (*c).cmsg_level = SOL_ALG;
-    (*c).cmsg_type = ALG_SET_OP;
-    (*c).cmsg_len = libc::CMSG_LEN(4) as _;
-    *libc::CMSG_DATA(c).cast::<u32>() = if enc { ALG_OP_ENCRYPT } else { ALG_OP_DECRYPT };
+        let mut c = libc::CMSG_FIRSTHDR(msg);
+        if c.is_null() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cmsg"));
+        }
+        (*c).cmsg_level = SOL_ALG;
+        (*c).cmsg_type = ALG_SET_OP;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        *libc::CMSG_DATA(c).cast::<u32>() = if enc { ALG_OP_ENCRYPT } else { ALG_OP_DECRYPT };
 
-    c = libc::CMSG_NXTHDR(msg, c);
-    if c.is_null() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cmsg"));
-    }
-    (*c).cmsg_level = SOL_ALG;
-    (*c).cmsg_type = ALG_SET_AEAD_ASSOCLEN;
-    (*c).cmsg_len = libc::CMSG_LEN(4) as _;
-    *libc::CMSG_DATA(c).cast::<u32>() = assoc;
+        c = libc::CMSG_NXTHDR(msg, c);
+        if c.is_null() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cmsg"));
+        }
+        (*c).cmsg_level = SOL_ALG;
+        (*c).cmsg_type = ALG_SET_AEAD_ASSOCLEN;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        *libc::CMSG_DATA(c).cast::<u32>() = assoc;
 
-    c = libc::CMSG_NXTHDR(msg, c);
-    if c.is_null() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cmsg"));
-    }
-    (*c).cmsg_level = SOL_ALG;
-    (*c).cmsg_type = ALG_SET_IV;
-    (*c).cmsg_len = libc::CMSG_LEN(4 + 12) as _;
-    let iv = libc::CMSG_DATA(c);
-    // struct af_alg_iv { __u32 ivlen; __u8 iv[]; }
-    iv.cast::<u32>().write_unaligned(12);
-    core::ptr::copy_nonoverlapping(nonce.as_ptr(), iv.add(4), 12);
+        c = libc::CMSG_NXTHDR(msg, c);
+        if c.is_null() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no cmsg"));
+        }
+        (*c).cmsg_level = SOL_ALG;
+        (*c).cmsg_type = ALG_SET_IV;
+        (*c).cmsg_len = libc::CMSG_LEN(4 + 12) as _;
+        let iv = libc::CMSG_DATA(c);
+        // struct af_alg_iv { __u32 ivlen; __u8 iv[]; }
+        iv.cast::<u32>().write_unaligned(12);
+        core::ptr::copy_nonoverlapping(nonce.as_ptr(), iv.add(4), 12);
     }
     Ok(())
 }
@@ -352,7 +392,12 @@ unsafe fn fill_cmsgs(msg: &mut libc::msghdr, enc: bool, assoc: u32, nonce: &[u8;
 /// Collect the kernel's `aad || (pt-space)` into `buf` (and the tag when
 /// encrypting) with a single recvmsg whose iovs total exactly the output
 /// length — see the module docs for why exact is not negotiable.
-fn recv_payload(fd: RawFd, aad_len: usize, buf: &mut [u8], tag: Option<&mut [u8]>) -> io::Result<()> {
+fn recv_payload(
+    fd: RawFd,
+    aad_len: usize,
+    buf: &mut [u8],
+    tag: Option<&mut [u8]>,
+) -> io::Result<()> {
     let mut tag = tag;
     let tag_len = tag.as_ref().map_or(0, |t| t.len());
     let total = aad_len + buf.len() + tag_len;
@@ -362,7 +407,10 @@ fn recv_payload(fd: RawFd, aad_len: usize, buf: &mut [u8], tag: Option<&mut [u8]
         // pt) goes straight into buf, the tag straight into its slot.
         let mut echo = [0u8; STACK_AAD];
         let mut dummy = [0u8; 1];
-        let mut iov = [libc::iovec { iov_base: core::ptr::null_mut(), iov_len: 0 }; 3];
+        let mut iov = [libc::iovec {
+            iov_base: core::ptr::null_mut(),
+            iov_len: 0,
+        }; 3];
         let mut n = 0;
         push_iov(&mut iov, &mut n, &mut echo[..aad_len]);
         push_iov(&mut iov, &mut n, buf);
@@ -419,7 +467,10 @@ fn recv_exact(fd: RawFd, msg: &mut libc::msghdr, expect: usize) -> io::Result<()
                 // the exact iov total rules out; treat it as a failure so a
                 // wrong assumption surfaces as a dropped connection, never
                 // as silent garbage.
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short afalg recvmsg"))
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short afalg recvmsg",
+                ))
             };
         }
         let e = io::Error::last_os_error();
@@ -433,10 +484,16 @@ fn recv_exact(fd: RawFd, msg: &mut libc::msghdr, expect: usize) -> io::Result<()
 /// race the software path at the record sizes the proxy actually seals.
 /// Runs once, before the first `Gcm::new` returns.
 fn calibrate() -> usize {
-    if matches!(std::env::var("TACHYON_AF_ALG").as_deref(), Ok("0") | Ok("off")) {
+    if matches!(
+        std::env::var("TACHYON_AF_ALG").as_deref(),
+        Ok("0") | Ok("off")
+    ) {
         return 0;
     }
-    if matches!(std::env::var("TACHYON_AF_ALG").as_deref(), Ok("1") | Ok("on") | Ok("force")) {
+    if matches!(
+        std::env::var("TACHYON_AF_ALG").as_deref(),
+        Ok("1") | Ok("on") | Ok("force")
+    ) {
         // Testing valve: route every non-empty payload through the kernel
         // even when the software cipher would have won the race, so the
         // whole test suite runs on `Gcm::Alg`. If AF_ALG is unavailable the
@@ -461,7 +518,13 @@ fn calibrate() -> usize {
     // the cutoff; nothing smaller ever goes to it. Iterations are tuned so
     // the whole calibration stays in the low milliseconds — it runs on the
     // first connection of a process.
-    for &(size, iters) in &[(256usize, 1500u32), (1024, 800), (1440, 600), (4096, 300), (16384, 150)] {
+    for &(size, iters) in &[
+        (256usize, 1500u32),
+        (1024, 800),
+        (1440, 600),
+        (4096, 300),
+        (16384, 150),
+    ] {
         let mut buf = vec![0x5Au8; size];
 
         let t0 = std::time::Instant::now();
@@ -596,7 +659,10 @@ mod tests {
                 a.open(&nonce, &aad, &mut buf, &tag),
                 "open failed pt_len={pt_len} aad_len={aad_len}"
             );
-            assert_eq!(buf, plain, "roundtrip mismatch pt_len={pt_len} aad_len={aad_len}");
+            assert_eq!(
+                buf, plain,
+                "roundtrip mismatch pt_len={pt_len} aad_len={aad_len}"
+            );
         }
     }
 
@@ -624,7 +690,9 @@ mod tests {
         let nonce = [5u8; 12];
         for &(pt_len, aad_len) in &[(1usize, 0usize), (1440, 18), (4096, 64), (16384, 5)] {
             let aad = vec![0x33u8; aad_len];
-            let plain: Vec<u8> = (0..pt_len).map(|i| (i.wrapping_mul(31) + 9) as u8).collect();
+            let plain: Vec<u8> = (0..pt_len)
+                .map(|i| (i.wrapping_mul(31) + 9) as u8)
+                .collect();
 
             let mut from_k = plain.clone();
             let mut from_s = plain.clone();
@@ -654,7 +722,10 @@ mod tests {
         bad_tag[3] ^= 0x40;
         let mut b1 = buf.clone();
         assert!(!a.open(&nonce, aad, &mut b1, &bad_tag));
-        assert!(b1.iter().all(|&x| x == 0), "failed open must leave no plaintext");
+        assert!(
+            b1.iter().all(|&x| x == 0),
+            "failed open must leave no plaintext"
+        );
 
         // Flip a bit in the ciphertext.
         let mut bad_ct = buf.clone();

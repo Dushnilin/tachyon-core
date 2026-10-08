@@ -137,8 +137,7 @@ mod linux {
 
         const TTL: Duration = Duration::from_secs(3);
         const CAPACITY: usize = 4096;
-        static CACHE: OnceLock<Mutex<lru::LruCache<Key, (Instant, ProcessInfo)>>> =
-            OnceLock::new();
+        static CACHE: OnceLock<Mutex<lru::LruCache<Key, (Instant, ProcessInfo)>>> = OnceLock::new();
 
         fn fresh(
             cache: &Mutex<lru::LruCache<Key, (Instant, ProcessInfo)>>,

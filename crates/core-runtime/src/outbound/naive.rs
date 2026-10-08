@@ -497,9 +497,12 @@ impl Naive {
                 .await
                 .map_err(|_| io::Error::other("naive: h3 request timeout"))?
                 .map_err(|e| io::Error::other(format!("naive: h3 request: {e}")))?;
-        let inner =
-            crate::outbound::transport::h3io::H3Stream::new(request_stream, send_request, conn_task)
-                .await?;
+        let inner = crate::outbound::transport::h3io::H3Stream::new(
+            request_stream,
+            send_request,
+            conn_task,
+        )
+        .await?;
         Ok(Box::new(Padded::new(inner)))
     }
 

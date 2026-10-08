@@ -53,7 +53,9 @@ impl Gcm {
         #[cfg(all(target_os = "linux", feature = "std"))]
         {
             let thr = crate::afalg::threshold();
-            if thr > 0 && let Ok(a) = crate::afalg::AfalgGcm::new(key, thr) {
+            if thr > 0
+                && let Ok(a) = crate::afalg::AfalgGcm::new(key, thr)
+            {
                 return Gcm::Alg(a);
             }
         }

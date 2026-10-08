@@ -20,6 +20,32 @@ unsafe extern "C" {
     fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
 }
 
+// On soft-float targets (armv6/mips, no FPU) LLVM lowers `f64::max` to a
+// libcall named `fmaximum_num`, the C23 spelling of the IEEE maxNum helper.
+// musl never grew C23 float functions, so the final link dies with
+// `undefined symbol: fmaximum_num` -- everywhere else the comparison is
+// expanded inline and the symbol is never mentioned. LLVM expects libm to
+// provide it; here libm is this function.
+#[cfg(all(
+    target_os = "linux",
+    not(target_env = "msvc"),
+    any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")
+))]
+#[unsafe(no_mangle)]
+pub extern "C" fn fmaximum_num(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a > b {
+        a
+    } else if a < b {
+        b
+    } else {
+        a
+    }
+}
+
 mod rule_set;
 
 use std::path::{Path, PathBuf};

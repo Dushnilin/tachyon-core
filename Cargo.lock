@@ -452,6 +452,7 @@ dependencies = [
  "lz4_flex",
  "md-5",
  "ml-kem",
+ "portable-atomic",
  "quinn",
  "rand_core 0.6.4",
  "regex",

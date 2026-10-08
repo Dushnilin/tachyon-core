@@ -12,8 +12,10 @@
 //! deferred: a connection with live streams stays up until the last one leaves.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
+
+use portable_atomic::AtomicI64;
 
 use tokio::sync::Mutex;
 

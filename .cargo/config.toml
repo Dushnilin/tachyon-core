@@ -67,3 +67,27 @@ rustflags = ["-C", "target-feature=+crt-static"]
 [target.powerpc64le-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# The two tier-3 MIPS targets link PIE by default here, and zig's C-shim
+# runtime then forgets its own std companion: the link dies on
+# `undefined symbol: heap.SmpAllocator` / `mem.eqlBytes` from zigc's
+# malloc/strdup. `-static -no-pie` -- what every other musl target above
+# already links as -- does not hit that path. CI builds these with plain
+# rust-lld via RUSTFLAGS, which overrides this array regardless.
+#
+# link-self-contained=no: there is no prebuilt self-contained CRT for a
+# tier-3 target on any host, so rustc's `crt1.o` is a bare name it then
+# cannot find ("failed to open object crt1.o"). Without the flag rustc
+# also passes -nostartfiles; with it gone zig links its own crt1.o.
+#
+# force-unwind-tables=no: panic = abort already, nothing unwinds. On mips32
+# the tables are the full ~400 KiB .eh_frame/.eh_frame_hdr (other targets
+# carry a fraction of that); dropping them takes mipsel from 13.27 to 12.89
+# MiB. That is still ~310 KiB over the 12 MiB release ceiling: the ~350 KiB
+# of .pdr procedure descriptors rustc emits on mips survives every strip
+# mode lld has, so no flag takes it out.
+[target.mipsel-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no", "-C", "force-unwind-tables=no"]
+
+[target.mips-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no", "-C", "force-unwind-tables=no"]

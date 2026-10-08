@@ -227,7 +227,7 @@ impl Transport {
     fn default_alpn(&self, secure: bool) -> &'static [&'static [u8]] {
         match &self.kind {
             Kind::Grpc { .. } => &[b"h2"],
-            Kind::Xhttp(_) => &[b"http/1.1"],
+            Kind::Xhttp(_) => &[b"h2", b"http/1.1"],
             Kind::Http { .. } if secure => &[b"h2"],
             _ => &[],
         }

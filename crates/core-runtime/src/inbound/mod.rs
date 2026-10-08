@@ -32,11 +32,73 @@ mod relay;
 ///
 /// `Any` is here so the relay can recognise a bare `TcpStream` behind the box
 /// and hand both ends to the kernel (`splice`) instead of copying.
-pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any> ProxyStream for T {}
+pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any> ProxyStream for T {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 pub type AnyStream = Box<dyn ProxyStream>;
 pub type AnyRead = Box<dyn AsyncRead + Send + Unpin>;
 pub type AnyWrite = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// A stream carrying its negotiated ALPN protocol from the TLS handshake.
+pub struct AlpnStream {
+    inner: AnyStream,
+    alpn: Option<Vec<u8>>,
+}
+
+impl AlpnStream {
+    pub fn new(inner: AnyStream, alpn: Option<Vec<u8>>) -> Self {
+        Self { inner, alpn }
+    }
+
+    pub fn alpn(&self) -> Option<&[u8]> {
+        self.alpn.as_deref()
+    }
+}
+
+impl AsyncRead for AlpnStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for AlpnStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Retrieve the negotiated ALPN protocol, if this stream carried a TLS handshake.
+pub fn stream_alpn(stream: &AnyStream) -> Option<&[u8]> {
+    let any = (**stream).as_any();
+    if let Some(a) = any.downcast_ref::<AlpnStream>() {
+        return a.alpn();
+    }
+    if let Some(t) = any.downcast_ref::<crate::inbound::tls::TlsStream<tokio::net::TcpStream>>() {
+        return t.alpn.as_deref();
+    }
+    None
+}
 
 /// An established upstream connection: raw streams or a shadowsocks codec.
 pub enum Conn {

@@ -473,10 +473,15 @@ impl WebpkiVerifier {
     }
 
     /// The Mozilla root store, which is what the reference ships with.
-    pub fn mozilla_roots() -> io::Result<Self> {
+    pub fn mozilla_store() -> RootCertStore {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Self::new(Arc::new(roots))
+        roots
+    }
+
+    /// The Mozilla root store, which is what the reference ships with.
+    pub fn mozilla_roots() -> io::Result<Self> {
+        Self::new(Arc::new(Self::mozilla_store()))
     }
 }
 

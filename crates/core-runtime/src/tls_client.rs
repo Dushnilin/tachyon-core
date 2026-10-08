@@ -304,6 +304,13 @@ impl TlsOptions {
     }
 
     fn root_store(&self) -> io::Result<rustls::RootCertStore> {
+        // No `ca` in the config means "no pin", not "trust nothing": an empty
+        // store here failed every DoH query and every plain-rustls handshake
+        // with `invalid peer certificate: UnknownIssuer`, so no domain ever
+        // resolved. `establish` already fell back to the Mozilla roots.
+        if self.ca_certs.is_empty() {
+            return Ok(core_tls::verify::WebpkiVerifier::mozilla_store());
+        }
         let mut roots = rustls::RootCertStore::empty();
         for cert in &self.ca_certs {
             roots
@@ -513,9 +520,11 @@ impl TlsOptions {
         }
         result?;
         let connection = core_tls::client::Connection::new(&mut handshake)?;
-        Ok(Box::new(crate::tls_utls::FingerprintStream::new(
+        let alpn = handshake.alpn.clone();
+        let tls_stream = Box::new(crate::tls_utls::FingerprintStream::new(
             stream, connection,
-        )))
+        ));
+        Ok(Box::new(crate::inbound::AlpnStream::new(tls_stream, alpn)))
     }
 
     pub async fn wrap(&self, stream: TcpStream) -> io::Result<AnyStream> {

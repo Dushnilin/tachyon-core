@@ -1074,11 +1074,7 @@ impl AsyncRead for XhttpConn {
             match ready!(split.dl.poll_recv(cx)) {
                 Some(Ok(chunk)) => {
                     let hx: String = chunk.iter().take(8).map(|b| format!("{b:02x}")).collect();
-                    crate::logging::debug(format_args!(
-                        "xhttp: dl {} bytes [{}]",
-                        chunk.len(),
-                        hx
-                    ));
+                    crate::logging::debug(format_args!("xhttp: dl {} bytes [{}]", chunk.len(), hx));
                     split.pending.extend_from_slice(&chunk)
                 }
                 Some(Err(e)) => {

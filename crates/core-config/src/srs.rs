@@ -573,14 +573,14 @@ fn read_domain_matcher(
     let _version = reader.u8()?;
     let leaves = reader.u64_slice()?;
     let label_bitmap = reader.u64_slice()?;
-        let labels = reader.bytes()?;
-        let ranks = index_ranks(&label_bitmap);
-        let set = SuccinctSet {
-            leaves,
-            label_bitmap,
-            labels,
-            ranks,
-        };
+    let labels = reader.bytes()?;
+    let ranks = index_ranks(&label_bitmap);
+    let set = SuccinctSet {
+        leaves,
+        label_bitmap,
+        labels,
+        ranks,
+    };
     let mut domains: Vec<String> = Vec::new();
     let mut prefixes: Vec<String> = Vec::new();
     for key in set.keys()? {
@@ -736,10 +736,7 @@ impl SuccinctSet {
     /// The position of the `index`-th set bit: the rank table turns the
     /// word walk into a binary search.
     fn select_ith_one(&self, index: usize) -> Option<usize> {
-        let word = self
-            .ranks
-            .partition_point(|rank| *rank <= index as u64)
-            - 1;
+        let word = self.ranks.partition_point(|rank| *rank <= index as u64) - 1;
         let mut rest = index - self.ranks[word] as usize;
         let mut bits = self.label_bitmap[word];
         while bits != 0 {

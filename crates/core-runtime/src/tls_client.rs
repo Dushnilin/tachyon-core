@@ -525,15 +525,12 @@ impl TlsOptions {
             "tls: established {} sni={} alpn=[{}]",
             name,
             self.server_name,
-            alpn
-                .iter()
+            alpn.iter()
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect::<Vec<_>>()
                 .join(",")
         ));
-        let tls_stream = Box::new(crate::tls_utls::FingerprintStream::new(
-            stream, connection,
-        ));
+        let tls_stream = Box::new(crate::tls_utls::FingerprintStream::new(stream, connection));
         Ok(Box::new(crate::inbound::AlpnStream::new(tls_stream, alpn)))
     }
 

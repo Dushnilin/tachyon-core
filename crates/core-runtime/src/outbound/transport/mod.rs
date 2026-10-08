@@ -270,10 +270,10 @@ impl Transport {
         early: &[u8],
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<(AnyStream, usize)> {
-        if let Kind::Xhttp(cfg) = &self.kind {
-            if let Some(stream) = cfg.connect_h2_stream(tls, server, port, dial).await? {
-                return Ok((stream, 0));
-            }
+        if let Kind::Xhttp(cfg) = &self.kind
+            && let Some(stream) = cfg.connect_h2_stream(tls, server, port, dial).await?
+        {
+            return Ok((stream, 0));
         }
 
         let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;

@@ -136,8 +136,10 @@ def snapshot_line(run, path):
 
 # ------------------------------------------------------------------ rendering
 def groups_of(part, bulk_gib):
-    """(title, group_key, field, fmt, lower_is_better) per metric group of the
-    comparison grid, in the order the columns appear."""
+    """(title, [(group_key, field, fmt, lower_is_better), ...]) per metric group
+    of the comparison grid, in the order the columns appear. The 1- and
+    8-connection metrics share one group: the cells carry both values,
+    "one / eight"."""
     rss_title = (
         "Пиковая память (клиент+сервер), MiB"
         if part == "A"
@@ -145,15 +147,21 @@ def groups_of(part, bulk_gib):
     )
     bg = f"{bulk_gib:g}" if bulk_gib else "2"
     return [
-        ("1 соединение, Гбит/с", "tput_1", "gbit_s", "{:.2f}", False),
-        ("CPU на ГиБ, 1 соединение, с", "tput_1", "cpu_s_per_gib", "{:.2f}", True),
-        ("8 соединений, Гбит/с", "tput_8", "gbit_s", "{:.2f}", False),
-        ("CPU на ГиБ, 8 соединения, с", "tput_8", "cpu_s_per_gib", "{:.2f}", True),
-        (f"Кусок {bg} ГиБ, 1 поток, Гбит/с", "bulk_1", "gbit_s", "{:.2f}", False),
-        (f"Кусок {bg} ГиБ, 8 потоков, Гбит/с", "bulk_8", "gbit_s", "{:.2f}", False),
-        ("Задержка p50, мкс", None, "p50_us", "{:.0f}", True),
-        ("Подключение, мс", None, "connect_ms", "{:.1f}", True),
-        (rss_title, "rss", None, "{:.1f}", True),
+        ("Скорость, Гбит/с (1 / 8 соед.)", [
+            ("tput_1", "gbit_s", "{:.2f}", False),
+            ("tput_8", "gbit_s", "{:.2f}", False),
+        ]),
+        ("CPU на ГиБ, с (1 / 8 соед.)", [
+            ("tput_1", "cpu_s_per_gib", "{:.2f}", True),
+            ("tput_8", "cpu_s_per_gib", "{:.2f}", True),
+        ]),
+        (f"Кусок {bg} ГиБ, Гбит/с (1 / 8 потоков)", [
+            ("bulk_1", "gbit_s", "{:.2f}", False),
+            ("bulk_8", "gbit_s", "{:.2f}", False),
+        ]),
+        ("Задержка p50, мкс", [(None, "p50_us", "{:.0f}", True)]),
+        ("Подключение, мс", [(None, "connect_ms", "{:.1f}", True)]),
+        (rss_title, [("rss", None, "{:.1f}", True)]),
     ]
 
 
@@ -163,6 +171,29 @@ def values(a, b, part, group_key, field):
     if group_key is None:
         return (a or {}).get(field), (b or {}).get(field)
     return num(a, group_key, field), num(b, group_key, field)
+
+
+def group_cells(a, b, part, fields, strict):
+    """(mine text, theirs text, verdict class) for one metric group: every
+    field formatted, joined with ' / ', class = worst of the pair."""
+    mine, theirs, classes = [], [], []
+    for gk, field, spec, lower in fields:
+        me, them = values(a, b, part, gk, field)
+        f = factor(me, them, lower)
+        classes.append(cell_cls(me, them, f, field, strict, lower))
+        mine.append("—" if me is None else spec.format(me))
+        theirs.append("—" if them is None else spec.format(them))
+    cls = LOSS if LOSS in classes else (TIE if TIE in classes else WIN)
+    return " / ".join(mine), " / ".join(theirs), cls
+
+
+def group_pct(a, b, part, fields, strict):
+    """Paired '±N% / ±N%' cell text for one metric group."""
+    out = []
+    for gk, field, _spec, lower in fields:
+        me, them = values(a, b, part, gk, field)
+        out.append(pct(factor(me, them, lower)))
+    return " / ".join(out)
 
 
 def cell_cls(me, them, f, field, strict, lower):
@@ -177,10 +208,11 @@ def verdict_of(a, b, part, strict, groups):
     if a.get("status") != "OK" or b.get("status") != "OK":
         return "none", False
     classes = []
-    for _title, gk, field, _spec, lower in groups:
-        me, them = values(a, b, part, gk, field)
-        f = factor(me, them, lower)
-        classes.append(cell_cls(me, them, f, field, strict, lower))
+    for _title, fields in groups:
+        for gk, field, _spec, lower in fields:
+            me, them = values(a, b, part, gk, field)
+            f = factor(me, them, lower)
+            classes.append(cell_cls(me, them, f, field, strict, lower))
     if LOSS in classes:
         return LOSS, True
     if WIN in classes:
@@ -209,7 +241,7 @@ def thead_html(groups):
         f'<th class="grp" colspan="3">{html.escape(t)}</th>' for t, *_ in groups
     )
     subs = "".join(
-        "<th>tachyon-core</th><th>sing-box</th><th>на сколько % лучше</th>"
+        "<th>tachyon-core</th><th>sing-box</th><th>%</th>"
         for _ in groups
     )
     return (
@@ -228,14 +260,12 @@ def grid_row(case, part, rows, a, b, strict, groups):
     vcls, both_ok = verdict_of(a, b, part, strict, groups)
     if both_ok:
         cells = ""
-        for _title, gk, field, spec, lower in groups:
-            me, them = values(a, b, part, gk, field)
-            f = factor(me, them, lower)
-            cls = cell_cls(me, them, f, field, strict, lower)
+        for _title, fields in groups:
+            mine, theirs, cls = group_cells(a, b, part, fields, strict)
             cells += (
-                f'<td class="num">{fmt_val(me, spec)}</td>'
-                f'<td class="num">{fmt_val(them, spec)}</td>'
-                f'<td class="pct {cls}">{pct(f)}</td>'
+                f'<td class="num">{mine}</td>'
+                f'<td class="num">{theirs}</td>'
+                f'<td class="pct {cls}">{group_pct(a, b, part, fields, strict)}</td>'
             )
         label = VERDICT_RU[vcls]
     else:
@@ -309,7 +339,8 @@ def tables_html(cells, strict, bulk_gib):
     legend = (
         '<p class="legend">в каждой группе колонок слева направо: результат '
         f"<b>{OUR_NAME}</b>, результат <b>{REF_NAME}</b> и на сколько процентов "
-        "мы лучше (зелёный) или хуже (красный).</p>"
+        "мы лучше (зелёный) или хуже (красный). Парные метрики — значения "
+        "через «/»: сначала 1 соединение/поток, потом 8.</p>"
     )
     return legend + "".join(out), totals_html_of(totals)
 
@@ -438,14 +469,14 @@ def head(title, live=False):
  .legend {{ color: var(--muted); font-size: 12.5px; line-height: 1.55;
    margin: 10px 0 6px; }}
  .legend b {{ color: var(--ink); font-weight: 700; }}
- .scroll {{ overflow: auto; background: var(--card); border: 1px solid var(--line);
+.scroll {{ overflow: auto; background: var(--card); border: 1px solid var(--line);
    border-radius: 14px; box-shadow: var(--shadow);
    max-height: calc(100vh - 130px); }}
- table.grid {{ border-collapse: separate; border-spacing: 0;
-   width: max-content; min-width: 100%; font-size: 13px;
+table.grid {{ border-collapse: separate; border-spacing: 0;
+   width: 100%; font-size: 12px;
    font-variant-numeric: tabular-nums; }}
- .grid th, .grid td {{ border-right: 1px solid var(--line);
-   border-bottom: 1px solid var(--line); padding: 5px 9px; white-space: nowrap; }}
+.grid th, .grid td {{ border-right: 1px solid var(--line);
+   border-bottom: 1px solid var(--line); padding: 4px 5px; }}
  .grid tr:last-child td {{ border-bottom: none; }}
  .grid th:last-child, .grid td:last-child {{ border-right: none; }}
  .grid thead th {{ position: sticky; z-index: 5; background: var(--head);
@@ -458,7 +489,7 @@ def head(title, live=False):
    text-transform: uppercase; letter-spacing: .04em; text-align: center;
    color: var(--faint); height: 26px; }}
  .grid th.name, .grid td.name {{ position: sticky; left: 0; text-align: left;
-   min-width: 210px; }}
+   min-width: 120px; }}
  .grid thead th.name {{ z-index: 7; background: var(--grp); color: var(--ink); }}
  .grid td.name {{ z-index: 3; background: var(--card);
    box-shadow: 6px 0 6px -6px rgba(15,15,40,.3); }}
@@ -466,7 +497,7 @@ def head(title, live=False):
    font-family: var(--mono); }}
  .grid td.num {{ text-align: right; font-weight: 550; color: var(--ink); }}
  .grid td.num.none {{ color: var(--none-ink); font-weight: 500; }}
- .grid td.pct {{ text-align: center; font-weight: 700; min-width: 74px; }}
+ .grid td.pct {{ text-align: center; font-weight: 700; min-width: 44px; }}
  .grid td.pct.win {{ background: var(--win-bg); color: var(--win-ink); }}
  .grid td.pct.loss {{ background: var(--loss-bg); color: var(--loss-ink); }}
  .grid td.pct.tie {{ background: var(--tie-bg); color: var(--tie-ink); }}
@@ -509,9 +540,7 @@ def head(title, live=False):
  .dtab td.num {{ text-align: right; font-weight: 650; font-family: var(--mono); }}
  .sub {{ font-style: normal; color: var(--faint); font-weight: 500; font-size: 11.5px; }}
  @media (max-width: 760px) {{
-  .grid th, .grid td {{ padding: 5px 7px; }}
-  .grid td.pct {{ min-width: 62px; }}
-  .grid th.name, .grid td.name {{ min-width: 150px; }}
+  .grid th, .grid td {{ padding: 4px 3px; }}
   #q {{ min-width: 140px; flex: 1; margin-left: 0; }}
  }}
 </style></head><body>
@@ -602,7 +631,7 @@ def meta_line(run, strict, extra=""):
             f"CPU, задержка и память не выше {int(MAX_COST * 100)}%, "
             f"подключение — не выше 1.5x эталона + 2 мс."
         )
-        + " Колонка «на сколько % лучше»: плюс — tachyon-core лучше на столько процентов."
+        + " Колонка «%»: плюс — tachyon-core лучше на столько процентов."
         + (f" {extra}" if extra else "")
         + "</p>"
     )

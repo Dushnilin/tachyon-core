@@ -866,6 +866,26 @@ def generate_html_report(results, profile, out_path):
         env_pill_cli = "Client CPU: Cores 0..3"
         env_pill_srv = "Server CPU: Cores 4..7"
 
+    t_rss_vals = [r['tachyon']['peak_rss_mib'] for r in results if r.get('tachyon') and r['tachyon'].get('status') == 'OK' and 'peak_rss_mib' in r['tachyon']]
+    t_cpu_vals = [r['tachyon']['cpu_s_per_gib'] for r in results if r.get('tachyon') and r['tachyon'].get('status') == 'OK' and r['tachyon'].get('cpu_s_per_gib')]
+    go_cpu_vals = []
+    for r in results:
+        for k in ('sing-box', 'xray', 'mihomo'):
+            if r.get(k) and r[k].get('status') == 'OK' and r[k].get('cpu_s_per_gib'):
+                go_cpu_vals.append(r[k]['cpu_s_per_gib'])
+
+    min_rss = f"{min(t_rss_vals):.0f}" if t_rss_vals else "5"
+    max_rss = f"{max(t_rss_vals):.0f}" if t_rss_vals else "75"
+    rss_chip = f"{min_rss}–{max_rss} MB"
+
+    min_t_cpu = f"{min(t_cpu_vals):.1f}" if t_cpu_vals else "0.8"
+    max_t_cpu = f"{max(t_cpu_vals):.1f}" if t_cpu_vals else "1.5"
+    t_cpu_chip = f"{min_t_cpu}–{max_t_cpu} s/G"
+
+    min_go_cpu = f"{min(go_cpu_vals):.1f}" if go_cpu_vals else "1.5"
+    max_go_cpu = f"{max(go_cpu_vals):.1f}" if go_cpu_vals else "8.3"
+    go_cpu_chip = f"{min_go_cpu}–{max_go_cpu} s/G"
+
     html = f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -1010,9 +1030,9 @@ def generate_html_report(results, profile, out_path):
       <div class="chip win"><span>побед tachyon:</span><b>{t_wins}/{t_total}</b></div>
       <div class="chip loss"><span>побед других:</span><b>{ref_wins}</b></div>
       <div class="chip tie"><span>паритет:</span><b>{ties}</b></div>
-      <div class="chip win"><span>память tachyon:</span><b>4–14 MB</b></div>
-      <div class="chip win"><span>CPU tachyon:</span><b>0.8–1.5 s/G</b></div>
-      <div class="chip"><span>CPU Go-ядер:</span><b>1.5–6.6 s/G</b></div>
+      <div class="chip win"><span>память tachyon:</span><b>{rss_chip}</b></div>
+      <div class="chip win"><span>CPU tachyon:</span><b>{t_cpu_chip}</b></div>
+      <div class="chip"><span>CPU Go-ядер:</span><b>{go_cpu_chip}</b></div>
     </div>
   </div>
 

@@ -1294,6 +1294,7 @@ async fn delay_test(
     cors: &[String],
 ) -> std::io::Result<()> {
     let deadline = Duration::from_millis(timeout.max(0) as u64);
+    crate::logging::debug(format_args!("delay[{index}]: start probing {url}"));
     let test = async {
         let (tls, host, port, authority, path) = parse_link(url)?;
         let target = Target::Domain(host.clone(), port);
@@ -1326,6 +1327,7 @@ async fn delay_test(
         let request =
             format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.ok()?;
+        crate::logging::debug(format_args!("delay[{index}]: HEAD sent to {authority}"));
         let mut byte = [0u8; 1];
         let mut status = Vec::new();
         loop {
@@ -1336,6 +1338,7 @@ async fn delay_test(
             }
         }
         let text = String::from_utf8_lossy(&status);
+        crate::logging::debug(format_args!("delay[{index}]: status line {text:?}"));
         let _ = text.split_whitespace().nth(1)?;
         u16::try_from(start.elapsed().as_millis()).ok()
     };

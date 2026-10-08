@@ -766,6 +766,8 @@ def generate_html_report(results, profile, out_path):
             t8 = cdata.get("tput_8", 0)
             p50 = cdata.get("p50_us", 0)
             peak = cdata.get("peak_rss_mib", 0)
+            cpu = cdata.get("cpu_s_per_gib")
+            cpu_str = f"{cpu:.2f} s/G" if (cpu is not None and cpu > 0) else "—"
             spd = max(t1, t8)
             pct = int(min(100, max(5, spd / max_row_spd * 100)))
             bar_color = "var(--win-ink)" if is_t else "var(--accent)"
@@ -785,8 +787,10 @@ def generate_html_report(results, profile, out_path):
             return f"""<td class='num {"col-t-cell" if is_t else ""}'>
               <div class='val-row'>
                 <span class='spd'>{t1:.2f}/{t8:.2f}<span class='unit'>G</span></span>
-                <span class='sub'>{fmt_lat(p50)} &bull; {peak:.1f}M</span>
                 {diff_badge}
+              </div>
+              <div class='cell-sub'>
+                <span>{fmt_lat(p50)}</span> &bull; <span>{peak:.1f}M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>{cpu_str}</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:{pct}%;background:{bar_color}'></div></div>
             </td>"""
@@ -846,12 +850,28 @@ def generate_html_report(results, profile, out_path):
     if xhttp_count > 0:
         cat_buttons += f"<button class='tab' onclick=\"filterCat('xhttp')\">XHTTP <i>{xhttp_count}</i></button>"
 
+    if profile in ("router2", "router-2core"):
+        env_tag = "ROUTER 2-CORE (Dual-Core)"
+        env_pill_worker = "2 worker потока (GOMAXPROCS=2, TACHYON_WORKERS=2)"
+        env_pill_cli = "Client CPU: Cores 0,1"
+        env_pill_srv = "Server CPU: Cores 2,3"
+    elif profile == "router":
+        env_tag = "ROUTER 1-CORE (Single-Core)"
+        env_pill_worker = "1 поток (1 worker / GOMAXPROCS=1)"
+        env_pill_cli = "Client CPU: Core 0"
+        env_pill_srv = "Server CPU: Core 1"
+    else:
+        env_tag = "DESKTOP UNLIMITED"
+        env_pill_worker = "Многопоточный режим"
+        env_pill_cli = "Client CPU: Cores 0..3"
+        env_pill_srv = "Server CPU: Cores 4..7"
+
     html = f"""<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Мульти-протокольный бенчмарк: tachyon-core vs sing-box vs Xray vs Mihomo</title>
+<title>Мульти-протокольный бенчмарк: tachyon-core vs sing-box vs Xray vs Mihomo ({env_tag})</title>
 <style>
  :root {{
   --bg: #0c0d11; --card: #15161d; --head: #1c1d25; --grp: #22232e;
@@ -890,7 +910,10 @@ def generate_html_report(results, profile, out_path):
  
  .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }}
  .title-group h1 {{ font-size: 15px; font-weight: 750; margin: 0; letter-spacing: -.02em; display: inline-block; }}
- .title-group .sub {{ color: var(--muted); font-size: 11px; margin-left: 8px; }}
+ .env-info {{ display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-top: 3px; flex-wrap: wrap; }}
+ .env-tag {{ font-size: 9px; font-weight: 750; background: var(--accent); color: #fff; padding: 2px 6px; border-radius: 4px; font-family: var(--mono); letter-spacing: .03em; }}
+ .env-val {{ color: var(--ink); font-weight: 600; }}
+ .env-pill {{ font-size: 10px; background: var(--card); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; font-family: var(--mono); color: var(--faint); }}
  
  .chips {{ display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }}
  .chip {{ display: inline-flex; align-items: center; gap: 5px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font-size: 11px; box-shadow: var(--shadow); }}
@@ -917,9 +940,9 @@ def generate_html_report(results, profile, out_path):
  .table-wrap {{ width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; }}
  table.grid {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 11.5px; font-variant-numeric: tabular-nums; }}
  
- col.c-name {{ width: 21%; }}
- col.c-t {{ width: 18.5%; }}
- col.c-s {{ width: 18.5%; }}
+ col.c-name {{ width: 20%; }}
+ col.c-t {{ width: 19%; }}
+ col.c-s {{ width: 19%; }}
  col.c-x {{ width: 17%; }}
  col.c-m {{ width: 12%; }}
  col.c-vd {{ width: 13%; }}
@@ -932,7 +955,7 @@ def generate_html_report(results, profile, out_path):
  .grid thead th.th-core {{ text-align: left; }}
  .grid thead th.th-t {{ background: var(--grp); color: var(--ink); border-left: 2px solid var(--win-ink); }}
  .grid thead th.th-vd {{ text-align: center; }}
- .th-hint {{ font-size: 9.5px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 3px; }}
+ .th-hint {{ font-size: 9px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 3px; }}
 
  .grid td.name {{ text-align: left; font-weight: 600; }}
  .name-line {{ display: flex; align-items: baseline; gap: 5px; overflow: hidden; }}
@@ -944,10 +967,12 @@ def generate_html_report(results, profile, out_path):
  .grid td.num.none {{ color: var(--none-ink); text-align: center; font-weight: 500; font-size: 11px; }}
  .grid td.num.fail {{ color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 10px; }}
  
- .val-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 4px; line-height: 1.2; }}
+ .val-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 4px; line-height: 1.15; }}
  .spd {{ font-weight: 700; font-size: 11.5px; font-family: var(--mono); color: var(--ink); white-space: nowrap; }}
  .unit {{ font-size: 9.5px; color: var(--muted); font-weight: 500; }}
- .sub {{ font-size: 10px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }}
+ .cell-sub {{ font-size: 9.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; line-height: 1.15; margin-top: 1px; }}
+ .cpu {{ color: var(--muted); font-family: var(--mono); font-weight: 600; }}
+ .col-t-cell .cpu {{ color: var(--win-ink); font-weight: 700; }}
  .diff {{ font-size: 9.5px; font-weight: 700; padding: 0 4px; border-radius: 4px; font-family: var(--mono); white-space: nowrap; }}
  .diff.win {{ background: var(--win-bg); color: var(--win-ink); }}
  .diff.loss {{ background: var(--loss-bg); color: var(--loss-ink); }}
@@ -972,15 +997,22 @@ def generate_html_report(results, profile, out_path):
   <div class="top-bar">
     <div class="title-group">
       <h1>Мульти-протокольный бенчмарк прокси-ядер (все {len(results)} протокола)</h1>
-      <span class="sub">tachyon-core (Rust) vs sing-box vs Xray-core vs Mihomo &bull; {profile.upper()} (1 поток, 1 worker)</span>
+      <div class="env-info">
+        <span class="env-tag">{env_tag}</span>
+        <span class="env-val">Docker Linux x86_64 &bull; AMD Ryzen 7 5800X3D (8C/16T)</span>
+        <span class="env-pill">{env_pill_worker}</span>
+        <span class="env-pill">{env_pill_cli}</span>
+        <span class="env-pill">{env_pill_srv}</span>
+      </div>
     </div>
     <div class="chips">
       <div class="chip"><span>протоколов:</span><b>{len(results)}</b></div>
       <div class="chip win"><span>побед tachyon:</span><b>{t_wins}/{t_total}</b></div>
       <div class="chip loss"><span>побед других:</span><b>{ref_wins}</b></div>
       <div class="chip tie"><span>паритет:</span><b>{ties}</b></div>
-      <div class="chip win"><span>память tachyon:</span><b>4–8 MB</b></div>
-      <div class="chip"><span>память Go:</span><b>35–80 MB</b></div>
+      <div class="chip win"><span>память tachyon:</span><b>4–14 MB</b></div>
+      <div class="chip win"><span>CPU tachyon:</span><b>0.8–1.5 s/G</b></div>
+      <div class="chip"><span>CPU Go-ядер:</span><b>1.5–6.6 s/G</b></div>
     </div>
   </div>
 
@@ -1005,10 +1037,10 @@ def generate_html_report(results, profile, out_path):
       <thead>
         <tr>
           <th class="th-name">Протокол</th>
-          <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
-          <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
-          <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
-          <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
+          <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+          <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+          <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+          <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
           <th class="th-vd">Вердикт</th>
         </tr>
       </thead>
@@ -1065,7 +1097,8 @@ def main():
     ap.add_argument("--sing-box", default="/bench/sing-box-lx")
     ap.add_argument("--xray", default="/bench/xray-linux")
     ap.add_argument("--mihomo", default="/bench/mihomo-linux")
-    ap.add_argument("--profile", choices=["router", "desktop"], default="router")
+    ap.add_argument("--profile", choices=["router", "router2", "desktop"], default="router2")
+    ap.add_argument("--workers", type=int, default=None, help="Worker threads per core")
     ap.add_argument("--seconds", type=int, default=1)
     ap.add_argument("--latency-rounds", type=int, default=800)
     ap.add_argument("--only", help="Filter protocol IDs")
@@ -1078,12 +1111,17 @@ def main():
         client_cpus = {0}
         server_cpus = {1} if len(all_cpus) > 1 else {0}
         load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
-        workers = 1
-    else:
+        workers = args.workers or 1
+    elif args.profile in ("router2", "router-2core"):
         client_cpus = {0, 1} if len(all_cpus) >= 4 else {0}
         server_cpus = {2, 3} if len(all_cpus) >= 4 else client_cpus
         load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
-        workers = None
+        workers = args.workers or 2
+    else:  # desktop
+        client_cpus = {0, 1, 2, 3} if len(all_cpus) >= 8 else {0, 1}
+        server_cpus = {4, 5, 6, 7} if len(all_cpus) >= 8 else {2, 3}
+        load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
+        workers = args.workers or None
 
     if hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, load_cpus)

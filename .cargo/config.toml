@@ -2,6 +2,9 @@
 # PATH; pin the real one for this workspace instead of relying on PATH order.
 # INCLUDE/LIB are required because the raw linker is invoked without vcvars.
 # On non-Windows hosts these entries are inert.
+#
+# NOTE: this is the only target in this file that is not linked by rust-lld, so
+# it is also the only one that must not get the `link-arg` block below.
 [target.x86_64-pc-windows-msvc]
 linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
 
@@ -9,8 +12,47 @@ linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools
 INCLUDE = { value = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\include;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\winrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\cppwinrt", force = true }
 LIB = { value = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64", force = true }
 
-# The RustCrypto crates gate their ARMv8 assembly behind cfg flags that are off by
-# default, so without these a router runs software AES and software GHASH. Measured
+# ---------------------------------------------------------------------------
+# The lld `link-arg` block, repeated verbatim in every musl target below
+# because cargo config has no way to share an array between sections:
+#
+#     "-C", "link-arg=--icf=safe",
+#     "-C", "link-arg=-z",
+#     "-C", "link-arg=noseparate-code",
+#     "-C", "link-arg=-z",
+#     "-C", "link-arg=norelro",
+#
+# These live in the arrays, and never in `RUSTFLAGS`: cargo takes rustflags
+# from exactly one place and the environment wins, so a one-off
+# `RUSTFLAGS=-C ... cargo build` silently drops every array in this file --
+# including the aarch64 `--cfg` trio, which is worth 7x on AES-GCM.
+#
+# Two things to know before editing these:
+#
+# - `linker = "rust-lld"` means rustc invokes lld directly rather than through
+#   a compiler driver, so there is no `-Wl,` prefix: `-C link-arg=-Wl,--icf=safe`
+#   is passed to lld verbatim and it dies on the unknown argument.
+# - `--icf=safe`, never `--icf=all`. `=all` folds byte-identical sections even
+#   when their addresses are observable, and `std::any::Any::downcast_ref` is
+#   observable: `TypeId` is the address of a static, so folding two type names
+#   together makes two types compare equal. `inbound/mod.rs` downcasts on the
+#   relay path to find a bare `TcpStream` and `splice` it, so `=all` would pick
+#   the wrong stream type on a router and nowhere else. `=safe` refuses to fold
+#   anything whose address is taken, which is what `TypeId` does.
+#
+# `noseparate-code` merges the RX/R/RELRO program headers that lld otherwise
+# pads apart, which is both bytes and i-cache locality; `norelro` drops a
+# segment the musl static build does not need.
+#
+# Deliberately absent: `-C target-feature=+aes` and friends. The RustCrypto
+# crates do their own CPUID dispatch on x86 (`aes` lib.rs:138-144,
+# `polyval` backend.rs:14-20) and refuse those instructions on a core without
+# them; the aarch64 backend is the one that is compile-time gated, by `--cfg`,
+# not by `target-feature`.
+# ---------------------------------------------------------------------------
+
+# The RustCrypto crates gate their ARMv8 assembly behind cfg flags that are off
+# by default, so without these a router runs software AES and software GHASH. Measured
 # on a Cortex-A55 in OpenWrt: AES-GCM did 0.03 GiB/s with the flags off and 0.22
 # with them on, on the same binary otherwise. Chacha's NEON path is gated the same
 # way.
@@ -19,21 +61,25 @@ LIB = { value = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC
 # emit those instructions anywhere in every crate, and a core without them would
 # take SIGILL instead of running. These cfgs select `#[target_feature]` functions
 # that are reached through runtime detection, which is how the x86 path already
-# picks its backend. NEON is the one exception: it is mandatory in ARMv8-A.
+# picks its backend. NEON needs no flag: it is mandatory in ARMv8-A, so it is
+# already in the aarch64 baseline (`rustc --print cfg` lists target_feature="neon").
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = [
     "--cfg", "aes_armv8",
     "--cfg", "polyval_armv8",
     "--cfg", "chacha20_force_neon",
-    "-C", "target-feature=+neon",
-    # Linker flags live here, not in the environment, because cargo takes
-    # rustflags from exactly one place and `RUSTFLAGS` from the shell wins:
-    # building the router target with `RUSTFLAGS=-C linker=rust-lld ...` on the
-    # command line silently dropped everything in this array. That build is what
-    # measured 0.03 GiB/s AES-GCM on a Cortex-A53 -- the software path, with the
-    # same number the flags being off produces on the desktop.
+    # Linker flags live here, not in the environment, for the reason at the top
+    # of this file: `RUSTFLAGS=-C linker=rust-lld ...` on the command line is
+    # what silently dropped this array. That build is what measured 0.03 GiB/s
+    # AES-GCM on a Cortex-A53 -- the software path, with the same number the
+    # cfgs being off produces on the desktop.
     "-C", "link-self-contained=yes",
+    "-C", "link-arg=--icf=safe",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=noseparate-code",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=norelro",
 ]
 
 # Both musl targets have no system linker on a Windows host and no toolchain
@@ -46,39 +92,45 @@ rustflags = [
 # build a plain x86-64 one for those.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v3", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
+# ARMv7-A: the baseline is already v7a + vfp3-d16, which is everything a
+# Cortex-A7/A8/A9/A15 has that the compiler will let us name. NEON is optional
+# in ARMv7-A, so `+neon` here would SIGILL on the parts without it rather than
+# be a win on the parts with it, and `+crc` is an ARMv8 extension the A7 does
+# not have. Nothing to turn on: only the link-arg block.
 [target.armv7-unknown-linux-musleabihf]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes"]
+rustflags = ["-C", "link-self-contained=yes", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
-[target.armv5te-unknown-linux-musleabi]
+# ARMv6 (`target_abi="eabi"`): softfloat, no FPU, no SIMD in the ISA. The one
+# extension this target has ever wanted is `fmaximum_num`, which is not a
+# target feature but a missing libm symbol -- see the shim in
+# `core-cli/src/main.rs`. Nothing to turn on; this section exists so the armv6
+# release binary links by the same explicit route as every other target instead
+# of by whatever the toolchain defaults happen to be.
+[target.arm-unknown-linux-musleabi]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes"]
+rustflags = ["-C", "link-self-contained=yes", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
-[target.i686-unknown-linux-musl]
+# rv64gc is exactly `a c m zaamo zalrsc zca zicsr zifencei` and nothing more
+# (`rustc --print cfg`), which is what the OpenWrt riscv64 boxes have. The
+# vector extension would be the only lever and no router SoC that ships this
+# target has it, so there is nothing to turn on.
+[target.riscv64gc-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "link-self-contained=yes", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
-[target.powerpc64-unknown-linux-musl]
-linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
-
-[target.powerpc64le-unknown-linux-musl]
-linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
-
-# The two tier-3 MIPS targets link PIE by default here, and zig's C-shim
-# runtime then forgets its own std companion: the link dies on
-# `undefined symbol: heap.SmpAllocator` / `mem.eqlBytes` from zigc's
-# malloc/strdup. `-static -no-pie` -- what every other musl target above
-# already links as -- does not hit that path. CI builds these with plain
-# rust-lld via RUSTFLAGS, which overrides this array regardless.
+# The two tier-3 MIPS targets link rust-lld with the self-contained CRT, the
+# same route every other musl target above takes. Earlier they went through
+# zig's C-shim runtime and needed `link-self-contained=no` because rustc's
+# `crt1.o` is then a bare name it cannot find ("failed to open object crt1.o").
+# rust-lld does not have that problem, so the flag is off, and the two MIPS
+# targets finally get their own array instead of having one handed to them on
+# the command line.
 #
-# link-self-contained=no: there is no prebuilt self-contained CRT for a
-# tier-3 target on any host, so rustc's `crt1.o` is a bare name it then
-# cannot find ("failed to open object crt1.o"). Without the flag rustc
-# also passes -nostartfiles; with it gone zig links its own crt1.o.
+# link-self-contained=yes: no other way to link a tier-3 target, whose std has
+# to be built from source anyway on the nightly job.
 #
 # force-unwind-tables=no: panic = abort already, nothing unwinds. On mips32
 # the tables are the full ~400 KiB .eh_frame/.eh_frame_hdr (other targets
@@ -87,7 +139,9 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # of .pdr procedure descriptors rustc emits on mips survives every strip
 # mode lld has, so no flag takes it out.
 [target.mipsel-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no", "-C", "force-unwind-tables=no"]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "force-unwind-tables=no", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
 [target.mips-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no", "-C", "force-unwind-tables=no"]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "force-unwind-tables=no", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]

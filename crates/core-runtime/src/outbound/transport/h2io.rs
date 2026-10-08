@@ -22,7 +22,7 @@ const STREAM_WINDOW: u32 = 4 << 20;
 const CONN_WINDOW: u32 = 16 << 20;
 /// Largest DATA frame we ask the peer to send (the protocol default is 16 KiB;
 /// Go's client asks for 1 MiB).
-const MAX_FRAME: u32 = 256 << 10;
+const MAX_FRAME: u32 = 1024 * 1024;
 
 /// The client handshake every h2-based transport shares, with windows sized
 /// for throughput.

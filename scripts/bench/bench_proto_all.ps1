@@ -5,7 +5,7 @@
 #   .\scripts\bench\bench_proto_all.ps1 -Only ss-aes-128-gcm    # single protocol
 #   .\scripts\bench\bench_proto_all.ps1 -Seconds 2              # longer bulk run
 param(
-    [ValidateSet("router", "desktop")]
+    [ValidateSet("router", "router2", "desktop")]
     [string]$Profile = "router",
     [int]$Seconds = 1,
     [int]$LatencyRounds = 800,

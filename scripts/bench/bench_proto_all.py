@@ -72,7 +72,7 @@ def run_sink(cpus):
 
 
 # ---------------------------------------------------------------- SOCKS5 client
-def socks_connect(timeout=10, retries=4):
+def socks_connect(timeout=10, retries=8):
     last_err = None
     for attempt in range(retries):
         try:
@@ -88,7 +88,7 @@ def socks_connect(timeout=10, retries=4):
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
-                time.sleep(0.06)
+                time.sleep(0.08)
     raise last_err or ConnectionError("failed to connect")
 
 
@@ -186,10 +186,19 @@ def wait_port_free(port, timeout=4.0):
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
-                time.sleep(0.02)
-        except OSError:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+            try:
+                with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s6:
+                    s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s6.bind(("::", port))
+            except OSError:
+                pass
+            time.sleep(0.04)
             return True
+        except OSError:
+            time.sleep(0.03)
     return False
 
 

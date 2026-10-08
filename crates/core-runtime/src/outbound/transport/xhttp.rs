@@ -372,9 +372,9 @@ impl H2Pool {
                 (client, active)
             };
 
-            let mut client = candidate;
+            let client = candidate;
             match client.ready().await {
-                Ok(_) => {
+                Ok(client) => {
                     return H2Acquire::Ready(client, active_streams);
                 }
                 Err(_) => {

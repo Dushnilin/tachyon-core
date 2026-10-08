@@ -374,7 +374,9 @@ impl AsyncWrite for H2Io {
 /// that came back empty, an assembler with no record -- against the bytes
 /// that actually moved, so a stall shows up as wait without served bytes.
 pub(crate) mod rdbg {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
+
+    use portable_atomic::AtomicU64;
 
     pub const SERVED: usize = 0;
     pub const FLUSH_WAIT: usize = 1;

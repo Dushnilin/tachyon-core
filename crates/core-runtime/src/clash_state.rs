@@ -7,9 +7,11 @@
 //! connection the way Clash does.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+
+use portable_atomic::AtomicU64;
 
 use tokio::sync::Notify;
 

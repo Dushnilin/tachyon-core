@@ -82,6 +82,11 @@ lru.workspace = true
 # aria / camellia / cast5 / des / sm4 use 0.5 (inout API).
 cipher = "0.4"
 cipher05 = { package = "cipher", version = "0.5" }
+# 64-bit atomics on mips32: std::sync::atomic::AtomicU64 does not exist
+# there and the mips build dies on the import. On every target that has
+# native LL/SC for 64 bits this is the same type std uses, so nothing
+# changes for aarch64/x86_64/armv6.
+portable-atomic = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -436,12 +436,10 @@ where
             }
             match tracker {
                 Some(tracker) => {
-                    relay_tracked(&mut Timed { inner: &mut client }, &mut upstream, tracker)
-                        .await?;
+                    relay_tracked(&mut client, &mut upstream, tracker).await?;
                 }
                 None => {
-                    copy_bidirectional_pooled(&mut Timed { inner: &mut client }, &mut upstream)
-                        .await?;
+                    copy_bidirectional_pooled(&mut client, &mut upstream).await?;
                 }
             }
             Ok(())
@@ -596,56 +594,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
             self.tracker.add_download(*n as u64);
         }
         poll
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
-    }
-}
-
-/// The client side of the uncounted copy loop, with each write into the app
-/// socket timed: relay bytes landing in a full receive window is sink
-/// backpressure, and without this span it hides inside the relay's busy time.
-struct Timed<'a, S> {
-    inner: &'a mut S,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for Timed<'_, S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for Timed<'_, S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        data: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
-        if crate::outbound::transport::h2io::rdbg::enabled() {
-            let t0 = crate::outbound::transport::h2io::rdbg::now_ns();
-            let poll = std::pin::Pin::new(&mut *self.inner).poll_write(cx, data);
-            if let std::task::Poll::Ready(Ok(_)) = &poll {
-                crate::outbound::transport::h2io::rdbg::note_app(t0);
-            }
-            poll
-        } else {
-            std::pin::Pin::new(&mut *self.inner).poll_write(cx, data)
-        }
     }
 
     fn poll_flush(

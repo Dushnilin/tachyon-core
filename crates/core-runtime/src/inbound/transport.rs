@@ -357,16 +357,15 @@ impl GrpcAccept {
             let Some(conn) = self.conn.as_mut() else {
                 return Ok(None);
             };
-            let (request, mut responder) =
-                match crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await {
-                    Some(Ok(pair)) => pair,
-                    Some(Err(err)) if self.first => anyhow::bail!("grpc: h2 accept: {err}"),
-                    Some(Err(_)) => return Ok(None),
-                    None if self.first => {
-                        anyhow::bail!("grpc: the connection ended before a request")
-                    }
-                    None => return Ok(None),
-                };
+            let (request, mut responder) = match conn.accept().await {
+                Some(Ok(pair)) => pair,
+                Some(Err(err)) if self.first => anyhow::bail!("grpc: h2 accept: {err}"),
+                Some(Err(_)) => return Ok(None),
+                None if self.first => {
+                    anyhow::bail!("grpc: the connection ended before a request")
+                }
+                None => return Ok(None),
+            };
             let first = std::mem::replace(&mut self.first, false);
             let path = request.uri().path().to_string();
             let method = request.method().as_str().to_string();
@@ -458,16 +457,15 @@ impl XhttpH2Accept {
             let Some(conn) = self.conn.as_mut() else {
                 return Ok(None);
             };
-            let (request, mut responder) =
-                match crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await {
-                    Some(Ok(pair)) => pair,
-                    Some(Err(err)) if self.first => anyhow::bail!("xhttp h2: accept: {err}"),
-                    Some(Err(_)) => return Ok(None),
-                    None if self.first => {
-                        anyhow::bail!("xhttp h2: the connection ended before a request")
-                    }
-                    None => return Ok(None),
-                };
+            let (request, mut responder) = match conn.accept().await {
+                Some(Ok(pair)) => pair,
+                Some(Err(err)) if self.first => anyhow::bail!("xhttp h2: accept: {err}"),
+                Some(Err(_)) => return Ok(None),
+                None if self.first => {
+                    anyhow::bail!("xhttp h2: the connection ended before a request")
+                }
+                None => return Ok(None),
+            };
             let first = std::mem::replace(&mut self.first, false);
             let req_path = request.uri().path().to_string();
             let method = request.method().as_str().to_string();
@@ -521,8 +519,7 @@ fn xhttp_h2_drive(
     mut conn: h2::server::Connection<AnyStream, Bytes>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await
-        {
+        while let Some(next) = conn.accept().await {
             match next {
                 Ok((_, mut responder)) => {
                     let response = http::Response::builder().status(404).body(()).unwrap();
@@ -541,8 +538,7 @@ fn xhttp_h2_drive(
 /// gets the same answer.
 fn grpc_drive(mut conn: h2::server::Connection<AnyStream, Bytes>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await
-        {
+        while let Some(next) = conn.accept().await {
             match next {
                 Ok((request, mut responder)) => {
                     crate::logging::debug(format_args!(

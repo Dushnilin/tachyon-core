@@ -391,7 +391,7 @@ impl H2Pool {
         let mut counter = None;
         if let Some(c) = client {
             let cnt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-            if guard.clients.len() >= 4 {
+            if guard.clients.len() >= 8 {
                 guard.clients.remove(0);
             }
             guard.clients.push(PooledClient {
@@ -502,7 +502,7 @@ impl XhttpConfig {
             true,
         )?;
 
-        let acq = self.h2_pool.acquire(4).await;
+        let acq = self.h2_pool.acquire(8).await;
         match acq {
             H2Acquire::Ready(client, counter) => {
                 let mut send_req = client

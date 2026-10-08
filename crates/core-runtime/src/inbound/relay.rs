@@ -221,6 +221,7 @@ pub(crate) async fn relay(
     };
     let signal = tracker.close_signal();
     tokio::select! {
+        biased;
         result = both => result,
         _ = signal.wait() => Err(super::closed_by_api()),
     }

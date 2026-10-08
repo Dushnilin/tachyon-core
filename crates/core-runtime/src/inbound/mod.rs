@@ -439,6 +439,7 @@ where
                     let relay = async { tokio::try_join!(up, down).map(|_| ()) };
                     tokio::pin!(relay);
                     tokio::select! {
+                        biased;
                         result = &mut relay => result,
                         _ = signal.wait() => Err(closed_by_api()),
                     }
@@ -470,8 +471,14 @@ fn closed_by_api() -> io::Error {
 fn relay_buf() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
+        if let Ok(val) = std::env::var("TACHYON_RELAY_BUF")
+            && let Ok(n) = val.parse::<usize>()
+            && n > 0
+        {
+            return n;
+        }
         if online_cores().is_some_and(|cores| (1..=2).contains(&cores)) {
-            16 * 1024
+            64 * 1024
         } else {
             2 * 65535
         }
@@ -546,7 +553,7 @@ fn take_buf() -> Vec<u8> {
 }
 
 fn give_buf(mut buf: Vec<u8>) {
-    if buf.capacity() != relay_buf() {
+    if buf.capacity() < relay_buf() || buf.capacity() > relay_buf() * 2 {
         return;
     }
     buf.clear();
@@ -630,12 +637,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Timed<'_, S> {
         cx: &mut std::task::Context<'_>,
         data: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        let t0 = crate::outbound::transport::h2io::rdbg::now_ns();
-        let poll = std::pin::Pin::new(&mut *self.inner).poll_write(cx, data);
-        if let std::task::Poll::Ready(Ok(_)) = &poll {
-            crate::outbound::transport::h2io::rdbg::note_app(t0);
+        if crate::outbound::transport::h2io::rdbg::enabled() {
+            let t0 = crate::outbound::transport::h2io::rdbg::now_ns();
+            let poll = std::pin::Pin::new(&mut *self.inner).poll_write(cx, data);
+            if let std::task::Poll::Ready(Ok(_)) = &poll {
+                crate::outbound::transport::h2io::rdbg::note_app(t0);
+            }
+            poll
+        } else {
+            std::pin::Pin::new(&mut *self.inner).poll_write(cx, data)
         }
-        poll
     }
 
     fn poll_flush(
@@ -672,6 +683,7 @@ where
         tracker,
     };
     tokio::select! {
+        biased;
         result = tokio::io::copy_bidirectional_with_sizes(
             &mut counted,
             upstream,

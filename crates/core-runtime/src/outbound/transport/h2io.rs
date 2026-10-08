@@ -413,7 +413,15 @@ pub(crate) mod rdbg {
     static T_READY: AtomicU64 = AtomicU64::new(0);
     static T_PARK: AtomicU64 = AtomicU64::new(0);
 
+    pub(crate) fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TACHYON_READDBG").is_some())
+    }
+
     pub(crate) fn now_ns() -> u64 {
+        if !enabled() {
+            return 0;
+        }
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START
             .get_or_init(std::time::Instant::now)
@@ -426,22 +434,26 @@ pub(crate) mod rdbg {
     /// payload onward. Split off `cons` so the residual -- the copy loop and
     /// the app socket write -- can be told apart from the protocol work.
     pub(crate) fn note_srv(t0: u64) {
-        let t = now_ns();
-        bump(SRV_N, 1);
-        bump(SRV_SUM, t.saturating_sub(t0));
+        if enabled() {
+            let t = now_ns();
+            bump(SRV_N, 1);
+            bump(SRV_SUM, t.saturating_sub(t0));
+        }
     }
 
     /// One write of relayed bytes into the client socket: how long the app
     /// side held the relay inside `poll_write` (a full receive window there
     /// is backpressure from the sink, not protocol cost).
     pub(crate) fn note_app(t0: u64) {
-        let t = now_ns();
-        bump(APP_N, 1);
-        bump(APP_SUM, t.saturating_sub(t0));
+        if enabled() {
+            let t = now_ns();
+            bump(APP_N, 1);
+            bump(APP_SUM, t.saturating_sub(t0));
+        }
     }
 
     pub(crate) fn note_conn_entry() {
-        if C[CYC_N].load(Ordering::Relaxed) > 0 {
+        if enabled() && C[CYC_N].load(Ordering::Relaxed) > 0 {
             T_CONN.store(now_ns(), Ordering::Relaxed);
         }
     }
@@ -451,7 +463,9 @@ pub(crate) mod rdbg {
     /// with bytes still sitting in the kernel.
     #[cfg(unix)]
     pub(crate) fn note_fd(fd: i32) {
-        FD.store(fd, Ordering::Relaxed);
+        if enabled() {
+            FD.store(fd, Ordering::Relaxed);
+        }
     }
 
     #[cfg(not(unix))]
@@ -485,6 +499,9 @@ pub(crate) mod rdbg {
     /// The relay saw a chunk: split the time since it last saw one into the
     /// part spent parked waiting for data and the part spent running.
     pub(crate) fn note_recv_ready() {
+        if !enabled() {
+            return;
+        }
         let t = now_ns();
         let prev = T_READY.swap(t, Ordering::Relaxed);
         let park = T_PARK.load(Ordering::Relaxed);
@@ -503,6 +520,9 @@ pub(crate) mod rdbg {
     }
 
     pub(crate) fn note_recv_park() {
+        if !enabled() {
+            return;
+        }
         T_PARK.store(now_ns(), Ordering::Relaxed);
         bump(PK_N, 1);
         if depth() == 0 {
@@ -524,6 +544,9 @@ pub(crate) mod rdbg {
                 mut self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<F::Output> {
+                if !enabled() {
+                    return self.0.as_mut().poll(cx);
+                }
                 init();
                 bump(CONN_POLL, 1);
                 note_conn_entry();
@@ -540,7 +563,9 @@ pub(crate) mod rdbg {
 
     #[inline]
     pub(crate) fn bump(i: usize, n: u64) {
-        C[i].fetch_add(n, Ordering::Relaxed);
+        if enabled() {
+            C[i].fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     fn snap() -> [u64; N] {

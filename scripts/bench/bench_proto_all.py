@@ -213,7 +213,7 @@ def make_certs(out_dir):
             "openssl", "req", "-x509", "-newkey", "ec",
             "-pkeyopt", "ec_paramgen_curve:prime256v1",
             "-nodes", "-keyout", key, "-out", crt,
-            "-days", "365", "-subj", "/CN=127.0.0.1",
+            "-days", "30", "-subj", "/CN=127.0.0.1",
             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
             "-addext", "basicConstraints=critical,CA:FALSE",
             "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
@@ -1215,8 +1215,10 @@ def main():
     if args.html:
         generate_html_report(all_results, args.profile, args.html)
         print(f"Saved HTML: {args.html}")
-        for extra in ("/bench/report.html", "/bench/report-router.html", "/bench/multi-router.html", "/bench/proto-all.html", "/bench/proto-all-router.html"):
-            if extra != args.html:
+        html_dir = os.path.dirname(args.html) or "."
+        for extra_name in ("report.html", "report-router.html", "multi-router.html", "proto-all.html", "proto-all-router.html"):
+            extra = os.path.join(html_dir, extra_name)
+            if os.path.abspath(extra) != os.path.abspath(args.html):
                 try:
                     generate_html_report(all_results, args.profile, extra)
                 except Exception:

@@ -375,6 +375,10 @@ impl WireGuard {
                     ),
                 )
             })?;
+        let _ = socket2::SockRef::from(&sock)
+            .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+        let _ = socket2::SockRef::from(&sock)
+            .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
         let (tx, rx) = mpsc::channel(CMD_QUEUE);
         let shared = Arc::new(WgShared {
             cmd_tx: tx,

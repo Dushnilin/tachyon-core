@@ -155,9 +155,7 @@ impl H2Stream {
                 self.pending.pop_front();
             }
         }
-        let n = want - left;
-        rdbg::bump(rdbg::SERVED, n as u64);
-        n
+        want - left
     }
 
     /// Drop `n` pending bytes without copying them.
@@ -199,7 +197,6 @@ impl H2Stream {
 
     /// Flush staged bytes as flow control allows; clears `out` when done.
     pub(crate) fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        rdbg::init();
         loop {
             if self.out.is_empty() {
                 return Poll::Ready(Ok(()));
@@ -210,10 +207,7 @@ impl H2Stream {
             let remaining = self.out.len();
             send.reserve_capacity(remaining);
             let cap = match send.poll_capacity(cx) {
-                Poll::Pending => {
-                    rdbg::bump(rdbg::FLUSH_WAIT, 1);
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(cap))) => cap,
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::other(format!("h2: capacity: {e}"))));
@@ -234,7 +228,6 @@ impl H2Stream {
     /// Wait for the next received chunk into `pending`.
     /// `Ok(false)` means the response body ended (EOF latched).
     pub(crate) fn poll_recv_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        rdbg::init();
         if self.recv.is_none() {
             let Some(response) = self.response.as_mut() else {
                 // Response already consumed; recv stream exhausted.
@@ -258,19 +251,13 @@ impl H2Stream {
         }
         let recv = self.recv.as_mut().expect("recv set above");
         match recv.poll_data(cx) {
-            Poll::Pending => {
-                rdbg::bump(rdbg::RECV_WAIT, 1);
-                rdbg::note_recv_park();
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(chunk))) => {
                 let len = chunk.len();
                 let _ = recv.flow_control().release_capacity(len);
                 // pushed as it arrived: no join, no copy of either side
                 self.pending.push_back(chunk);
                 self.pending_len += len;
-                rdbg::bump(rdbg::RECV_MSG, 1);
-                rdbg::note_recv_ready();
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -365,274 +352,5 @@ impl AsyncWrite for H2Io {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         self.h2.poll_shutdown(cx)
-    }
-}
-
-/// Temporary read/write path counters, on when `TACHYON_READDBG` is set: one
-/// delta line per second appended to /tmp/tachyon-readbg.txt. Counts every
-/// wait the pipeline can sit in -- a recv with nothing buffered, a capacity
-/// that came back empty, an assembler with no record -- against the bytes
-/// that actually moved, so a stall shows up as wait without served bytes.
-pub(crate) mod rdbg {
-    use std::sync::atomic::Ordering;
-
-    use portable_atomic::AtomicU64;
-
-    pub const SERVED: usize = 0;
-    pub const FLUSH_WAIT: usize = 1;
-    pub const RECV_WAIT: usize = 2;
-    pub const RECV_MSG: usize = 3;
-    pub const A_READY: usize = 4;
-    pub const A_PARK: usize = 5;
-    pub const A_BYTES: usize = 6;
-    pub const MSG: usize = 7;
-    pub const CONN_POLL: usize = 8;
-    pub const CYC_N: usize = 9;
-    pub const CYC_SUM: usize = 10;
-    pub const WAIT_SUM: usize = 11;
-    pub const CONS_SUM: usize = 12;
-    pub const HAND_SUM: usize = 13;
-    pub const SRV_N: usize = 14;
-    pub const SRV_SUM: usize = 15;
-    pub const APP_N: usize = 16;
-    pub const APP_SUM: usize = 17;
-    pub const CD_N: usize = 18;
-    pub const CD_SUM: usize = 19;
-    pub const PK_N: usize = 20;
-    pub const PK_E: usize = 21;
-    pub const PK_SUM: usize = 22;
-    pub const PK_MAX: usize = 23;
-    pub const RD_SUM: usize = 24;
-    pub const RD_MAX: usize = 25;
-
-    const N: usize = 26;
-
-    #[cfg(unix)]
-    static FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-    static T_CONN: AtomicU64 = AtomicU64::new(0);
-    static T_READY: AtomicU64 = AtomicU64::new(0);
-    static T_PARK: AtomicU64 = AtomicU64::new(0);
-
-    pub(crate) fn enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("TACHYON_READDBG").is_some())
-    }
-
-    pub(crate) fn now_ns() -> u64 {
-        if !enabled() {
-            return 0;
-        }
-        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        START
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_nanos() as u64
-    }
-
-    /// One relay read call that came back with data: from entry to `Ready`,
-    /// which is the grpc hunk handout plus the vmess decrypt that copies the
-    /// payload onward. Split off `cons` so the residual -- the copy loop and
-    /// the app socket write -- can be told apart from the protocol work.
-    pub(crate) fn note_srv(t0: u64) {
-        if enabled() {
-            let t = now_ns();
-            bump(SRV_N, 1);
-            bump(SRV_SUM, t.saturating_sub(t0));
-        }
-    }
-
-    /// One write of relayed bytes into the client socket: how long the app
-    /// side held the relay inside `poll_write` (a full receive window there
-    /// is backpressure from the sink, not protocol cost).
-    pub(crate) fn note_app(t0: u64) {
-        if enabled() {
-            let t = now_ns();
-            bump(APP_N, 1);
-            bump(APP_SUM, t.saturating_sub(t0));
-        }
-    }
-
-    pub(crate) fn note_conn_entry() {
-        if enabled() && C[CYC_N].load(Ordering::Relaxed) > 0 {
-            T_CONN.store(now_ns(), Ordering::Relaxed);
-        }
-    }
-
-    /// Last outbound TCP socket: the park probe below reads its unread depth,
-    /// which tells a relay parked on nothing-buffers apart from one parked
-    /// with bytes still sitting in the kernel.
-    #[cfg(unix)]
-    pub(crate) fn note_fd(fd: i32) {
-        if enabled() {
-            FD.store(fd, Ordering::Relaxed);
-        }
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn note_fd(_fd: i32) {}
-
-    #[cfg(unix)]
-    fn depth() -> i32 {
-        let fd = FD.load(Ordering::Relaxed);
-        if fd < 0 {
-            return -1;
-        }
-        let mut n: libc::c_int = 0;
-        // FIONREAD: bytes the kernel still holds for this socket
-        let r = unsafe { libc::ioctl(fd, 0x541B, &mut n as *mut libc::c_int) };
-        if r < 0 { -1 } else { n }
-    }
-
-    #[cfg(not(unix))]
-    fn depth() -> i32 {
-        -1
-    }
-
-    fn note_depth(dst_max: usize, dst_sum: usize) {
-        let d = depth();
-        if d >= 0 {
-            bump(dst_sum, d as u64);
-            C[dst_max].fetch_max(d as u64, Ordering::Relaxed);
-        }
-    }
-
-    /// The relay saw a chunk: split the time since it last saw one into the
-    /// part spent parked waiting for data and the part spent running.
-    pub(crate) fn note_recv_ready() {
-        if !enabled() {
-            return;
-        }
-        let t = now_ns();
-        let prev = T_READY.swap(t, Ordering::Relaxed);
-        let park = T_PARK.load(Ordering::Relaxed);
-        if prev == 0 || park < prev || t <= prev {
-            return;
-        }
-        bump(CYC_N, 1);
-        bump(CYC_SUM, t - prev);
-        bump(WAIT_SUM, t - park);
-        bump(CONS_SUM, park - prev);
-        note_depth(RD_MAX, RD_SUM);
-        let conn = T_CONN.load(Ordering::Relaxed);
-        if conn < t {
-            bump(HAND_SUM, t - conn);
-        }
-    }
-
-    pub(crate) fn note_recv_park() {
-        if !enabled() {
-            return;
-        }
-        T_PARK.store(now_ns(), Ordering::Relaxed);
-        bump(PK_N, 1);
-        if depth() == 0 {
-            bump(PK_E, 1);
-        }
-        note_depth(PK_MAX, PK_SUM);
-    }
-
-    /// Count polls of the h2 connection future: one per wake of the mux task.
-    /// Against `recv_msg` this shows whether the connection parses one DATA
-    /// chunk per wake (a ping-pong with the pump) or drains whole bursts.
-    pub(crate) fn counted<F: std::future::Future>(
-        f: F,
-    ) -> impl std::future::Future<Output = F::Output> {
-        struct Counted<F>(std::pin::Pin<Box<F>>);
-        impl<F: std::future::Future> std::future::Future for Counted<F> {
-            type Output = F::Output;
-            fn poll(
-                mut self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<F::Output> {
-                if !enabled() {
-                    return self.0.as_mut().poll(cx);
-                }
-                init();
-                bump(CONN_POLL, 1);
-                note_conn_entry();
-                let t0 = now_ns();
-                let poll = self.0.as_mut().poll(cx);
-                bump(CD_N, 1);
-                bump(CD_SUM, now_ns().saturating_sub(t0));
-                poll
-            }
-        }
-        Counted(Box::pin(f))
-    }
-    static C: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
-
-    #[inline]
-    pub(crate) fn bump(i: usize, n: u64) {
-        if enabled() {
-            C[i].fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    fn snap() -> [u64; N] {
-        std::array::from_fn(|i| C[i].load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn init() {
-        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        ONCE.get_or_init(|| {
-            if std::env::var_os("TACHYON_READDBG").is_none() {
-                return;
-            }
-            std::thread::spawn(|| {
-                let mut last = [0u64; N];
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let cur = snap();
-                    if cur == last {
-                        continue;
-                    }
-                    use std::io::Write;
-                    let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/tachyon-readbg.txt")
-                    else {
-                        continue;
-                    };
-                    let cyc_n = cur[CYC_N] - last[CYC_N];
-                    let avg = |sum: u64| sum.checked_div(cyc_n).map_or(0, |v| v / 1000);
-                    let own_avg = |sum: u64, n: u64| sum.checked_div(n.max(1)).map_or(0, |v| v / 1000);
-                    let _ = writeln!(
-                        f,
-                        "{} served={} recv_msg={} recv_wait={} flush_wait={} msg={} a_ready={} a_park={} a_bytes={} conn_poll={} cyc={}us wait={}us cons={}us hand={}us srv={}us app={}us srv_n={} app_n={} cyc_n={} cd={}us cd_n={} pk_n={} pk_e={} pk_avg={} pk_max={} rd_avg={} rd_max={}",
-                        std::process::id(),
-                        cur[SERVED] - last[SERVED],
-                        cur[RECV_MSG] - last[RECV_MSG],
-                        cur[RECV_WAIT] - last[RECV_WAIT],
-                        cur[FLUSH_WAIT] - last[FLUSH_WAIT],
-                        cur[MSG] - last[MSG],
-                        cur[A_READY] - last[A_READY],
-                        cur[A_PARK] - last[A_PARK],
-                        cur[A_BYTES] - last[A_BYTES],
-                        cur[CONN_POLL] - last[CONN_POLL],
-                        avg(cur[CYC_SUM] - last[CYC_SUM]),
-                        avg(cur[WAIT_SUM] - last[WAIT_SUM]),
-                        avg(cur[CONS_SUM] - last[CONS_SUM]),
-                        avg(cur[HAND_SUM] - last[HAND_SUM]),
-                        own_avg(cur[SRV_SUM] - last[SRV_SUM], cur[SRV_N] - last[SRV_N]),
-                        own_avg(cur[APP_SUM] - last[APP_SUM], cur[APP_N] - last[APP_N]),
-                        cur[SRV_N] - last[SRV_N],
-                        cur[APP_N] - last[APP_N],
-                        cyc_n,
-                        own_avg(cur[CD_SUM] - last[CD_SUM], cur[CD_N] - last[CD_N]),
-                        cur[CD_N] - last[CD_N],
-                        cur[PK_N] - last[PK_N],
-                        cur[PK_E] - last[PK_E],
-                        own_avg(cur[PK_SUM] - last[PK_SUM], cur[PK_N] - last[PK_N]),
-                        cur[PK_MAX],
-                        (cur[RD_SUM] - last[RD_SUM])
-                            .checked_div((cur[RECV_MSG] - last[RECV_MSG]).max(1))
-                            .unwrap_or(0),
-                        cur[RD_MAX],
-                    );
-                    last = cur;
-                }
-            });
-        });
     }
 }

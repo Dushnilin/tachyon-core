@@ -220,12 +220,15 @@ def parse_cpus(spec):
 
 def server_cfg(case, port):
     inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=port)
-    return {
+    cfg = {
         "log": {"level": os.environ.get("PROTO_LOG", "error")},
         "inbounds": [inbound],
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "route": {"final": "direct"},
     }
+    if os.environ.get("PROTO_PPROF"):
+        cfg["experimental"] = {"debug": {"listen": "127.0.0.1:6060"}}
+    return cfg
 
 
 def client_cfg(case, proxy_port, server_port):

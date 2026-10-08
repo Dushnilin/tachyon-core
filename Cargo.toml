@@ -9,6 +9,15 @@ members = [
     "crates/core-tls",
 ]
 
+# h2 with UNCLAIMED_DENOMINATOR 2 -> 32: WINDOW_UPDATE every window/32
+# instead of window/2. grpc-go fills its 64 KiB send quota then stops until a
+# WU lands, so a 4 MiB connection window updated at window/2 pauses the single
+# stream for ~7 ms every 6 MiB and vmess-grpc tput_1 ran at 0.5-0.7x of the
+# reference; at window/32 the stream stays fed and tput_1 reaches parity
+# (2.63 vs 2.74 Gbit/s). Vendored: upstream h2 has no knob for this ratio.
+[patch.crates-io]
+h2 = { path = "vendor/h2" }
+
 [workspace.package]
 version = "0.0.1"
 edition = "2024"

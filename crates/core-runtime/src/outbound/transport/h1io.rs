@@ -513,7 +513,28 @@ pub(crate) async fn send(
         io.write_all(body).await?;
     }
     io.flush().await?;
-    read_head(io).await
+    crate::logging::debug(format_args!(
+        "h1: >> {} {} (close={close})",
+        request.method(),
+        request.uri()
+    ));
+    let out = read_head(io).await;
+    match &out {
+        Ok((head, _)) => crate::logging::debug(format_args!(
+            "h1: << {} {} -> status={} framing={:?} close={}",
+            request.method(),
+            request.uri(),
+            head.status,
+            head.framing,
+            head.close
+        )),
+        Err(e) => crate::logging::debug(format_args!(
+            "h1: << head err for {} {}: {e}",
+            request.method(),
+            request.uri()
+        )),
+    }
+    out
 }
 
 /// Chunked framing for one body write: `<hex len>\r\n<payload>\r\n`.

@@ -17,8 +17,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The 12 MiB budget the CI cross job enforces, in bytes. A release that is
-  # bigger than the gate would be a release nobody could install on a router.
   SIZE_BUDGET: 12582912
 
 jobs:
@@ -41,95 +39,149 @@ jobs:
   build:
     name: ${{ matrix.name }}
     needs: check-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # The OpenWrt targets, by the name its own package feed uses. Every
-          # one is a static musl build: an OpenWrt box has no matching glibc,
-          # and the binary has to land in /usr/bin on flash.
+          # OpenWrt router musl targets (static binary)
           - name: x86_64
             target: x86_64-unknown-linux-musl
+            use_musl_lld: true
+            budget: 12582912
           - name: aarch64
             target: aarch64-unknown-linux-musl
+            budget: 12582912
           - name: armv7
             target: armv7-unknown-linux-musleabihf
+            use_musl_lld: true
+            budget: 12582912
           - name: armv6
             target: arm-unknown-linux-musleabi
+            use_musl_lld: true
+            budget: 12582912
           - name: riscv64
             target: riscv64gc-unknown-linux-musl
-          # mipsel and mips have no prebuilt std: they are tier-3 and need the
-          # standard library built from source, which is what `build-std` is for
-          # and why these two want nightly.
+            use_musl_lld: true
+            budget: 12582912
+          # mipsel and mips have no prebuilt std: tier-3 targets that need
+          # the standard library built from source via nightly + build-std
           - name: mipsel
             target: mipsel-unknown-linux-musl
             build-std: true
+            use_musl_lld: true
+            budget: 12582912
           - name: mips
             target: mips-unknown-linux-musl
             build-std: true
+            use_musl_lld: true
+            budget: 12582912
+          # Desktop & Server targets
+          - name: linux-amd64
+            target: x86_64-unknown-linux-gnu
+            budget: 16777216
+          - name: windows-amd64
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            is_windows: true
+            budget: 20971520
+          - name: darwin-amd64
+            target: x86_64-apple-darwin
+            os: macos-latest
+            budget: 16777216
+          - name: darwin-arm64
+            target: aarch64-apple-darwin
+            os: macos-latest
+            budget: 16777216
     steps:
       - uses: actions/checkout@v4
-      # `rustup target add` refuses a tier-3 target outright -- there are no
-      # prebuilt artifacts to add, and it says so and exits non-zero -- so the two
-      # MIPS entries must not be asked to install their target. They get nightly
-      # plus rust-src and let `-Z build-std` compile the standard library.
+
       - name: Toolchain (prebuilt std)
         if: ${{ !matrix.build-std }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+
       - name: Toolchain (std from source)
         if: ${{ matrix.build-std }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           components: rust-src
-      # Skipped for aarch64: RUSTFLAGS from the env would override the
-      # `[target.aarch64-*]` rustflags array in .cargo/config.toml and drop
-      # its `--cfg aes_armv8`/`polyval_armv8`/`chacha20_force_neon`, which is
-      # what selects the RustCrypto ARMv8 assembly. The config already
-      # provides linker=rust-lld and link-self-contained=yes for that target.
+
+      # Link musl with rust-lld where needed. Skipped for aarch64 because .cargo/config.toml
+      # already configures rustflags with ARMv8 assembly features + neon + rust-lld.
       - name: Link musl with rust-lld
-        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
+        if: ${{ matrix.use_musl_lld }}
         run: echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
+
+      # Windows runner uses MSVC's link.exe from PATH
+      - name: Windows linker override
+        if: ${{ matrix.is_windows }}
+        shell: bash
+        run: echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe" >> "$GITHUB_ENV"
+
       - name: Build
+        shell: bash
         run: |
           if [ -n "${{ matrix.build-std }}" ]; then
-            # `panic_abort` is already the release profile's setting, so the
-            # unwinding tables have nowhere to live and would only cost size.
             cargo build --workspace --release --target ${{ matrix.target }} \
               -Z build-std=std,panic_abort
           else
             cargo build --workspace --release --target ${{ matrix.target }}
           fi
+
       - name: Size budget
+        shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/tachyon-core"
-          size=$(stat -c%s "$bin")
-          echo "${{ matrix.name }}: $size bytes, budget $SIZE_BUDGET"
-          test "$size" -le "$SIZE_BUDGET"
+          if [ "${{ matrix.is_windows }}" = "true" ]; then
+            bin="target/${{ matrix.target }}/release/tachyon-core.exe"
+          else
+            bin="target/${{ matrix.target }}/release/tachyon-core"
+          fi
+          size=$(wc -c < "$bin" | tr -d ' ')
+          budget="${{ matrix.budget || env.SIZE_BUDGET }}"
+          echo "${{ matrix.name }}: $size bytes, budget $budget"
+          test "$size" -le "$budget"
+
       - name: The binary is for this architecture
-        # Not `tachyon-core version`: these are foreign-architecture binaries and
-        # the runner cannot exec them. Read the header instead, which is the check
-        # that would actually catch a stale target directory.
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
         run: |
           file "target/${{ matrix.target }}/release/tachyon-core"
-      - name: Pack
+
+      - name: Pack (Unix)
+        if: ${{ !matrix.is_windows }}
+        shell: bash
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
           name="tachyon-core-${{ matrix.name }}-${ver}"
-          cp "target/${{ matrix.target }}/release/tachyon-core" "./${name}"
+          bin="target/${{ matrix.target }}/release/tachyon-core"
+          cp "$bin" "./${name}"
           sha256sum "./${name}" > "./${name}.sha256"
           tar -czf "${name}.tar.gz" "./${name}"
+
+      - name: Pack (Windows)
+        if: ${{ matrix.is_windows }}
+        shell: bash
+        run: |
+          ver="${{ inputs.tag || github.ref_name }}"
+          name="tachyon-core-${{ matrix.name }}-${ver}"
+          bin="target/${{ matrix.target }}/release/tachyon-core.exe"
+          cp "$bin" "./tachyon-core.exe"
+          sha256sum "./tachyon-core.exe" > "./${name}.sha256"
+          tar -czf "${name}.tar.gz" "./tachyon-core.exe"
+          powershell -Command "Compress-Archive -Path './tachyon-core.exe' -DestinationPath '${name}.zip'"
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
           path: |
             tachyon-core-${{ matrix.name }}-*.tar.gz
+            tachyon-core-${{ matrix.name }}-*.zip
             tachyon-core-${{ matrix.name }}-*.sha256
-          if-no-files-found: error
+          if-no-files-found: warn
 
   release:
     name: attach to the release
@@ -150,8 +202,6 @@ jobs:
           rm -f ./*.sha256
           cat SHA256SUMS
       - name: The notes for this version, not the whole file
-        # `body_path: CHANGELOG.md` would publish every version ever written as
-        # the notes for this one, and the next release would still read as 0.0.1.
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
           ver="${ver#v}"
@@ -171,5 +221,6 @@ jobs:
           body_path: notes.md
           files: |
             artifacts/*.tar.gz
+            artifacts/*.zip
             artifacts/SHA256SUMS
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false

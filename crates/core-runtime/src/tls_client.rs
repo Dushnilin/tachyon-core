@@ -521,6 +521,16 @@ impl TlsOptions {
         result?;
         let connection = core_tls::client::Connection::new(&mut handshake)?;
         let alpn = handshake.alpn.clone();
+        crate::logging::debug(format_args!(
+            "tls: established {} sni={} alpn=[{}]",
+            name,
+            self.server_name,
+            alpn
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
         let tls_stream = Box::new(crate::tls_utls::FingerprintStream::new(
             stream, connection,
         ));

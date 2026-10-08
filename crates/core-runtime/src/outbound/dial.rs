@@ -258,6 +258,7 @@ impl DialOptions {
     /// Everything that has to be set before the socket connects.
     /// Everything that has to be set before the socket connects.
     fn apply(&self, fd: RawFd, addr: &SocketAddr, udp: bool) -> io::Result<()> {
+        let _ = addr;
         if self.reuse_addr {
             set_bool(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
         }
@@ -286,6 +287,7 @@ impl DialOptions {
                 )?;
             }
         }
+        #[cfg(target_os = "linux")]
         if addr.is_ipv6() && udp && !self.udp_fragment {
             set_int(
                 fd,
@@ -299,10 +301,15 @@ impl DialOptions {
                 None => set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0)?,
                 Some((idle, interval)) => {
                     set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    const TCP_KEEPIDLE_OPT: libc::c_int = libc::TCP_KEEPALIVE;
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                    const TCP_KEEPIDLE_OPT: libc::c_int = libc::TCP_KEEPIDLE;
+
                     set_int(
                         fd,
                         libc::IPPROTO_TCP,
-                        libc::TCP_KEEPIDLE,
+                        TCP_KEEPIDLE_OPT,
                         idle.as_secs() as libc::c_int,
                     )?;
                     set_int(

@@ -1,0 +1,223 @@
+name: Build All Platforms
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.*"
+      - ".cargo/**"
+      - ".github/workflows/build-all.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SIZE_BUDGET: 12582912
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # OpenWrt router musl targets (static binary)
+          - name: x86_64-musl
+            target: x86_64-unknown-linux-musl
+            arch: "x86_64"
+            desc: "x86-64-v3 routers, mini-PCs, Proxmox"
+            use_musl_lld: true
+            budget: 12582912
+          - name: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            arch: "AArch64 / ARM64"
+            desc: "NanoPi R3S/R4S, GL.iNet Flint 2, RPi 4/5"
+            budget: 12582912
+          - name: armv7-musl
+            target: armv7-unknown-linux-musleabihf
+            arch: "ARMv7 (hardfloat)"
+            desc: "Keenetic Hopper/Titan, Xiaomi AX1800, IPQ4019"
+            use_musl_lld: true
+            budget: 12582912
+          - name: armv6-musl
+            target: arm-unknown-linux-musleabi
+            arch: "ARMv5/v6 (softfloat)"
+            desc: "Legacy ARM routers"
+            use_musl_lld: true
+            budget: 12582912
+          - name: riscv64-musl
+            target: riscv64gc-unknown-linux-musl
+            arch: "RISC-V 64"
+            desc: "SiFive, Milk-V, Banana Pi BPI-F3"
+            use_musl_lld: true
+            budget: 12582912
+          - name: mipsel-musl
+            target: mipsel-unknown-linux-musl
+            arch: "MIPSEL (softfloat)"
+            desc: "MediaTek MT7621, ramips routers"
+            build-std: true
+            use_musl_lld: true
+            budget: 12582912
+          - name: mips-musl
+            target: mips-unknown-linux-musl
+            arch: "MIPS Big-Endian"
+            desc: "Qualcomm Atheros ath79 routers"
+            build-std: true
+            use_musl_lld: true
+            budget: 12582912
+          # Desktop & Server targets
+          - name: linux-amd64
+            target: x86_64-unknown-linux-gnu
+            arch: "x86_64 (glibc)"
+            desc: "Ubuntu / Debian / RHEL / Arch Linux"
+            budget: 16777216
+          - name: windows-amd64
+            target: x86_64-pc-windows-msvc
+            arch: "x86_64 (MSVC)"
+            desc: "Windows 10 / 11 x64"
+            os: windows-latest
+            is_windows: true
+            budget: 20971520
+          - name: darwin-amd64
+            target: x86_64-apple-darwin
+            arch: "x86_64 (Intel)"
+            desc: "macOS Intel"
+            os: macos-latest
+            budget: 16777216
+          - name: darwin-arm64
+            target: aarch64-apple-darwin
+            arch: "Apple Silicon (M1..M4)"
+            desc: "macOS Apple Silicon"
+            os: macos-latest
+            budget: 16777216
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain (prebuilt std)
+        if: ${{ !matrix.build-std }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Toolchain (std from source)
+        if: ${{ matrix.build-std }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      # Link musl with rust-lld where needed. Skipped for aarch64 because .cargo/config.toml
+      # already configures rustflags with ARMv8 assembly features + neon + rust-lld.
+      - name: Link musl with rust-lld
+        if: ${{ matrix.use_musl_lld }}
+        run: echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
+
+      # Windows runner uses MSVC's link.exe from PATH
+      - name: Windows linker override
+        if: ${{ matrix.is_windows }}
+        shell: bash
+        run: echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.build-std }}" ]; then
+            cargo build --workspace --release --target ${{ matrix.target }} \
+              -Z build-std=std,panic_abort
+          else
+            cargo build --workspace --release --target ${{ matrix.target }}
+          fi
+
+      - name: Size budget check
+        shell: bash
+        run: |
+          if [ "${{ matrix.is_windows }}" = "true" ]; then
+            bin="target/${{ matrix.target }}/release/tachyon-core.exe"
+          else
+            bin="target/${{ matrix.target }}/release/tachyon-core"
+          fi
+          size=$(wc -c < "$bin" | tr -d ' ')
+          budget="${{ matrix.budget || env.SIZE_BUDGET }}"
+          echo "${{ matrix.name }}: $size bytes, budget $budget"
+          test "$size" -le "$budget"
+
+      - name: Architecture check
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          file "target/${{ matrix.target }}/release/tachyon-core"
+
+      - name: Pack (Unix)
+        if: ${{ !matrix.is_windows }}
+        shell: bash
+        run: |
+          name="tachyon-core-${{ matrix.name }}"
+          bin="target/${{ matrix.target }}/release/tachyon-core"
+          cp "$bin" "./${name}"
+          sha256sum "./${name}" > "./${name}.sha256"
+          tar -czf "${name}.tar.gz" "./${name}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - name: Pack (Windows)
+        if: ${{ matrix.is_windows }}
+        shell: bash
+        run: |
+          name="tachyon-core-${{ matrix.name }}"
+          bin="target/${{ matrix.target }}/release/tachyon-core.exe"
+          cp "$bin" "./tachyon-core.exe"
+          sha256sum "./tachyon-core.exe" > "./${name}.sha256"
+          tar -czf "${name}.tar.gz" "./tachyon-core.exe"
+          powershell -Command "Compress-Archive -Path './tachyon-core.exe' -DestinationPath '${name}.zip'"
+          sha256sum "${name}.zip" > "${name}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            tachyon-core-${{ matrix.name }}-*.tar.gz
+            tachyon-core-${{ matrix.name }}-*.zip
+            tachyon-core-${{ matrix.name }}.tar.gz
+            tachyon-core-${{ matrix.name }}.zip
+            *.sha256
+          if-no-files-found: warn
+
+  summary:
+    name: Consolidate Artifacts & Summary
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate Checksums & Step Summary
+        run: |
+          cd artifacts
+          cat ./*.sha256 | sort -u > SHA256SUMS
+          
+          echo "## ⚡ Tachyon Core Multi-Platform Build Completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package / Artifact | Size | SHA256 Checksum |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|:---:|---|:" >> $GITHUB_STEP_SUMMARY
+          
+          for f in $(ls tachyon-core-*.tar.gz tachyon-core-*.zip 2>/dev/null); do
+            sz=$(ls -lh "$f" | awk '{print $5}')
+            sha=$(sha256sum "$f" | awk '{print $1}')
+            echo "| \`$f\` | **$sz** | \`$sha\` |" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: artifacts/SHA256SUMS

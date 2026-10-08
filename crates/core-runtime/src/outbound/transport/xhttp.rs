@@ -621,6 +621,9 @@ pub(crate) async fn connect(
     });
     let scheme = if secure { "https" } else { "http" };
     let mode = cfg.resolved_mode(secure, is_h2);
+    crate::logging::debug(format_args!(
+        "xhttp: connect {server}:{port} secure={secure} is_h2={is_h2} mode={mode:?}"
+    ));
 
     // Over HTTP/2, stream-one uses a single bidirectional h2 stream, multiplexed
     // across pooled h2 connections (XMUX).
@@ -1034,9 +1037,16 @@ async fn pump(mut body: h1io::Body, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let n = match body.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
+            Ok(0) => {
+                crate::logging::debug(format_args!("xhttp pump: eof"));
+                break;
+            }
+            Ok(n) => {
+                crate::logging::debug(format_args!("xhttp pump: read {n} bytes"));
+                n
+            }
             Err(e) => {
+                crate::logging::debug(format_args!("xhttp pump: err {e}"));
                 let _ = tx.send(Err(e)).await;
                 return;
             }
@@ -1062,9 +1072,23 @@ impl AsyncRead for XhttpConn {
                 return Poll::Ready(Ok(()));
             }
             match ready!(split.dl.poll_recv(cx)) {
-                Some(Ok(chunk)) => split.pending.extend_from_slice(&chunk),
-                Some(Err(e)) => return Poll::Ready(Err(e)),
-                None => return Poll::Ready(Ok(())), // EOF
+                Some(Ok(chunk)) => {
+                    let hx: String = chunk.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                    crate::logging::debug(format_args!(
+                        "xhttp: dl {} bytes [{}]",
+                        chunk.len(),
+                        hx
+                    ));
+                    split.pending.extend_from_slice(&chunk)
+                }
+                Some(Err(e)) => {
+                    crate::logging::debug(format_args!("xhttp: dl err {e}"));
+                    return Poll::Ready(Err(e));
+                }
+                None => {
+                    crate::logging::debug(format_args!("xhttp: dl eof"));
+                    return Poll::Ready(Ok(()));
+                } // EOF
             }
         }
     }
@@ -1096,6 +1120,12 @@ impl AsyncWrite for XhttpConn {
                 if state.in_flight.is_none() {
                     let writer = state.writer.take().expect("post writer present");
                     let data = buf.to_vec();
+                    let hx: String = data.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                    crate::logging::debug(format_args!(
+                        "xhttp: wr {} bytes [{}] -> packets",
+                        data.len(),
+                        hx
+                    ));
                     state.in_flight =
                         Some(Box::pin(async move { write_packets(writer, data).await }));
                 }

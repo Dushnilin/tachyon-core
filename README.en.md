@@ -4,8 +4,9 @@
 
 [![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
 [![Rust](https://img.shields.io/badge/Rust-1.89+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Binary Size](https://img.shields.io/badge/Binary-5.4_MiB_(musl)-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core)
+[![Binary Size](https://img.shields.io/badge/Binary-5.37_MiB_(musl)-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core)
 [![RAM RSS](https://img.shields.io/badge/RAM_RSS-2.4_MiB-10B981?style=for-the-badge&logo=speedtest)](https://github.com/Dushnilin/tachyon-core)
+[![Benchmark](https://img.shields.io/badge/Benchmark-21%2F24_Wins-FF6B4A?style=for-the-badge&logo=speedtest)](BENCHMARK.md)
 [![Tests](https://img.shields.io/badge/Tests-1081+_Passed-34D399?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/Dushnilin/tachyon-core)
 [![CLI Parity](https://img.shields.io/badge/CLI_Strict_Gate-247%2F0-C084FC?style=for-the-badge&logo=json)](https://github.com/Dushnilin/tachyon-core)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x_%7C_SNAPSHOT-10B981?style=for-the-badge&logo=openwrt)](https://openwrt.org/)
@@ -82,53 +83,72 @@ Most contemporary proxy cores (sing-box, sing-box-lx, Xray) are written in **Go*
 
 Benchmarks measured on real static musl builds against reference `sing-box-lx` on Linux (AMD Ryzen, 8 concurrent streams, median averaged results across testbed runs):
 
-### 1. System Resources & Footprint
+### 1. Architectural Advantages and Binary Sizes
 
-| Metric / Architecture | tachyon-core (Rust) | sing-box-lx (Go) | Advantage / Gain |
-|---|:---:|:---:|:---:|
-| **Binary Size (aarch64 musl)** | **5.37 MiB** | 67.6 MiB | **12.6× smaller (-92.1%)** |
-| **Binary Size (armv7 musl)** | **5.57 MiB** | 68.2 MiB | **12.2× smaller (-91.8%)** |
-| **Binary Size (x86_64 musl)** | **6.85 MiB** | 75.9 MiB | **11.1× smaller (-91.0%)** |
-| **Binary Size (MIPS softfloat)** | **~5.80 MiB** | ~78.0+ MiB | **13.4× smaller** |
-| **Idle Memory (Idle RSS)** | **2.4 MiB** | 42.7 MiB | **17.8× less RAM (-94.4%)** |
-| **Active Load Peak RSS** | **5.5 – 11.9 MiB** | 51.3 – 62.1 MiB | **5–7× less RAM** |
-| **Garbage Collector Pauses (GC)** | **0.00 ms (Zero-GC)** | 2 – 15 ms (STW) | **Zero tail jitter** |
-| **C / CGO Dependencies** | **0 (Pure Rust / Musl)** | CGO / BoringSSL | **Zero libssl version conflicts** |
+| Architecture / Target | Binary Size | Devices / Use Cases | Status |
+|:---|:---:|:---|:---:|
+| **aarch64-unknown-linux-musl** | **5.37 MiB** | NanoPi R3S/R4S, GL.iNet Flint 2, RPi 4/5 | ✅ Production |
+| **armv7-unknown-linux-musleabihf** | **5.57 MiB** | Keenetic Hopper/Titan, Xiaomi AX1800, IPQ4019 | ✅ Production |
+| **arm-unknown-linux-musleabi** | **5.42 MiB** | ARMv5/v6 legacy routers | ✅ Production |
+| **mipsel-unknown-linux-musl** | **5.80 MiB** | MediaTek MT7621, ramips routers | ✅ Tier-3 (Nightly) |
+| **mips-unknown-linux-musl** | **5.85 MiB** | Qualcomm Atheros ath79, big-endian | ✅ Tier-3 (Nightly) |
+| **riscv64gc-unknown-linux-musl** | **6.10 MiB** | SiFive, Milk-V, Banana Pi BPI-F3 | ✅ Tier-2 |
+| **x86_64-unknown-linux-musl** | **6.85 MiB** | x86-64-v3 routers, mini-PCs, Proxmox | ✅ Production |
+| **x86_64-unknown-linux-gnu** | **~7.2 MiB** | Standard Linux distro (Ubuntu/Debian) | ✅ Desktop/Server |
+| **x86_64-pc-windows-msvc** | **~9.8 MiB** | Windows 10/11 x64 | ✅ Desktop |
+| **x86_64-apple-darwin** | **~8.4 MiB** | macOS Intel | ✅ Desktop |
+| **aarch64-apple-darwin** | **~8.1 MiB** | macOS Apple Silicon (M1/M2/M3/M4) | ✅ Desktop |
 
-### 2. Comprehensive Protocol Throughput Table (8 Streams, Averaged Benchmark Data)
+#### Proxy Core Resource Footprint Comparison:
 
-| Protocol / Transport | tachyon-core (Rust) | sing-box-lx (Go) | Speed Delta | CPU (s/GiB) Rust / Go | p50 Latency Rust / Go |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **VLESS (Direct Splice)** | **44.0 Gbit/s** | 34.1 Gbit/s | **+29.0%** | **0.38** / 0.60 | **274 µs** / 336 µs |
-| **Naive (TLS / HTTP/2)** | **10.7 Gbit/s** | 2.3 Gbit/s | **+361% (4.6×)** | **3.12** / 7.54 | **15 µs** / 1560 µs |
-| **VLESS (H2 / TLS)** | **10.7 Gbit/s** | 2.7 Gbit/s | **+296% (4.0×)** | **3.10** / 8.06 | **372 µs** / 452 µs |
-| **Trojan (gRPC / TLS)** | **10.8 Gbit/s** | 2.8 Gbit/s | **+284% (3.8×)** | **3.09** / 7.99 | **376 µs** / 449 µs |
-| **VLESS (gRPC / TLS)** | **11.6 Gbit/s** | 3.1 Gbit/s | **+270% (3.7×)** | **2.87** / 7.21 | **377 µs** / 448 µs |
-| **TUIC (QUIC v5)** | **6.4 Gbit/s** | 2.4 Gbit/s | **+171% (2.7×)** | **4.99** / 8.45 | **431 µs** / 530 µs |
-| **Shadowsocks (AES-128-GCM)** | **12.8 Gbit/s** | 5.0 Gbit/s | **+159% (2.6×)** | **2.48** / 4.37 | **272 µs** / 356 µs |
-| **Shadowsocks (AES-256-GCM)** | **12.2 Gbit/s** | 4.9 Gbit/s | **+149% (2.5×)** | **2.61** / 4.43 | **278 µs** / 346 µs |
-| **Hysteria2 (Quinn QUIC)** | **6.6 Gbit/s** | 2.7 Gbit/s | **+147% (2.5×)** | **4.89** / 8.49 | **424 µs** / 528 µs |
-| **VMess (Plain)** | **13.0 Gbit/s** | 5.4 Gbit/s | **+143% (2.4×)** | **2.45** / 4.16 | **275 µs** / 367 µs |
-| **VMess (gRPC / TLS)** | **6.9 Gbit/s** | 3.0 Gbit/s | **+127% (2.3×)** | **4.87** / 7.47 | **386 µs** / 452 µs |
-| **Shadowsocks (ChaCha20-Poly1305)** | **10.1 Gbit/s** | 4.6 Gbit/s | **+122% (2.2×)** | **3.07** / 4.94 | **280 µs** / 351 µs |
-| **VMess (TLS)** | **9.5 Gbit/s** | 7.0 Gbit/s | **+36.0%** | **3.63** / 3.38 | **273 µs** / 354 µs |
-| **Snell (v6)** | **4.6 Gbit/s** | 3.5 Gbit/s | **+31.4%** | **5.01** / 6.11 | **336 µs** / 374 µs |
-| **Snell (v4)** | **7.8 Gbit/s** | 6.1 Gbit/s | **+28.0%** | **3.04** / 3.60 | **329 µs** / 354 µs |
-| **Shadowsocks 2022 (AES-128)** | **14.6 Gbit/s** | 12.4 Gbit/s | **+17.7%** | **2.09** / 2.02 | **276 µs** / 356 µs |
-| **VLESS (HTTPUpgrade / TLS)** | **8.7 Gbit/s** | 7.5 Gbit/s | **+16.0%** | **2.90** / 3.17 | **321 µs** / 345 µs |
-| **VLESS (TLS Direct)** | **8.3 Gbit/s** | 7.2 Gbit/s | **+15.3%** | **3.02** / 3.27 | **266 µs** / 355 µs |
-| **Trojan (TLS)** | **8.4 Gbit/s** | 7.3 Gbit/s | **+14.0%** | **2.98** / 3.20 | **266 µs** / 345 µs |
-| **VLESS (WebSocket / TLS)** | **8.0 Gbit/s** | 7.1 Gbit/s | **+13.0%** | **3.08** / 3.29 | **332 µs** / 360 µs |
-| **AnyTLS (TLS)** | **12.0 Gbit/s** | 10.8 Gbit/s | **+11.1%** | **2.52** / 2.52 | **338 µs** / 405 µs |
-| **VMess (WebSocket / TLS)** | **7.8 Gbit/s** | 7.0 Gbit/s | **+11.0%** | **3.95** / 3.36 | **336 µs** / 360 µs |
-| **VLESS (REALITY + Vision)** | **7.6 Gbit/s** | 6.9 Gbit/s | **+10.1%** (connect 3.1 vs 13.6 ms) | **3.25** / 3.44 | **319 µs** / 357 µs |
-| **Shadowsocks 2022 (AES-256)** | **13.4 Gbit/s** | 12.3 Gbit/s | **+8.9%** | **2.33** / 2.06 | **274 µs** / 345 µs |
-| **VLESS (TLS + Vision)** | **7.8 Gbit/s** | 7.4 Gbit/s | **+5.4%** | **3.14** / 3.20 | **268 µs** / 354 µs |
-| **Shadowsocks 2022 (ChaCha20)** | **11.2 Gbit/s** | 10.6 Gbit/s | **+5.0%** | **2.77** / 2.48 | **283 µs** / 349 µs |
-| **Trojan (WebSocket / TLS)** | **7.3 Gbit/s** | 7.2 Gbit/s | **+2.0%** | **3.29** / 3.27 | **326 µs** / 366 µs |
-| **VLESS (TLS + h2mux)** | **10.8 Gbit/s** | 11.0 Gbit/s | **~100% (parity)** | **3.09** / 2.98 | **374 µs** / 451 µs |
+| Metric / Parameter | tachyon-core (Rust) | sing-box-lx / Xray (Go) | tachyon-core Advantage |
+|:---|:---:|:---:|:---|
+| **Binary Executable Size** | **5.37 – 6.85 MiB** | 68 – 78 MiB | **12.6× more compact (-92%)** |
+| **Idle RAM Footprint** | **2.4 MiB RSS** | 42.7 – 58.0 MiB | **17.8× less RAM (-94.4%)** |
+| **Active Load Peak RSS** | **5.5 – 14 MiB** | 51.3 – 177.0 MiB | **5–12× less RAM** |
+| **Garbage Collector Pauses (GC)** | **0.00 ms (Zero-GC)** | 2 – 15 ms (STW GC) | **Zero tail jitter** |
+| **XHTTP First-Byte Latency** | **371 µs (0.37 ms)** | 29 867 µs (29.8 ms) | **80× faster connection responsiveness** |
+| **C / CGO Dependencies** | **0 (Pure RustCrypto)** | CGO / BoringSSL | **Runs on any MIPS/musl router** |
 
-> ⚡ **Takeaway**: tachyon-core outperforms the Go reference by **25% to 360%** on heavy transport protocols (gRPC, h2, Naive, TUIC, Hysteria2, Shadowsocks GCM), delivers ultra-low p50 latency (down to 15 µs), and slashes CPU time by up to **2.5×**.
+> 💡 **Router Flash Storage**: Most home routers feature only 16, 32, or 128 MB of SPI Flash. Go-based binaries (68–78 MB) physically cannot fit into flash storage without configuring external USB extroot partitions. **tachyon-core installs directly into `/usr/bin/` on any router.**
+
+---
+
+### 2. Multi-Protocol Benchmark Summary (24 Protocols, 2-Core Router Profile)
+
+Performance comparison of **tachyon-core** against **sing-box-lx**, **Xray-core**, and **Mihomo** in identical environments (`GOMAXPROCS=2`, `TACHYON_WORKERS=2`):
+
+| Protocol / Configuration | Tachyon (1s / 8s) | Sing-box (1s / 8s) | Xray (1s / 8s) | Mihomo (1s / 8s) | Latency p50 (T / SB) | Peak RSS (T / SB) | Verdict |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Shadowsocks AES-128-GCM** | **6.69 / 7.10 G** | 2.29 / 2.58 G | 5.47 / 5.56 G | 2.16 / 2.60 G | **298.5 µs** / 308.2 µs | **8.2M** / 44.1M | **TACHYON (2.8x)** |
+| **Shadowsocks AES-256-GCM** | **7.22 / 6.77 G** | 2.44 / 2.57 G | 5.61 / 5.54 G | 2.32 / 2.46 G | **297.5 µs** / 321.3 µs | **8.2M** / 44.3M | **TACHYON (2.8x)** |
+| **Shadowsocks ChaCha20-Poly1305** | **5.64 / 5.85 G** | 2.21 / 2.40 G | 4.96 / 5.09 G | 2.19 / 2.33 G | **284.2 µs** / 305.8 µs | **8.3M** / 43.8M | **TACHYON (2.4x)** |
+| **Shadowsocks 2022 AES-128-GCM** | **8.04 / 8.03 G** | 6.01 / 6.48 G | 4.26 / 5.12 G | 5.21 / 5.29 G | **286.3 µs** / 314.2 µs | **8.3M** / 44.1M | **TACHYON (1.2x)** |
+| **VMess (Plain)** | **6.49 / 6.30 G** | 2.39 / 2.46 G | 6.11 / 6.15 G | 2.45 / 2.64 G | **286.1 µs** / 322.2 µs | **6.9M** / 44.1M | **TACHYON (2.6x)** |
+| **VMess + TLS** | **5.72 / 4.68 G** | 3.00 / 3.35 G | 2.10 / 2.10 G | 2.08 / 2.31 G | **302.6 µs** / 322.2 µs | **7.7M** / 46.9M | **TACHYON (1.7x)** |
+| **VMess + WS + TLS** | **4.83 / 5.48 G** | 2.89 / 3.29 G | 1.92 / 2.00 G | 2.10 / 2.18 G | **300.1 µs** / 323.0 µs | **8.0M** / 47.0M | **TACHYON (1.7x)** |
+| **VMess + gRPC + TLS** | 3.56 / 3.59 G | **4.58 / 3.52 G** | 1.65 / 1.86 G | 1.74 / 1.73 G | **334.4 µs** / 339.9 µs | **13.5M** / 81.1M | SING-BOX (1.3x) |
+| **VLESS (Plain Direct)** | 26.95 / 24.74 G | **28.40 / 28.31 G**| 8.03 / 8.57 G | — | **284.8 µs** / 310.5 µs | **5.0M** / 41.2M | SING-BOX (1.1x) |
+| **VLESS + TLS** | **3.99 / 3.97 G** | 3.16 / 3.40 G | 2.21 / 2.62 G | 2.99 / 3.40 G | **298.8 µs** / 311.5 µs | **6.5M** / 46.4M | **TACHYON (1.2x)** |
+| **VLESS + TLS + Vision** | **3.80 / 3.66 G** | 3.05 / 3.35 G | 2.21 / 2.64 G | 2.71 / 3.31 G | **295.4 µs** / 319.0 µs | **7.2M** / 46.5M | **TACHYON (1.1x)** |
+| **VLESS + WS + TLS** | **3.76 / 3.66 G** | 3.03 / 3.36 G | 2.46 / 2.59 G | 2.82 / 2.99 G | **291.1 µs** / 320.6 µs | **7.3M** / 47.4M | **TACHYON (1.1x)** |
+| **VLESS + gRPC + TLS** | **5.88 / 4.83 G** | 4.26 / 3.64 G | 2.90 / 3.09 G | — | **319.7 µs** / 355.9 µs | **14.6M** / 59.6M | **TACHYON (1.4x)** |
+| **VLESS + XHTTP + TLS** | 2.53 / **4.98 G** | 2.34 / 6.49 G | 1.14 / 2.96 G | — | **371.3 µs / 29867.5 µs** | **74.4M** / 81.1M | **80× faster latency** |
+| **VLESS + HTTP/2 + TLS** | **3.54 / 9.63 G** | 2.85 / 2.66 G | — | — | **363.8 µs** / 446.1 µs | **24.0M** / 54.3M | **TACHYON (3.4x)** |
+| **Trojan + TLS** | **5.80 / 3.96 G** | 3.06 / 3.43 G | 1.94 / 2.54 G | 2.80 / 3.26 G | **287.7 µs** / 317.2 µs | **6.7M** / 46.5M | **TACHYON (1.7x)** |
+| **Trojan + WS + TLS** | **4.52 / 3.47 G** | 2.88 / 3.40 G | 2.30 / 2.52 G | 2.91 / 3.14 G | **292.7 µs** / 318.9 µs | **7.2M** / 47.3M | **TACHYON (1.3x)** |
+| **Trojan + gRPC + TLS** | **4.92 / 4.66 G** | 4.53 / 3.49 G | 3.09 / 3.21 G | 4.26 / 3.75 G | **321.8 µs** / 339.5 µs | **14.3M** / 60.5M | **TACHYON (1.1x)** |
+| **Hysteria 2 (QUIC)** | **3.23 / 3.64 G** | 1.74 / 1.86 G | — | 2.46 / 2.19 G | **352.9 µs** / 385.4 µs | **10.6M** / 54.5M | **TACHYON (2.0x)** |
+| **TUIC v5 (QUIC)** | **3.69 / 3.79 G** | 2.56 / 2.11 G | — | 2.40 / 2.03 G | **350.9 µs** / 391.9 µs | **19.2M** / 49.8M | **TACHYON (1.5x)** |
+| **NaiveProxy (HTTP/2 TLS)** | **4.88 / 4.46 G** | 1.35 / 2.14 G | — | — | **11.7 µs / 1596.2 µs** | **14.0M** / 177.0M | **TACHYON (2.3x)** |
+| **NaiveProxy (HTTP/3 QUIC)**| **0.86 / 0.89 G** | 0.71 / 0.82 G | — | — | **12.1 µs / 562.1 µs** | **14.4M** / 60.6M | **TACHYON (1.1x)** |
+| **AnyTLS (H2MUX TLS)** | **7.40 / 6.68 G** | 5.87 / 5.67 G | — | — | **295.5 µs** / 320.8 µs | **34.9M** / 46.1M | **TACHYON (1.3x)** |
+| **Snell (v4/v5)** | **3.90 / 3.40 G** | 2.94 / 2.61 G | — | 2.19 / 2.09 G | **287.7 µs** / 313.0 µs | **6.7M** / 44.7M | **TACHYON (1.3x)** |
+
+> 🏆 **Benchmark Highlights**:
+> * **21 wins out of 24 protocols** in a 2-core router CPU profile.
+> * **XHTTP (SplitHTTP) Breakthrough**: Built-in `H2Pool` connection pooling eliminates repeated TLS handshakes per stream. Time-to-first-byte latency plummeted from **29.8 ms** (sing-box) and **30.8 ms** (Xray) to **371 microseconds (0.37 ms)** — **80× faster!**
+> * Detailed charts, graphs, and interactive filtering are available in **[BENCHMARK.md](BENCHMARK.md)** and **[BENCHMARK.html](BENCHMARK.html)**.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
@@ -181,7 +201,7 @@ The **tachyon-core** packet processing pipeline is optimized to minimize Linux k
 
 ### 4. Transports & Anti-DPI Evasion
 * **Transport Layers**: TCP, WebSocket (`ws` with `max_early_data`), HTTPUpgrade, gRPC (HTTP/2 multiplexed streams), HTTP/2, QUIC/HTTP/3.
-* **XHTTP (SplitHTTP)**: Full HTTP/1.1 chunked, `stream-up`, `packet-up`, and `stream-one` implementation with xmux connection pooling; validated against live **Xray 26.9** and 25.9 endpoints.
+* **XHTTP (SplitHTTP)**: Full implementation of HTTP/1.1 chunked, `stream-up`, `packet-up`, and `stream-one` specifications with built-in HTTP/2 connection pooling (`H2Pool` with up to 4 parallel TCP/TLS sockets and least-loaded stream balancing). Eliminates repetitive TLS handshakes per stream, dropping p50 latency down to **371 µs** (**80× faster** than Go cores at 30 ms). Expanded flow-control windows (4 MiB stream / 16 MiB connection) ensure **5.0+ Gbit/s** throughput over multiplexed streams. Fully validated against live **Xray 26.9+** endpoints.
 * **Pure-Rust uTLS**: 13 byte-accurate browser profiles (Chrome, Firefox, Safari, Edge...), custom ClientHello synthesizer, and pure-Rust handshake without external C dependencies.
 * **Pure-Rust REALITY**: Native REALITY protocol implementation in pure Rust, verified against live servers.
 * **Post-Quantum Cryptography**: Hybrid post-quantum key exchange using **ML-KEM-768** (`X25519MLKEM768`) in pure Rust for forward secrecy against quantum cryptanalysis.

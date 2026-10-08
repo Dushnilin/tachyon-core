@@ -573,12 +573,14 @@ fn read_domain_matcher(
     let _version = reader.u8()?;
     let leaves = reader.u64_slice()?;
     let label_bitmap = reader.u64_slice()?;
-    let labels = reader.bytes()?;
-    let set = SuccinctSet {
-        leaves,
-        label_bitmap,
-        labels,
-    };
+        let labels = reader.bytes()?;
+        let ranks = index_ranks(&label_bitmap);
+        let set = SuccinctSet {
+            leaves,
+            label_bitmap,
+            labels,
+            ranks,
+        };
     let mut domains: Vec<String> = Vec::new();
     let mut prefixes: Vec<String> = Vec::new();
     for key in set.keys()? {
@@ -622,6 +624,11 @@ struct SuccinctSet {
     leaves: Vec<u64>,
     label_bitmap: Vec<u64>,
     labels: Vec<u8>,
+    /// `ranks[w]` — ones before word `w`; `ranks[words]` is the total count.
+    /// The reference keeps the same table (`indexRank64`) so that rank/select
+    /// stay O(1)/O(log words): a plain scan per edge is quadratic and the
+    /// hagezi-class sets take minutes on a router.
+    ranks: Vec<u64>,
 }
 
 impl SuccinctSet {
@@ -670,10 +677,12 @@ impl SuccinctSet {
             label_index += 1;
             index += 1;
         }
+        let ranks = index_ranks(&label_bitmap);
         Self {
             leaves,
             label_bitmap,
             labels,
+            ranks,
         }
     }
 
@@ -701,9 +710,8 @@ impl SuccinctSet {
                 return;
             };
             current.push(label);
-            let next_node = count_zeros(&self.label_bitmap, cursor + 1);
-            let next_bitmap = match select_ith_one(&self.label_bitmap, next_node.saturating_sub(1))
-            {
+            let next_node = self.count_zeros(cursor + 1);
+            let next_bitmap = match self.select_ith_one(next_node.saturating_sub(1)) {
                 Some(index) => index + 1,
                 None => {
                     current.pop();
@@ -714,6 +722,34 @@ impl SuccinctSet {
             current.pop();
             cursor += 1;
         }
+    }
+
+    /// The rank index: ones before each word, plus the total.
+    fn count_zeros(&self, index: usize) -> usize {
+        let word = index >> 6;
+        let bit = index & 63;
+        let mask = if bit == 0 { 0 } else { u64::MAX >> (64 - bit) };
+        let ones = self.ranks[word] + (self.label_bitmap[word] & mask).count_ones() as u64;
+        index - ones as usize
+    }
+
+    /// The position of the `index`-th set bit: the rank table turns the
+    /// word walk into a binary search.
+    fn select_ith_one(&self, index: usize) -> Option<usize> {
+        let word = self
+            .ranks
+            .partition_point(|rank| *rank <= index as u64)
+            - 1;
+        let mut rest = index - self.ranks[word] as usize;
+        let mut bits = self.label_bitmap[word];
+        while bits != 0 {
+            if rest == 0 {
+                return Some((word << 6) + bits.trailing_zeros() as usize);
+            }
+            bits &= bits - 1;
+            rest -= 1;
+        }
+        None
     }
 }
 
@@ -733,42 +769,15 @@ fn get_bit(bits: &[u64], index: usize) -> u64 {
     (bits[word] >> (index & 63)) & 1
 }
 
-/// `countZeros(bm, i)` = `i - popcount(bm[0..i))`.
-fn count_zeros(bits: &[u64], index: usize) -> usize {
-    let mut ones = 0usize;
-    for (word_index, word) in bits.iter().enumerate() {
-        let start = word_index * 64;
-        if start >= index {
-            break;
-        }
-        let end = (index - start).min(64);
-        let mask = if end == 0 {
-            0
-        } else if end >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << end) - 1
-        };
-        ones += (word & mask).count_ones() as usize;
+fn index_ranks(bitmap: &[u64]) -> Vec<u64> {
+    let mut ranks = Vec::with_capacity(bitmap.len() + 1);
+    let mut total = 0u64;
+    for word in bitmap {
+        ranks.push(total);
+        total += word.count_ones() as u64;
     }
-    index - ones
-}
-
-/// `selectIthOne(bm, i)`: the bit index of the `i`-th set bit.
-fn select_ith_one(bits: &[u64], index: usize) -> Option<usize> {
-    let mut seen = 0usize;
-    for (word_index, word) in bits.iter().enumerate() {
-        let mut word = *word;
-        while word != 0 {
-            let bit = word.trailing_zeros() as usize;
-            if seen == index {
-                return Some(word_index * 64 + bit);
-            }
-            seen += 1;
-            word &= word - 1;
-        }
-    }
-    None
+    ranks.push(total);
+    ranks
 }
 
 // ------------------------------------------------------------- ip encoding

@@ -345,40 +345,48 @@ impl H2Pool {
 
     pub(crate) async fn acquire(&self, max_conns: usize) -> H2Acquire {
         loop {
-            let mut guard = self.state.lock().await;
-            let mut i = 0;
-            while i < guard.clients.len() {
-                let client = guard.clients[i].client.clone();
-                match client.ready().await {
-                    Ok(_) => {
-                        i += 1;
-                    }
-                    Err(_) => {
-                        guard.clients.remove(i);
-                    }
+            let (candidate, active_streams) = {
+                let mut guard = self.state.lock().await;
+
+                if guard.clients.len() + guard.active_dials < max_conns {
+                    guard.active_dials += 1;
+                    return H2Acquire::NeedDial;
+                }
+
+                if guard.clients.is_empty() {
+                    drop(guard);
+                    self.notify.notified().await;
+                    continue;
+                }
+
+                let (_idx, best) = guard
+                    .clients
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, c)| c.active_streams.load(std::sync::atomic::Ordering::Relaxed))
+                    .expect("non-empty");
+
+                let client = best.client.clone();
+                let active = best.active_streams.clone();
+                active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (client, active)
+            };
+
+            let mut client = candidate;
+            match client.ready().await {
+                Ok(_) => {
+                    return H2Acquire::Ready(client, active_streams);
+                }
+                Err(_) => {
+                    active_streams.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut guard = self.state.lock().await;
+                    guard
+                        .clients
+                        .retain(|c| !std::sync::Arc::ptr_eq(&c.active_streams, &active_streams));
+                    drop(guard);
+                    self.notify.notify_waiters();
                 }
             }
-
-            if guard.clients.len() + guard.active_dials < max_conns {
-                guard.active_dials += 1;
-                return H2Acquire::NeedDial;
-            }
-
-            if let Some(pos) = guard
-                .clients
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, c)| c.active_streams.load(std::sync::atomic::Ordering::Relaxed))
-                .map(|(idx, _)| idx)
-            {
-                let best = &guard.clients[pos];
-                best.active_streams
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return H2Acquire::Ready(best.client.clone(), best.active_streams.clone());
-            }
-
-            drop(guard);
-            self.notify.notified().await;
         }
     }
 
@@ -504,11 +512,7 @@ impl XhttpConfig {
 
         let acq = self.h2_pool.acquire(8).await;
         match acq {
-            H2Acquire::Ready(client, counter) => {
-                let mut send_req = client
-                    .ready()
-                    .await
-                    .map_err(|e| io::Error::other(format!("xhttp: h2 ready: {e}")))?;
+            H2Acquire::Ready(mut send_req, counter) => {
                 let (response, send) = send_req
                     .send_request(request, false)
                     .map_err(|e| io::Error::other(format!("xhttp: send_request: {e}")))?;
@@ -948,7 +952,8 @@ struct SplitConn {
     session_id: String,
 }
 
-type InFlight = Option<Pin<Box<dyn Future<Output = io::Result<(PostWriter, usize)>> + Send>>>;
+type InFlight =
+    Option<tokio::sync::oneshot::Receiver<io::Result<(PostWriter, usize)>>>;
 
 /// One packet-up write in progress: the writer plus its bounded POST run.
 struct PacketsState {
@@ -1037,16 +1042,9 @@ async fn pump(mut body: h1io::Body, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let n = match body.read(&mut buf).await {
-            Ok(0) => {
-                crate::logging::debug(format_args!("xhttp pump: eof"));
-                break;
-            }
-            Ok(n) => {
-                crate::logging::debug(format_args!("xhttp pump: read {n} bytes"));
-                n
-            }
+            Ok(0) => break,
+            Ok(n) => n,
             Err(e) => {
-                crate::logging::debug(format_args!("xhttp pump: err {e}"));
                 let _ = tx.send(Err(e)).await;
                 return;
             }
@@ -1072,19 +1070,9 @@ impl AsyncRead for XhttpConn {
                 return Poll::Ready(Ok(()));
             }
             match ready!(split.dl.poll_recv(cx)) {
-                Some(Ok(chunk)) => {
-                    let hx: String = chunk.iter().take(8).map(|b| format!("{b:02x}")).collect();
-                    crate::logging::debug(format_args!("xhttp: dl {} bytes [{}]", chunk.len(), hx));
-                    split.pending.extend_from_slice(&chunk)
-                }
-                Some(Err(e)) => {
-                    crate::logging::debug(format_args!("xhttp: dl err {e}"));
-                    return Poll::Ready(Err(e));
-                }
-                None => {
-                    crate::logging::debug(format_args!("xhttp: dl eof"));
-                    return Poll::Ready(Ok(()));
-                } // EOF
+                Some(Ok(chunk)) => split.pending.extend_from_slice(&chunk),
+                Some(Err(e)) => return Poll::Ready(Err(e)),
+                None => return Poll::Ready(Ok(())), // EOF
             }
         }
     }
@@ -1116,30 +1104,34 @@ impl AsyncWrite for XhttpConn {
                 if state.in_flight.is_none() {
                     let writer = state.writer.take().expect("post writer present");
                     let data = buf.to_vec();
-                    let hx: String = data.iter().take(8).map(|b| format!("{b:02x}")).collect();
-                    crate::logging::debug(format_args!(
-                        "xhttp: wr {} bytes [{}] -> packets",
-                        data.len(),
-                        hx
-                    ));
-                    state.in_flight =
-                        Some(Box::pin(async move { write_packets(writer, data).await }));
+                    // The POST runs on its own task: rustls reports a write as
+                    // done once the plaintext is buffered (tokio-rustls
+                    // `poll_write` returns Ready while the TLS record flush is
+                    // still Pending), so nothing is guaranteed to poll us
+                    // again -- the upload must not depend on that.
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        let _ = tx.send(write_packets(writer, data).await);
+                    });
+                    state.in_flight = Some(rx);
                 }
-                match state
-                    .in_flight
-                    .as_mut()
-                    .expect("set above")
-                    .as_mut()
-                    .poll(cx)
+                match std::future::Future::poll(
+                    Pin::new(state.in_flight.as_mut().expect("set above")),
+                    cx,
+                )
                 {
-                    Poll::Ready(Ok((writer, n))) => {
+                    Poll::Ready(Ok(Ok((writer, n)))) => {
                         state.writer = Some(writer);
                         state.in_flight = None;
                         Poll::Ready(Ok(n.min(buf.len())))
                     }
-                    Poll::Ready(Err(e)) => {
+                    Poll::Ready(Ok(Err(e))) => {
                         state.in_flight = None;
                         Poll::Ready(Err(e))
+                    }
+                    Poll::Ready(Err(_recv)) => {
+                        state.in_flight = None;
+                        Poll::Ready(Err(io::Error::other("xhttp: upload task gone")))
                     }
                     Poll::Pending => Poll::Pending,
                 }

@@ -182,6 +182,17 @@ def measure_throughput(streams, seconds, pid):
     return round(got * 8 / elapsed / 1e9, 2), per_gib
 
 
+def wait_port_free(port, timeout=4.0):
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
+                time.sleep(0.02)
+        except OSError:
+            return True
+    return False
+
+
 def wait_listen(port, timeout=12):
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout:
@@ -371,6 +382,55 @@ def get_cases(certs):
             },
             "client_mihomo": {"type": "vless", "uuid": UUID, "network": "grpc", "tls": True, "skip-cert-verify": True, "servername": "127.0.0.1", "grpc-opts": {"grpc-service-name": "bench"}},
         },
+        {
+            "id": "vless-xhttp-tls",
+            "cat": "VLESS",
+            "name": "VLESS + XHTTP + TLS",
+            "server_type": "xray",
+            "server_xray": {
+                "protocol": "vless",
+                "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "tls",
+                    "xhttpSettings": {"path": "/bench"},
+                    "tlsSettings": {"certificates": [{"certificateFile": c, "keyFile": k}]}
+                }
+            },
+            "client_sb": {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "tls": tls_c, "transport": {"type": "xhttp", "path": "/bench"}},
+            "client_xray": {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "encryption": "none"}]}]},
+                "streamSettings": dict(tls_xray, network="xhttp", xhttpSettings={"path": "/bench"})
+            },
+            "client_mihomo": None,
+        },
+        {
+            "id": "vless-httpupgrade-tls",
+            "cat": "VLESS",
+            "name": "VLESS + HTTPUpgrade + TLS",
+            "server": {"type": "vless", "users": [{"name": "u", "uuid": UUID}], "tls": tls_s, "transport": {"type": "httpupgrade", "path": "/bench"}},
+            "client_sb": {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "tls": tls_c, "transport": {"type": "httpupgrade", "path": "/bench"}},
+            "client_xray": {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "encryption": "none"}]}]},
+                "streamSettings": dict(tls_xray, network="httpupgrade", httpupgradeSettings={"path": "/bench"})
+            },
+            "client_mihomo": {"type": "vless", "uuid": UUID, "network": "httpupgrade", "tls": True, "skip-cert-verify": True, "servername": "127.0.0.1", "httpupgrade-opts": {"path": "/bench"}},
+        },
+        {
+            "id": "vless-h2-tls",
+            "cat": "VLESS",
+            "name": "VLESS + HTTP/2 + TLS",
+            "server": {"type": "vless", "users": [{"name": "u", "uuid": UUID}], "tls": tls_s, "transport": {"type": "http", "path": "/bench"}},
+            "client_sb": {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "tls": tls_c, "transport": {"type": "http", "path": "/bench"}},
+            "client_xray": {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "encryption": "none"}]}]},
+                "streamSettings": dict(tls_xray, network="h2", httpSettings={"path": "/bench"})
+            },
+            "client_mihomo": {"type": "vless", "uuid": UUID, "network": "h2", "tls": True, "skip-cert-verify": True, "servername": "127.0.0.1", "h2-opts": {"path": "/bench"}},
+        },
 
         # --- Trojan ---
         {
@@ -442,6 +502,15 @@ def get_cases(certs):
             "client_mihomo": None,
         },
         {
+            "id": "naive-quic",
+            "cat": "QUIC / H2",
+            "name": "NaiveProxy (HTTP/3 QUIC)",
+            "server": {"type": "naive", "users": [{"username": "naive-user", "password": "naive-secret"}], "tls": tls_s},
+            "client_sb": {"type": "naive", "server": "127.0.0.1", "server_port": SERVER_PORT, "username": "naive-user", "password": "naive-secret", "quic": True, "tls": {"enabled": True, "server_name": "127.0.0.1", "certificate_path": c}},
+            "client_xray": None,
+            "client_mihomo": None,
+        },
+        {
             "id": "anytls",
             "cat": "QUIC / H2",
             "name": "AnyTLS (H2MUX TLS)",
@@ -464,8 +533,29 @@ def get_cases(certs):
 
 
 # ---------------------------------------------------------------- proxy launcher
-def launch_server(ref_bin, srv_inbound, server_cpus, workers=None):
+def launch_server(ref_bin, case, server_cpus, workers=None, xray_bin=None):
+    wait_port_free(SERVER_PORT)
     d = tempfile.mkdtemp(prefix="proto_srv_")
+
+    if case.get("server_type") == "xray" and xray_bin:
+        cfg_path = os.path.join(d, "config.json")
+        inbound = dict(case["server_xray"], port=SERVER_PORT, listen="127.0.0.1")
+        cfg = {
+            "log": {"loglevel": "error"},
+            "inbounds": [inbound],
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+        }
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        env = os.environ.copy()
+        if workers:
+            env["GOMAXPROCS"] = str(workers)
+        pre = (lambda: os.sched_setaffinity(0, server_cpus)) if hasattr(os, "sched_setaffinity") else None
+        proc = subprocess.Popen([xray_bin, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
+        wait_listen(SERVER_PORT)
+        return proc, d
+
+    srv_inbound = case["server"]
     cfg_path = os.path.join(d, "config.json")
     # Bind to :: so both IPv4 127.0.0.1 and IPv6 ::1 are bound
     inbound = dict(srv_inbound, tag="srv-in", listen="::", listen_port=SERVER_PORT)
@@ -634,14 +724,32 @@ def generate_html_report(results, profile, out_path):
     ref_wins = 0
     ties = 0
 
+    cat_counts = {}
+    xhttp_count = 0
+    for r in results:
+        cat = r.get("cat", "Other")
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        if "xhttp" in r.get("id", ""):
+            xhttp_count += 1
+
+    def fmt_lat(us):
+        if not us or us <= 0:
+            return "—"
+        if us >= 1000:
+            return f"{us/1000:.1f}ms"
+        return f"{us:.0f}µs"
+
     rows = ""
     for r in results:
+        cid = r["id"]
+        cname = r["name"]
+        cat = r.get("cat", "Other")
+
         t_data = r.get("tachyon")
         s_data = r.get("sing-box")
         x_data = r.get("xray")
         m_data = r.get("mihomo")
 
-        # Find max speed in this row for bar scaling
         speeds = []
         for d in (t_data, s_data, x_data, m_data):
             if d and d.get("status") == "OK":
@@ -650,24 +758,41 @@ def generate_html_report(results, profile, out_path):
 
         def ctd(cdata, is_t=False):
             if not cdata:
-                return "<td class='empty'>—</td>"
+                return "<td class='num none'>—</td>"
             if cdata.get("status") != "OK":
-                return "<td class='fail'>FAIL</td>"
+                err = cdata.get("error", "FAIL")
+                return f"<td class='num fail' title='{err}'>FAIL</td>"
             t1 = cdata.get("tput_1", 0)
             t8 = cdata.get("tput_8", 0)
             p50 = cdata.get("p50_us", 0)
             peak = cdata.get("peak_rss_mib", 0)
             spd = max(t1, t8)
             pct = int(min(100, max(5, spd / max_row_spd * 100)))
-            bar_color = "#3fb950" if is_t else "#58a6ff"
-            return f"""<td>
-              <div class='val-row'><span class='spd'>{t1:.1f} / {t8:.1f}</span> <span class='unit'>Gbps</span></div>
+            bar_color = "var(--win-ink)" if is_t else "var(--accent)"
+            
+            diff_badge = ""
+            if not is_t and t_data and t_data.get("status") == "OK":
+                t_spd = max(t_data.get("tput_1", 0), t_data.get("tput_8", 0))
+                if spd > 0:
+                    ratio = t_spd / spd
+                    if ratio >= 1.05:
+                        diff_badge = f"<span class='diff win'>+{int((ratio-1)*100)}%</span>"
+                    elif ratio <= 0.95:
+                        diff_badge = f"<span class='diff loss'>-{int((1/ratio-1)*100)}%</span>"
+                    else:
+                        diff_badge = "<span class='diff tie'>~0%</span>"
+
+            return f"""<td class='num {"col-t-cell" if is_t else ""}'>
+              <div class='val-row'>
+                <span class='spd'>{t1:.2f}/{t8:.2f}<span class='unit'>G</span></span>
+                <span class='sub'>{fmt_lat(p50)} &bull; {peak:.1f}M</span>
+                {diff_badge}
+              </div>
               <div class='bar-bg'><div class='bar-fill' style='width:{pct}%;background:{bar_color}'></div></div>
-              <div class='sub'>{p50:.0f} µs &bull; {peak:.1f} MB</div>
             </td>"""
 
-        # verdict
-        win_badge = "<span class='badge tie'>—</span>"
+        row_status = "none"
+        win_badge = "<span class='vpill none'>нет данных</span>"
         if t_data and t_data.get("status") == "OK":
             t_total += 1
             t_speed = max(t_data.get("tput_1", 0), t_data.get("tput_8", 0))
@@ -682,152 +807,256 @@ def generate_html_report(results, profile, out_path):
             if best_ref > 0:
                 ratio = t_speed / best_ref
                 if ratio >= 1.05:
-                    win_badge = f"<span class='badge win'>TACHYON +{int((ratio-1)*100)}%</span>"
+                    win_badge = f"<span class='vpill win'>TACHYON +{int((ratio-1)*100)}%</span>"
                     t_wins += 1
+                    row_status = "win"
                 elif ratio <= 0.95:
-                    win_badge = f"<span class='badge loss'>{best_name.upper()} +{int((1/ratio-1)*100)}%</span>"
+                    win_badge = f"<span class='vpill loss'>{best_name.upper()} +{int((1/ratio-1)*100)}%</span>"
                     ref_wins += 1
+                    row_status = "loss"
                 else:
-                    win_badge = "<span class='badge tie'>TIE</span>"
+                    win_badge = "<span class='vpill tie'>ПАРИТЕТ</span>"
                     ties += 1
+                    row_status = "tie"
             else:
-                win_badge = "<span class='badge win'>TACHYON ONLY</span>"
+                win_badge = "<span class='vpill win'>TACHYON ONLY</span>"
                 t_wins += 1
+                row_status = "win"
 
-        cat = r.get("cat", "Other")
         rows += f"""
-        <tr data-cat='{cat}'>
-          <td class='proto-cell'>
-            <strong>{r['name']}</strong>
-            <div class='cat-tag'>{cat} &bull; {r['id']}</div>
+        <tr class='case {row_status}' data-cat='{cat}' data-k='{cid} {cname.lower()}'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>{cname}</span>
+              <span class='cid-tag'>{cid}</span>
+            </div>
           </td>
           {ctd(t_data, is_t=True)}
           {ctd(s_data)}
           {ctd(x_data)}
           {ctd(m_data)}
-          <td>{win_badge}</td>
+          <td class='vd'>{win_badge}</td>
         </tr>
         """
 
-    html = f"""<!DOCTYPE html>
+    cat_buttons = f"<button class='tab on' onclick=\"filterCat('all')\">Все <i>{len(results)}</i></button>"
+    for cname in ("Shadowsocks", "VMess", "VLESS", "Trojan", "QUIC / H2"):
+        if cname in cat_counts:
+            cat_buttons += f"<button class='tab' onclick=\"filterCat('{cname}')\">{cname} <i>{cat_counts[cname]}</i></button>"
+    if xhttp_count > 0:
+        cat_buttons += f"<button class='tab' onclick=\"filterCat('xhttp')\">XHTTP <i>{xhttp_count}</i></button>"
+
+    html = f"""<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>All-Protocol Multi-Proxy Benchmark</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мульти-протокольный бенчмарк: tachyon-core vs sing-box vs Xray vs Mihomo</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0d1117; color: #c9d1d9; padding: 28px; line-height: 1.5; }}
-  .header {{ margin-bottom: 24px; }}
-  h1 {{ font-size: 24px; color: #58a6ff; font-weight: 700; margin-bottom: 6px; }}
-  .subtitle {{ font-size: 13px; color: #8b949e; }}
-  
-  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; max-width: 1300px; }}
-  .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }}
-  .card-title {{ font-size: 11px; text-transform: uppercase; color: #8b949e; font-weight: 600; margin-bottom: 6px; }}
-  .card-value {{ font-size: 26px; font-weight: 700; color: #f0f6fc; font-family: monospace; }}
-  .card-value.green {{ color: #3fb950; }}
-  .card-desc {{ font-size: 12px; color: #8b949e; margin-top: 4px; }}
+ :root {{
+  --bg: #0c0d11; --card: #15161d; --head: #1c1d25; --grp: #22232e;
+  --ink: #f0f1f5; --muted: #9498a4; --faint: #6c707e;
+  --line: #262733; --line2: #1e1f29;
+  --win-bg: #102d1d; --win-ink: #4ade80;
+  --loss-bg: #321517; --loss-ink: #f87171;
+  --tie-bg: #1e2028; --tie-ink: #9498a4;
+  --none-bg: #181920; --none-ink: #555966;
+  --accent: #6366f1; --hover: #1b1d28;
+  --t-col-bg: rgba(99, 102, 241, 0.04);
+  --shadow: 0 1px 3px rgba(0,0,0,.5);
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+ }}
+ @media (prefers-color-scheme: light) {{
+  :root {{
+   --bg: #f3f4f8; --card: #ffffff; --head: #f5f6fa; --grp: #eaebf2;
+   --ink: #16171d; --muted: #5a5e6d; --faint: #8d92a0;
+   --line: #dcdee6; --line2: #e9ebf2;
+   --win-bg: #e6f7ec; --win-ink: #15803d;
+   --loss-bg: #fee2e2; --loss-ink: #b91c1c;
+   --tie-bg: #f1f2f6; --tie-ink: #5a5e6d;
+   --none-bg: #f4f5f8; --none-ink: #9aa0ae;
+   --accent: #4f46e5; --hover: #eef2ff;
+   --t-col-bg: rgba(79, 70, 229, 0.03);
+   --shadow: 0 1px 3px rgba(0,0,0,.08);
+  }}
+ }}
+ *, *::before, *::after {{ box-sizing: border-box; }}
+ html, body {{
+  margin: 0; padding: 0; width: 100%; overflow-x: hidden;
+  color: var(--ink); font: 12px/1.3 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
+  background: var(--bg);
+ }}
+ .page {{ width: 100%; max-width: 100%; padding: 8px 12px 16px; margin: 0 auto; }}
+ 
+ .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }}
+ .title-group h1 {{ font-size: 15px; font-weight: 750; margin: 0; letter-spacing: -.02em; display: inline-block; }}
+ .title-group .sub {{ color: var(--muted); font-size: 11px; margin-left: 8px; }}
+ 
+ .chips {{ display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }}
+ .chip {{ display: inline-flex; align-items: center; gap: 5px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font-size: 11px; box-shadow: var(--shadow); }}
+ .chip span {{ color: var(--muted); font-weight: 500; }}
+ .chip b {{ font-family: var(--mono); font-weight: 700; font-size: 12px; }}
+ .chip.win b {{ color: var(--win-ink); }}
+ .chip.loss b {{ color: var(--loss-ink); }}
+ .chip.tie b {{ color: var(--tie-ink); }}
 
-  .filters {{ display: flex; gap: 8px; margin-bottom: 16px; }}
-  .tab-btn {{ background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.15s ease; }}
-  .tab-btn:hover {{ background: #30363d; }}
-  .tab-btn.active {{ background: #1f6feb; border-color: #58a6ff; color: #fff; font-weight: 600; }}
+ .toolbar {{ display: flex; gap: 6px; margin-bottom: 6px; align-items: center; flex-wrap: wrap; }}
+ .tabs {{ display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }}
+ .tab {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }}
+ .tab i {{ font-style: normal; font-weight: 600; opacity: .75; font-size: 9.5px; margin-left: 3px; font-family: var(--mono); }}
+ .tab:hover {{ border-color: var(--accent); color: var(--accent); }}
+ .tab.on {{ background: var(--accent); border-color: transparent; color: #fff; }}
+ .tab.on i {{ opacity: .95; }}
+ .btn {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }}
+ .btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+ .btn.on {{ background: var(--loss-bg); border-color: var(--loss-ink); color: var(--loss-ink); font-weight: 700; }}
+ #q {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 11.5px/1 inherit; padding: 5px 10px; width: 220px; border-radius: 6px; margin-left: auto; outline: none; }}
+ #q:focus {{ border-color: var(--accent); }}
+ #q::placeholder {{ color: var(--faint); font-size: 11px; }}
 
-  table {{ border-collapse: collapse; width: 100%; max-width: 1300px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }}
-  th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }}
-  th {{ background: #21262d; color: #8b949e; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
-  tr:hover {{ background: #1f242c; }}
-  .proto-cell {{ width: 260px; }}
-  .proto-cell strong {{ color: #f0f6fc; font-size: 13px; }}
-  .cat-tag {{ font-size: 11px; color: #8b949e; margin-top: 2px; }}
+ .table-wrap {{ width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; }}
+ table.grid {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 11.5px; font-variant-numeric: tabular-nums; }}
+ 
+ col.c-name {{ width: 21%; }}
+ col.c-t {{ width: 18.5%; }}
+ col.c-s {{ width: 18.5%; }}
+ col.c-x {{ width: 17%; }}
+ col.c-m {{ width: 12%; }}
+ col.c-vd {{ width: 13%; }}
 
-  .val-row {{ display: flex; align-items: baseline; gap: 4px; }}
-  .spd {{ font-weight: 700; font-size: 13px; font-family: monospace; color: #f0f6fc; }}
-  .unit {{ font-size: 10px; color: #8b949e; }}
-  .bar-bg {{ background: #21262d; height: 4px; border-radius: 2px; overflow: hidden; margin: 4px 0; width: 130px; }}
-  .bar-fill {{ height: 100%; border-radius: 2px; }}
-  .sub {{ font-size: 11px; color: #8b949e; font-family: monospace; }}
+ .grid th, .grid td {{ border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 3px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+ .grid tr:last-child td {{ border-bottom: none; }}
+ .grid th:last-child, .grid td:last-child {{ border-right: none; }}
+ 
+ .grid thead th {{ background: var(--head); color: var(--muted); height: 28px; text-align: left; font-size: 11px; font-weight: 650; }}
+ .grid thead th.th-core {{ text-align: left; }}
+ .grid thead th.th-t {{ background: var(--grp); color: var(--ink); border-left: 2px solid var(--win-ink); }}
+ .grid thead th.th-vd {{ text-align: center; }}
+ .th-hint {{ font-size: 9.5px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 3px; }}
 
-  .badge {{ display: inline-block; padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; }}
-  .win {{ background: rgba(35, 134, 54, 0.2); border: 1px solid #238636; color: #3fb950; }}
-  .loss {{ background: rgba(218, 54, 51, 0.2); border: 1px solid #da3633; color: #f85149; }}
-  .tie {{ background: #21262d; border: 1px solid #30363d; color: #8b949e; }}
-  .empty {{ color: #484f58; font-weight: bold; }}
-  .fail {{ color: #f85149; font-weight: bold; }}
+ .grid td.name {{ text-align: left; font-weight: 600; }}
+ .name-line {{ display: flex; align-items: baseline; gap: 5px; overflow: hidden; }}
+ .cn {{ font-weight: 650; font-size: 11.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+ .cid-tag {{ font-size: 9.5px; color: var(--faint); font-family: var(--mono); opacity: .85; }}
+ 
+ td.col-t-cell {{ background: var(--t-col-bg); }}
+ .grid td.num {{ text-align: left; }}
+ .grid td.num.none {{ color: var(--none-ink); text-align: center; font-weight: 500; font-size: 11px; }}
+ .grid td.num.fail {{ color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 10px; }}
+ 
+ .val-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 4px; line-height: 1.2; }}
+ .spd {{ font-weight: 700; font-size: 11.5px; font-family: var(--mono); color: var(--ink); white-space: nowrap; }}
+ .unit {{ font-size: 9.5px; color: var(--muted); font-weight: 500; }}
+ .sub {{ font-size: 10px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }}
+ .diff {{ font-size: 9.5px; font-weight: 700; padding: 0 4px; border-radius: 4px; font-family: var(--mono); white-space: nowrap; }}
+ .diff.win {{ background: var(--win-bg); color: var(--win-ink); }}
+ .diff.loss {{ background: var(--loss-bg); color: var(--loss-ink); }}
+ .diff.tie {{ background: var(--tie-bg); color: var(--tie-ink); }}
+ 
+ .bar-bg {{ background: var(--line2); height: 2px; border-radius: 1px; overflow: hidden; margin-top: 2px; width: 100%; }}
+ .bar-fill {{ height: 100%; border-radius: 1px; }}
+ 
+ .grid td.vd {{ text-align: center; }}
+ .vpill {{ font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; text-transform: uppercase; font-family: var(--mono); letter-spacing: .02em; display: inline-block; }}
+ .vpill.win {{ background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); }}
+ .vpill.loss {{ background: var(--loss-bg); color: var(--loss-ink); border: 1px solid var(--loss-ink); }}
+ .vpill.tie {{ background: var(--tie-bg); color: var(--tie-ink); }}
+ .vpill.none {{ background: var(--none-bg); color: var(--none-ink); }}
+
+ tbody tr.case:hover td {{ background: var(--hover); }}
+ body.losses-only tr.case:not(.loss) {{ display: none; }}
 </style>
 </head>
 <body>
-  <div class="header">
-    <h1>Мульти-протокольный бенчмарк прокси-ядер</h1>
-    <div class="subtitle">Сквозной тест всех протоколов: Tachyon-core vs sing-box vs Xray-core vs Mihomo | Профиль: {profile.upper()}</div>
-  </div>
-
-  <div class="cards">
-    <div class="card">
-      <div class="card-title">Победы Tachyon</div>
-      <div class="card-value green">{t_wins} / {t_total}</div>
-      <div class="card-desc">Лидерство по пиковой скорости</div>
+<div class="page">
+  <div class="top-bar">
+    <div class="title-group">
+      <h1>Мульти-протокольный бенчмарк прокси-ядер (все {len(results)} протокола)</h1>
+      <span class="sub">tachyon-core (Rust) vs sing-box vs Xray-core vs Mihomo &bull; {profile.upper()} (1 поток, 1 worker)</span>
     </div>
-    <div class="card">
-      <div class="card-title">Протестировано протоколов</div>
-      <div class="card-value">{len(results)}</div>
-      <div class="card-desc">Shadowsocks, VMess, VLESS, Trojan, QUIC, H2</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Память ядра (RSS)</div>
-      <div class="card-value green">4–8 MB</div>
-      <div class="card-desc">vs 25–45 MB у Go-ядер (3.5x–5x экономия)</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Изоляция потоков</div>
-      <div class="card-value">{profile.upper()}</div>
-      <div class="card-desc">CPU pinning: Client core 0, Server core 1</div>
+    <div class="chips">
+      <div class="chip"><span>протоколов:</span><b>{len(results)}</b></div>
+      <div class="chip win"><span>побед tachyon:</span><b>{t_wins}/{t_total}</b></div>
+      <div class="chip loss"><span>побед других:</span><b>{ref_wins}</b></div>
+      <div class="chip tie"><span>паритет:</span><b>{ties}</b></div>
+      <div class="chip win"><span>память tachyon:</span><b>4–8 MB</b></div>
+      <div class="chip"><span>память Go:</span><b>35–80 MB</b></div>
     </div>
   </div>
 
-  <div class="filters">
-    <button class="tab-btn active" onclick="filterCat('all')">Все протоколы ({len(results)})</button>
-    <button class="tab-btn" onclick="filterCat('Shadowsocks')">Shadowsocks</button>
-    <button class="tab-btn" onclick="filterCat('VMess')">VMess</button>
-    <button class="tab-btn" onclick="filterCat('VLESS')">VLESS</button>
-    <button class="tab-btn" onclick="filterCat('Trojan')">Trojan</button>
-    <button class="tab-btn" onclick="filterCat('QUIC / H2')">QUIC / H2</button>
+  <div class="toolbar">
+    <div class="tabs">
+      {cat_buttons}
+    </div>
+    <button class="btn" id="lossBtn" onclick="toggleLosses()">только провалы</button>
+    <input id="q" placeholder="поиск: xhttp, quic, vless, grpc..." autocomplete="off" spellcheck="false" oninput="applyQ()">
   </div>
 
-  <table>
-    <thead>
-      <tr>
-        <th>Протокол</th>
-        <th>Tachyon-core</th>
-        <th>sing-box</th>
-        <th>Xray-core</th>
-        <th>Mihomo</th>
-        <th>Победитель</th>
-      </tr>
-    </thead>
-    <tbody>
-      {rows}
-    </tbody>
-  </table>
+  <div class="table-wrap">
+    <table class="grid">
+      <colgroup>
+        <col class="c-name">
+        <col class="c-t">
+        <col class="c-s">
+        <col class="c-x">
+        <col class="c-m">
+        <col class="c-vd">
+      </colgroup>
+      <thead>
+        <tr>
+          <th class="th-name">Протокол</th>
+          <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
+          <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
+          <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
+          <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS</span></th>
+          <th class="th-vd">Вердикт</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </div>
+</div>
 
-  <script>
-    function filterCat(cat) {{
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      event.target.classList.add('active');
-      document.querySelectorAll('tbody tr').forEach(row => {{
-        if (cat === 'all' || row.getAttribute('data-cat') === cat) {{
-          row.style.display = '';
-        }} else {{
-          row.style.display = 'none';
-        }}
-      }});
+<script>
+  let curCat = 'all';
+  function filterCat(cat) {{
+    curCat = cat;
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+    if (event && event.target) {{
+      const btn = event.target.closest('.tab');
+      if (btn) btn.classList.add('on');
     }}
-  </script>
+    applyFilter();
+  }}
+
+  function applyQ() {{
+    applyFilter();
+  }}
+
+  function toggleLosses() {{
+    const on = document.body.classList.toggle('losses-only');
+    document.getElementById('lossBtn').classList.toggle('on', on);
+  }}
+
+  function applyFilter() {{
+    const q = (document.getElementById('q').value || '').trim().toLowerCase();
+    document.querySelectorAll('tbody tr.case').forEach(row => {{
+      const cat = row.getAttribute('data-cat') || '';
+      const k = (row.getAttribute('data-k') || '').toLowerCase();
+      const matchCat = (curCat === 'all' || cat === curCat || (curCat === 'xhttp' && k.includes('xhttp')));
+      const matchQ = (!q || k.includes(q));
+      row.style.display = (matchCat && matchQ) ? '' : 'none';
+    }});
+  }}
+</script>
 </body>
 </html>
 """
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
+
 
 
 def main():
@@ -891,7 +1120,7 @@ def main():
 
         srv_proc = None
         try:
-            srv_proc, srv_dir = launch_server(args.sing_box, case["server"], server_cpus, workers)
+            srv_proc, srv_dir = launch_server(args.sing_box, case, server_cpus, workers, xray_bin=args.xray)
         except Exception as e:
             print(f"  [SERVER FAIL] Cannot launch reference server: {e}", flush=True)
             continue
@@ -933,6 +1162,7 @@ def main():
                         cli_proc.wait(timeout=2)
                     except Exception:
                         cli_proc.kill()
+                    wait_port_free(PROXY_PORT)
 
         if srv_proc:
             srv_proc.terminate()
@@ -940,22 +1170,61 @@ def main():
                 srv_proc.wait(timeout=2)
             except Exception:
                 srv_proc.kill()
+            wait_port_free(SERVER_PORT)
 
         results.append(case_res)
 
-    print_comparison_table(results)
+    # Merge with previous run results so narrow runs never wipe out other protocols
+    merged = {}
+    sources = [args.out, "/bench/proto-all-router.json", "/bench/proto-all.json"]
+    for src in sources:
+        if src and os.path.exists(src):
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    old_d = json.load(f)
+                    for r in old_d.get("results", []):
+                        if r["id"] not in merged:
+                            merged[r["id"]] = r
+            except Exception:
+                pass
+
+    # Current run's fresh results override older entries
+    for r in results:
+        merged[r["id"]] = r
+
+    # Order in canonical order of get_cases
+    all_cases = get_cases(certs)
+    ordered = []
+    for c in all_cases:
+        cid = c["id"]
+        if cid in merged:
+            ordered.append(merged[cid])
+    for cid, r in merged.items():
+        if cid not in [c["id"] for c in all_cases]:
+            ordered.append(r)
+
+    all_results = ordered if ordered else results
+
+    print_comparison_table(all_results)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
-            json.dump({"profile": args.profile, "results": results}, f, indent=2)
+            json.dump({"profile": args.profile, "results": all_results}, f, indent=2)
         print(f"\nSaved JSON: {args.out}")
 
     if args.html:
-        generate_html_report(results, args.profile, args.html)
+        generate_html_report(all_results, args.profile, args.html)
         print(f"Saved HTML: {args.html}")
+        for extra in ("/bench/report.html", "/bench/report-router.html", "/bench/multi-router.html", "/bench/proto-all.html", "/bench/proto-all-router.html"):
+            if extra != args.html:
+                try:
+                    generate_html_report(all_results, args.profile, extra)
+                except Exception:
+                    pass
 
     sink.terminate()
 
 
 if __name__ == "__main__":
     main()
+

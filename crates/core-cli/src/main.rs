@@ -274,8 +274,24 @@ fn main() -> ExitCode {
         mi_option_set(43, 0);
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().cloned().unwrap_or_else(|| "help".into());
-    args.remove(0);
+    // The reference accepts its global options before the command, and tachyon
+    // validates configs as `sing-box -c <path> check` — without this every
+    // tachyon-side restart died on `unknown command '-c'`.
+    let mut leading_config: Option<String> = None;
+    while args.len() >= 2 && (args[0] == "-c" || args[0] == "--config") {
+        leading_config = Some(args[1].clone());
+        args.drain(0..2);
+    }
+    let command = if args.is_empty() {
+        "help".to_string()
+    } else {
+        args.remove(0)
+    };
+    if let Some(path) = leading_config
+        && !args.iter().any(|arg| arg == "-c" || arg == "--config")
+    {
+        args.splice(0..0, ["-c".to_string(), path]);
+    }
 
     let result = match command.as_str() {
         "version" | "-v" | "--version" => {

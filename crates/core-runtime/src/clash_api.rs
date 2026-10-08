@@ -549,9 +549,12 @@ fn classify_with_ui(path: &str, external_ui: bool) -> (Route, &'static [&'static
                     Err(_) => (Route::Unknown, GET_DELETE),
                 }
             }
-            None => match p.strip_prefix("/providers/") {
-                Some(_) => (Route::Providers, GET_ONLY),
-                None => classify_proxies(path, external_ui),
+            None => match p.strip_prefix("/group/") {
+                Some(rest) => classify_group(rest),
+                None => match p.strip_prefix("/providers/") {
+                    Some(_) => (Route::Providers, GET_ONLY),
+                    None => classify_proxies(path, external_ui),
+                },
             },
         },
     }
@@ -572,6 +575,18 @@ fn classify_proxies(path: &str, external_ui: bool) -> (Route, &'static [&'static
         }
         None if external_ui => classify_ui(path),
         None => (Route::Unknown, GET_ONLY),
+    }
+}
+
+/// `/group/{name}/delay`: urltest groups live on their own mount in the
+/// reference, and tachyon's UI probes them here rather than under `/proxies`.
+fn classify_group(rest: &str) -> (Route, &'static [&'static str]) {
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    match rest.rsplit_once('/') {
+        Some((base, "delay")) if !base.is_empty() && !base.contains('/') => {
+            (Route::Delay(base.to_string()), GET_ONLY)
+        }
+        _ => (Route::Unknown, GET_ONLY),
     }
 }
 
@@ -1829,6 +1844,19 @@ mod tests {
             classify_with_ui("/proxies/a/b", false).0,
             Route::Unknown
         ));
+        assert!(matches!(
+            classify_with_ui("/group/sel/delay", false).0,
+            Route::Delay(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/group/sel/delay/", false).0,
+            Route::Delay(_)
+        ));
+        assert!(matches!(
+            classify_with_ui("/group/sel", false).0,
+            Route::Unknown
+        ));
+        assert_eq!(classify_with_ui("/group/sel/delay", false).1, GET_ONLY);
         assert!(matches!(
             classify_with_ui("/proxies//sel", false).0,
             Route::Unknown

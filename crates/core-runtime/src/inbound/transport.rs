@@ -177,6 +177,9 @@ impl Transport {
         // happens to the connection, and a connection that is only attaching
         // to a session never hands a stream over at all.
         if self.kind == Kind::Xhttp {
+            if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
+                return Accepted::xhttp_h2(stream, &self.path).await;
+            }
             return self.xhttp_accept(stream).await.map(Accepted::Once);
         }
         let mut stream = stream;
@@ -300,6 +303,8 @@ pub(crate) enum Accepted {
     /// pooled corpse and fails with a closed pipe before it ever reaches us.
     /// Boxed: an h2 `Connection` is far bigger than the pipe it wraps.
     Grpc(Box<GrpcAccept>),
+    /// An XHTTP HTTP/2 connection: one session per stream (stream-one), or multiplexed.
+    XhttpH2(Box<XhttpH2Accept>),
 }
 
 impl Accepted {
@@ -312,6 +317,19 @@ impl Accepted {
         Ok(Self::Grpc(Box::new(GrpcAccept {
             conn: Some(conn),
             service: service.to_string(),
+            first: true,
+        })))
+    }
+
+    /// The XHTTP HTTP/2 half: handshake, and accept streams on the path.
+    async fn xhttp_h2(stream: AnyStream, path: &str) -> anyhow::Result<Self> {
+        let conn = crate::outbound::transport::h2io::server_builder()
+            .handshake(stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("xhttp h2: handshake: {e}"))?;
+        Ok(Self::XhttpH2(Box::new(XhttpH2Accept {
+            conn: Some(conn),
+            path: path.to_string(),
             first: true,
         })))
     }
@@ -415,7 +433,97 @@ where
             }
             Ok(())
         }
+        Accepted::XhttpH2(mut xhttp) => {
+            let mut sessions = Vec::new();
+            while let Some(stream) = xhttp.next().await.map_err(io::Error::other)? {
+                sessions.push(tokio::spawn(make(stream)));
+            }
+            for session in sessions {
+                let _ = session.await;
+            }
+            Ok(())
+        }
     }
+}
+
+pub(crate) struct XhttpH2Accept {
+    conn: Option<h2::server::Connection<AnyStream, Bytes>>,
+    path: String,
+    first: bool,
+}
+
+impl XhttpH2Accept {
+    async fn next(&mut self) -> anyhow::Result<Option<AnyStream>> {
+        loop {
+            let Some(conn) = self.conn.as_mut() else {
+                return Ok(None);
+            };
+            let (request, mut responder) =
+                match crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await {
+                    Some(Ok(pair)) => pair,
+                    Some(Err(err)) if self.first => anyhow::bail!("xhttp h2: accept: {err}"),
+                    Some(Err(_)) => return Ok(None),
+                    None if self.first => {
+                        anyhow::bail!("xhttp h2: the connection ended before a request")
+                    }
+                    None => return Ok(None),
+                };
+            let first = std::mem::replace(&mut self.first, false);
+            let req_path = request.uri().path().to_string();
+            let method = request.method().as_str().to_string();
+
+            if method != "POST" || !xhttp_h2_path_matches(&req_path, &self.path) {
+                let response = http::Response::builder().status(404).body(()).unwrap();
+                let _ = responder.send_response(response, true);
+                if first {
+                    let conn = self
+                        .conn
+                        .take()
+                        .expect("xhttp: connection exists before first stream");
+                    let _ = xhttp_h2_drive(conn).await;
+                    anyhow::bail!("xhttp h2: rejected {method} {req_path:?} (expected POST {})", self.path);
+                }
+                continue;
+            }
+
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            let send = responder
+                .send_response(response, false)
+                .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
+            let recv = request.into_body();
+            let h2_stream = crate::outbound::transport::h2io::H2Stream::server(recv, send);
+            return Ok(Some(Box::new(crate::outbound::transport::h2io::H2Io { h2: h2_stream })));
+        }
+    }
+}
+
+fn xhttp_h2_path_matches(target: &str, configured: &str) -> bool {
+    let (path, _query) = match target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (target, None),
+    };
+    match path.strip_prefix(configured) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+fn xhttp_h2_drive(mut conn: h2::server::Connection<AnyStream, Bytes>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await {
+            match next {
+                Ok((_, mut responder)) => {
+                    let response = http::Response::builder().status(404).body(()).unwrap();
+                    let _ = responder.send_response(response, true);
+                }
+                Err(_) => return,
+            }
+        }
+    })
 }
 
 /// Keep a rejected connection running until the far end gives up on it.
@@ -690,10 +798,11 @@ impl Transport {
                 .await;
             }
         };
-        let segments: Vec<&str> = if rest.is_empty() {
+        let trimmed = rest.trim_matches('/');
+        let segments: Vec<&str> = if trimmed.is_empty() {
             Vec::new()
         } else {
-            rest[1..].split('/').collect()
+            trimmed.split('/').collect()
         };
         let sid = self.session_id(&segments, query, &headers);
         let seq = self.seq_present(&segments, query, &headers);

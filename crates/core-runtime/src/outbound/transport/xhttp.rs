@@ -328,13 +328,13 @@ impl XhttpConfig {
         })
     }
 
-    fn resolved_mode(&self, tls: bool) -> Mode {
+    fn resolved_mode(&self, tls: bool, is_h2: bool) -> Mode {
         match self.mode {
-            // auto: Reality → stream-one, otherwise packet-up. Reality is not
-            // implemented yet, so auto is packet-up until it lands (F2).
+            // In HTTP/2 or Reality, auto resolves to stream-one; otherwise packet-up.
+            Mode::Auto if is_h2 => Mode::StreamOne,
             Mode::Auto => Mode::PacketUp,
             other => {
-                let _ = tls;
+                let _ = (tls, is_h2);
                 other
             }
         }
@@ -355,6 +355,7 @@ pub(crate) async fn connect(
     cfg: &XhttpConfig,
     dialer: std::sync::Arc<Dialer>,
 ) -> io::Result<AnyStream> {
+    let is_h2 = crate::inbound::stream_alpn(&stream) == Some(b"h2");
     let authority = cfg.host.clone().unwrap_or_else(|| {
         if server.contains(':') && !server.starts_with('[') {
             format!("[{server}]:{port}")
@@ -363,7 +364,39 @@ pub(crate) async fn connect(
         }
     });
     let scheme = if secure { "https" } else { "http" };
-    let mode = cfg.resolved_mode(secure);
+    let mode = cfg.resolved_mode(secure, is_h2);
+
+    // Over HTTP/2, stream-one uses a single bidirectional h2 stream
+    if is_h2 && mode == Mode::StreamOne {
+        let (send_request, connection) = super::h2io::client_builder()
+            .handshake(stream)
+            .await
+            .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
+            }
+        });
+        let mut send_request = send_request
+            .ready()
+            .await
+            .map_err(|e| io::Error::other(format!("xhttp: h2 ready: {e}")))?;
+        let request = cfg.build_request(
+            scheme,
+            &authority,
+            &cfg.meta.uplink_method,
+            None,
+            None,
+            true,
+        )?;
+        let (response, send) = send_request
+            .send_request(request, false)
+            .map_err(|e| io::Error::other(format!("xhttp: send_request: {e}")))?;
+        return Ok(Box::new(super::h2io::H2Io {
+            h2: super::h2io::H2Stream::new(response, send, conn_task),
+        }));
+    }
+
     let mut this = SplitConn::new(cfg);
 
     // stream-one is one bidirectional request on one connection: the body goes
@@ -901,6 +934,10 @@ impl XhttpConfig {
                     extra_headers.push(("cookie".to_string(), format!("{}={}", m.session_key, sid)))
                 }
             }
+        } else if !path.ends_with('/') {
+            // stream-one: the reference client and Xray server expect the path to end
+            // with a trailing slash when matching the route.
+            path.push('/');
         }
         if let Some(seq) = seq {
             match m.seq_placement {

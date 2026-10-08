@@ -72,10 +72,13 @@ impl ServerTls {
             Some("grpc") if !this.alpn.iter().any(|p| p == b"h2") => {
                 this.alpn.push(b"h2".to_vec());
             }
-            // in front, not appended: the listener picks by its own order, and
-            // an `h2` this server cannot serve must not win the negotiation
-            Some("xhttp") if !this.alpn.iter().any(|p| p == b"http/1.1") => {
-                this.alpn.insert(0, b"http/1.1".to_vec());
+            Some("xhttp") => {
+                if !this.alpn.iter().any(|p| p == b"h2") {
+                    this.alpn.insert(0, b"h2".to_vec());
+                }
+                if !this.alpn.iter().any(|p| p == b"http/1.1") {
+                    this.alpn.push(b"http/1.1".to_vec());
+                }
             }
             _ => {}
         }
@@ -185,6 +188,7 @@ impl ServerTls {
                 ));
             }
         }
+        let alpn = handshake.alpn.clone();
         let (sealer, opener) = handshake
             .application
             .take()
@@ -202,6 +206,7 @@ impl ServerTls {
             taken: 0,
             eof: false,
             closed: false,
+            alpn,
         })
     }
 }
@@ -256,6 +261,8 @@ pub struct TlsStream<S> {
     eof: bool,
     /// close_notify is due to go out once, at shutdown
     closed: bool,
+    /// The ALPN protocol chosen by the server handshake, if any.
+    pub alpn: Option<Vec<u8>>,
 }
 
 impl<S> TlsStream<S> {

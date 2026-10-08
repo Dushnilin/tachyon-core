@@ -481,7 +481,10 @@ impl XhttpH2Accept {
                         .take()
                         .expect("xhttp: connection exists before first stream");
                     let _ = xhttp_h2_drive(conn).await;
-                    anyhow::bail!("xhttp h2: rejected {method} {req_path:?} (expected POST {})", self.path);
+                    anyhow::bail!(
+                        "xhttp h2: rejected {method} {req_path:?} (expected POST {})",
+                        self.path
+                    );
                 }
                 continue;
             }
@@ -496,7 +499,9 @@ impl XhttpH2Accept {
                 .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
             let recv = request.into_body();
             let h2_stream = crate::outbound::transport::h2io::H2Stream::server(recv, send);
-            return Ok(Some(Box::new(crate::outbound::transport::h2io::H2Io { h2: h2_stream })));
+            return Ok(Some(Box::new(crate::outbound::transport::h2io::H2Io {
+                h2: h2_stream,
+            })));
         }
     }
 }
@@ -512,9 +517,12 @@ fn xhttp_h2_path_matches(target: &str, configured: &str) -> bool {
     }
 }
 
-fn xhttp_h2_drive(mut conn: h2::server::Connection<AnyStream, Bytes>) -> tokio::task::JoinHandle<()> {
+fn xhttp_h2_drive(
+    mut conn: h2::server::Connection<AnyStream, Bytes>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await {
+        while let Some(next) = crate::outbound::transport::h2io::rdbg::counted(conn.accept()).await
+        {
             match next {
                 Ok((_, mut responder)) => {
                     let response = http::Response::builder().status(404).body(()).unwrap();

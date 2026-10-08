@@ -1303,7 +1303,9 @@ async fn delay_test(
         let conn = match dialled {
             Ok(crate::inbound::Conn::Plain(conn)) => conn,
             Ok(_) => {
-                crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: non-plain connection"));
+                crate::logging::debug(format_args!(
+                    "delay[{index}]: dial {host}:{port}: non-plain connection"
+                ));
                 return None;
             }
             Err(e) => {

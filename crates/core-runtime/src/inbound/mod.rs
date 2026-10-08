@@ -440,11 +440,8 @@ where
                         .await?;
                 }
                 None => {
-                    copy_bidirectional_pooled(
-                        &mut Timed { inner: &mut client },
-                        &mut upstream,
-                    )
-                    .await?;
+                    copy_bidirectional_pooled(&mut Timed { inner: &mut client }, &mut upstream)
+                        .await?;
                 }
             }
             Ok(())
@@ -831,10 +828,7 @@ where
     }
 }
 
-async fn copy_bidirectional_pooled<A, B>(
-    a: &mut A,
-    b: &mut B,
-) -> io::Result<(u64, u64)>
+async fn copy_bidirectional_pooled<A, B>(a: &mut A, b: &mut B) -> io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,

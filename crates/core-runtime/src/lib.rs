@@ -169,6 +169,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         .rule_sets()
         .start_remote(&router, cache_file.clone())
         .await?;
+    router.start_endpoints().await?;
     let dns_service = dns::DnsService::build(root).context("dns section")?;
     if let Some(service) = &dns_service {
         // `dns.server.detour` dials through the outbounds

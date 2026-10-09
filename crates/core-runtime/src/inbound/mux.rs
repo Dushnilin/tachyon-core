@@ -138,12 +138,64 @@ pub async fn serve_mux(
                 return;
             }
 
-            logging::info(format_args!(
-                "mux inbound {tag} stream from {peer} to {target}"
-            ));
+            let flag_val = u16::from_be_bytes(flags);
+            let is_packetaddr = (flag_val & 2 != 0)
+                || (matches!(&target, Target::Domain(h, _) if h == crate::outbound::packet::SEQ_PACKET_MAGIC));
+            let is_udp = (flag_val & 1 != 0) || is_packetaddr;
 
-            let client = ClientConn::framed(Box::new(h2_io), local);
-            let _ = drive_framed(client, peer, target, &tag, &router).await;
+            if is_udp {
+                logging::info(format_args!(
+                    "mux inbound {tag} UDP stream (packetaddr={is_packetaddr}) from {peer} to {target}"
+                ));
+                let (mut h2_read, h2_write) = tokio::io::split(h2_io);
+                let writer: Arc<tokio::sync::Mutex<crate::inbound::AnyWrite>> =
+                    Arc::new(tokio::sync::Mutex::new(Box::new(h2_write)));
+                let frame = if is_packetaddr {
+                    crate::inbound::udp::DatagramFrame::PacketAddr
+                } else {
+                    crate::inbound::udp::DatagramFrame::LengthPrefixed
+                };
+                let hub = crate::inbound::udp::UdpHub::new(
+                    Arc::clone(&router),
+                    crate::inbound::udp::DEFAULT_UDP_TIMEOUT,
+                    frame,
+                );
+                let reply = crate::inbound::udp::Reply::Stream(writer);
+                let mut len_buf = [0u8; 2];
+                loop {
+                    if let Err(err) = h2_read.read_exact(&mut len_buf).await {
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof && len_buf == [0, 0] {
+                            break;
+                        }
+                        break;
+                    }
+                    let pkt_len = u16::from_be_bytes(len_buf) as usize;
+                    let mut payload = vec![0u8; pkt_len];
+                    if h2_read.read_exact(&mut payload).await.is_err() {
+                        break;
+                    }
+                    if is_packetaddr {
+                        if let Ok((dest_target, data)) =
+                            crate::outbound::packet::take_addr_port(&payload)
+                            && let Ok(dest_addr) =
+                                crate::inbound::udp::udp_destination(&dest_target)
+                        {
+                            let _ = hub.handle(reply.clone(), peer, dest_addr, data, &tag).await;
+                        }
+                    } else if let Ok(dest_addr) = crate::inbound::udp::udp_destination(&target) {
+                        let _ = hub
+                            .handle(reply.clone(), peer, dest_addr, &payload, &tag)
+                            .await;
+                    }
+                }
+            } else {
+                logging::info(format_args!(
+                    "mux inbound {tag} stream from {peer} to {target}"
+                ));
+
+                let client = ClientConn::framed(Box::new(h2_io), local);
+                let _ = drive_framed(client, peer, target, &tag, &router).await;
+            }
         });
     }
 
@@ -264,7 +316,10 @@ mod tests {
             "sp.mux.sing-box.arpa".to_string(),
             443
         )));
-        assert!(!is_mux_target(&Target::Domain("google.com".to_string(), 444)));
+        assert!(!is_mux_target(&Target::Domain(
+            "google.com".to_string(),
+            444
+        )));
         assert!(!is_mux_target(&Target::Ip(
             "127.0.0.1:444".parse().unwrap()
         )));

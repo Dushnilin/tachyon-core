@@ -31,7 +31,7 @@ pub(crate) const SEQ_PACKET_MAGIC: &str = "sp.packet-addr.v2fly.arpa";
 
 const MAX_DATAGRAM: usize = 65_535;
 /// the largest address: type + 16 bytes + port
-const MAX_ADDR_PORT: usize = 19;
+pub(crate) const MAX_ADDR_PORT: usize = 19;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PacketEncoding {

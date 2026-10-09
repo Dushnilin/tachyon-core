@@ -493,7 +493,10 @@ impl XhttpConfig {
         port: u16,
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<Option<AnyStream>> {
-        let mode = self.resolved_mode(tls.is_some(), true);
+        let Some(tls) = tls else {
+            return Ok(None);
+        };
+        let mode = self.resolved_mode(true, true);
         if mode != Mode::StreamOne {
             return Ok(None);
         }
@@ -505,7 +508,7 @@ impl XhttpConfig {
                 format!("{server}:{port}")
             }
         });
-        let scheme = if tls.is_some() { "https" } else { "http" };
+        let scheme = "https";
         let request = self.build_request(
             scheme,
             &authority,
@@ -534,10 +537,7 @@ impl XhttpConfig {
                 let res = async {
                     let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
                     let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-                    let stream: AnyStream = match tls {
-                        Some(tls) => tls.wrap_with_defaults(tcp, alpn).await?,
-                        None => Box::new(tcp),
-                    };
+                    let stream: AnyStream = tls.wrap_with_defaults(tcp, alpn).await?;
                     let is_h2 = crate::inbound::stream_alpn(&stream) == Some(b"h2");
                     if !is_h2 {
                         return Err(io::Error::other("xhttp: server did not negotiate h2"));

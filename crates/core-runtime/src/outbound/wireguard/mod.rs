@@ -279,8 +279,7 @@ impl WireGuard {
                 let host = peer
                     .get("address")
                     .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("{peer_at}: missing address"))?
+                    .unwrap_or("")
                     .to_string();
                 let port = peer
                     .get("port")
@@ -379,6 +378,12 @@ impl WireGuard {
             .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
         let _ = socket2::SockRef::from(&sock)
             .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+        if self.cfg.listen_port > 0 {
+            logging::info(format_args!(
+                "wireguard[{}]: server listening on udp 0.0.0.0:{}",
+                self.cfg.tag, self.cfg.listen_port
+            ));
+        }
         let (tx, rx) = mpsc::channel(CMD_QUEUE);
         let shared = Arc::new(WgShared {
             cmd_tx: tx,
@@ -392,6 +397,13 @@ impl WireGuard {
         });
         *guard = Some(Arc::clone(&shared));
         Ok(shared)
+    }
+
+    pub async fn start_listen(&self) -> io::Result<()> {
+        if self.cfg.listen_port > 0 {
+            let _ = self.shared().await?;
+        }
+        Ok(())
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
@@ -793,6 +805,28 @@ impl Stack {
         self.send_raw(pi, &pkt);
     }
 
+    fn send_handshake_resp(&self, pi: usize, resp: &[u8], src: SocketAddr) {
+        let Some(params) = self.cfg.awg.as_ref() else {
+            let _ = self.sock.try_send_to(resp, src);
+            return;
+        };
+        let pad = params.padding(awg::RESPONSE);
+        let window = self.peers[pi].udp_window;
+        let mut pkt = vec![0u8; pad + resp.len()];
+        awg::fill_random(&mut pkt[..pad]);
+        pkt[pad..].copy_from_slice(resp);
+        if params.random_trailers {
+            let at = pkt.len();
+            pkt.resize(at + awg::trailer_len(window, pad + resp.len()), 0);
+            awg::fill_random(&mut pkt[at..]);
+        }
+        if let Some(key) = &params.header_protection {
+            let nonce = pkt[..12].to_vec();
+            awg::mask_header(key, &nonce, &mut pkt[pad..pad + resp.len()]);
+        }
+        let _ = self.sock.try_send_to(&pkt, src);
+    }
+
     /// Seal one transport datagram with AWG 3.x dressing: content padding or
     /// a random trailer inside the AEAD, the s4 random prefix in front, and
     /// the header masked by the header-protection keystream.
@@ -859,6 +893,9 @@ impl Stack {
     }
 
     async fn resolve_peer(&mut self, pi: usize) {
+        if self.peers[pi].endpoint.host.is_empty() {
+            return;
+        }
         if self.peers[pi]
             .resolve_at
             .is_some_and(|t| Instant::now() < t)
@@ -1044,7 +1081,7 @@ impl Stack {
         }
     }
 
-    fn process_inbound(&mut self, buf: &[u8]) {
+    fn process_inbound(&mut self, buf: &[u8], src: SocketAddr) {
         // AWG-aware classification: the message may carry an s-padding
         // prefix, a masked magic-header type word and a random trailer.
         let known_index = |idx: u32| self.index_peer.contains_key(&idx);
@@ -1090,13 +1127,13 @@ impl Stack {
             self.peers[pi].udp_window = self.peers[pi].udp_window.max(buf.len() as u32);
         }
         logging::debug(format_args!(
-            "wireguard[{}]: recv type={msg_type} len={} idx={recv_idx}",
+            "wireguard[{}]: recv type={msg_type} len={} idx={recv_idx} src={src}",
             self.cfg.tag,
             msg.len()
         ));
         match msg_type {
             noise::MSG_INITIATION => {
-                // Responder-only message; we never answer handshakes.
+                self.on_initiation(msg, src);
             }
             // Handshake response layout: [4..8] = sender (responder),
             // [8..12] = receiver (our initiation sender index).
@@ -1105,15 +1142,60 @@ impl Stack {
                     return;
                 }
                 let receiver = u32::from_le_bytes(msg[8..12].try_into().expect("4 bytes"));
-                self.on_response(msg, receiver);
+                self.on_response(msg, receiver, src);
             }
             noise::MSG_COOKIE_REPLY => self.on_cookie(msg, recv_idx),
-            noise::MSG_TRANSPORT => self.on_transport(msg, recv_idx),
+            noise::MSG_TRANSPORT => self.on_transport(msg, recv_idx, src),
             _ => {}
         }
     }
 
-    fn on_response(&mut self, msg: &[u8], recv_idx: u32) {
+    fn on_initiation(&mut self, msg: &[u8], src: SocketAddr) {
+        let Ok(init_res) =
+            noise::process_initiation(&self.cfg.private_key, &self.cfg.public_key, msg)
+        else {
+            return;
+        };
+        let Some(pi) = self
+            .peers
+            .iter()
+            .position(|p| p.endpoint.public_key == init_res.sender_static_pub)
+        else {
+            logging::debug(format_args!(
+                "wireguard[{}]: handshake initiation from unknown peer",
+                self.cfg.tag
+            ));
+            return;
+        };
+        let psk = self.peers[pi].endpoint.pre_shared_key;
+        let resp_word = noise::gen_type(
+            self.cfg
+                .awg
+                .as_ref()
+                .map(|a| a.header(awg::RESPONSE))
+                .unwrap_or(noise::HDR_RESPONSE),
+        );
+        let (resp_msg, mut session) =
+            noise::build_response(&init_res, &self.cfg.private_key, psk.as_ref(), resp_word);
+        if let Some(params) = self.cfg.awg.as_ref() {
+            session.set_awg_transport(params.header(awg::TRANSPORT));
+        }
+        logging::debug(format_args!(
+            "wireguard[{}]: handshake initiation accepted (peer {pi}) from {src}",
+            self.cfg.tag
+        ));
+        self.peers[pi].resolved = Some(src);
+        self.index_peer.insert(session.local_index, pi);
+        self.peers[pi].session = Some(session);
+        self.peers[pi].session_since = Some(Instant::now());
+        self.peers[pi].last_recv = Some(Instant::now());
+        self.peers[pi].hs = None;
+        self.send_handshake_resp(pi, &resp_msg, src);
+        self.peers[pi].last_sent = Some(Instant::now());
+        self.peers[pi].flush = true;
+    }
+
+    fn on_response(&mut self, msg: &[u8], recv_idx: u32, src: SocketAddr) {
         let Some(&pi) = self.index_peer.get(&recv_idx) else {
             logging::debug(format_args!(
                 "wireguard[{}]: response for unknown index {recv_idx} (known: {:?})",
@@ -1135,6 +1217,7 @@ impl Stack {
                     "wireguard[{}]: handshake complete (peer {pi})",
                     self.cfg.tag
                 ));
+                self.peers[pi].resolved = Some(src);
                 self.index_peer.insert(session.local_index, pi);
                 self.peers[pi].session = Some(session);
                 self.peers[pi].session_since = Some(Instant::now());
@@ -1186,7 +1269,7 @@ impl Stack {
         }
     }
 
-    fn on_transport(&mut self, msg: &[u8], recv_idx: u32) {
+    fn on_transport(&mut self, msg: &[u8], recv_idx: u32, src: SocketAddr) {
         let Some(&pi) = self.index_peer.get(&recv_idx) else {
             return;
         };
@@ -1204,14 +1287,37 @@ impl Stack {
             return;
         }
         self.peers[pi].last_recv = Some(Instant::now());
+        self.peers[pi].resolved = Some(src);
         if plain.is_empty() {
             return; // keepalive
         }
-        let Some((src, dst, proto, hdr_len)) = ipv4_info(&plain) else {
+        let Some((src_ip, dst, proto, hdr_len)) = ipv4_info(&plain) else {
             self.recycle(plain);
             return;
         };
+        let src_u32 = u32::from(src_ip);
+        let allowed = self.peers[pi]
+            .endpoint
+            .allowed_ips
+            .iter()
+            .any(|&(net, bits)| {
+                bits == 0 || (src_u32 >> (32 - bits as u32)) == (net >> (32 - bits as u32))
+            });
+        if !allowed {
+            logging::debug(format_args!(
+                "wireguard[{}]: cryptokey routing dropped packet with src {src_ip} from peer {pi}",
+                self.cfg.tag
+            ));
+            self.recycle(plain);
+            return;
+        }
         if dst != self.cfg.local_addr {
+            if let Some(dest_pi) = self.lpm(dst)
+                && dest_pi != pi
+            {
+                let _ = self.xmit_to_peer(dest_pi, plain);
+                return;
+            }
             self.recycle(plain);
             return;
         }
@@ -1220,7 +1326,7 @@ impl Stack {
             let dport = u16::from_be_bytes([plain[hdr_len + 2], plain[hdr_len + 3]]);
             let sender = match self.udp.get(&dport) {
                 Some(sess)
-                    if sess.target.ip() == IpAddr::V4(src)
+                    if sess.target.ip() == IpAddr::V4(src_ip)
                         && (sess.target.port() == sport || sess.target.port() == 0) =>
                 {
                     Some(sess.to_caller.clone())
@@ -1566,8 +1672,8 @@ async fn run(
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
-        while let Ok(n) = stack.sock.try_recv(&mut buf) {
-            stack.process_inbound(&buf[..n]);
+        while let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) {
+            stack.process_inbound(&buf[..n], src);
         }
         while let Ok(cmd) = rx.try_recv() {
             stack.process_cmd(cmd);
@@ -1583,8 +1689,8 @@ async fn run(
                 Some(cmd) => stack.process_cmd(cmd),
                 None => return Ok(()),
             },
-            res = sock.recv(&mut buf) => match res {
-                Ok(n) => stack.process_inbound(&buf[..n]),
+            res = sock.recv_from(&mut buf) => match res {
+                Ok((n, src)) => stack.process_inbound(&buf[..n], src),
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             },
             _ = tokio::time::sleep_until(deadline) => {}
@@ -1830,5 +1936,100 @@ mod tests {
         assert_eq!(ipv4_checksum(&pkt[..20]), 0);
         assert_eq!(ipv4_dst(&pkt), Some(dst));
         assert!(ipv4_info(&[0u8; 10]).is_none());
+    }
+
+    fn b64(data: &[u8]) -> String {
+        const B64_ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                B64_ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                B64_ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn wireguard_server_responder_accepts_initiation() {
+        use std::net::IpAddr;
+
+        let server_priv = [0x55u8; 32];
+        let client_priv = [0x66u8; 32];
+        let server_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(server_priv))
+                .to_bytes();
+        let client_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(client_priv))
+                .to_bytes();
+
+        let s_bind = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = s_bind.local_addr().unwrap().port();
+        drop(s_bind);
+
+        let cfg_json = json!({
+            "private_key": b64(&server_priv),
+            "address": ["10.66.66.1/24"],
+            "listen_port": port,
+            "peers": [{
+                "public_key": b64(&client_pub),
+                "allowed_ips": ["10.66.66.2/32"]
+            }]
+        });
+        let map = cfg_json.as_object().unwrap();
+        let wg = WireGuard::build(map, "endpoints[0]").expect("build wg server");
+        wg.start_listen().await.expect("start listen");
+
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client sock");
+        let server_addr = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port);
+
+        let hs = noise::build_initiation(
+            &client_priv,
+            &client_pub,
+            &server_pub,
+            None,
+            &noise::tai64n_now(),
+            noise::HDR_INIT.0,
+        );
+        client_sock
+            .send_to(hs.initiation(), server_addr)
+            .await
+            .expect("send init");
+
+        let mut resp_buf = vec![0u8; 1500];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_secs(3), client_sock.recv_from(&mut resp_buf))
+                .await
+                .expect("timeout waiting for handshake response")
+                .expect("recv response");
+        assert_eq!(from.port(), port);
+
+        let mut client_session = noise::process_response(&hs, &resp_buf[..n], &client_pub, None)
+            .expect("client process response");
+
+        // Send transport keepalive from client to server
+        let plain = b"";
+        let sealed = client_session.seal(plain).expect("seal");
+        client_sock
+            .send_to(&sealed, server_addr)
+            .await
+            .expect("send transport");
     }
 }

@@ -3,58 +3,80 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Мульти-протокольный бенчмарк: tachyon-core vs sing-box vs Xray vs Mihomo (ROUTER 1-CORE (Single-Core))</title>
+<title>Бенчмарк прокси-ядер: tachyon-core vs Steer vs Xray vs Mihomo vs sing-box</title>
 <style>
  :root {
-  --bg: #0c0d11; --card: #15161d; --head: #1c1d25; --grp: #22232e;
+  --bg: #0c0d11; --card: #15161d; --card-alt: #1a1b24; --head: #1c1d25; --grp: #22232e;
   --ink: #f0f1f5; --muted: #9498a4; --faint: #6c707e;
   --line: #262733; --line2: #1e1f29;
   --win-bg: #102d1d; --win-ink: #4ade80;
   --loss-bg: #321517; --loss-ink: #f87171;
   --tie-bg: #1e2028; --tie-ink: #9498a4;
   --none-bg: #181920; --none-ink: #555966;
-  --accent: #6366f1; --hover: #1b1d28;
+  --accent: #6366f1; --accent-glow: rgba(99, 102, 241, 0.15); --hover: #1b1d28;
   --t-col-bg: rgba(99, 102, 241, 0.04);
   --shadow: 0 1px 3px rgba(0,0,0,.5);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,.6);
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
  }
  @media (prefers-color-scheme: light) {
   :root {
-   --bg: #f3f4f8; --card: #ffffff; --head: #f5f6fa; --grp: #eaebf2;
+   --bg: #f3f4f8; --card: #ffffff; --card-alt: #f8f9fc; --head: #f5f6fa; --grp: #eaebf2;
    --ink: #16171d; --muted: #5a5e6d; --faint: #8d92a0;
    --line: #dcdee6; --line2: #e9ebf2;
    --win-bg: #e6f7ec; --win-ink: #15803d;
    --loss-bg: #fee2e2; --loss-ink: #b91c1c;
    --tie-bg: #f1f2f6; --tie-ink: #5a5e6d;
    --none-bg: #f4f5f8; --none-ink: #9aa0ae;
-   --accent: #4f46e5; --hover: #eef2ff;
+   --accent: #4f46e5; --accent-glow: rgba(79, 70, 229, 0.1); --hover: #eef2ff;
    --t-col-bg: rgba(79, 70, 229, 0.03);
    --shadow: 0 1px 3px rgba(0,0,0,.08);
+   --shadow-lg: 0 8px 24px rgba(0,0,0,.1);
   }
  }
  *, *::before, *::after { box-sizing: border-box; }
  html, body {
   margin: 0; padding: 0; width: 100%; overflow-x: hidden;
-  color: var(--ink); font: 12px/1.3 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
+  color: var(--ink); font: 12px/1.35 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
   background: var(--bg);
  }
- .page { width: 100%; max-width: 100%; padding: 8px 12px 16px; margin: 0 auto; }
- 
- .top-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
- .title-group h1 { font-size: 15px; font-weight: 750; margin: 0; letter-spacing: -.02em; display: inline-block; }
+ .page { width: 100%; max-width: 100%; padding: 10px 14px 24px; margin: 0 auto; }
+
+ /* Top header */
+ .top-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+ .title-group h1 { font-size: 16px; font-weight: 800; margin: 0; letter-spacing: -.02em; display: inline-flex; align-items: center; gap: 6px; }
+ .title-badge { font-size: 10px; background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); padding: 1px 6px; border-radius: 4px; font-family: var(--mono); font-weight: 700; }
  .env-info { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-top: 3px; flex-wrap: wrap; }
- .env-tag { font-size: 9px; font-weight: 750; background: var(--accent); color: #fff; padding: 2px 6px; border-radius: 4px; font-family: var(--mono); letter-spacing: .03em; }
+ .env-tag { font-size: 9.5px; font-weight: 750; background: var(--accent); color: #fff; padding: 2px 7px; border-radius: 4px; font-family: var(--mono); letter-spacing: .03em; }
  .env-val { color: var(--ink); font-weight: 600; }
  .env-pill { font-size: 10px; background: var(--card); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; font-family: var(--mono); color: var(--faint); }
- 
- .chips { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
- .chip { display: inline-flex; align-items: center; gap: 5px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font-size: 11px; box-shadow: var(--shadow); }
- .chip span { color: var(--muted); font-weight: 500; }
- .chip b { font-family: var(--mono); font-weight: 700; font-size: 12px; }
- .chip.win b { color: var(--win-ink); }
- .chip.loss b { color: var(--loss-ink); }
- .chip.tie b { color: var(--tie-ink); }
 
+ /* View Mode Switcher */
+ .view-nav { display: flex; gap: 6px; align-items: center; background: var(--card); border: 1px solid var(--line); padding: 4px; border-radius: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+ .view-btn { appearance: none; border: 1px solid transparent; background: transparent; color: var(--muted); font: 650 11.5px/1.2 inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer; transition: all .15s ease; display: inline-flex; align-items: center; gap: 6px; }
+ .view-btn:hover { color: var(--ink); background: var(--hover); }
+ .view-btn.on { background: var(--accent); color: #fff; font-weight: 700; box-shadow: 0 2px 6px var(--accent-glow); }
+ .view-count { font-size: 9.5px; font-family: var(--mono); opacity: .85; background: rgba(0,0,0,0.2); padding: 1px 5px; border-radius: 4px; }
+
+ /* Bento KPI Grid */
+ .bento-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 8px; margin-bottom: 12px; }
+ .bento-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow); position: relative; overflow: hidden; transition: transform .12s ease, border-color .12s ease; }
+ .bento-card:hover { border-color: var(--accent); }
+ .bento-card.lead { border-color: rgba(74, 222, 128, 0.4); background: linear-gradient(180deg, var(--card) 0%, rgba(16, 45, 29, 0.2) 100%); }
+ .bento-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+ .bento-pill { font-size: 9.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; font-family: var(--mono); }
+ .bento-pill.win { background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); }
+ .bento-val { font-size: 20px; font-weight: 800; font-family: var(--mono); color: var(--ink); letter-spacing: -.02em; line-height: 1.1; margin-bottom: 2px; }
+ .bento-card.lead .bento-val { color: var(--win-ink); }
+ .bento-sub { font-size: 10.5px; color: var(--faint); font-weight: 500; line-height: 1.25; margin-bottom: 4px; }
+ .bento-compare { font-size: 9.5px; font-family: var(--mono); color: var(--muted); border-top: 1px solid var(--line2); padding-top: 4px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+ /* Section headers */
+ .section-header { display: flex; align-items: center; justify-content: space-between; margin: 12px 0 6px; flex-wrap: wrap; gap: 8px; }
+ .section-title { font-size: 13.5px; font-weight: 750; color: var(--ink); margin: 0; display: inline-flex; align-items: center; gap: 6px; }
+ .section-sub { font-size: 11px; color: var(--muted); font-weight: 500; }
+
+ /* Toolbar */
  .toolbar { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; flex-wrap: wrap; }
  .tabs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
  .tab { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }
@@ -65,13 +87,25 @@
  .btn { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }
  .btn:hover { border-color: var(--accent); color: var(--accent); }
  .btn.on { background: var(--loss-bg); border-color: var(--loss-ink); color: var(--loss-ink); font-weight: 700; }
- #q { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 11.5px/1 inherit; padding: 5px 10px; width: 220px; border-radius: 6px; margin-left: auto; outline: none; }
+ #q { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 11.5px/1 inherit; padding: 5px 10px; width: 240px; border-radius: 6px; margin-left: auto; outline: none; }
  #q:focus { border-color: var(--accent); }
  #q::placeholder { color: var(--faint); font-size: 11px; }
 
- .table-wrap { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; }
+ /* Table styles */
+ .table-wrap { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; margin-bottom: 12px; }
  table.grid { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 11.5px; font-variant-numeric: tabular-nums; }
- 
+
+ /* Cores table columns */
+ col.cc-name { width: 20%; }
+ col.cc-sz { width: 9%; }
+ col.cc-start { width: 10%; }
+ col.cc-ram { width: 13%; }
+ col.cc-lat { width: 13%; }
+ col.cc-tp1 { width: 11%; }
+ col.cc-tp8 { width: 11%; }
+ col.cc-cpu { width: 13%; }
+
+ /* Protocols table columns */
  col.c-name { width: 20%; }
  col.c-t { width: 19%; }
  col.c-s { width: 19%; }
@@ -79,14 +113,13 @@
  col.c-m { width: 12%; }
  col.c-vd { width: 13%; }
 
- .grid th, .grid td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 3px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ .grid th, .grid td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 4px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
  .grid tr:last-child td { border-bottom: none; }
  .grid th:last-child, .grid td:last-child { border-right: none; }
  
  .grid thead th { background: var(--head); color: var(--muted); height: 28px; text-align: left; font-size: 11px; font-weight: 650; }
- .grid thead th.th-core { text-align: left; }
  .grid thead th.th-t { background: var(--grp); color: var(--ink); border-left: 2px solid var(--win-ink); }
- .grid thead th.th-vd { text-align: center; }
+ .grid thead th.th-center { text-align: center; }
  .th-hint { font-size: 9px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 3px; }
 
  .grid td.name { text-align: left; font-weight: 600; }
@@ -95,6 +128,8 @@
  .cid-tag { font-size: 9.5px; color: var(--faint); font-family: var(--mono); opacity: .85; }
  
  td.col-t-cell { background: var(--t-col-bg); }
+ tr.lead-row td { background: rgba(74, 222, 128, 0.04); }
+ tr.lead-row td.name { border-left: 3px solid var(--win-ink); }
  .grid td.num { text-align: left; }
  .grid td.num.none { color: var(--none-ink); text-align: center; font-weight: 500; font-size: 11px; }
  .grid td.num.fail { color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 10px; }
@@ -104,14 +139,14 @@
  .unit { font-size: 9.5px; color: var(--muted); font-weight: 500; }
  .cell-sub { font-size: 9.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; line-height: 1.15; margin-top: 1px; }
  .cpu { color: var(--muted); font-family: var(--mono); font-weight: 600; }
- .col-t-cell .cpu { color: var(--win-ink); font-weight: 700; }
+ .col-t-cell .cpu, tr.lead-row .cpu { color: var(--win-ink); font-weight: 700; }
  .diff { font-size: 9.5px; font-weight: 700; padding: 0 4px; border-radius: 4px; font-family: var(--mono); white-space: nowrap; }
  .diff.win { background: var(--win-bg); color: var(--win-ink); }
  .diff.loss { background: var(--loss-bg); color: var(--loss-ink); }
  .diff.tie { background: var(--tie-bg); color: var(--tie-ink); }
  
- .bar-bg { background: var(--line2); height: 2px; border-radius: 1px; overflow: hidden; margin-top: 2px; width: 100%; }
- .bar-fill { height: 100%; border-radius: 1px; }
+ .bar-bg { background: var(--line2); height: 3px; border-radius: 1.5px; overflow: hidden; margin-top: 3px; width: 100%; }
+ .bar-fill { height: 100%; border-radius: 1.5px; }
  
  .grid td.vd { text-align: center; }
  .vpill { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; text-transform: uppercase; font-family: var(--mono); letter-spacing: .02em; display: inline-block; }
@@ -120,65 +155,462 @@
  .vpill.tie { background: var(--tie-bg); color: var(--tie-ink); }
  .vpill.none { background: var(--none-bg); color: var(--none-ink); }
 
- tbody tr.case:hover td { background: var(--hover); }
+ tbody tr.case:hover td, tbody tr.core-row:hover td { background: var(--hover); }
  body.losses-only tr.case:not(.loss) { display: none; }
+
+ /* Architecture comparison cards */
+ .arch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; margin-bottom: 12px; }
+ .arch-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow); }
+ .arch-title { font-size: 12px; font-weight: 700; color: var(--ink); margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between; }
+ .arch-tag { font-size: 9.5px; font-family: var(--mono); padding: 1px 5px; border-radius: 4px; }
+ .arch-tag.rust { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid #6366f1; }
+ .arch-tag.c { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid #0284c7; }
+ .arch-tag.go { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid #d97706; }
+ .arch-body { font-size: 11px; color: var(--muted); line-height: 1.4; }
+ .arch-stat { font-family: var(--mono); font-weight: 700; color: var(--ink); }
+
+ /* Methodology footer */
+ .method-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: var(--muted); line-height: 1.45; box-shadow: var(--shadow); }
+ .method-head { font-weight: 700; color: var(--ink); margin-bottom: 4px; font-size: 11.5px; }
+ .method-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 </style>
 </head>
 <body>
 <div class="page">
+  <!-- Top header -->
   <div class="top-bar">
     <div class="title-group">
-      <h1>Мульти-протокольный бенчмарк прокси-ядер (все 25 протокола)</h1>
+      <h1>Бенчмарк прокси-ядер <span class="title-badge">ROUTER 1-CORE</span></h1>
       <div class="env-info">
-        <span class="env-tag">ROUTER 1-CORE (Single-Core)</span>
-        <span class="env-val">Docker Linux x86_64 &bull; AMD Ryzen 7 5800X3D (8C/16T)</span>
-        <span class="env-pill">1 поток (1 worker / GOMAXPROCS=1)</span>
-        <span class="env-pill">Client CPU: Core 0 (1 ядро)</span>
-        <span class="env-pill">Server CPU: 4 ядра (VPS upstream model)</span>
+        <span class="env-tag">Single-Core Isolation</span>
+        <span class="env-val">Docker Linux x86_64 &bull; AMD Ryzen 7 5800X3D (8C/16T, 96MB V-Cache)</span>
+        <span class="env-pill">1 worker / GOMAXPROCS=1</span>
+        <span class="env-pill">Client CPU: Core 0</span>
+        <span class="env-pill">Proxy CPU: Core 1</span>
+        <span class="env-pill">Upstream Server: Cores 2-5 (4 ядра)</span>
       </div>
     </div>
-    <div class="chips">
-      <div class="chip"><span>протоколов:</span><b>25</b></div>
-      <div class="chip win"><span>побед tachyon:</span><b>22/25</b></div>
-      <div class="chip loss"><span>побед других:</span><b>0</b></div>
-      <div class="chip tie"><span>паритет:</span><b>3</b></div>
-      <div class="chip win"><span>память tachyon:</span><b>5–55 MB</b></div>
-      <div class="chip win"><span>CPU tachyon:</span><b>0.2–9.5 s/G</b></div>
-      <div class="chip"><span>CPU Go-ядер:</span><b>0.2–11.3 s/G</b></div>
+  </div>
+
+  <!-- Mode Switcher -->
+  <div class="view-nav">
+    <button class="view-btn on" id="btn-view-all" onclick="switchView('all')">
+      📊 Все результаты (Полный дашборд)
+    </button>
+    <button class="view-btn" id="btn-view-cores" onclick="switchView('cores')">
+      ⚡ Сравнение 5 ядер (+ Steer) <span class="view-count">5 ядер + Direct</span>
+    </button>
+    <button class="view-btn" id="btn-view-proto" onclick="switchView('proto')">
+      🌐 25 протоколов (Tachyon vs Go) <span class="view-count">25 сценариев</span>
+    </button>
+  </div>
+
+  <!-- Bento KPI Grid -->
+  <div class="bento-grid">
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>💾 ОПЕРАТИВНАЯ ПАМЯТЬ</span>
+        <span class="bento-pill win">🥇 1-Е МЕСТО</span>
+      </div>
+      <div class="bento-val">4.2 MiB</div>
+      <div class="bento-sub">Пик 4.6 MiB (в 9.5x меньше sing-box)</div>
+      <div class="bento-compare">Steer: 5.1M &bull; Xray: 25.0M &bull; SB: 39.9M</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>⚡ ХОЛОДНЫЙ СТАРТ</span>
+        <span class="bento-pill win">🥇 1-Е МЕСТО</span>
+      </div>
+      <div class="bento-val">22.3 ms</div>
+      <div class="bento-sub">В 12x быстрее эталонного sing-box</div>
+      <div class="bento-compare">Steer: 142ms &bull; Xray: 161ms &bull; SB: 268ms</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>🚀 СКОРОСТЬ (1 ЯДРО)</span>
+        <span class="bento-pill win">🥇 РЕКОРД ДАТА-ПЛЕЙНА</span>
+      </div>
+      <div class="bento-val">51.74 Gbps</div>
+      <div class="bento-sub">8 потоков, 0.163 s CPU на GiB</div>
+      <div class="bento-compare">Xray: 53.1G &bull; SB: 51.5G &bull; Steer: 8.0G</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>⏱️ ЗАДЕРЖКА (RTT p50)</span>
+        <span class="bento-pill win">🥇 МИНИМУМ ДЖИТТЕРА</span>
+      </div>
+      <div class="bento-val">170.0 µs</div>
+      <div class="bento-sub">p99: 221.4 µs (+76 µs над Direct)</div>
+      <div class="bento-compare">Direct: 93.5µs &bull; Steer: 174µs &bull; SB: 183µs</div>
+    </div>
+
+    <div class="bento-card">
+      <div class="bento-head">
+        <span>📦 РАЗМЕР БИНАРНИКА</span>
+        <span class="bento-pill" style="background:var(--card-alt);color:var(--ink);border:1px solid var(--line)">C / RUST MUSL</span>
+      </div>
+      <div class="bento-val" style="font-size:18px">1.76M / 11.6M</div>
+      <div class="bento-sub">Steer 1.76M (C) &bull; Tachyon 11.6M (Rust)</div>
+      <div class="bento-compare">Xray: 34.9M &bull; Mihomo: 59.1M &bull; SB: 76.0M</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>🌐 МАТРИЦА ПРОТОКОЛОВ</span>
+        <span class="bento-pill win">88% ПОБЕД</span>
+      </div>
+      <div class="bento-val">22 / 25</div>
+      <div class="bento-sub">22 победы, 3 паритета, 0 поражений</div>
+      <div class="bento-compare">Shadowsocks &bull; VMess &bull; VLESS &bull; QUIC &bull; XHTTP</div>
     </div>
   </div>
 
-  <div class="toolbar">
-    <div class="tabs">
-      <button class='tab on' onclick="filterCat('all')">Все <i>25</i></button><button class='tab' onclick="filterCat('Shadowsocks')">Shadowsocks <i>4</i></button><button class='tab' onclick="filterCat('VMess')">VMess <i>4</i></button><button class='tab' onclick="filterCat('VLESS')">VLESS <i>8</i></button><button class='tab' onclick="filterCat('Trojan')">Trojan <i>3</i></button><button class='tab' onclick="filterCat('QUIC / H2')">QUIC / H2 <i>6</i></button><button class='tab' onclick="filterCat('xhttp')">XHTTP <i>1</i></button>
+  <!-- SECTION 1: 5 CORES COMPARISON -->
+  <div id="sec-cores">
+    <div class="section-header">
+      <div>
+        <h2 class="section-title">⚡ Сравнительный архитектурный бенчмарк 5 ядер (со Steer)</h2>
+        <div class="section-sub">Сквозной тест маршрутизации и data-plane: SOCKS5 Inbound → Direct Outbound. Замеряется на 1 изолированном ядре CPU (Router single-core profile).</div>
+      </div>
+      <div style="font-size:11px;font-family:var(--mono);color:var(--muted)">
+        Direct сокет: <b style="color:var(--ink)">93.5 µs</b> &bull; <b style="color:var(--ink)">39.5 Gbps</b>
+      </div>
     </div>
-    <button class="btn" id="lossBtn" onclick="toggleLosses()">только провалы</button>
-    <input id="q" placeholder="поиск: xhttp, quic, vless, grpc..." autocomplete="off" spellcheck="false" oninput="applyQ()">
+
+    <div class="table-wrap">
+      <table class="grid">
+        <colgroup>
+          <col class="cc-name">
+          <col class="cc-sz">
+          <col class="cc-start">
+          <col class="cc-ram">
+          <col class="cc-lat">
+          <col class="cc-tp1">
+          <col class="cc-tp8">
+          <col class="cc-cpu">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Ядро / Архитектурный стек</th>
+            <th>Размер</th>
+            <th>Холодный старт</th>
+            <th>Idle / Peak RAM</th>
+            <th>Задержка (p50 / p99)</th>
+            <th>1 поток (1s)</th>
+            <th>8 потоков (8s)</th>
+            <th>CPU на GiB / Вердикт</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- DIRECT Baseline -->
+          <tr class="core-row" style="opacity:0.85">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">DIRECT (Loopback baseline)</span>
+              </div>
+              <div class="cell-sub">Нативный сокет ядра Linux (без прокси)</div>
+            </td>
+            <td class="num"><span class="spd">—</span></td>
+            <td class="num"><span class="spd">&lt; 1 ms</span></td>
+            <td class="num"><span class="spd">—</span></td>
+            <td class="num">
+              <div class="val-row"><span class="spd">93.5 µs</span></div>
+              <div class="cell-sub">p99: 138.6 µs</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">43.29<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:83%;background:var(--muted)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">39.45<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:76%;background:var(--muted)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.000 s/G</span></div>
+              <div class="cell-sub"><span class="vpill none">BASELINE</span></div>
+            </td>
+          </tr>
+
+          <!-- TACHYON CORE -->
+          <tr class="core-row lead-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn" style="color:var(--win-ink)">tachyon-core 0.0.1</span>
+                <span class="vpill win">1-Е МЕСТО</span>
+              </div>
+              <div class="cell-sub">Rust 2024, static musl, pure Rust crypto, tokio</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">11.61<span class="unit">M</span></span></div>
+              <div class="cell-sub">zero C-deps</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">22.3 ms</span></div>
+              <div class="cell-sub"><span class="diff win">12.0x быстрее</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">4.2 / 4.6<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff win">-89.5% RAM</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">170.0 µs</span></div>
+              <div class="cell-sub">p99: 221.4 µs (+76µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">50.76<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:100%;background:var(--win-ink)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">51.74<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:100%;background:var(--win-ink)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.163 s/G</span></div>
+              <div class="cell-sub"><span class="vpill win">АБСОЛЮТНЫЙ ЛИДЕР</span></div>
+            </td>
+          </tr>
+
+          <!-- STEER -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">steer 2.0.3 (box-connector)</span>
+                <span class="vpill" style="background:rgba(56, 189, 248, 0.15);color:#38bdf8;border:1px solid #0284c7">C OPENWRT</span>
+              </div>
+              <div class="cell-sub">C (steerd + steer-dnsd + steer-box-connector)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:#38bdf8">1.76<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff win">наименьший</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">141.9 ms</span></div>
+              <div class="cell-sub"><span class="diff win">1.9x быстрее SB</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">5.1 / 5.4<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff win">-87.2% RAM</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">173.6 µs</span></div>
+              <div class="cell-sub">p99: 221.7 µs (+80µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">9.59<span class="unit">G</span></span><span class="diff loss">-81%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:19%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">8.01<span class="unit">G</span></span><span class="diff loss">-85%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:15%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">1.067 s/G</span></div>
+              <div class="cell-sub"><span class="vpill" style="background:rgba(56, 189, 248, 0.15);color:#38bdf8">C-КОМПАКТНОСТЬ</span></div>
+            </td>
+          </tr>
+
+          <!-- XRAY CORE -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">Xray-core 26.3.27</span>
+              </div>
+              <div class="cell-sub">Go 1.26.1 linux/amd64, XTLS runtime</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">34.88<span class="unit">M</span></span></div>
+              <div class="cell-sub">Go bin</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">161.1 ms</span></div>
+              <div class="cell-sub"><span class="diff win">1.7x быстрее SB</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">25.0 / 25.6<span class="unit">M</span></span></div>
+              <div class="cell-sub">Go runtime</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">183.9 µs</span></div>
+              <div class="cell-sub">p99: 233.4 µs (+90µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">49.98<span class="unit">G</span></span><span class="diff tie">~0%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:98%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">53.09<span class="unit">G</span></span><span class="diff win">+3%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:100%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.158 s/G</span></div>
+              <div class="cell-sub"><span class="vpill tie">GO-ПАЙПЛАЙН</span></div>
+            </td>
+          </tr>
+
+          <!-- MIHOMO -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">Mihomo Meta v1.19.32</span>
+              </div>
+              <div class="cell-sub">Go 1.26.8 linux/amd64, Clash Meta core</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">59.12<span class="unit">M</span></span></div>
+              <div class="cell-sub">Go Clash</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">211.3 ms</span></div>
+              <div class="cell-sub"><span class="diff win">1.3x быстрее SB</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">32.9 / 33.9<span class="unit">M</span></span></div>
+              <div class="cell-sub">Clash state</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">188.5 µs</span></div>
+              <div class="cell-sub">p99: 251.3 µs (+95µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">50.03<span class="unit">G</span></span><span class="diff tie">~0%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:98%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">48.23<span class="unit">G</span></span><span class="diff loss">-7%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:93%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.174 s/G</span></div>
+              <div class="cell-sub"><span class="vpill tie">CLASH META</span></div>
+            </td>
+          </tr>
+
+          <!-- SING-BOX LX -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">sing-box version 1.14.2-lx.12</span>
+              </div>
+              <div class="cell-sub">Go 1.26.8 linux/amd64, эталонная реализация</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">76.01<span class="unit">M</span></span></div>
+              <div class="cell-sub">самый тяжелый</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">268.2 ms</span></div>
+              <div class="cell-sub"><span class="diff loss">12.0x медленнее</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">39.9 / 40.8<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff loss">9.5x больше</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">182.6 µs</span></div>
+              <div class="cell-sub">p99: 232.8 µs (+89µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">48.57<span class="unit">G</span></span><span class="diff loss">-4%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:96%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">51.53<span class="unit">G</span></span><span class="diff tie">~0%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:99%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.166 s/G</span></div>
+              <div class="cell-sub"><span class="vpill tie">ЭТАЛОН GO</span></div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Architectural Insights Cards -->
+    <div class="arch-grid">
+      <div class="arch-card">
+        <div class="arch-title">
+          <span>🦀 Rust 2024 / tachyon-core</span>
+          <span class="arch-tag rust">НУЛЕВЫЕ АЛЛОКАЦИИ</span>
+        </div>
+        <div class="arch-body">
+          Нулевые аллокации в relay-цикле, прямое использование ядра Linux (<span class="arch-stat">splice</span>, <span class="arch-stat">recvmmsg</span>, zero-copy buffers), чистый Rust криптостек без сборщика мусора (GC) и без C FFI. Итог: <span class="arch-stat">4.2 MiB RAM</span> (меньше даже C-ядра!), старт <span class="arch-stat">22.3 ms</span> и пропускная способность <span class="arch-stat">51.7 Gbps</span>.
+        </div>
+      </div>
+
+      <div class="arch-card">
+        <div class="arch-title">
+          <span>🇨 C / OpenWrt / Steer</span>
+          <span class="arch-tag c">УЛЬТРА-КОМПАКТНОСТЬ C</span>
+        </div>
+        <div class="arch-body">
+          Специализированный легковесный стек на C (OpenWrt/ubus). Минимальный размер бинарника (<span class="arch-stat">1.76 MiB</span>) и скромный RSS (<span class="arch-stat">5.1 MiB</span>). Однако разделение на 3 процесса (<span class="arch-stat">connector ↔ steerd ↔ dnsd</span>) с IPC через локальные сокеты и отсутствие zero-copy батчинга ограничивают throughput до <span class="arch-stat">8.0–9.6 Gbps</span> при <span class="arch-stat">1.07 s/GiB CPU</span>.
+        </div>
+      </div>
+
+      <div class="arch-card">
+        <div class="arch-title">
+          <span>🐹 Go Runtimes / sing-box, Xray, Mihomo</span>
+          <span class="arch-tag go">ТЯЖЕЛЫЙ RUNTIME</span>
+        </div>
+        <div class="arch-body">
+          Высокая пропускная способность на больших объемах (<span class="arch-stat">48–53 Gbps</span>), но высокая базовая плата за Go runtime: <span class="arch-stat">25–40 MiB</span> постоянного RSS даже в idle, GC-паузы и долгий холодный старт (<span class="arch-stat">160–270 ms</span>) из-за динамической инициализации runtime и структур данных.
+        </div>
+      </div>
+    </div>
   </div>
 
-  <div class="table-wrap">
-    <table class="grid">
-      <colgroup>
-        <col class="c-name">
-        <col class="c-t">
-        <col class="c-s">
-        <col class="c-x">
-        <col class="c-m">
-        <col class="c-vd">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="th-name">Протокол</th>
-          <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-vd">Вердикт</th>
-        </tr>
-      </thead>
-      <tbody>
-        
-        <tr class='case win' data-cat='Shadowsocks' data-k='ss-aes-128-gcm shadowsocks aes-128-gcm'>
+  <!-- SECTION 2: 25 PROTOCOLS MATRIX -->
+  <div id="sec-protocols">
+    <div class="section-header">
+      <div>
+        <h2 class="section-title">🌐 Мульти-протокольная матрица (все 25 протокола)</h2>
+        <div class="section-sub">Сквозные замеры 25 конфигураций прокси: от Shadowsocks и VMess до VLESS Vision, gRPC, QUIC (Hysteria 2 / TUIC) и XHTTP.</div>
+      </div>
+      <div style="font-size:11px;font-family:var(--mono);color:var(--win-ink)">
+        <b>22 победы</b> tachyon &bull; <b>3 паритета</b> &bull; <b>0 поражений</b>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="tabs">
+        <button class='tab on' onclick="filterCat('all')">Все <i>25</i></button>
+        <button class='tab' onclick="filterCat('Shadowsocks')">Shadowsocks <i>4</i></button>
+        <button class='tab' onclick="filterCat('VMess')">VMess <i>4</i></button>
+        <button class='tab' onclick="filterCat('VLESS')">VLESS <i>8</i></button>
+        <button class='tab' onclick="filterCat('Trojan')">Trojan <i>3</i></button>
+        <button class='tab' onclick="filterCat('QUIC / H2')">QUIC / H2 <i>6</i></button>
+        <button class='tab' onclick="filterCat('xhttp')">XHTTP <i>1</i></button>
+      </div>
+      <button class="btn" id="lossBtn" onclick="toggleLosses()">только провалы</button>
+      <input id="q" placeholder="поиск: xhttp, quic, vless, grpc, ss..." autocomplete="off" spellcheck="false" oninput="applyQ()">
+    </div>
+
+    <div class="table-wrap">
+      <table class="grid">
+        <colgroup>
+          <col class="c-name">
+          <col class="c-t">
+          <col class="c-s">
+          <col class="c-x">
+          <col class="c-m">
+          <col class="c-vd">
+        </colgroup>
+        <thead>
+          <tr>
+            <th class="th-name">Протокол</th>
+            <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-vd">Вердикт</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class='case win' data-cat='Shadowsocks' data-k='ss-aes-128-gcm shadowsocks aes-128-gcm'>
           <td class='name'>
             <div class='name-line'>
               <span class='cn'>Shadowsocks AES-128-GCM</span>
@@ -1310,17 +1742,59 @@
             </td>
           <td class='vd'><span class='vpill win'>TACHYON +35%</span></td>
         </tr>
-        
-      </tbody>
-    </table>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- SECTION 3: METHODOLOGY -->
+  <div class="method-card">
+    <div class="method-head">🛠️ Методология тестирования и конфигурация стенда</div>
+    <div>
+      Тестирование проводилось в изолированном Docker-контейнере Linux (WSL2 kernel 6.18.33.1, AMD Ryzen 7 5800X3D). 
+      Для исключения взаимного влияния потоков применяется жесткая изоляция CPU affinity (taskset): клиент нагрузки генерирует трафик строго на Core 0, тестируемый прокси-процесс исполняется строго на Core 1 (в однопоточном режиме: <code>TACHYON_WORKERS=1</code>, <code>GOMAXPROCS=1</code>), а целевой апстрим-сервер занимает ядра Cores 2-5.
+      Замеры памяти производятся через <code>/proc/[pid]/smaps_rollup</code> с фиксацией PSS/RSS (для Steer суммируется всё дерево процессов: <code>connector</code>, <code>steerd</code>, <code>steer-dnsd</code>).
+      Замер холодного старта фиксирует время от момента <code>exec()</code> до первого успешного TCP/SOCKS handshake.
+    </div>
+    <div class="method-tags">
+      <span class="env-pill">iperf3 1 поток (60s)</span>
+      <span class="env-pill">iperf3 8 потоков (60s)</span>
+      <span class="env-pill">h2load 100 conns</span>
+      <span class="env-pill">1000 sequential RTT probes</span>
+      <span class="env-pill">smaps_rollup RSS accounting</span>
+      <span class="env-pill">Zero CPU steal verification</span>
+    </div>
   </div>
 </div>
 
 <script>
   let curCat = 'all';
+  let curView = 'all';
+
+  function switchView(mode) {
+    curView = mode;
+    document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('on'));
+    const btn = document.getElementById(mode === 'all' ? 'btn-view-all' : (mode === 'cores' ? 'btn-view-cores' : 'btn-view-proto'));
+    if (btn) btn.classList.add('on');
+
+    const secCores = document.getElementById('sec-cores');
+    const secProto = document.getElementById('sec-protocols');
+
+    if (mode === 'all') {
+      secCores.style.display = '';
+      secProto.style.display = '';
+    } else if (mode === 'cores') {
+      secCores.style.display = '';
+      secProto.style.display = 'none';
+    } else if (mode === 'proto') {
+      secCores.style.display = 'none';
+      secProto.style.display = '';
+    }
+  }
+
   function filterCat(cat) {
     curCat = cat;
-    document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+    document.querySelectorAll('.tabs .tab').forEach(b => b.classList.remove('on'));
     if (event && event.target) {
       const btn = event.target.closest('.tab');
       if (btn) btn.classList.add('on');

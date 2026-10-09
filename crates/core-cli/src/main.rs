@@ -3,7 +3,8 @@
 #[cfg(all(
     target_os = "linux",
     not(target_env = "msvc"),
-    not(feature = "allocstat")
+    not(feature = "allocstat"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -15,7 +16,11 @@ static GLOBAL: allocstat::Counting = allocstat::Counting;
 #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
 mod allocstat;
 
-#[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_env = "msvc"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 unsafe extern "C" {
     fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
 }
@@ -551,8 +556,11 @@ fn main() -> ExitCode {
     // which the runtime does before main -- these two calls are what stands.
     #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
     unsafe {
-        mi_option_set(15, 0);
-        mi_option_set(43, 0);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            mi_option_set(15, 0);
+            mi_option_set(43, 0);
+        }
         raise_rlimit_nofile();
     }
     let raw_args: Vec<String> = std::env::args().skip(1).collect();

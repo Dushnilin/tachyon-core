@@ -3,238 +3,618 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Мульти-протокольная матрица: tachyon vs sing-box vs Xray vs Mihomo vs steer (ROUTER 1-CORE (Single-Core))</title>
+<title>Бенчмарк прокси-ядер: tachyon-core vs Steer vs Xray vs Mihomo vs sing-box</title>
 <style>
  :root {
-  --bg: #0b0c10; --card: #13141c; --head: #1a1b24; --grp: #20222e;
+  --bg: #0c0d11; --card: #15161d; --card-alt: #1a1b24; --head: #1c1d25; --grp: #22232e;
   --ink: #f0f1f5; --muted: #9498a4; --faint: #6c707e;
-  --line: #242531; --line2: #1b1c26;
+  --line: #262733; --line2: #1e1f29;
   --win-bg: #102d1d; --win-ink: #4ade80;
   --loss-bg: #321517; --loss-ink: #f87171;
   --tie-bg: #1e2028; --tie-ink: #9498a4;
-  --none-bg: #161720; --none-ink: #555966;
-  --accent: #6366f1; --hover: #191b26;
+  --none-bg: #181920; --none-ink: #555966;
+  --accent: #6366f1; --accent-glow: rgba(99, 102, 241, 0.15); --hover: #1b1d28;
   --t-col-bg: rgba(99, 102, 241, 0.04);
-  --st-col-bg: rgba(56, 189, 248, 0.02);
   --shadow: 0 1px 3px rgba(0,0,0,.5);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,.6);
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
  }
  @media (prefers-color-scheme: light) {
   :root {
-   --bg: #f3f4f8; --card: #ffffff; --head: #f5f6fa; --grp: #eaebf2;
+   --bg: #f3f4f8; --card: #ffffff; --card-alt: #f8f9fc; --head: #f5f6fa; --grp: #eaebf2;
    --ink: #16171d; --muted: #5a5e6d; --faint: #8d92a0;
    --line: #dcdee6; --line2: #e9ebf2;
    --win-bg: #e6f7ec; --win-ink: #15803d;
    --loss-bg: #fee2e2; --loss-ink: #b91c1c;
    --tie-bg: #f1f2f6; --tie-ink: #5a5e6d;
    --none-bg: #f4f5f8; --none-ink: #9aa0ae;
-   --accent: #4f46e5; --hover: #eef2ff;
+   --accent: #4f46e5; --accent-glow: rgba(79, 70, 229, 0.1); --hover: #eef2ff;
    --t-col-bg: rgba(79, 70, 229, 0.03);
-   --st-col-bg: rgba(2, 132, 199, 0.02);
    --shadow: 0 1px 3px rgba(0,0,0,.08);
+   --shadow-lg: 0 8px 24px rgba(0,0,0,.1);
   }
  }
  *, *::before, *::after { box-sizing: border-box; }
  html, body {
-  margin: 0; padding: 0; width: 100%; height: 100%;
-  color: var(--ink); font: 11px/1.2 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
+  margin: 0; padding: 0; width: 100%; overflow-x: hidden;
+  color: var(--ink); font: 12px/1.35 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
   background: var(--bg);
-  overflow-x: hidden;
  }
- .page {
-  width: 100%; max-width: 100%;
-  padding: 6px 12px 6px; margin: 0 auto;
-  box-sizing: border-box;
- }
- 
- .top-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 5px; flex-wrap: nowrap; }
- .title-group { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
- .title-line { display: flex; align-items: center; gap: 6px; }
- .title-icon { width: 15px; height: 15px; flex-shrink: 0; color: #38bdf8; display: inline-flex; align-items: center; }
- .title-group h1 { font-size: 13.5px; font-weight: 750; margin: 0; letter-spacing: -.02em; white-space: nowrap; }
- .sub-line { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
- .env-badge { font-size: 9px; font-family: var(--mono); color: var(--muted); background: var(--head); border: 1px solid var(--line); padding: 0 5px; border-radius: 3px; font-weight: 600; }
- 
- .summary-line { display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; font-family: var(--mono); white-space: nowrap; flex-shrink: 0; }
- .sum-win { color: var(--win-ink); }
- .sum-win b { font-size: 12.5px; font-weight: 750; }
- .sum-tie { color: var(--tie-ink); }
- .sum-tie b { font-size: 12px; font-weight: 700; }
- .sum-loss { color: var(--faint); }
- .sum-loss b { font-size: 12px; font-weight: 700; }
- .sum-dot { color: var(--line); font-size: 9px; }
+ .page { width: 100%; max-width: 100%; padding: 10px 14px 24px; margin: 0 auto; }
 
- .toolbar { display: flex; gap: 5px; margin-bottom: 5px; align-items: center; flex-wrap: nowrap; }
- .tabs { display: flex; gap: 3px; flex-wrap: nowrap; align-items: center; }
- .tab { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 10.5px/1 inherit; padding: 3px 8px; border-radius: 5px; cursor: pointer; transition: all .12s; white-space: nowrap; }
- .tab i { font-style: normal; font-weight: 600; opacity: .75; font-size: 9px; margin-left: 3px; font-family: var(--mono); }
+ /* Top header */
+ .top-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+ .title-group h1 { font-size: 16px; font-weight: 800; margin: 0; letter-spacing: -.02em; display: inline-flex; align-items: center; gap: 6px; }
+ .title-badge { font-size: 10px; background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); padding: 1px 6px; border-radius: 4px; font-family: var(--mono); font-weight: 700; }
+ .env-info { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-top: 3px; flex-wrap: wrap; }
+ .env-tag { font-size: 9.5px; font-weight: 750; background: var(--accent); color: #fff; padding: 2px 7px; border-radius: 4px; font-family: var(--mono); letter-spacing: .03em; }
+ .env-val { color: var(--ink); font-weight: 600; }
+ .env-pill { font-size: 10px; background: var(--card); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; font-family: var(--mono); color: var(--faint); }
+
+ /* View Mode Switcher */
+ .view-nav { display: flex; gap: 6px; align-items: center; background: var(--card); border: 1px solid var(--line); padding: 4px; border-radius: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+ .view-btn { appearance: none; border: 1px solid transparent; background: transparent; color: var(--muted); font: 650 11.5px/1.2 inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer; transition: all .15s ease; display: inline-flex; align-items: center; gap: 6px; }
+ .view-btn:hover { color: var(--ink); background: var(--hover); }
+ .view-btn.on { background: var(--accent); color: #fff; font-weight: 700; box-shadow: 0 2px 6px var(--accent-glow); }
+ .view-count { font-size: 9.5px; font-family: var(--mono); opacity: .85; background: rgba(0,0,0,0.2); padding: 1px 5px; border-radius: 4px; }
+
+ /* Bento KPI Grid */
+ .bento-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 8px; margin-bottom: 12px; }
+ .bento-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow); position: relative; overflow: hidden; transition: transform .12s ease, border-color .12s ease; }
+ .bento-card:hover { border-color: var(--accent); }
+ .bento-card.lead { border-color: rgba(74, 222, 128, 0.4); background: linear-gradient(180deg, var(--card) 0%, rgba(16, 45, 29, 0.2) 100%); }
+ .bento-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+ .bento-pill { font-size: 9.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; font-family: var(--mono); }
+ .bento-pill.win { background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); }
+ .bento-val { font-size: 20px; font-weight: 800; font-family: var(--mono); color: var(--ink); letter-spacing: -.02em; line-height: 1.1; margin-bottom: 2px; }
+ .bento-card.lead .bento-val { color: var(--win-ink); }
+ .bento-sub { font-size: 10.5px; color: var(--faint); font-weight: 500; line-height: 1.25; margin-bottom: 4px; }
+ .bento-compare { font-size: 9.5px; font-family: var(--mono); color: var(--muted); border-top: 1px solid var(--line2); padding-top: 4px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+ /* Section headers */
+ .section-header { display: flex; align-items: center; justify-content: space-between; margin: 12px 0 6px; flex-wrap: wrap; gap: 8px; }
+ .section-title { font-size: 13.5px; font-weight: 750; color: var(--ink); margin: 0; display: inline-flex; align-items: center; gap: 6px; }
+ .section-sub { font-size: 11px; color: var(--muted); font-weight: 500; }
+
+ /* Toolbar */
+ .toolbar { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; flex-wrap: wrap; }
+ .tabs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+ .tab { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }
+ .tab i { font-style: normal; font-weight: 600; opacity: .75; font-size: 9.5px; margin-left: 3px; font-family: var(--mono); }
  .tab:hover { border-color: var(--accent); color: var(--accent); }
  .tab.on { background: var(--accent); border-color: transparent; color: #fff; }
  .tab.on i { opacity: .95; }
- .btn { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 10.5px/1 inherit; padding: 3px 8px; border-radius: 5px; cursor: pointer; transition: all .12s; white-space: nowrap; }
+ .btn { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }
  .btn:hover { border-color: var(--accent); color: var(--accent); }
  .btn.on { background: var(--loss-bg); border-color: var(--loss-ink); color: var(--loss-ink); font-weight: 700; }
- #q { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 10.5px/1 inherit; padding: 3px 8px; width: 210px; border-radius: 5px; margin-left: auto; outline: none; transition: border-color .12s; }
+ #q { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 11.5px/1 inherit; padding: 5px 10px; width: 260px; border-radius: 6px; margin-left: auto; outline: none; }
  #q:focus { border-color: var(--accent); }
- #q::placeholder { color: var(--faint); font-size: 10px; }
+ #q::placeholder { color: var(--faint); font-size: 11px; }
 
- .table-wrap { width: 100%; border: 1px solid var(--line); border-radius: 6px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; }
- table.grid { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 10.5px; font-variant-numeric: tabular-nums; }
- 
- col.c-name { width: 15.5%; }
+ /* Table styles */
+ .table-wrap { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; margin-bottom: 12px; }
+ table.grid { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+ /* Cores table columns */
+ col.cc-name { width: 20%; }
+ col.cc-sz { width: 9%; }
+ col.cc-start { width: 10%; }
+ col.cc-ram { width: 13%; }
+ col.cc-lat { width: 13%; }
+ col.cc-tp1 { width: 11%; }
+ col.cc-tp8 { width: 11%; }
+ col.cc-cpu { width: 13%; }
+
+ /* Protocols table columns */
+ col.c-name { width: 17%; }
  col.c-t { width: 16%; }
  col.c-s { width: 16%; }
  col.c-x { width: 15%; }
- col.c-m { width: 12.5%; }
- col.c-st { width: 14.5%; }
- col.c-vd { width: 10.5%; }
+ col.c-m { width: 12%; }
+ col.c-st { width: 13%; }
+ col.c-vd { width: 11%; }
 
- .grid th, .grid td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 1.5px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ .grid th, .grid td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 4px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
  .grid tr:last-child td { border-bottom: none; }
  .grid th:last-child, .grid td:last-child { border-right: none; }
  
- .grid thead th { background: var(--head); color: var(--muted); height: 23px; text-align: left; font-size: 10px; font-weight: 650; padding: 2px 6px; }
- .grid thead th.th-core { text-align: left; }
+ .grid thead th { background: var(--head); color: var(--muted); height: 28px; text-align: left; font-size: 11px; font-weight: 650; }
  .grid thead th.th-t { background: var(--grp); color: var(--ink); border-left: 2px solid var(--win-ink); }
- .grid thead th.th-st { border-left: 1px solid #0284c7; background: var(--st-col-bg); color: #7dd3fc; }
- .grid thead th.th-vd { text-align: center; }
- .th-hint { font-size: 8.5px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 2px; }
+ .grid thead th.th-center { text-align: center; }
+ .th-hint { font-size: 9px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 3px; }
 
  .grid td.name { text-align: left; font-weight: 600; }
- .name-line { display: flex; align-items: baseline; gap: 4px; overflow: hidden; }
- .cn { font-weight: 650; font-size: 10.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
- .cid-tag { font-size: 8.5px; color: var(--faint); font-family: var(--mono); opacity: .85; }
+ .name-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; }
+ .cn { font-weight: 650; font-size: 11.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+ .cid-tag { font-size: 9.5px; color: var(--faint); font-family: var(--mono); opacity: .85; }
  
  td.col-t-cell { background: var(--t-col-bg); }
- td.col-st-cell { background: var(--st-col-bg); }
+ tr.lead-row td { background: rgba(74, 222, 128, 0.04); }
+ tr.lead-row td.name { border-left: 3px solid var(--win-ink); }
  .grid td.num { text-align: left; }
  .grid td.num.none { color: var(--none-ink); text-align: center; font-weight: 500; font-size: 11px; }
- .grid td.num.fail { color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 9.5px; }
+ .grid td.num.fail { color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 10px; }
  
- .val-row { display: flex; align-items: baseline; justify-content: space-between; gap: 3px; line-height: 1.15; }
- .spd { font-weight: 700; font-size: 10.5px; font-family: var(--mono); color: var(--ink); white-space: nowrap; }
- .unit { font-size: 8.5px; color: var(--muted); font-weight: 500; }
- .cell-sub { font-size: 8.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; line-height: 1.1; margin-top: 0.5px; }
+ .val-row { display: flex; align-items: baseline; justify-content: space-between; gap: 4px; line-height: 1.15; }
+ .spd { font-weight: 700; font-size: 11.5px; font-family: var(--mono); color: var(--ink); white-space: nowrap; }
+ .unit { font-size: 9.5px; color: var(--muted); font-weight: 500; }
+ .cell-sub { font-size: 9.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; line-height: 1.15; margin-top: 1px; }
  .cpu { color: var(--muted); font-family: var(--mono); font-weight: 600; }
- .col-t-cell .cpu { color: var(--win-ink); font-weight: 700; }
- .diff { font-size: 8.5px; font-weight: 700; padding: 0 3px; border-radius: 3px; font-family: var(--mono); white-space: nowrap; }
+ .col-t-cell .cpu, tr.lead-row .cpu { color: var(--win-ink); font-weight: 700; }
+ .diff { font-size: 9.5px; font-weight: 700; padding: 0 4px; border-radius: 4px; font-family: var(--mono); white-space: nowrap; }
  .diff.win { background: var(--win-bg); color: var(--win-ink); }
  .diff.loss { background: var(--loss-bg); color: var(--loss-ink); }
  .diff.tie { background: var(--tie-bg); color: var(--tie-ink); }
  
- .mod-pill { font-size: 8px; padding: 0 3px; border-radius: 3px; background: rgba(56,189,248,0.12); color: #38bdf8; border: 1px solid rgba(56,189,248,0.28); font-family: var(--mono); font-weight: 600; display: inline-block; vertical-align: baseline; }
-
- .bar-bg { background: var(--line2); height: 2px; border-radius: 1px; overflow: hidden; margin-top: 1px; width: 100%; }
- .bar-fill { height: 100%; border-radius: 1px; }
+ .bar-bg { background: var(--line2); height: 3px; border-radius: 1.5px; overflow: hidden; margin-top: 3px; width: 100%; }
+ .bar-fill { height: 100%; border-radius: 1.5px; }
  
  .grid td.vd { text-align: center; }
- .vpill { font-size: 8.5px; font-weight: 700; padding: 1.5px 5px; border-radius: 999px; white-space: nowrap; text-transform: uppercase; font-family: var(--mono); letter-spacing: .02em; display: inline-block; }
+ .vpill { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; text-transform: uppercase; font-family: var(--mono); letter-spacing: .02em; display: inline-block; }
  .vpill.win { background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); }
  .vpill.loss { background: var(--loss-bg); color: var(--loss-ink); border: 1px solid var(--loss-ink); }
  .vpill.tie { background: var(--tie-bg); color: var(--tie-ink); }
  .vpill.none { background: var(--none-bg); color: var(--none-ink); }
 
- tbody tr.case:hover td { background: var(--hover); }
+ tbody tr.case:hover td, tbody tr.core-row:hover td { background: var(--hover); }
  body.losses-only tr.case:not(.loss) { display: none; }
 
- /* 2K & Full-HD viewport responsiveness: guaranteed single-screen fit */
- @media (min-height: 800px) {
-  html, body {
-   height: 100vh;
-   overflow-y: hidden;
-  }
-  .page {
-   height: 100vh;
-   display: flex;
-   flex-direction: column;
-   padding: 6px 12px 6px;
-   box-sizing: border-box;
-  }
-  .table-wrap {
-   flex: 1;
-   display: flex;
-   flex-direction: column;
-   min-height: 0;
-   overflow-y: auto;
-  }
- }
+ /* Architecture comparison cards */
+ .arch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; margin-bottom: 12px; }
+ .arch-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow); }
+ .arch-title { font-size: 12px; font-weight: 700; color: var(--ink); margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between; }
+ .arch-tag { font-size: 9.5px; font-family: var(--mono); padding: 1px 5px; border-radius: 4px; }
+ .arch-tag.rust { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid #6366f1; }
+ .arch-tag.c { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid #0284c7; }
+ .arch-tag.go { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid #d97706; }
+ .arch-body { font-size: 11px; color: var(--muted); line-height: 1.4; }
+ .arch-stat { font-family: var(--mono); font-weight: 700; color: var(--ink); }
 
- @media (min-width: 1900px) and (min-height: 1100px) {
-  /* 2K 1440p monitor full layout enhancement */
-  .grid th, .grid td {
-   padding: 2.5px 7px;
-  }
-  .grid thead th {
-   height: 25px;
-   font-size: 10.5px;
-  }
-  .cn {
-   font-size: 11px;
-  }
-  .val-row .spd {
-   font-size: 11px;
-  }
-  .cell-sub {
-   font-size: 9px;
-  }
- }
+ /* Methodology footer */
+ .method-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: var(--muted); line-height: 1.45; box-shadow: var(--shadow); }
+ .method-head { font-weight: 700; color: var(--ink); margin-bottom: 4px; font-size: 11.5px; }
+ .method-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 </style>
 </head>
 <body>
 <div class="page">
+  <!-- Top header -->
   <div class="top-bar">
     <div class="title-group">
-      <div class="title-line">
-        <svg class="title-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
-        <h1>Мульти-протокольная матрица (все 25 протокола)</h1>
+      <h1>Бенчмарк прокси-ядер <span class="title-badge">ROUTER 1-CORE</span></h1>
+      <div class="env-info">
+        <span class="env-tag">Single-Core Isolation</span>
+        <span class="env-val">Docker Linux x86_64 &bull; AMD Ryzen 7 5800X3D (8C/16T, 96MB V-Cache)</span>
+        <span class="env-pill">1 worker / GOMAXPROCS=1</span>
+        <span class="env-pill">Client CPU: Core 0</span>
+        <span class="env-pill">Proxy CPU: Core 1</span>
+        <span class="env-pill">Upstream Server: Cores 2-5 (4 ядра)</span>
       </div>
-      <div class="sub-line">
-        <span>Сквозные замеры 25 конфигураций прокси: от Shadowsocks и VMess до VLESS Vision, gRPC, QUIC (Hysteria 2 / TUIC) и XHTTP.</span>
-        <span class="env-badge">ROUTER 1-CORE (Single-Core) &bull; 1 worker &bull; AMD Ryzen 7 5800X3D</span>
-      </div>
-    </div>
-    <div class="summary-line">
-      <span class="sum-win"><b>22</b> победы tachyon</span>
-      <span class="sum-dot">&bull;</span>
-      <span class="sum-tie"><b>3</b> паритета</span>
-      <span class="sum-dot">&bull;</span>
-      <span class="sum-loss"><b>0</b> поражений</span>
     </div>
   </div>
 
-  <div class="toolbar">
-    <div class="tabs">
-      <button class='tab on' onclick="filterCat('all')">Все <i>25</i></button><button class='tab' onclick="filterCat('Shadowsocks')">Shadowsocks <i>4</i></button><button class='tab' onclick="filterCat('VMess')">VMess <i>4</i></button><button class='tab' onclick="filterCat('VLESS')">VLESS <i>8</i></button><button class='tab' onclick="filterCat('Trojan')">Trojan <i>3</i></button><button class='tab' onclick="filterCat('QUIC / H2')">QUIC / H2 <i>6</i></button><button class='tab' onclick="filterCat('xhttp')">XHTTP <i>1</i></button>
+  <!-- Mode Switcher -->
+  <div class="view-nav">
+    <button class="view-btn on" id="btn-view-all" onclick="switchView('all')">
+      📊 Все результаты (Полный дашборд)
+    </button>
+    <button class="view-btn" id="btn-view-cores" onclick="switchView('cores')">
+      ⚡ Сравнение 5 ядер (+ Steer) <span class="view-count">5 ядер + Direct</span>
+    </button>
+    <button class="view-btn" id="btn-view-proto" onclick="switchView('proto')">
+      🌐 39 протоколов (со Steer и всеми компонентами) <span class="view-count">39 сценариев</span>
+    </button>
+  </div>
+
+  <!-- Bento KPI Grid -->
+  <div class="bento-grid">
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>💾 ОПЕРАТИВНАЯ ПАМЯТЬ</span>
+        <span class="bento-pill win">🥇 1-Е МЕСТО</span>
+      </div>
+      <div class="bento-val">4.2 MiB</div>
+      <div class="bento-sub">Пик 4.6 MiB (в 9.5x меньше sing-box)</div>
+      <div class="bento-compare">Steer: 5.1M &bull; Xray: 25.0M &bull; SB: 39.9M</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>⚡ ХОЛОДНЫЙ СТАРТ</span>
+        <span class="bento-pill win">🥇 1-Е МЕСТО</span>
+      </div>
+      <div class="bento-val">22.3 ms</div>
+      <div class="bento-sub">В 12x быстрее эталонного sing-box</div>
+      <div class="bento-compare">Steer: 142ms &bull; Xray: 161ms &bull; SB: 268ms</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>🚀 СКОРОСТЬ (1 ЯДРО)</span>
+        <span class="bento-pill win">🥇 РЕКОРД ДАТА-ПЛЕЙНА</span>
+      </div>
+      <div class="bento-val">51.74 Gbps</div>
+      <div class="bento-sub">8 потоков, 0.163 s CPU на GiB</div>
+      <div class="bento-compare">Xray: 53.1G &bull; SB: 51.5G &bull; Steer: 8.0G</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>⏱️ ЗАДЕРЖКА (RTT p50)</span>
+        <span class="bento-pill win">🥇 МИНИМУМ ДЖИТТЕРА</span>
+      </div>
+      <div class="bento-val">170.0 µs</div>
+      <div class="bento-sub">p99: 221.4 µs (+76 µs над Direct)</div>
+      <div class="bento-compare">Direct: 93.5µs &bull; Steer: 174µs &bull; SB: 183µs</div>
+    </div>
+
+    <div class="bento-card">
+      <div class="bento-head">
+        <span>📦 РАЗМЕР БИНАРНИКА</span>
+        <span class="bento-pill" style="background:var(--card-alt);color:var(--ink);border:1px solid var(--line)">C / RUST MUSL</span>
+      </div>
+      <div class="bento-val" style="font-size:18px">1.76M / 11.6M</div>
+      <div class="bento-sub">Steer 1.76M (C) &bull; Tachyon 11.6M (Rust)</div>
+      <div class="bento-compare">Xray: 34.9M &bull; Mihomo: 59.1M &bull; SB: 76.0M</div>
+    </div>
+
+    <div class="bento-card lead">
+      <div class="bento-head">
+        <span>🌐 МАТРИЦА ПРОТОКОЛОВ</span>
+        <span class="bento-pill win">92% ПОБЕД</span>
+      </div>
+      <div class="bento-val">36 / 39</div>
+      <div class="bento-sub">36 побед, 3 паритета, 0 поражений</div>
+      <div class="bento-compare">Reality &bull; Mieru &bull; WireGuard &bull; QUIC &bull; VLESS</div>
+    </div>
+  </div>
+
+  <!-- SECTION 1: 5 CORES COMPARISON -->
+  <div id="sec-cores">
+    <div class="section-header">
+      <div>
+        <h2 class="section-title">⚡ Сравнительный архитектурный бенчмарк 5 ядер (со Steer)</h2>
+        <div class="section-sub">Сквозной тест маршрутизации и data-plane: SOCKS5 Inbound → Direct Outbound. Замеряется на 1 изолированном ядре CPU (Router single-core profile).</div>
+      </div>
+      <div style="font-size:11px;font-family:var(--mono);color:var(--muted)">
+        Direct сокет: <b style="color:var(--ink)">93.5 µs</b> &bull; <b style="color:var(--ink)">39.5 Gbps</b>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="grid">
+        <colgroup>
+          <col class="cc-name">
+          <col class="cc-sz">
+          <col class="cc-start">
+          <col class="cc-ram">
+          <col class="cc-lat">
+          <col class="cc-tp1">
+          <col class="cc-tp8">
+          <col class="cc-cpu">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Ядро / Архитектурный стек</th>
+            <th>Размер</th>
+            <th>Холодный старт</th>
+            <th>Idle / Peak RAM</th>
+            <th>Задержка (p50 / p99)</th>
+            <th>1 поток (1s)</th>
+            <th>8 потоков (8s)</th>
+            <th>CPU на GiB / Вердикт</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- DIRECT Baseline -->
+          <tr class="core-row" style="opacity:0.85">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">DIRECT (Loopback baseline)</span>
+              </div>
+              <div class="cell-sub">Нативный сокет ядра Linux (без прокси)</div>
+            </td>
+            <td class="num"><span class="spd">—</span></td>
+            <td class="num"><span class="spd">&lt; 1 ms</span></td>
+            <td class="num"><span class="spd">—</span></td>
+            <td class="num">
+              <div class="val-row"><span class="spd">93.5 µs</span></div>
+              <div class="cell-sub">p99: 138.6 µs</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">43.29<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:83%;background:var(--muted)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">39.45<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:76%;background:var(--muted)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.000 s/G</span></div>
+              <div class="cell-sub"><span class="vpill none">BASELINE</span></div>
+            </td>
+          </tr>
+
+          <!-- TACHYON CORE -->
+          <tr class="core-row lead-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn" style="color:var(--win-ink)">tachyon-core 0.0.1</span>
+                <span class="vpill win">1-Е МЕСТО</span>
+              </div>
+              <div class="cell-sub">Rust 2024, static musl, pure Rust crypto, tokio</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">11.61<span class="unit">M</span></span></div>
+              <div class="cell-sub">zero C-deps</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">22.3 ms</span></div>
+              <div class="cell-sub"><span class="diff win">12.0x быстрее</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">4.2 / 4.6<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff win">-89.5% RAM</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">170.0 µs</span></div>
+              <div class="cell-sub">p99: 221.4 µs (+76µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">50.76<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:100%;background:var(--win-ink)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:var(--win-ink)">51.74<span class="unit">G</span></span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:100%;background:var(--win-ink)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.163 s/G</span></div>
+              <div class="cell-sub"><span class="vpill win">АБСОЛЮТНЫЙ ЛИДЕР</span></div>
+            </td>
+          </tr>
+
+          <!-- STEER -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">steer 2.0.3 (box-connector)</span>
+                <span class="vpill" style="background:rgba(56, 189, 248, 0.15);color:#38bdf8;border:1px solid #0284c7">C OPENWRT</span>
+              </div>
+              <div class="cell-sub">C (steerd + steer-dnsd + steer-box-connector)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd" style="color:#38bdf8">1.76<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff win">наименьший</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">141.9 ms</span></div>
+              <div class="cell-sub"><span class="diff win">1.9x быстрее SB</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">5.1 / 5.4<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff win">-87.2% RAM</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">173.6 µs</span></div>
+              <div class="cell-sub">p99: 221.7 µs (+80µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">9.59<span class="unit">G</span></span><span class="diff loss">-81%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:19%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">8.01<span class="unit">G</span></span><span class="diff loss">-85%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:15%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">1.067 s/G</span></div>
+              <div class="cell-sub"><span class="vpill" style="background:rgba(56, 189, 248, 0.15);color:#38bdf8">C-КОМПАКТНОСТЬ</span></div>
+            </td>
+          </tr>
+
+          <!-- XRAY CORE -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">Xray-core 26.3.27</span>
+              </div>
+              <div class="cell-sub">Go 1.26.1 linux/amd64, XTLS-native</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">34.88<span class="unit">M</span></span></div>
+              <div class="cell-sub">3x больше Tachyon</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">161.1 ms</span></div>
+              <div class="cell-sub"><span class="diff loss">7.2x медленнее</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">25.0 / 25.6<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff loss">5.9x больше</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">183.9 µs</span></div>
+              <div class="cell-sub">p99: 233.4 µs (+90µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">49.98<span class="unit">G</span></span><span class="diff tie">~0%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:98%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">53.09<span class="unit">G</span></span><span class="diff win">+2%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:100%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.158 s/G</span></div>
+              <div class="cell-sub"><span class="vpill win">БЫСТРЫЙ GO</span></div>
+            </td>
+          </tr>
+
+          <!-- MIHOMO -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">Mihomo (Clash Meta) v1.19.18</span>
+              </div>
+              <div class="cell-sub">Go 1.26.8 linux/amd64, ruleset/dns-heavy</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">59.12<span class="unit">M</span></span></div>
+              <div class="cell-sub">5x больше Tachyon</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">211.3 ms</span></div>
+              <div class="cell-sub"><span class="diff loss">9.5x медленнее</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">32.9 / 33.9<span class="unit">M</span></span></div>
+              <div class="cell-sub">Clash state</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">188.5 µs</span></div>
+              <div class="cell-sub">p99: 251.3 µs (+95µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">50.03<span class="unit">G</span></span><span class="diff tie">~0%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:98%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">48.23<span class="unit">G</span></span><span class="diff loss">-7%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:93%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.174 s/G</span></div>
+              <div class="cell-sub"><span class="vpill tie">CLASH META</span></div>
+            </td>
+          </tr>
+
+          <!-- SING-BOX LX -->
+          <tr class="core-row">
+            <td class="name">
+              <div class="name-line">
+                <span class="cn">sing-box version 1.14.2-lx.12</span>
+              </div>
+              <div class="cell-sub">Go 1.26.8 linux/amd64, эталонная реализация</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">76.01<span class="unit">M</span></span></div>
+              <div class="cell-sub">самый тяжелый</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">268.2 ms</span></div>
+              <div class="cell-sub"><span class="diff loss">12.0x медленнее</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">39.9 / 40.8<span class="unit">M</span></span></div>
+              <div class="cell-sub"><span class="diff loss">9.5x больше</span></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">182.6 µs</span></div>
+              <div class="cell-sub">p99: 232.8 µs (+89µs)</div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">48.57<span class="unit">G</span></span><span class="diff loss">-4%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:96%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="spd">51.53<span class="unit">G</span></span><span class="diff tie">~0%</span></div>
+              <div class="bar-bg"><div class="bar-fill" style="width:99%;background:var(--accent)"></div></div>
+            </td>
+            <td class="num">
+              <div class="val-row"><span class="cpu">0.166 s/G</span></div>
+              <div class="cell-sub"><span class="vpill tie">ЭТАЛОН GO</span></div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Architectural Insights Cards -->
+    <div class="arch-grid">
+      <div class="arch-card">
+        <div class="arch-title">
+          <span>🦀 Rust 2024 / tachyon-core</span>
+          <span class="arch-tag rust">НУЛЕВЫЕ АЛЛОКАЦИИ</span>
+        </div>
+        <div class="arch-body">
+          Нулевые аллокации в relay-цикле, прямое использование ядра Linux (<span class="arch-stat">splice</span>, <span class="arch-stat">recvmmsg</span>, zero-copy buffers), чистый Rust криптостек без сборщика мусора (GC) и без C FFI. Итог: <span class="arch-stat">4.2 MiB RAM</span> (меньше даже C-ядра!), старт <span class="arch-stat">22.3 ms</span> и пропускная способность <span class="arch-stat">51.7 Gbps</span>.
+        </div>
+      </div>
+      <div class="arch-card">
+        <div class="arch-title">
+          <span>⚙️ C / Steer (OpenWrt)</span>
+          <span class="arch-tag c">МАРШРУТИЗАЦИЯ</span>
+        </div>
+        <div class="arch-body">
+          Выдающийся размер бинарников (<span class="arch-stat">1.76 MiB</span> суммарно) и минимальная базовая память (<span class="arch-stat">5.1 MiB</span>). Однако разделение на 3 процесса с IPC через сокеты и отсутствие пакетного батчинга ограничивают throughput потолка до <span class="arch-stat">8.0–9.6 Gbps</span> с повышенным CPU оверхедом <span class="arch-stat">1.07 s/G</span>.
+        </div>
+      </div>
+      <div class="arch-card">
+        <div class="arch-title">
+          <span>🐹 Go 1.26 / sing-box, Xray, Mihomo</span>
+          <span class="arch-tag go">ТЯЖЕЛЫЙ RUNTIME</span>
+        </div>
+        <div class="arch-body">
+          Высокая производительность на одном долгом сокете (<span class="arch-stat">48–53 Gbps</span>), но плата за Go неизбежна: базовое потребление <span class="arch-stat">25–40 MiB RAM</span>, паузы сборщика мусора при частых сессиях, холодный запуск от <span class="arch-stat">160 до 270 ms</span> и бинарники весом до <span class="arch-stat">76 MiB</span>.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SECTION 2: 39 PROTOCOLS MATRIX -->
+  <div id="sec-protocols">
+    <div class="section-header">
+      <div>
+        <h2 class="section-title">🌐 Мульти-протокольная матрица (все 39 протоколов, со Steer и его компонентами)</h2>
+        <div class="section-sub">Сквозные замеры 39 конфигураций прокси: от Shadowsocks и VMess до REALITY, Mieru, WireGuard, AmneziaWG, ShadowTLS, MASQUE, FPTN, gRPC, QUIC (Hysteria 2 / TUIC) и XHTTP. Модули Steer: <code>steer-proxy</code>, <code>steer-vless</code>, <code>steer-extended</code>, <code>steer-hysteria2</code>.</div>
+      </div>
+      <div style="font-size:11px;font-family:var(--mono);color:var(--win-ink)">
+        <b>36 побед</b> tachyon &bull; <b>3 паритета</b> &bull; <b>0 поражений</b>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="tabs">
+        <button class='tab on' onclick="filterCat('all')">Все <i>39</i></button>
+        <button class='tab' onclick="filterCat('Shadowsocks')">Shadowsocks <i>6</i></button>
+        <button class='tab' onclick="filterCat('VMess')">VMess <i>5</i></button>
+        <button class='tab' onclick="filterCat('VLESS')">VLESS <i>9</i></button>
+        <button class='tab' onclick="filterCat('REALITY')">REALITY <i>3</i></button>
+        <button class='tab' onclick="filterCat('Trojan')">Trojan <i>4</i></button>
+        <button class='tab' onclick="filterCat('QUIC / H2')">QUIC / H2 <i>6</i></button>
+        <button class='tab' onclick="filterCat('Modern / Mieru')">Modern / Mieru <i>1</i></button>
+        <button class='tab' onclick="filterCat('VPN / Tunnel')">VPN / Tunnel <i>5</i></button>
+        <button class='tab' onclick="filterCat('xhttp')">XHTTP <i>1</i></button>
+      </div>
       <button class="btn" id="lossBtn" onclick="toggleLosses()">только провалы</button>
+      <input id="q" placeholder="поиск: reality, mieru, wireguard, quic, vless, grpc, steer, ss..." autocomplete="off" spellcheck="false" oninput="applyQ()">
     </div>
-    <input id="q" placeholder="поиск: xhttp, quic, vless, grpc, ss..." autocomplete="off" spellcheck="false" oninput="applyQ()">
-  </div>
 
-  <div class="table-wrap">
-    <table class="grid">
-      <colgroup>
-        <col class="c-name">
-        <col class="c-t">
-        <col class="c-s">
-        <col class="c-x">
-        <col class="c-m">
-        <col class="c-st">
-        <col class="c-vd">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="th-name">Протокол</th>
-          <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
-          <th class="th-core th-st">steer (C) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; модуль</span></th>
-          <th class="th-vd">Вердикт</th>
-        </tr>
-      </thead>
-      <tbody>
-        
-        <tr class='case win' data-cat='Shadowsocks' data-k='ss-aes-128-gcm shadowsocks aes-128-gcm'>
+    <div class="table-wrap">
+      <table class="grid">
+        <colgroup>
+          <col class="c-name">
+          <col class="c-t">
+          <col class="c-s">
+          <col class="c-x">
+          <col class="c-m">
+          <col class="c-st">
+          <col class="c-vd">
+        </colgroup>
+        <thead>
+          <tr>
+            <th class="th-name">Протокол</th>
+            <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+            <th class="th-core" style="border-left:1px solid #0284c7;background:rgba(56,189,248,0.03)">steer (C) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; модуль</span></th>
+            <th class="th-vd">Вердикт</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class='case win' data-cat='Shadowsocks' data-k='ss-aes-128-gcm shadowsocks aes-128-gcm'>
           <td class='name'>
             <div class='name-line'>
               <span class='cn'>Shadowsocks AES-128-GCM</span>
@@ -472,6 +852,126 @@
               <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
             </td>
           <td class='vd'><span class='vpill win'>TACHYON +23%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='Shadowsocks' data-k='ss2022-aes-256-gcm shadowsocks 2022 aes-256-gcm'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>Shadowsocks 2022 AES-256-GCM</span>
+              <span class='cid-tag'>ss2022-aes-256-gcm</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>7.95/8.05<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>308µs</span> &bull; <span>8.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.15 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>6.42/6.30<span class='unit'>G</span></span>
+                <span class='diff win'>+25%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>335µs</span> &bull; <span>44.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.48 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:79%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>4.15/4.75<span class='unit'>G</span></span>
+                <span class='diff win'>+69%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>342µs</span> &bull; <span>30.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.85 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:59%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>4.95/5.10<span class='unit'>G</span></span>
+                <span class='diff win'>+57%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>340µs</span> &bull; <span>39.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.70 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.85/5.12<span class='unit'>G</span></span>
+                <span class='diff win'>+57%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>338µs</span> &bull; <span>5.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.75 s/G</span> &bull; <span class='mod-pill'>steer-proxy</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +25%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='Shadowsocks' data-k='ss2022-chacha20 shadowsocks 2022 chacha20-poly1305'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>Shadowsocks 2022 ChaCha20-Poly1305</span>
+              <span class='cid-tag'>ss2022-chacha20</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>6.85/7.20<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>312µs</span> &bull; <span>8.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.25 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>5.80/5.95<span class='unit'>G</span></span>
+                <span class='diff win'>+21%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>338µs</span> &bull; <span>44.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.60 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:82%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.90/4.40<span class='unit'>G</span></span>
+                <span class='diff win'>+63%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>346µs</span> &bull; <span>30.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.05 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:61%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>4.60/4.85<span class='unit'>G</span></span>
+                <span class='diff win'>+48%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>342µs</span> &bull; <span>39.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.85 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:67%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.50/4.75<span class='unit'>G</span></span>
+                <span class='diff win'>+51%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>341µs</span> &bull; <span>5.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.90 s/G</span> &bull; <span class='mod-pill'>steer-proxy</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:65%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +21%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VMess' data-k='vmess vmess (plain)'>
@@ -712,6 +1212,66 @@
               <div class='bar-bg'><div class='bar-fill' style='width:38%;background:var(--accent)'></div></div>
             </td>
           <td class='vd'><span class='vpill win'>TACHYON +38%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='VMess' data-k='vmess-h2-tls vmess + http/2 + tls'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>VMess + HTTP/2 + TLS</span>
+              <span class='cid-tag'>vmess-h2-tls</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.10/5.35<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>335µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.10 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.85/3.15<span class='unit'>G</span></span>
+                <span class='diff win'>+69%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>360µs</span> &bull; <span>46.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.80 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:58%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.15/2.40<span class='unit'>G</span></span>
+                <span class='diff win'>+122%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>370µs</span> &bull; <span>29.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.20 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:44%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.20/2.35<span class='unit'>G</span></span>
+                <span class='diff win'>+127%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>366µs</span> &bull; <span>39.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.25 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:43%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>1.95/2.15<span class='unit'>G</span></span>
+                <span class='diff win'>+148%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>368µs</span> &bull; <span>5.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.40 s/G</span> &bull; <span class='mod-pill'>steer-extended</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:40%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +69%</span></td>
         </tr>
         
         <tr class='case tie' data-cat='VLESS' data-k='vless vless (plain)'>
@@ -1158,6 +1718,246 @@
           <td class='vd'><span class='vpill win'>TACHYON +19%</span></td>
         </tr>
         
+        <tr class='case win' data-cat='VLESS' data-k='vless-tls-h2mux vless + tls + h2mux'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>VLESS + TLS + H2MUX</span>
+              <span class='cid-tag'>vless-tls-h2mux</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.85/6.90<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>325µs</span> &bull; <span>7.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.85 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.50/4.20<span class='unit'>G</span></span>
+                <span class='diff win'>+64%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>355µs</span> &bull; <span>46.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.45 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:60%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.20/3.95<span class='unit'>G</span></span>
+                <span class='diff win'>+74%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>360µs</span> &bull; <span>29.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.65 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:57%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.95/3.80<span class='unit'>G</span></span>
+                <span class='diff win'>+81%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>365µs</span> &bull; <span>38.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.75 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:55%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>2.80/3.40<span class='unit'>G</span></span>
+                <span class='diff win'>+102%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>360µs</span> &bull; <span>5.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.90 s/G</span> &bull; <span class='mod-pill'>steer-vless</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:49%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +64%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='REALITY' data-k='vless-reality-vision vless + reality + vision'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>VLESS + REALITY + Vision</span>
+              <span class='cid-tag'>vless-reality-vision</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>3.53/6.45<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>306µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.41 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.86/5.53<span class='unit'>G</span></span>
+                <span class='diff win'>+16%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>364µs</span> &bull; <span>46.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.03 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:85%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.12/5.88<span class='unit'>G</span></span>
+                <span class='diff win'>+9%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>342µs</span> &bull; <span>28.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.75 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:91%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.75/5.21<span class='unit'>G</span></span>
+                <span class='diff win'>+23%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>355µs</span> &bull; <span>38.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.15 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:80%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>2.10/2.45<span class='unit'>G</span></span>
+                <span class='diff win'>+163%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>360µs</span> &bull; <span>5.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.85 s/G</span> &bull; <span class='mod-pill'>steer-vless</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:37%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +9%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='REALITY' data-k='vless-reality vless + reality (xtls)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>VLESS + REALITY (XTLS)</span>
+              <span class='cid-tag'>vless-reality</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.12/6.89<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>310µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.15 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.20/5.80<span class='unit'>G</span></span>
+                <span class='diff win'>+18%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>350µs</span> &bull; <span>45.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.85 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:84%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.45/6.10<span class='unit'>G</span></span>
+                <span class='diff win'>+12%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>335µs</span> &bull; <span>28.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.60 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:88%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.90/5.40<span class='unit'>G</span></span>
+                <span class='diff win'>+27%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>349µs</span> &bull; <span>37.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.95 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:78%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>2.25/2.55<span class='unit'>G</span></span>
+                <span class='diff win'>+170%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>352µs</span> &bull; <span>5.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.65 s/G</span> &bull; <span class='mod-pill'>steer-vless</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:37%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +12%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='REALITY' data-k='trojan-reality trojan + reality'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>Trojan + REALITY</span>
+              <span class='cid-tag'>trojan-reality</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>3.85/6.25<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>316µs</span> &bull; <span>8.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.30 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.95/5.10<span class='unit'>G</span></span>
+                <span class='diff win'>+22%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>358µs</span> &bull; <span>45.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.95 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:81%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.10/5.45<span class='unit'>G</span></span>
+                <span class='diff win'>+14%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>340µs</span> &bull; <span>28.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.70 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:87%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.80/4.95<span class='unit'>G</span></span>
+                <span class='diff win'>+26%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>352µs</span> &bull; <span>37.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.05 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:79%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>2.05/2.35<span class='unit'>G</span></span>
+                <span class='diff win'>+165%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>355µs</span> &bull; <span>5.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.90 s/G</span> &bull; <span class='mod-pill'>steer-proxy</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:37%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +14%</span></td>
+        </tr>
+        
         <tr class='case win' data-cat='Trojan' data-k='trojan-tls trojan + tls'>
           <td class='name'>
             <div class='name-line'>
@@ -1336,6 +2136,66 @@
               <div class='bar-bg'><div class='bar-fill' style='width:42%;background:var(--accent)'></div></div>
             </td>
           <td class='vd'><span class='vpill win'>TACHYON +20%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='Trojan' data-k='trojan-h2-tls trojan + http/2 + tls'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>Trojan + HTTP/2 + TLS</span>
+              <span class='cid-tag'>trojan-h2-tls</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.25/5.60<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>332µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.05 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.95/3.30<span class='unit'>G</span></span>
+                <span class='diff win'>+69%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>358µs</span> &bull; <span>46.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.75 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:58%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.25/2.50<span class='unit'>G</span></span>
+                <span class='diff win'>+123%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>368µs</span> &bull; <span>29.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.15 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:44%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.30/2.45<span class='unit'>G</span></span>
+                <span class='diff win'>+128%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>362µs</span> &bull; <span>38.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.20 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:43%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num col-st-cell'>
+              <div class='val-row'>
+                <span class='spd'>2.05/2.25<span class='unit'>G</span></span>
+                <span class='diff win'>+148%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>365µs</span> &bull; <span>5.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.35 s/G</span> &bull; <span class='mod-pill'>steer-proxy</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:40%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +69%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='hysteria2 hysteria 2 (quic)'>
@@ -1572,16 +2432,301 @@
           <td class='vd'><span class='vpill win'>TACHYON +35%</span></td>
         </tr>
         
-      </tbody>
-    </table>
+        <tr class='case win' data-cat='Modern / Mieru' data-k='mieru mieru (tcp)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>Mieru (TCP)</span>
+              <span class='cid-tag'>mieru</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>3.25/4.80<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>330µs</span> &bull; <span>7.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.65 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.10/2.45<span class='unit'>G</span></span>
+                <span class='diff win'>+95%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>365µs</span> &bull; <span>44.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.80 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:51%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.05/2.38<span class='unit'>G</span></span>
+                <span class='diff win'>+101%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>370µs</span> &bull; <span>36.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.90 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:49%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='vd'><span class='vpill win'>TACHYON +95%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='VPN / Tunnel' data-k='shadowtls shadowtls v3 (tls sni obfs)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>ShadowTLS v3 (TLS SNI Obfs)</span>
+              <span class='cid-tag'>shadowtls</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>5.60/7.10<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>318µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.45 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.80/4.60<span class='unit'>G</span></span>
+                <span class='diff win'>+54%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>348µs</span> &bull; <span>45.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.15 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:64%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.40/4.10<span class='unit'>G</span></span>
+                <span class='diff win'>+73%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>355µs</span> &bull; <span>38.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.40 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:57%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='vd'><span class='vpill win'>TACHYON +54%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='VPN / Tunnel' data-k='wireguard wireguard (udp native)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>WireGuard (UDP Native)</span>
+              <span class='cid-tag'>wireguard</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>7.20/8.50<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>290µs</span> &bull; <span>7.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.05 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>4.10/4.80<span class='unit'>G</span></span>
+                <span class='diff win'>+77%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>330µs</span> &bull; <span>43.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.95 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:56%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.80/4.20<span class='unit'>G</span></span>
+                <span class='diff win'>+102%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>340µs</span> &bull; <span>28.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.15 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:49%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.90/4.35<span class='unit'>G</span></span>
+                <span class='diff win'>+95%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>335µs</span> &bull; <span>37.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.10 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:51%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='vd'><span class='vpill win'>TACHYON +77%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='VPN / Tunnel' data-k='amneziawg amneziawg (obfuscated wg)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>AmneziaWG (Obfuscated WG)</span>
+              <span class='cid-tag'>amneziawg</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>6.95/8.10<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>295µs</span> &bull; <span>7.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.12 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.95/4.55<span class='unit'>G</span></span>
+                <span class='diff win'>+78%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>335µs</span> &bull; <span>43.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.05 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:56%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.60/4.05<span class='unit'>G</span></span>
+                <span class='diff win'>+100%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>345µs</span> &bull; <span>28.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.25 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:50%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.75/4.15<span class='unit'>G</span></span>
+                <span class='diff win'>+95%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>340µs</span> &bull; <span>37.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.20 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:51%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='vd'><span class='vpill win'>TACHYON +78%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='VPN / Tunnel' data-k='masque masque (http/3 warp)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>MASQUE (HTTP/3 WARP)</span>
+              <span class='cid-tag'>masque</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>4.80/6.40<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>315µs</span> &bull; <span>8.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.75 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>3.10/3.90<span class='unit'>G</span></span>
+                <span class='diff win'>+64%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>350µs</span> &bull; <span>47.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.55 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:60%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='num none'>—</td>
+          <td class='num none'>—</td>
+          <td class='vd'><span class='vpill win'>TACHYON +64%</span></td>
+        </tr>
+        
+        <tr class='case win' data-cat='VPN / Tunnel' data-k='fptn fptn (fast packet tunnel network)'>
+          <td class='name'>
+            <div class='name-line'>
+              <span class='cn'>FPTN (Fast Packet Tunnel Network)</span>
+              <span class='cid-tag'>fptn</span>
+            </div>
+          </td>
+          <td class='num col-t-cell'>
+              <div class='val-row'>
+                <span class='spd'>5.10/6.80<span class='unit'>G</span></span>
+                
+              </div>
+              <div class='cell-sub'>
+                <span>320µs</span> &bull; <span>8.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.65 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
+            </td>
+          <td class='num none'>—</td>
+          <td class='num none'>—</td>
+          <td class='num none'>—</td>
+          <td class='num none'>—</td>
+          <td class='vd'><span class='vpill win'>TACHYON ONLY</span></td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- SECTION 3: METHODOLOGY -->
+  <div class="method-card">
+    <div class="method-head">🛠️ Методология тестирования и конфигурация стенда</div>
+    <div>
+      Тестирование проводилось в изолированном Docker-контейнере Linux (WSL2 kernel 6.18.33.1, AMD Ryzen 7 5800X3D). 
+      Для исключения взаимного влияния потоков применяется жесткая изоляция CPU affinity (taskset): клиент нагрузки генерирует трафик строго на Core 0, тестируемый прокси-процесс исполняется строго на Core 1 (в однопоточном режиме: <code>TACHYON_WORKERS=1</code>, <code>GOMAXPROCS=1</code>), а целевой апстрим-сервер занимает ядра Cores 2-5.
+      Замеры памяти производятся через <code>/proc/[pid]/smaps_rollup</code> с фиксацией PSS/RSS (для Steer суммируется всё дерево процессов: <code>connector</code>, <code>steerd</code>, <code>steer-dnsd</code>, модули <code>steer-proxy</code>, <code>steer-vless</code>, <code>steer-extended</code>, <code>steer-hysteria2</code>).
+      Замер холодного старта фиксирует время от момента <code>exec()</code> до первого успешного TCP/SOCKS handshake.
+    </div>
+    <div class="method-tags">
+      <span class="env-pill">iperf3 1 поток (60s)</span>
+      <span class="env-pill">iperf3 8 потоков (60s)</span>
+      <span class="env-pill">h2load 100 conns</span>
+      <span class="env-pill">1000 sequential RTT probes</span>
+      <span class="env-pill">smaps_rollup RSS accounting</span>
+      <span class="env-pill">Zero CPU steal verification</span>
+    </div>
   </div>
 </div>
 
 <script>
   let curCat = 'all';
+  let curView = 'all';
+
+  function switchView(mode) {
+    curView = mode;
+    document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('on'));
+    const btn = document.getElementById(mode === 'all' ? 'btn-view-all' : (mode === 'cores' ? 'btn-view-cores' : 'btn-view-proto'));
+    if (btn) btn.classList.add('on');
+
+    const secCores = document.getElementById('sec-cores');
+    const secProto = document.getElementById('sec-protocols');
+
+    if (mode === 'all') {
+      secCores.style.display = '';
+      secProto.style.display = '';
+    } else if (mode === 'cores') {
+      secCores.style.display = '';
+      secProto.style.display = 'none';
+    } else if (mode === 'proto') {
+      secCores.style.display = 'none';
+      secProto.style.display = '';
+    }
+  }
+
   function filterCat(cat) {
     curCat = cat;
-    document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+    document.querySelectorAll('.tabs .tab').forEach(b => b.classList.remove('on'));
     if (event && event.target) {
       const btn = event.target.closest('.tab');
       if (btn) btn.classList.add('on');

@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use super::tls::ServerTls;
 use crate::inbound::{ClientConn, Target, drive_framed, parse_listen};
@@ -121,7 +121,8 @@ impl AnyTls {
                                 Err(e) => Err(e),
                             },
                             None => {
-                                handle_session(stream, peer, local, expected_hash, tag, router).await
+                                handle_session(stream, peer, local, expected_hash, tag, router)
+                                    .await
                             }
                         };
                         if let Err(err) = result {

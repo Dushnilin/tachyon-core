@@ -65,14 +65,7 @@ impl Hysteria2 {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                users.insert(
-                    password,
-                    if name.is_empty() {
-                        i.to_string()
-                    } else {
-                        name
-                    },
-                );
+                users.insert(password, if name.is_empty() { i.to_string() } else { name });
             }
         } else if let Some(pw) = obj.get("password").and_then(Value::as_str) {
             users.insert(pw.to_string(), "default".to_string());
@@ -115,7 +108,9 @@ impl Hysteria2 {
             };
             let ep_sock = std::net::UdpSocket::bind(ep_bind)?;
             let ep = quinn::Endpoint::new(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9u8; 32]))),
+                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
+                    &[9u8; 32],
+                ))),
                 Some(server_config),
                 ep_sock,
                 runtime,
@@ -167,7 +162,9 @@ impl Hysteria2 {
         } else {
             let sock = std::net::UdpSocket::bind(addr)?;
             let ep = quinn::Endpoint::new(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9u8; 32]))),
+                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
+                    &[9u8; 32],
+                ))),
                 Some(server_config),
                 sock,
                 runtime,
@@ -232,24 +229,20 @@ async fn handle_hy2_connection(
     let peer = conn.remote_address();
 
     // Authenticate via HTTP/3 session
-    let user_name = match tokio::time::timeout(
-        DEFAULT_AUTH_TIMEOUT,
-        authenticate_hy2(&conn, &users),
-    )
-    .await
-    {
-        Ok(Ok(name)) => name,
-        Ok(Err(e)) => {
-            logging::debug(format_args!("hysteria2[{tag}] {peer} auth failed: {e}"));
-            conn.close(quinn::VarInt::from_u32(0), b"auth failed");
-            return;
-        }
-        Err(_) => {
-            logging::debug(format_args!("hysteria2[{tag}] {peer} auth timed out"));
-            conn.close(quinn::VarInt::from_u32(0), b"auth timeout");
-            return;
-        }
-    };
+    let user_name =
+        match tokio::time::timeout(DEFAULT_AUTH_TIMEOUT, authenticate_hy2(&conn, &users)).await {
+            Ok(Ok(name)) => name,
+            Ok(Err(e)) => {
+                logging::debug(format_args!("hysteria2[{tag}] {peer} auth failed: {e}"));
+                conn.close(quinn::VarInt::from_u32(0), b"auth failed");
+                return;
+            }
+            Err(_) => {
+                logging::debug(format_args!("hysteria2[{tag}] {peer} auth timed out"));
+                conn.close(quinn::VarInt::from_u32(0), b"auth timeout");
+                return;
+            }
+        };
 
     logging::info(format_args!(
         "hysteria2[{tag}] {peer} authenticated as {user_name}"
@@ -352,7 +345,12 @@ async fn handle_hy2_connection(
             };
             let complete = {
                 let mut defrag = defragger.lock().expect("defragger");
-                defrag.feed(pid, frag_id, frag_total, bytes::Bytes::copy_from_slice(payload))
+                defrag.feed(
+                    pid,
+                    frag_id,
+                    frag_total,
+                    bytes::Bytes::copy_from_slice(payload),
+                )
             };
             if let Some(pkt) = complete {
                 let target = match parse_target_str(dest) {
@@ -466,9 +464,9 @@ fn parse_target_str(s: &str) -> Option<Target> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::Mutex;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::Mutex;
 
     static TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 

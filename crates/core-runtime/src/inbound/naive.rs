@@ -86,8 +86,15 @@ impl Naive {
                         let result: io::Result<()> = match tls {
                             Some(tls) => match tls.accept(stream).await {
                                 Ok(tls_stream) => {
-                                    handle_h2(tls_stream, peer, local, &tag, &router, &allowed_auths)
-                                        .await
+                                    handle_h2(
+                                        tls_stream,
+                                        peer,
+                                        local,
+                                        &tag,
+                                        &router,
+                                        &allowed_auths,
+                                    )
+                                    .await
                                 }
                                 Err(e) => Err(e),
                             },

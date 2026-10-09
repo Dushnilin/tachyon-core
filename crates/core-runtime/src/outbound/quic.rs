@@ -394,7 +394,10 @@ pub(crate) fn parse_sing_addr_port(slice: &[u8]) -> Option<(Target, usize)> {
             }
             let ip = std::net::Ipv4Addr::new(slice[1], slice[2], slice[3], slice[4]);
             let port = u16::from_be_bytes([slice[5], slice[6]]);
-            Some((Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))), 7))
+            Some((
+                Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))),
+                7,
+            ))
         }
         0x02 => {
             if slice.len() < 19 {
@@ -404,7 +407,10 @@ pub(crate) fn parse_sing_addr_port(slice: &[u8]) -> Option<(Target, usize)> {
             ip_bytes.copy_from_slice(&slice[1..17]);
             let ip = std::net::Ipv6Addr::from(ip_bytes);
             let port = u16::from_be_bytes([slice[17], slice[18]]);
-            Some((Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))), 19))
+            Some((
+                Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))),
+                19,
+            ))
         }
         0x00 => {
             if slice.len() < 2 {
@@ -422,7 +428,9 @@ pub(crate) fn parse_sing_addr_port(slice: &[u8]) -> Option<(Target, usize)> {
     }
 }
 
-pub(crate) async fn read_sing_addr_port<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Target> {
+pub(crate) async fn read_sing_addr_port<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<Target> {
     let mut atype = [0u8; 1];
     reader.read_exact(&mut atype).await?;
     match atype[0] {
@@ -431,7 +439,9 @@ pub(crate) async fn read_sing_addr_port<R: AsyncRead + Unpin>(reader: &mut R) ->
             reader.read_exact(&mut buf).await?;
             let ip = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
             let port = u16::from_be_bytes([buf[4], buf[5]]);
-            Ok(Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))))
+            Ok(Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(
+                ip, port,
+            ))))
         }
         0x02 => {
             let mut buf = [0u8; 18];
@@ -440,7 +450,9 @@ pub(crate) async fn read_sing_addr_port<R: AsyncRead + Unpin>(reader: &mut R) ->
             ip_bytes.copy_from_slice(&buf[..16]);
             let ip = std::net::Ipv6Addr::from(ip_bytes);
             let port = u16::from_be_bytes([buf[16], buf[17]]);
-            Ok(Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))))
+            Ok(Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip, port, 0, 0,
+            ))))
         }
         0x00 => {
             let mut len = [0u8; 1];

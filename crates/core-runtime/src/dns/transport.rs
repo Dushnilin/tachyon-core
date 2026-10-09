@@ -39,6 +39,10 @@ pub enum Kind {
     Mdns,
     /// lx `group`: several member servers behind one tag
     Group,
+    /// DHCP-provided DNS resolver
+    Dhcp,
+    /// systemd-resolved local stub resolver
+    Resolved,
 }
 
 pub struct ServerConfig {
@@ -429,6 +433,8 @@ impl ServerConfig {
             "hosts" => Kind::Hosts,
             "mdns" => Kind::Mdns,
             "group" => Kind::Group,
+            "dhcp" => Kind::Dhcp,
+            "resolved" => Kind::Resolved,
             other => anyhow::bail!("{at}: dns server type {other:?} not implemented yet"),
         };
         let hosts = match kind {
@@ -480,10 +486,15 @@ impl ServerConfig {
             .and_then(Value::as_u64)
             .map(|p| p as u16)
             .unwrap_or(match kind {
-                Kind::Udp | Kind::Tcp | Kind::Tls => 53,
+                Kind::Udp | Kind::Tcp | Kind::Tls | Kind::Resolved => 53,
                 Kind::Https | Kind::H3 => 443,
                 Kind::Quic => 853,
-                Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Mdns | Kind::Group => 0,
+                Kind::Fakeip
+                | Kind::Local
+                | Kind::Hosts
+                | Kind::Mdns
+                | Kind::Group
+                | Kind::Dhcp => 0,
             });
         // dns tls/https/quic/h3 servers implicitly use TLS: the reference
         // forces `enabled` on when the key is absent, and builds a client with
@@ -546,7 +557,13 @@ impl ServerConfig {
         // address
         let needs_server = !matches!(
             kind,
-            Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Mdns | Kind::Group
+            Kind::Fakeip
+                | Kind::Local
+                | Kind::Hosts
+                | Kind::Mdns
+                | Kind::Group
+                | Kind::Dhcp
+                | Kind::Resolved
         );
         if needs_server && server.is_empty() {
             anyhow::bail!("{at}: missing server");
@@ -768,7 +785,12 @@ pub async fn exchange(
             Kind::Https => exchange_doh(cfg, addr, query, dialer).await,
             Kind::Quic => exchange_doq(cfg, addr, query, dialer).await,
             Kind::H3 => exchange_h3(cfg, addr, query, dialer).await,
-            Kind::Fakeip | Kind::Local | Kind::Hosts | Kind::Group => Err(io::Error::other(
+            Kind::Fakeip
+            | Kind::Local
+            | Kind::Hosts
+            | Kind::Group
+            | Kind::Dhcp
+            | Kind::Resolved => Err(io::Error::other(
                 "dns: this transport answers without reaching the wire",
             )),
         }

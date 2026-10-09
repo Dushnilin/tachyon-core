@@ -194,7 +194,11 @@ pub fn build_session_id_v3(password: &str, random: &[u8; 32], sni: &[u8]) -> io:
 }
 
 /// Build a standard TLS 1.3 ClientHello record with SNI, ALPN, Supported Versions, and Session ID.
-fn build_tls_client_hello(sni: &str, random: &[u8; 32], session_id: &[u8; 32]) -> io::Result<Vec<u8>> {
+fn build_tls_client_hello(
+    sni: &str,
+    random: &[u8; 32],
+    session_id: &[u8; 32],
+) -> io::Result<Vec<u8>> {
     let mut handshake = Vec::new();
 
     // Client version: TLS 1.2 compatibility
@@ -238,7 +242,9 @@ fn build_tls_client_hello(sni: &str, random: &[u8; 32], session_id: &[u8; 32]) -
     extensions.extend_from_slice(&supported_versions);
 
     // 3. ALPN Extension (0x0010) -> h2, http/1.1
-    let alpn = [0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'];
+    let alpn = [
+        0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1',
+    ];
     extensions.extend_from_slice(&0x0010u16.to_be_bytes());
     extensions.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
     extensions.extend_from_slice(&alpn);

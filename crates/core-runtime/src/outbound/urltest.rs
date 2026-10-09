@@ -417,7 +417,10 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
             head_at.as_millis()
         ));
         let head = String::from_utf8_lossy(&head);
-        let Some(status) = head.lines().next().and_then(|line| line.split_whitespace().nth(1))
+        let Some(status) = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
         else {
             return ProbeAttempt::Fail;
         };

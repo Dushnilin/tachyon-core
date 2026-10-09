@@ -17,7 +17,7 @@ use serde_json::Value;
 #[allow(unused_imports)]
 use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, TunReply, UdpHub};
 #[allow(unused_imports)]
-use crate::inbound::{drive_framed, ClientConn, Target};
+use crate::inbound::{ClientConn, Target, drive_framed};
 #[allow(unused_imports)]
 use crate::logging;
 use crate::outbound::urltest::parse_duration;
@@ -91,8 +91,14 @@ impl Tun {
             .unwrap_or(DEFAULT_MTU);
 
         let gso = obj.get("gso").and_then(Value::as_bool).unwrap_or(true);
-        let auto_route = obj.get("auto_route").and_then(Value::as_bool).unwrap_or(false);
-        let strict_route = obj.get("strict_route").and_then(Value::as_bool).unwrap_or(false);
+        let auto_route = obj
+            .get("auto_route")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let strict_route = obj
+            .get("strict_route")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let udp_timeout = parse_duration(
             obj.get("udp_timeout"),
@@ -202,20 +208,19 @@ impl Tun {
                 while let Some(reply) = tun_rx.recv().await {
                     if let SocketAddr::V4(dst_v4) = reply.dest {
                         let src_ip = Ipv4Addr::UNSPECIFIED;
-                        let pkt = build_ipv4_udp(
-                            src_ip,
-                            *dst_v4.ip(),
-                            0,
-                            dst_v4.port(),
-                            &reply.payload,
-                        );
+                        let pkt =
+                            build_ipv4_udp(src_ip, *dst_v4.ip(), 0, dst_v4.port(), &reply.payload);
                         let _ = linux::write_packet(&async_fd_write, &pkt, vnet_hdr).await;
                     }
                 }
             });
 
             // With GRO/GSO support, aggregate packets can be up to 65536 bytes
-            let buf_size = if vnet_hdr { 65536 + VNET_HDR_LEN } else { self.mtu + 64 };
+            let buf_size = if vnet_hdr {
+                65536 + VNET_HDR_LEN
+            } else {
+                self.mtu + 64
+            };
             let mut buf = vec![0u8; buf_size];
             let hdr_offset = if vnet_hdr { VNET_HDR_LEN } else { 0 };
 
@@ -351,14 +356,7 @@ async fn handle_ipv4_packet(
                     let tag = tag.to_string();
                     tokio::spawn(async move {
                         let client = ClientConn::framed(Box::new(client_stream), source);
-                        let _ = drive_framed(
-                            client,
-                            source,
-                            Target::Ip(dest),
-                            &tag,
-                            &router,
-                        )
-                        .await;
+                        let _ = drive_framed(client, source, Target::Ip(dest), &tag, &router).await;
                     });
                     drop(server_stream);
                 }
@@ -504,9 +502,8 @@ mod linux {
                 for (i, byte) in name_bytes[..copy_len].iter().enumerate() {
                     addr_req.ifr_name[i] = *byte as libc::c_char;
                 }
-                let sin: *mut libc::sockaddr_in = unsafe {
-                    &mut addr_req.ifr_ifru.ifru_addr as *mut _ as *mut libc::sockaddr_in
-                };
+                let sin: *mut libc::sockaddr_in =
+                    unsafe { &mut addr_req.ifr_ifru.ifru_addr as *mut _ as *mut libc::sockaddr_in };
                 unsafe {
                     (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
                     (*sin).sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
@@ -549,7 +546,11 @@ mod linux {
             let mut guard = async_fd.readable().await?;
             match guard.try_io(|inner| {
                 let n = unsafe {
-                    libc::read(inner.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    libc::read(
+                        inner.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
                 };
                 if n < 0 {
                     Err(io::Error::last_os_error())
@@ -582,7 +583,11 @@ mod linux {
             let mut guard = async_fd.writable().await?;
             match guard.try_io(|inner| {
                 let n = unsafe {
-                    libc::write(inner.as_raw_fd(), data.as_ptr() as *const libc::c_void, data.len())
+                    libc::write(
+                        inner.as_raw_fd(),
+                        data.as_ptr() as *const libc::c_void,
+                        data.len(),
+                    )
                 };
                 if n < 0 {
                     Err(io::Error::last_os_error())

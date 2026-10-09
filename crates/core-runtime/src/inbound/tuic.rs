@@ -112,10 +112,7 @@ impl Tuic {
 
     pub async fn serve(self) {
         let tag = self.tag.clone();
-        logging::info(format_args!(
-            "tuic[{tag}] listening on {}",
-            self.local_addr
-        ));
+        logging::info(format_args!("tuic[{tag}] listening on {}", self.local_addr));
 
         while let Some(incoming) = self.endpoint.accept().await {
             let router = Arc::clone(&self.router);
@@ -149,24 +146,20 @@ async fn handle_tuic_connection(
     let peer = conn.remote_address();
 
     // Authenticate via client uni stream
-    let (user_name, conn) = match tokio::time::timeout(
-        DEFAULT_AUTH_TIMEOUT,
-        authenticate_tuic(&conn, &users),
-    )
-    .await
-    {
-        Ok(Ok(user_name)) => (user_name, conn),
-        Ok(Err(e)) => {
-            logging::debug(format_args!("tuic[{tag}] {peer} auth failed: {e}"));
-            conn.close(quinn::VarInt::from_u32(0), b"auth failed");
-            return;
-        }
-        Err(_) => {
-            logging::debug(format_args!("tuic[{tag}] {peer} auth timed out"));
-            conn.close(quinn::VarInt::from_u32(0), b"auth timeout");
-            return;
-        }
-    };
+    let (user_name, conn) =
+        match tokio::time::timeout(DEFAULT_AUTH_TIMEOUT, authenticate_tuic(&conn, &users)).await {
+            Ok(Ok(user_name)) => (user_name, conn),
+            Ok(Err(e)) => {
+                logging::debug(format_args!("tuic[{tag}] {peer} auth failed: {e}"));
+                conn.close(quinn::VarInt::from_u32(0), b"auth failed");
+                return;
+            }
+            Err(_) => {
+                logging::debug(format_args!("tuic[{tag}] {peer} auth timed out"));
+                conn.close(quinn::VarInt::from_u32(0), b"auth timeout");
+                return;
+            }
+        };
 
     logging::info(format_args!(
         "tuic[{tag}] {peer} authenticated as {user_name}"
@@ -253,7 +246,12 @@ async fn handle_tuic_connection(
                     };
                     let complete = {
                         let mut defrag = defragger.lock().expect("defragger");
-                        defrag.feed(pid, frag_id, frag_total, bytes::Bytes::copy_from_slice(payload))
+                        defrag.feed(
+                            pid,
+                            frag_id,
+                            frag_total,
+                            bytes::Bytes::copy_from_slice(payload),
+                        )
                     };
                     if let (Some(pkt), Some(target)) = (complete, target_opt) {
                         let dest_addr = match target {
@@ -328,8 +326,8 @@ async fn authenticate_tuic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
 
     static TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 

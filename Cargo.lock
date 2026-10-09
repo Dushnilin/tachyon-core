@@ -354,11 +354,14 @@ name = "core-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64",
  "core-config",
  "core-runtime",
  "mimalloc",
+ "rand_core 0.6.4",
  "serde_json",
  "tokio",
+ "x25519-dalek",
 ]
 
 [[package]]

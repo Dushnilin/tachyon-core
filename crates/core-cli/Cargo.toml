@@ -17,10 +17,6 @@ full = [
     "core-config/full",
     "core-runtime/full",
 ]
-lite = [
-    "core-config/lite",
-    "core-runtime/lite",
-]
 # counting allocator + per-second heap dump, see src/allocstat.rs
 allocstat = ["core-runtime/allocstat"]
 

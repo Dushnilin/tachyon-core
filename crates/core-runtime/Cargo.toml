@@ -13,10 +13,6 @@ full = [
     "clash-api",
     "core-config/full",
 ]
-lite = [
-    "clash-api",
-    "core-config/lite",
-]
 clash-api = []
 allocstat = []
 

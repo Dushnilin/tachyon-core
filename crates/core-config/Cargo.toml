@@ -10,7 +10,6 @@ rust-version.workspace = true
 [features]
 default = ["full"]
 full = ["brotli", "regex"]
-lite = []
 
 [dependencies]
 base64.workspace = true

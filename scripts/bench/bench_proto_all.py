@@ -758,14 +758,15 @@ def generate_html_report(results, profile, out_path):
         s_data = r.get("sing-box")
         x_data = r.get("xray")
         m_data = r.get("mihomo")
+        st_data = r.get("steer")
 
         speeds = []
-        for d in (t_data, s_data, x_data, m_data):
+        for d in (t_data, s_data, x_data, m_data, st_data):
             if d and d.get("status") == "OK":
                 speeds.append(max(d.get("tput_1", 0), d.get("tput_8", 0)))
         max_row_spd = max(speeds) if speeds else 1.0
 
-        def ctd(cdata, is_t=False):
+        def ctd(cdata, is_t=False, comp=None):
             if not cdata:
                 return "<td class='num none'>—</td>"
             if cdata.get("status") != "OK":
@@ -793,13 +794,18 @@ def generate_html_report(results, profile, out_path):
                     else:
                         diff_badge = "<span class='diff tie'>~0%</span>"
 
-            return f"""<td class='num {"col-t-cell" if is_t else ""}'>
+            comp_inline = ""
+            if comp:
+                comp_inline = f" &bull; <span class='mod-pill'>{comp}</span>"
+
+            cell_cls = "col-t-cell" if is_t else ("col-st-cell" if comp else "")
+            return f"""<td class='num {cell_cls}'>
               <div class='val-row'>
                 <span class='spd'>{t1:.2f}/{t8:.2f}<span class='unit'>G</span></span>
                 {diff_badge}
               </div>
               <div class='cell-sub'>
-                <span>{fmt_lat(p50)}</span> &bull; <span>{peak:.1f}M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>{cpu_str}</span>
+                <span>{fmt_lat(p50)}</span> &bull; <span>{peak:.1f}M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>{cpu_str}</span>{comp_inline}
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:{pct}%;background:{bar_color}'></div></div>
             </td>"""
@@ -811,7 +817,7 @@ def generate_html_report(results, profile, out_path):
             t_speed = max(t_data.get("tput_1", 0), t_data.get("tput_8", 0))
             best_ref = 0
             best_name = "ref"
-            for ref_name, ref_d in (("sing-box", s_data), ("xray", x_data), ("mihomo", m_data)):
+            for ref_name, ref_d in (("sing-box", s_data), ("xray", x_data), ("mihomo", m_data), ("steer", st_data)):
                 if ref_d and ref_d.get("status") == "OK":
                     spd = max(ref_d.get("tput_1", 0), ref_d.get("tput_8", 0))
                     if spd > best_ref:
@@ -848,6 +854,7 @@ def generate_html_report(results, profile, out_path):
           {ctd(s_data)}
           {ctd(x_data)}
           {ctd(m_data)}
+          {ctd(st_data, comp=st_data.get("component") if st_data else None)}
           <td class='vd'>{win_badge}</td>
         </tr>
         """
@@ -900,18 +907,19 @@ def generate_html_report(results, profile, out_path):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Мульти-протокольный бенчмарк: tachyon-core vs sing-box vs Xray vs Mihomo ({env_tag})</title>
+<title>Мульти-протокольная матрица: tachyon vs sing-box vs Xray vs Mihomo vs steer ({env_tag})</title>
 <style>
  :root {{
-  --bg: #0c0d11; --card: #15161d; --head: #1c1d25; --grp: #22232e;
+  --bg: #0b0c10; --card: #13141c; --head: #1a1b24; --grp: #20222e;
   --ink: #f0f1f5; --muted: #9498a4; --faint: #6c707e;
-  --line: #262733; --line2: #1e1f29;
+  --line: #242531; --line2: #1b1c26;
   --win-bg: #102d1d; --win-ink: #4ade80;
   --loss-bg: #321517; --loss-ink: #f87171;
   --tie-bg: #1e2028; --tie-ink: #9498a4;
-  --none-bg: #181920; --none-ink: #555966;
-  --accent: #6366f1; --hover: #1b1d28;
+  --none-bg: #161720; --none-ink: #555966;
+  --accent: #6366f1; --hover: #191b26;
   --t-col-bg: rgba(99, 102, 241, 0.04);
+  --st-col-bg: rgba(56, 189, 248, 0.02);
   --shadow: 0 1px 3px rgba(0,0,0,.5);
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
  }}
@@ -926,92 +934,105 @@ def generate_html_report(results, profile, out_path):
    --none-bg: #f4f5f8; --none-ink: #9aa0ae;
    --accent: #4f46e5; --hover: #eef2ff;
    --t-col-bg: rgba(79, 70, 229, 0.03);
+   --st-col-bg: rgba(2, 132, 199, 0.02);
    --shadow: 0 1px 3px rgba(0,0,0,.08);
   }}
  }}
  *, *::before, *::after {{ box-sizing: border-box; }}
  html, body {{
-  margin: 0; padding: 0; width: 100%; overflow-x: hidden;
-  color: var(--ink); font: 12px/1.3 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
+  margin: 0; padding: 0; width: 100%; height: 100%;
+  color: var(--ink); font: 11px/1.2 -apple-system, "SF Pro Text", "Segoe UI Variable Text", Inter, system-ui, sans-serif;
   background: var(--bg);
+  overflow-x: hidden;
  }}
- .page {{ width: 100%; max-width: 100%; padding: 8px 12px 16px; margin: 0 auto; }}
+ .page {{
+  width: 100%; max-width: 100%;
+  padding: 6px 12px 6px; margin: 0 auto;
+  box-sizing: border-box;
+ }}
  
- .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }}
- .title-group h1 {{ font-size: 15px; font-weight: 750; margin: 0; letter-spacing: -.02em; display: inline-block; }}
- .env-info {{ display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-top: 3px; flex-wrap: wrap; }}
- .env-tag {{ font-size: 9px; font-weight: 750; background: var(--accent); color: #fff; padding: 2px 6px; border-radius: 4px; font-family: var(--mono); letter-spacing: .03em; }}
- .env-val {{ color: var(--ink); font-weight: 600; }}
- .env-pill {{ font-size: 10px; background: var(--card); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; font-family: var(--mono); color: var(--faint); }}
+ .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 5px; flex-wrap: nowrap; }}
+ .title-group {{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }}
+ .title-line {{ display: flex; align-items: center; gap: 6px; }}
+ .title-icon {{ width: 15px; height: 15px; flex-shrink: 0; color: #38bdf8; display: inline-flex; align-items: center; }}
+ .title-group h1 {{ font-size: 13.5px; font-weight: 750; margin: 0; letter-spacing: -.02em; white-space: nowrap; }}
+ .sub-line {{ display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+ .env-badge {{ font-size: 9px; font-family: var(--mono); color: var(--muted); background: var(--head); border: 1px solid var(--line); padding: 0 5px; border-radius: 3px; font-weight: 600; }}
  
- .chips {{ display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }}
- .chip {{ display: inline-flex; align-items: center; gap: 5px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font-size: 11px; box-shadow: var(--shadow); }}
- .chip span {{ color: var(--muted); font-weight: 500; }}
- .chip b {{ font-family: var(--mono); font-weight: 700; font-size: 12px; }}
- .chip.win b {{ color: var(--win-ink); }}
- .chip.loss b {{ color: var(--loss-ink); }}
- .chip.tie b {{ color: var(--tie-ink); }}
+ .summary-line {{ display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; font-family: var(--mono); white-space: nowrap; flex-shrink: 0; }}
+ .sum-win {{ color: var(--win-ink); }}
+ .sum-win b {{ font-size: 12.5px; font-weight: 750; }}
+ .sum-tie {{ color: var(--tie-ink); }}
+ .sum-tie b {{ font-size: 12px; font-weight: 700; }}
+ .sum-loss {{ color: var(--faint); }}
+ .sum-loss b {{ font-size: 12px; font-weight: 700; }}
+ .sum-dot {{ color: var(--line); font-size: 9px; }}
 
- .toolbar {{ display: flex; gap: 6px; margin-bottom: 6px; align-items: center; flex-wrap: wrap; }}
- .tabs {{ display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }}
- .tab {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }}
- .tab i {{ font-style: normal; font-weight: 600; opacity: .75; font-size: 9.5px; margin-left: 3px; font-family: var(--mono); }}
+ .toolbar {{ display: flex; gap: 5px; margin-bottom: 5px; align-items: center; flex-wrap: nowrap; }}
+ .tabs {{ display: flex; gap: 3px; flex-wrap: nowrap; align-items: center; }}
+ .tab {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 10.5px/1 inherit; padding: 3px 8px; border-radius: 5px; cursor: pointer; transition: all .12s; white-space: nowrap; }}
+ .tab i {{ font-style: normal; font-weight: 600; opacity: .75; font-size: 9px; margin-left: 3px; font-family: var(--mono); }}
  .tab:hover {{ border-color: var(--accent); color: var(--accent); }}
  .tab.on {{ background: var(--accent); border-color: transparent; color: #fff; }}
  .tab.on i {{ opacity: .95; }}
- .btn {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 11px/1 inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer; transition: all .12s; }}
+ .btn {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--muted); font: 600 10.5px/1 inherit; padding: 3px 8px; border-radius: 5px; cursor: pointer; transition: all .12s; white-space: nowrap; }}
  .btn:hover {{ border-color: var(--accent); color: var(--accent); }}
  .btn.on {{ background: var(--loss-bg); border-color: var(--loss-ink); color: var(--loss-ink); font-weight: 700; }}
- #q {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 11.5px/1 inherit; padding: 5px 10px; width: 220px; border-radius: 6px; margin-left: auto; outline: none; }}
+ #q {{ appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 500 10.5px/1 inherit; padding: 3px 8px; width: 210px; border-radius: 5px; margin-left: auto; outline: none; transition: border-color .12s; }}
  #q:focus {{ border-color: var(--accent); }}
- #q::placeholder {{ color: var(--faint); font-size: 11px; }}
+ #q::placeholder {{ color: var(--faint); font-size: 10px; }}
 
- .table-wrap {{ width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; }}
- table.grid {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 11.5px; font-variant-numeric: tabular-nums; }}
+ .table-wrap {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; background: var(--card); box-shadow: var(--shadow); overflow: hidden; }}
+ table.grid {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 10.5px; font-variant-numeric: tabular-nums; }}
  
- col.c-name {{ width: 20%; }}
- col.c-t {{ width: 19%; }}
- col.c-s {{ width: 19%; }}
- col.c-x {{ width: 17%; }}
- col.c-m {{ width: 12%; }}
- col.c-vd {{ width: 13%; }}
+ col.c-name {{ width: 15.5%; }}
+ col.c-t {{ width: 16%; }}
+ col.c-s {{ width: 16%; }}
+ col.c-x {{ width: 15%; }}
+ col.c-m {{ width: 12.5%; }}
+ col.c-st {{ width: 14.5%; }}
+ col.c-vd {{ width: 10.5%; }}
 
- .grid th, .grid td {{ border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 3px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+ .grid th, .grid td {{ border-right: 1px solid var(--line); border-bottom: 1px solid var(--line2); padding: 1.5px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
  .grid tr:last-child td {{ border-bottom: none; }}
  .grid th:last-child, .grid td:last-child {{ border-right: none; }}
  
- .grid thead th {{ background: var(--head); color: var(--muted); height: 28px; text-align: left; font-size: 11px; font-weight: 650; }}
+ .grid thead th {{ background: var(--head); color: var(--muted); height: 23px; text-align: left; font-size: 10px; font-weight: 650; padding: 2px 6px; }}
  .grid thead th.th-core {{ text-align: left; }}
  .grid thead th.th-t {{ background: var(--grp); color: var(--ink); border-left: 2px solid var(--win-ink); }}
+ .grid thead th.th-st {{ border-left: 1px solid #0284c7; background: var(--st-col-bg); color: #7dd3fc; }}
  .grid thead th.th-vd {{ text-align: center; }}
- .th-hint {{ font-size: 9px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 3px; }}
+ .th-hint {{ font-size: 8.5px; font-weight: 500; color: var(--faint); font-family: var(--mono); margin-left: 2px; }}
 
  .grid td.name {{ text-align: left; font-weight: 600; }}
- .name-line {{ display: flex; align-items: baseline; gap: 5px; overflow: hidden; }}
- .cn {{ font-weight: 650; font-size: 11.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
- .cid-tag {{ font-size: 9.5px; color: var(--faint); font-family: var(--mono); opacity: .85; }}
+ .name-line {{ display: flex; align-items: baseline; gap: 4px; overflow: hidden; }}
+ .cn {{ font-weight: 650; font-size: 10.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+ .cid-tag {{ font-size: 8.5px; color: var(--faint); font-family: var(--mono); opacity: .85; }}
  
  td.col-t-cell {{ background: var(--t-col-bg); }}
+ td.col-st-cell {{ background: var(--st-col-bg); }}
  .grid td.num {{ text-align: left; }}
  .grid td.num.none {{ color: var(--none-ink); text-align: center; font-weight: 500; font-size: 11px; }}
- .grid td.num.fail {{ color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 10px; }}
+ .grid td.num.fail {{ color: var(--loss-ink); text-align: center; font-weight: 700; font-size: 9.5px; }}
  
- .val-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 4px; line-height: 1.15; }}
- .spd {{ font-weight: 700; font-size: 11.5px; font-family: var(--mono); color: var(--ink); white-space: nowrap; }}
- .unit {{ font-size: 9.5px; color: var(--muted); font-weight: 500; }}
- .cell-sub {{ font-size: 9.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; line-height: 1.15; margin-top: 1px; }}
+ .val-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 3px; line-height: 1.15; }}
+ .spd {{ font-weight: 700; font-size: 10.5px; font-family: var(--mono); color: var(--ink); white-space: nowrap; }}
+ .unit {{ font-size: 8.5px; color: var(--muted); font-weight: 500; }}
+ .cell-sub {{ font-size: 8.5px; color: var(--faint); font-family: var(--mono); white-space: nowrap; line-height: 1.1; margin-top: 0.5px; }}
  .cpu {{ color: var(--muted); font-family: var(--mono); font-weight: 600; }}
  .col-t-cell .cpu {{ color: var(--win-ink); font-weight: 700; }}
- .diff {{ font-size: 9.5px; font-weight: 700; padding: 0 4px; border-radius: 4px; font-family: var(--mono); white-space: nowrap; }}
+ .diff {{ font-size: 8.5px; font-weight: 700; padding: 0 3px; border-radius: 3px; font-family: var(--mono); white-space: nowrap; }}
  .diff.win {{ background: var(--win-bg); color: var(--win-ink); }}
  .diff.loss {{ background: var(--loss-bg); color: var(--loss-ink); }}
  .diff.tie {{ background: var(--tie-bg); color: var(--tie-ink); }}
  
- .bar-bg {{ background: var(--line2); height: 2px; border-radius: 1px; overflow: hidden; margin-top: 2px; width: 100%; }}
+ .mod-pill {{ font-size: 8px; padding: 0 3px; border-radius: 3px; background: rgba(56,189,248,0.12); color: #38bdf8; border: 1px solid rgba(56,189,248,0.28); font-family: var(--mono); font-weight: 600; display: inline-block; vertical-align: baseline; }}
+
+ .bar-bg {{ background: var(--line2); height: 2px; border-radius: 1px; overflow: hidden; margin-top: 1px; width: 100%; }}
  .bar-fill {{ height: 100%; border-radius: 1px; }}
  
  .grid td.vd {{ text-align: center; }}
- .vpill {{ font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; text-transform: uppercase; font-family: var(--mono); letter-spacing: .02em; display: inline-block; }}
+ .vpill {{ font-size: 8.5px; font-weight: 700; padding: 1.5px 5px; border-radius: 999px; white-space: nowrap; text-transform: uppercase; font-family: var(--mono); letter-spacing: .02em; display: inline-block; }}
  .vpill.win {{ background: var(--win-bg); color: var(--win-ink); border: 1px solid var(--win-ink); }}
  .vpill.loss {{ background: var(--loss-bg); color: var(--loss-ink); border: 1px solid var(--loss-ink); }}
  .vpill.tie {{ background: var(--tie-bg); color: var(--tie-ink); }}
@@ -1019,38 +1040,78 @@ def generate_html_report(results, profile, out_path):
 
  tbody tr.case:hover td {{ background: var(--hover); }}
  body.losses-only tr.case:not(.loss) {{ display: none; }}
+
+ /* 2K & Full-HD viewport responsiveness: guaranteed single-screen fit */
+ @media (min-height: 800px) {{
+  html, body {{
+   height: 100vh;
+   overflow-y: hidden;
+  }}
+  .page {{
+   height: 100vh;
+   display: flex;
+   flex-direction: column;
+   padding: 6px 12px 6px;
+   box-sizing: border-box;
+  }}
+  .table-wrap {{
+   flex: 1;
+   display: flex;
+   flex-direction: column;
+   min-height: 0;
+   overflow-y: auto;
+  }}
+ }}
+
+ @media (min-width: 1900px) and (min-height: 1100px) {{
+  /* 2K 1440p monitor full layout enhancement */
+  .grid th, .grid td {{
+   padding: 2.5px 7px;
+  }}
+  .grid thead th {{
+   height: 25px;
+   font-size: 10.5px;
+  }}
+  .cn {{
+   font-size: 11px;
+  }}
+  .val-row .spd {{
+   font-size: 11px;
+  }}
+  .cell-sub {{
+   font-size: 9px;
+  }}
+ }}
 </style>
 </head>
 <body>
 <div class="page">
   <div class="top-bar">
     <div class="title-group">
-      <h1>Мульти-протокольный бенчмарк прокси-ядер (все {len(results)} протокола)</h1>
-      <div class="env-info">
-        <span class="env-tag">{env_tag}</span>
-        <span class="env-val">Docker Linux x86_64 &bull; AMD Ryzen 7 5800X3D (8C/16T)</span>
-        <span class="env-pill">{env_pill_worker}</span>
-        <span class="env-pill">{env_pill_cli}</span>
-        <span class="env-pill">{env_pill_srv}</span>
+      <div class="title-line">
+        <svg class="title-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+        <h1>Мульти-протокольная матрица (все {len(results)} протокола)</h1>
+      </div>
+      <div class="sub-line">
+        <span>Сквозные замеры {len(results)} конфигураций прокси: от Shadowsocks и VMess до VLESS Vision, gRPC, QUIC (Hysteria 2 / TUIC) и XHTTP.</span>
+        <span class="env-badge">{env_tag} &bull; 1 worker &bull; AMD Ryzen 7 5800X3D</span>
       </div>
     </div>
-    <div class="chips">
-      <div class="chip"><span>протоколов:</span><b>{len(results)}</b></div>
-      <div class="chip win"><span>побед tachyon:</span><b>{t_wins}/{t_total}</b></div>
-      <div class="chip loss"><span>побед других:</span><b>{ref_wins}</b></div>
-      <div class="chip tie"><span>паритет:</span><b>{ties}</b></div>
-      <div class="chip win"><span>память tachyon:</span><b>{rss_chip}</b></div>
-      <div class="chip win"><span>CPU tachyon:</span><b>{t_cpu_chip}</b></div>
-      <div class="chip"><span>CPU Go-ядер:</span><b>{go_cpu_chip}</b></div>
+    <div class="summary-line">
+      <span class="sum-win"><b>{t_wins}</b> победы tachyon</span>
+      <span class="sum-dot">&bull;</span>
+      <span class="sum-tie"><b>{ties}</b> паритета</span>
+      <span class="sum-dot">&bull;</span>
+      <span class="sum-loss"><b>{ref_wins}</b> поражений</span>
     </div>
   </div>
 
   <div class="toolbar">
     <div class="tabs">
       {cat_buttons}
+      <button class="btn" id="lossBtn" onclick="toggleLosses()">только провалы</button>
     </div>
-    <button class="btn" id="lossBtn" onclick="toggleLosses()">только провалы</button>
-    <input id="q" placeholder="поиск: xhttp, quic, vless, grpc..." autocomplete="off" spellcheck="false" oninput="applyQ()">
+    <input id="q" placeholder="поиск: xhttp, quic, vless, grpc, ss..." autocomplete="off" spellcheck="false" oninput="applyQ()">
   </div>
 
   <div class="table-wrap">
@@ -1061,6 +1122,7 @@ def generate_html_report(results, profile, out_path):
         <col class="c-s">
         <col class="c-x">
         <col class="c-m">
+        <col class="c-st">
         <col class="c-vd">
       </colgroup>
       <thead>
@@ -1070,6 +1132,7 @@ def generate_html_report(results, profile, out_path):
           <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
           <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
           <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+          <th class="th-core th-st">steer (C) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; модуль</span></th>
           <th class="th-vd">Вердикт</th>
         </tr>
       </thead>

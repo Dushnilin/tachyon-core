@@ -261,5 +261,8 @@ async fn server_enforces_cipher_suite_preference() {
     let n = theirs.read(&mut answer).await.expect("read server hello");
     let resp = &answer[..n];
     // Cipher suite is at offset 44 in TLS 1.3 ServerHello
-    assert!(resp.windows(2).any(|w| w == [0x13, 0x03]), "server negotiated 0x1303");
+    assert!(
+        resp.windows(2).any(|w| w == [0x13, 0x03]),
+        "server negotiated 0x1303"
+    );
 }

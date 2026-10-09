@@ -11,8 +11,10 @@ end, plus the server half of the four TCP proxy protocols.
 ### What runs
 
 - **Inbounds**: `mixed` (HTTP, SOCKS4/4a, SOCKS5 with UDP ASSOCIATE), `direct`,
-  `redirect` (Linux `REDIRECT`), `tproxy` (v4/v6 with `IP_TRANSPARENT`), and the
-  server inbounds `vless`, `trojan`, `vmess` and `shadowsocks`.
+  `redirect` (Linux `REDIRECT`), `tproxy` (v4/v6 with `IP_TRANSPARENT`), `tun`
+  (pure-Rust `/dev/net/tun` with GRO/GSO `IFF_VNET_HDR` and auto-route), and the
+  server inbounds `vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic`
+  and `wireguard`.
 - **Server inbounds** accept the TCP command and the UDP command, over a `tls`
   block with our own handshake — TLS 1.3, X25519, three cipher suites, ALPN, no
   resumption, HelloRetryRequest handled the same way the client does.
@@ -23,13 +25,15 @@ end, plus the server half of the four TCP proxy protocols.
 - **Transports**: `ws`, `httpupgrade`, `grpc`, `http`, `xhttp` with `xmux`,
   all three `packet_encoding` modes, uTLS fingerprints and REALITY.
 - **DNS**: `udp`, `tcp`, `tls`, `https`, `quic`, `h3`, `fakeip`, `local`,
-  `hosts`, `group` and `mdns`; logical rules, `rule_set`, hijack-DNS,
+  `hosts`, `group`, `mdns`, `dhcp` and `resolved`; logical rules, `rule_set`, hijack-DNS,
   `reverse_mapping`, `client_subnet`.
 - **Routing**: the matcher set including `route.find_neighbor` for
   `source_mac_address` and `source_hostname`, sniffing, and the SRS rule-set
   reader.
-- **Experimental**: `clash_api` REST with websocket streaming and the `external_ui`
-  download, and a `cache.db` that Go bbolt can read.
+- **Experimental**: `clash_api` REST with websocket streaming, delay history, and `external_ui`
+  download, and a `cache.db` that Go bbolt can read with auto-flush on timeout and buffer size.
+- **OpenWrt Integration**: procd init script, UCI configuration, automatic `RLIMIT_NOFILE`
+  raising, and full CLI flag compatibility (`-D`, `-C`, multiple `-c`).
 
 ### Measurements
 
@@ -70,10 +74,10 @@ so the same source builds for 32-bit softfloat MIPS.
 Stated plainly, because a release note that hides them is worth less than one
 that names them:
 
-- No `tun` inbound, no `lxd` daemon, no libbox/Android bindings.
-- No server inbound for `hysteria2`, `tuic` or WireGuard yet; the vless, trojan
-  and vmess server sides do not speak mux (`packetaddr`/`xudp`), Vision's server
-  splice, or the legacy vmess CFB body.
+- No `lxd` daemon, no libbox/Android bindings.
+- Tailscale and openconnect not implemented.
+- The vless, trojan and vmess server sides do not speak mux (`packetaddr`/`xudp`),
+  Vision's server splice, or the legacy vmess CFB body.
 - `insecure: true` with no certificate on a server inbound is refused: it needs
   an ephemeral key pair, and nothing here can sign a certificate.
 - `COMPAT.md` predates most of this work and does not describe the tree.

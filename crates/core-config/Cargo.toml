@@ -7,11 +7,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["full"]
+full = ["brotli", "regex"]
+lite = []
+
 [dependencies]
 base64.workspace = true
-brotli.workspace = true
+brotli = { workspace = true, optional = true }
 flate2.workspace = true
 # the reference compiles every `*_regex` matcher while it parses a rule
-regex.workspace = true
+regex = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

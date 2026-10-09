@@ -7,9 +7,21 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["full"]
+full = [
+    "clash-api",
+    "core-config/full",
+]
+lite = [
+    "core-config/lite",
+]
+clash-api = []
+allocstat = []
+
 [dependencies]
 argon2.workspace = true
-core-config = { path = "../core-config" }
+core-config = { path = "../core-config", default-features = false }
 core-crypto = { path = "../core-crypto" }
 core-experimental = { path = "../core-experimental" }
 core-tls = { path = "../core-tls" }

@@ -3,6 +3,7 @@
 //! the same node set a subscription loader would produce.
 
 use std::collections::HashSet;
+#[cfg(feature = "brotli")]
 use std::io::Read as _;
 
 use base64::Engine as _;
@@ -65,15 +66,23 @@ fn decode_token(token: &str) -> Result<Vec<u8>, String> {
     if rem != 0 {
         padded.push_str(&"=".repeat(4 - rem));
     }
+    #[allow(unused_mut)]
     let mut bytes = base64::engine::general_purpose::STANDARD
         .decode(padded)
         .map_err(|e| format!("invalid base64: {e}"))?;
     if compressed {
-        let mut out = Vec::new();
-        brotli::Decompressor::new(std::io::Cursor::new(bytes.as_slice()), 4096)
-            .read_to_end(&mut out)
-            .map_err(|e| format!("brotli decompress failed: {e}"))?;
-        bytes = out;
+        #[cfg(feature = "brotli")]
+        {
+            let mut out = Vec::new();
+            brotli::Decompressor::new(std::io::Cursor::new(bytes.as_slice()), 4096)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("brotli decompress failed: {e}"))?;
+            bytes = out;
+        }
+        #[cfg(not(feature = "brotli"))]
+        {
+            return Err("fptnb: brotli compressed tokens not supported in lite build".to_string());
+        }
     }
     Ok(bytes)
 }

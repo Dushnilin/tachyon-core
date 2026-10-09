@@ -1,4 +1,5 @@
 pub mod cache_file;
+#[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod clash_mode;
 pub mod clash_state;
@@ -18,6 +19,7 @@ pub mod route;
 pub mod tls_client;
 pub mod tls_utls;
 pub mod ws;
+#[cfg(feature = "clash-api")]
 mod zip;
 
 use std::net::SocketAddr;
@@ -179,7 +181,9 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
 
     let mut tasks = Vec::new();
     tasks.extend(router.take_probe_tasks());
+    #[allow(unused_mut)]
     let mut clash_api = None;
+    #[cfg(feature = "clash-api")]
     if let Some(clash) = clash_api::ClashApi::build(root).context("experimental.clash_api")? {
         let (addr, handle) = clash.bind_and_spawn(Arc::clone(&router)).await?;
         logging::info(format_args!("clash-api: restful api listening at {addr}"));

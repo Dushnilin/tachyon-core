@@ -12,12 +12,21 @@ name = "tachyon-core"
 path = "src/main.rs"
 
 [features]
+default = ["full"]
+full = [
+    "core-config/full",
+    "core-runtime/full",
+]
+lite = [
+    "core-config/lite",
+    "core-runtime/lite",
+]
 # counting allocator + per-second heap dump, see src/allocstat.rs
-allocstat = []
+allocstat = ["core-runtime/allocstat"]
 
 [dependencies]
-core-config = { path = "../core-config" }
-core-runtime = { path = "../core-runtime" }
+core-config = { path = "../core-config", default-features = false }
+core-runtime = { path = "../core-runtime", default-features = false }
 serde_json.workspace = true
 anyhow.workspace = true
 base64.workspace = true

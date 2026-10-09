@@ -10,7 +10,8 @@ param(
     [int]$Seconds = 2,
     [int]$LatencyRounds = 3000,
     [switch]$Quick,
-    [string]$Only = ""
+    [string]$Only = "",
+    [switch]$Steer
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +42,26 @@ if (-not (Test-Path $mihomoPath)) {
     Remove-Item -Force $gzPath
 }
 
+# Ensure Steer binaries exist if requested
+$steerDir = "$work\steer"
+if ($Steer -and (-not (Test-Path "$steerDir\usr\bin\sing-box"))) {
+    Write-Host "Downloading Steer..."
+    New-Item -ItemType Directory -Force $steerDir | Out-Null
+    $coreIpk = "$work\steer-core.ipk"
+    $connIpk = "$work\steer-box-connector.ipk"
+    Invoke-WebRequest -Uri "https://github.com/splify2/steer/releases/download/v2.0.3/steer-core-2.0.3-1_x86_64.ipk" -OutFile $coreIpk
+    Invoke-WebRequest -Uri "https://github.com/splify2/steer-box-connector/releases/download/v2.0.3/steer-box-connector-2.0.3-1_x86_64.ipk" -OutFile $connIpk
+    python -c "
+import tarfile, os
+for ipk in [r'$coreIpk', r'$connIpk']:
+    with tarfile.open(ipk, 'r:*') as t:
+        data_f = t.extractfile('data.tar.gz')
+        with tarfile.open(fileobj=data_f, mode='r:gz') as dt:
+            dt.extractall(r'$steerDir')
+"
+    Remove-Item -Force $coreIpk, $connIpk
+}
+
 $extraArgs = @("--profile", $Profile, "--seconds", $Seconds, "--latency-rounds", $LatencyRounds)
 if ($Quick) {
     $extraArgs += @("--no-c1k", "--seconds", "1", "--latency-rounds", "1500")
@@ -48,17 +69,21 @@ if ($Quick) {
 if ($Only) {
     $extraArgs += @("--only", $Only)
 }
+if ($Steer -or (Test-Path "$steerDir\usr\bin\sing-box")) {
+    $extraArgs += @("--steer", "/bench/steer/usr/bin/sing-box")
+}
 
-$outJson = "/bench/multi-$Profile.json"
-$outHtml = "/bench/multi-$Profile.html"
+$suffix = if ($Steer) { "$Profile-steer" } else { $Profile }
+$outJson = "/bench/multi-$suffix.json"
+$outHtml = "/bench/multi-$suffix.html"
 $extraArgs += @("--out", $outJson, "--html", $outHtml)
 
 $argStr = $extraArgs -join " "
 
 Write-Host "Launching multi-proxy benchmark ($Profile profile) ..."
-docker run --rm --ulimit nofile=1048576:1048576 `
+docker run --rm --ulimit nofile=1048576:1048576 --cap-add=NET_ADMIN `
     -v "${work}:/bench" python:3 `
-    sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux && python3 /bench/bench_multi.py $argStr"
+    sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux /bench/steer/usr/bin/* /bench/steer/usr/sbin/* 2>/dev/null; python3 /bench/bench_multi.py $argStr"
 
-Write-Host "`nReport saved to: $work\multi-$Profile.html"
-Write-Host "JSON saved to:   $work\multi-$Profile.json"
+Write-Host "`nReport saved to: $work\multi-$suffix.html"
+Write-Host "JSON saved to:   $work\multi-$suffix.json"

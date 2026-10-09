@@ -206,3 +206,37 @@ async fn a_closed_client_is_an_end_of_file_and_not_a_truncation() {
         "the client did not see a clean end: {left:?}"
     );
 }
+
+#[tokio::test]
+async fn inbound_server_enforces_cipher_suites() {
+    core_tls::install_default_provider();
+    let tls = ServerTls::from_config(
+        &json!({
+            "enabled": true,
+            "certificate": CERT.lines().collect::<Vec<&str>>(),
+            "key": KEY.lines().collect::<Vec<&str>>(),
+            "alpn": ["tachyon"],
+            "cipher_suites": ["TLS_CHACHA20_POLY1305_SHA256"],
+        }),
+        "test",
+    )
+    .expect("the test certificate parses");
+
+    let (ours, theirs) = tokio::io::duplex(64 * 1024);
+    let client = tokio::spawn(async move {
+        let name = PkiServerName::try_from("localhost").expect("server name");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config()));
+        connector
+            .connect(name, theirs)
+            .await
+            .expect("rustls client handshake")
+    });
+    tls.accept(ours).await.expect("our handshake");
+    let client = client.await.expect("client task");
+    let suite = client.get_ref().1.negotiated_cipher_suite();
+    assert_eq!(
+        suite.map(|s| s.suite()),
+        Some(core_tls::rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
+        "server selected restricted suite"
+    );
+}

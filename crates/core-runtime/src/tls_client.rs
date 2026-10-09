@@ -104,6 +104,7 @@ pub struct TlsOptions {
     /// busy websocket. `None` means "decide", see [`TlsOptions::own_stack`].
     stack: Option<bool>,
     fragment: bool,
+    cipher_suites: Vec<String>,
 }
 
 impl TlsOptions {
@@ -242,6 +243,17 @@ impl TlsOptions {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
+        let cipher_suites = tls
+            .get("cipher_suites")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Some(Self {
             fingerprint,
             reality,
@@ -254,6 +266,7 @@ impl TlsOptions {
             max_tls12,
             ca_certs,
             fragment,
+            cipher_suites,
         }))
     }
 
@@ -344,7 +357,7 @@ impl TlsOptions {
         use std::hash::{Hash, Hasher as _};
         use std::sync::{Mutex, OnceLock};
 
-        type Key = (bool, bool, bool, Vec<Vec<u8>>, u64);
+        type Key = (bool, bool, bool, Vec<Vec<u8>>, Vec<String>, u64);
         static CACHE: OnceLock<Mutex<HashMap<Key, Arc<rustls::ClientConfig>>>> = OnceLock::new();
 
         let mut ca = DefaultHasher::new();
@@ -356,6 +369,7 @@ impl TlsOptions {
             self.max_tls12,
             self.insecure,
             alpn.to_vec(),
+            self.cipher_suites.clone(),
             ca.finish(),
         );
         let cache = CACHE.get_or_init(Mutex::default);
@@ -363,7 +377,24 @@ impl TlsOptions {
             return Ok(Arc::clone(config));
         }
 
-        let builder = rustls::ClientConfig::builder_with_protocol_versions(versions);
+        let provider = if !self.cipher_suites.is_empty() {
+            let suites: Vec<_> = self
+                .cipher_suites
+                .iter()
+                .filter_map(|s| core_crypto::resolve_cipher_suite(s))
+                .collect();
+            if !suites.is_empty() {
+                Arc::new(core_crypto::provider_with_suites(suites))
+            } else {
+                Arc::new(core_crypto::provider())
+            }
+        } else {
+            Arc::new(core_crypto::provider())
+        };
+
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .map_err(|e| io::Error::other(format!("tls: protocol versions: {e}")))?;
         let mut config = if self.insecure {
             builder
                 .dangerous()
@@ -389,10 +420,24 @@ impl TlsOptions {
         &self,
         default_alpn: &[&[u8]],
     ) -> io::Result<core_tls::quic::QuicClientConfig> {
-        let builder =
-            rustls::ClientConfig::builder_with_provider(core_tls::quic::configured_provider())
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(|e| io::Error::other(format!("QUIC TLS provider: {e}")))?;
+        let provider = if !self.cipher_suites.is_empty() {
+            let suites: Vec<_> = self
+                .cipher_suites
+                .iter()
+                .filter_map(|s| core_crypto::resolve_cipher_suite(s))
+                .collect();
+            if !suites.is_empty() {
+                Arc::new(core_crypto::provider_with_suites(suites))
+            } else {
+                core_tls::quic::configured_provider()
+            }
+        } else {
+            core_tls::quic::configured_provider()
+        };
+
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| io::Error::other(format!("QUIC TLS provider: {e}")))?;
         let mut config = if self.insecure {
             builder
                 .dangerous()
@@ -508,18 +553,24 @@ impl TlsOptions {
             } else {
                 (plain, None)
             };
-        let config = core_tls::client::Config {
-            template: &template,
-            server_name: if self.disable_sni {
-                ""
-            } else {
-                &self.server_name
-            },
-            alpn: &alpn,
-            verifier: &*verifier,
-            reality: seal,
-            fragment: self.fragment,
-        };
+            let cipher_suites: Vec<u16> = self
+                .cipher_suites
+                .iter()
+                .filter_map(|s| core_crypto::resolve_cipher_suite_id(s))
+                .collect();
+            let config = core_tls::client::Config {
+                template: &template,
+                server_name: if self.disable_sni {
+                    ""
+                } else {
+                    &self.server_name
+                },
+                alpn: &alpn,
+                verifier: &*verifier,
+                reality: seal,
+                fragment: self.fragment,
+                cipher_suites,
+            };
         let mut handshake = core_tls::client::Handshake::new(config)?;
         let mut stream = stream;
         let result = handshake

@@ -37,6 +37,7 @@ pub struct ServerTls {
     chain: Vec<Vec<u8>>,
     key: Arc<dyn core_tls::rustls::sign::SigningKey>,
     alpn: Vec<Vec<u8>>,
+    cipher_suites: Vec<u16>,
 }
 
 impl ServerTls {
@@ -161,10 +162,21 @@ impl ServerTls {
                 .collect(),
             Some(_) => anyhow::bail!("{at}: tls: alpn: must be a string or a list"),
         };
+
+        let cipher_suites = match object.get("cipher_suites") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(core_crypto::resolve_cipher_suite_id)
+                .collect(),
+            _ => Vec::new(),
+        };
+
         Ok(ServerTls {
             chain,
             key: signing,
             alpn,
+            cipher_suites,
         })
     }
 
@@ -203,14 +215,27 @@ impl ServerTls {
             .ok_or_else(|| anyhow::anyhow!("{at}: tls: the key file holds no key"))?;
 
         core_tls::install_default_provider();
-        let mut cfg = core_tls::rustls::ServerConfig::builder_with_provider(
-            core_tls::quic::configured_provider(),
-        )
-        .with_protocol_versions(&[&core_tls::rustls::version::TLS13])
-        .map_err(|e| anyhow::anyhow!("{at}: tls: {e}"))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("{at}: tls: {e}"))?;
+        let provider = match object.get("cipher_suites") {
+            Some(Value::Array(list)) => {
+                let suites: Vec<_> = list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(core_crypto::resolve_cipher_suite)
+                    .collect();
+                if !suites.is_empty() {
+                    Arc::new(core_crypto::provider_with_suites(suites))
+                } else {
+                    core_tls::quic::configured_provider()
+                }
+            }
+            _ => core_tls::quic::configured_provider(),
+        };
+        let mut cfg = core_tls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&core_tls::rustls::version::TLS13])
+            .map_err(|e| anyhow::anyhow!("{at}: tls: {e}"))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("{at}: tls: {e}"))?;
 
         let alpn: Vec<Vec<u8>> = match object.get("alpn") {
             None => default_alpn.iter().map(|p| p.to_vec()).collect(),
@@ -251,6 +276,7 @@ impl ServerTls {
             chain: self.chain.clone(),
             key: Arc::clone(&self.key),
             alpn: self.alpn.clone(),
+            cipher_suites: self.cipher_suites.clone(),
         })?;
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run(&mut stream)).await {
             Ok(result) => result?,

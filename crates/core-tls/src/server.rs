@@ -57,13 +57,15 @@ pub struct Config {
     pub key: Arc<dyn SigningKey>,
     /// protocols to pick from, in the order of preference; empty means none
     pub alpn: Vec<Vec<u8>>,
+    /// cipher suites to accept/prefer, in order; empty means defaults [0x1301, 0x1303, 0x1302]
+    pub cipher_suites: Vec<u16>,
 }
 
 /// One handshake. [`Handshake::run`] is the whole thing.
 pub struct Handshake {
     config: Config,
     shares: Shares,
-    suite: u16,
+    pub suite: u16,
     hash: Hash,
     key_len: usize,
     schedule: KeySchedule,
@@ -128,7 +130,7 @@ impl Handshake {
     }
 
     /// The ClientHello: its suites, its key share, its session id, its ALPN.
-    async fn read_hello(&mut self, stream: &mut (dyn Stream + '_)) -> std::io::Result<()> {
+    pub async fn read_hello(&mut self, stream: &mut (dyn Stream + '_)) -> std::io::Result<()> {
         let raw = read_record(stream).await?;
         if raw[0] != ContentType::Handshake as u8 {
             return Err(bad("the first record from the client is not a handshake"));
@@ -156,10 +158,14 @@ impl Handshake {
         }
 
         // cipher suites, in our order of preference
-        self.suite = *hello
-            .suites
+        let allowed = if self.config.cipher_suites.is_empty() {
+            &[0x1301u16, 0x1303, 0x1302][..]
+        } else {
+            &self.config.cipher_suites[..]
+        };
+        self.suite = *allowed
             .iter()
-            .find(|id| [0x1301u16, 0x1303, 0x1302].contains(id))
+            .find(|id| hello.suites.contains(id))
             .ok_or_else(|| bad("the client offered no cipher suite we serve"))?;
         let (hash, key_len) = suite_params(self.suite);
         self.hash = hash;
@@ -648,6 +654,7 @@ mod tests {
             chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x01]],
             key: core_crypto::sign::any_supported_type(&der).expect("a signing key"),
             alpn: Vec::new(),
+            cipher_suites: Vec::new(),
         })
         .expect("server config");
         handshake

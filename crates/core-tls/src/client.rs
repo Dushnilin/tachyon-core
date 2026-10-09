@@ -79,6 +79,7 @@ pub struct Config<'a> {
     /// hello's X25519 exchange produces, and the verifier is told that key.
     pub reality: Option<RealitySeal<'a>>,
     pub fragment: bool,
+    pub cipher_suites: Vec<u16>,
 }
 
 /// One handshake. [`Handshake::run`] is the whole thing over a blocking stream.
@@ -122,12 +123,16 @@ impl<'a> Handshake<'a> {
         // the suite list is a run of 16-bit ids, and it is the fingerprint's
         // own bytes: a trailing odd byte is ignored rather than guessed at
         let suites = &config.template.cipher_suites;
-        let offered: Vec<u16> = suites
-            .iter()
-            .step_by(2)
-            .zip(suites.iter().skip(1).step_by(2))
-            .map(|(high, low)| u16::from_be_bytes([*high, *low]))
-            .collect();
+        let offered: Vec<u16> = if !config.cipher_suites.is_empty() {
+            config.cipher_suites.clone()
+        } else {
+            suites
+                .iter()
+                .step_by(2)
+                .zip(suites.iter().skip(1).step_by(2))
+                .map(|(high, low)| u16::from_be_bytes([*high, *low]))
+                .collect()
+        };
         Ok(Handshake {
             shares: Shares::for_body(&key_share)?,
             offered,
@@ -203,8 +208,20 @@ impl<'a> Handshake<'a> {
         } else {
             entropy(&mut self.session_id)?;
         }
+        let mut template_override;
+        let template = if !self.config.cipher_suites.is_empty() {
+            template_override = self.config.template.clone();
+            let mut cs_bytes = Vec::with_capacity(self.config.cipher_suites.len() * 2);
+            for id in &self.config.cipher_suites {
+                cs_bytes.extend_from_slice(&id.to_be_bytes());
+            }
+            template_override.cipher_suites = cs_bytes;
+            &template_override
+        } else {
+            self.config.template
+        };
         let mut record = hello::build(
-            self.config.template,
+            template,
             &random,
             &self.session_id,
             self.config.server_name,
@@ -671,6 +688,7 @@ mod tests {
             verifier: &AcceptsAnything,
             reality: None,
             fragment: false,
+            cipher_suites: Vec::new(),
         })
         .expect("handshake");
         let raw = hello::build(

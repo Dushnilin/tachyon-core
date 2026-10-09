@@ -135,6 +135,7 @@ async fn shake(
         alpn: &alpn,
         verifier,
         reality: None,
+        fragment: false,
     };
     let mut client = Handshake::new(config).map_err(|e| e.to_string())?;
     let mut sock = client_side;
@@ -309,6 +310,7 @@ async fn application_data_flows_after_the_handshake() {
         alpn: &alpn,
         verifier: &verifier,
         reality: None,
+        fragment: false,
     };
     let mut client = Handshake::new(config).expect("a handshake");
     let mut sock = client_side;
@@ -402,6 +404,7 @@ async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
             public_key: &server_public,
             short_id,
         }),
+        fragment: false,
     };
     let mut client = Handshake::new(config).expect("a handshake");
     client.start(&mut client_side).await.expect("hello");

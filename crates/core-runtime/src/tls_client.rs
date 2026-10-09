@@ -103,6 +103,7 @@ pub struct TlsOptions {
     /// two of its own buffers, and that came to a third of the client CPU on a
     /// busy websocket. `None` means "decide", see [`TlsOptions::own_stack`].
     stack: Option<bool>,
+    fragment: bool,
 }
 
 impl TlsOptions {
@@ -232,6 +233,15 @@ impl TlsOptions {
             None => None,
         };
 
+        let fragment = tls
+            .get("fragment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || tls
+                .get("record_fragment")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
         Ok(Some(Self {
             fingerprint,
             reality,
@@ -243,6 +253,7 @@ impl TlsOptions {
             min_tls13,
             max_tls12,
             ca_certs,
+            fragment,
         }))
     }
 
@@ -423,6 +434,9 @@ impl TlsOptions {
     /// third of the client CPU. The one thing ours cannot do is TLS 1.2 on the
     /// client, so a config pinned to 1.2 stays on rustls.
     fn own_stack(&self) -> bool {
+        if self.fragment {
+            return true;
+        }
         if self.fingerprint().is_some() {
             return true;
         }
@@ -504,6 +518,7 @@ impl TlsOptions {
             alpn: &alpn,
             verifier: &*verifier,
             reality: seal,
+            fragment: self.fragment,
         };
         let mut handshake = core_tls::client::Handshake::new(config)?;
         let mut stream = stream;

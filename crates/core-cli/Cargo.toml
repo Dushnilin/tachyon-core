@@ -20,6 +20,9 @@ core-config = { path = "../core-config" }
 core-runtime = { path = "../core-runtime" }
 serde_json.workspace = true
 anyhow.workspace = true
+base64.workspace = true
+rand_core = { version = "0.6.4", default-features = false, features = ["getrandom"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # The router build runs on musl/aarch64 where the system allocator is the

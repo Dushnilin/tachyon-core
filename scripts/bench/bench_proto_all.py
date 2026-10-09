@@ -542,7 +542,7 @@ def get_cases(certs):
 
 
 # ---------------------------------------------------------------- proxy launcher
-def launch_server(ref_bin, case, server_cpus, workers=None, xray_bin=None):
+def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None):
     wait_port_free(SERVER_PORT)
     d = tempfile.mkdtemp(prefix="proto_srv_")
 
@@ -557,8 +557,8 @@ def launch_server(ref_bin, case, server_cpus, workers=None, xray_bin=None):
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
         env = os.environ.copy()
-        if workers:
-            env["GOMAXPROCS"] = str(workers)
+        if server_workers:
+            env["GOMAXPROCS"] = str(server_workers)
         pre = (lambda: os.sched_setaffinity(0, server_cpus)) if hasattr(os, "sched_setaffinity") else None
         proc = subprocess.Popen([xray_bin, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
         wait_listen(SERVER_PORT)
@@ -577,9 +577,9 @@ def launch_server(ref_bin, case, server_cpus, workers=None, xray_bin=None):
     with open(cfg_path, "w") as f:
         json.dump(cfg, f)
     env = os.environ.copy()
-    if workers:
-        env["GOMAXPROCS"] = str(workers)
-        env["TACHYON_WORKERS"] = str(workers)
+    if server_workers:
+        env["GOMAXPROCS"] = str(server_workers)
+        env["TACHYON_WORKERS"] = str(server_workers)
     pre = (lambda: os.sched_setaffinity(0, server_cpus)) if hasattr(os, "sched_setaffinity") else None
     proc = subprocess.Popen([ref_bin, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
     
@@ -862,18 +862,18 @@ def generate_html_report(results, profile, out_path):
     if profile in ("router2", "router-2core"):
         env_tag = "ROUTER 2-CORE (Dual-Core)"
         env_pill_worker = "2 worker потока (GOMAXPROCS=2, TACHYON_WORKERS=2)"
-        env_pill_cli = "Client CPU: Cores 0,1"
-        env_pill_srv = "Server CPU: Cores 2,3"
+        env_pill_cli = "Client CPU: Cores 0,1 (2 ядра)"
+        env_pill_srv = "Server CPU: 4 ядра (VPS upstream model)"
     elif profile == "router":
         env_tag = "ROUTER 1-CORE (Single-Core)"
         env_pill_worker = "1 поток (1 worker / GOMAXPROCS=1)"
-        env_pill_cli = "Client CPU: Core 0"
-        env_pill_srv = "Server CPU: Core 1"
+        env_pill_cli = "Client CPU: Core 0 (1 ядро)"
+        env_pill_srv = "Server CPU: 4 ядра (VPS upstream model)"
     else:
         env_tag = "DESKTOP UNLIMITED"
         env_pill_worker = "Многопоточный режим"
         env_pill_cli = "Client CPU: Cores 0..3"
-        env_pill_srv = "Server CPU: Cores 4..7"
+        env_pill_srv = "Server CPU: Cores 4..7 (VPS upstream model)"
 
     t_rss_vals = [r['tachyon']['peak_rss_mib'] for r in results if r.get('tachyon') and r['tachyon'].get('status') == 'OK' and 'peak_rss_mib' in r['tachyon']]
     t_cpu_vals = [r['tachyon']['cpu_s_per_gib'] for r in results if r.get('tachyon') and r['tachyon'].get('status') == 'OK' and r['tachyon'].get('cpu_s_per_gib')]
@@ -1136,27 +1136,49 @@ def main():
     args = ap.parse_args()
 
     all_cpus = set(range(os.cpu_count() or 1))
-    if args.profile == "router":
-        client_cpus = {0}
-        server_cpus = {1} if len(all_cpus) > 1 else {0}
+    if len(all_cpus) >= 8:
+        # High-core test machine: strict physical core isolation
+        # Client proxy simulates the router CPU budget (1 core for router, 2 cores for router2).
+        # Server proxy simulates a remote datacenter VPS (4 dedicated cores, unstarved GOMAXPROCS).
+        # Sink and load generator run on the remaining cores (e.g. 8+ cores) to prevent load starvation.
+        if args.profile == "router":
+            client_cpus = {0}
+            workers = args.workers or 1
+        elif args.profile in ("router2", "router-2core"):
+            client_cpus = {0, 1}
+            workers = args.workers or 2
+        else:  # desktop
+            client_cpus = {0, 1, 2, 3}
+            workers = args.workers or None
+
+        server_cpus = {2, 3, 4, 5} if args.profile in ("router", "router2", "router-2core") else {4, 5, 6, 7}
+        server_workers = 4
         load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
-        workers = args.workers or 1
-    elif args.profile in ("router2", "router-2core"):
-        client_cpus = {0, 1} if len(all_cpus) >= 4 else {0}
-        server_cpus = {2, 3} if len(all_cpus) >= 4 else client_cpus
-        load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
-        workers = args.workers or 2
-    else:  # desktop
-        client_cpus = {0, 1, 2, 3} if len(all_cpus) >= 8 else {0, 1}
-        server_cpus = {4, 5, 6, 7} if len(all_cpus) >= 8 else {2, 3}
-        load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
-        workers = args.workers or None
+    else:
+        if args.profile == "router":
+            client_cpus = {0}
+            server_cpus = {1} if len(all_cpus) > 1 else {0}
+            load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
+            workers = args.workers or 1
+            server_workers = None
+        elif args.profile in ("router2", "router-2core"):
+            client_cpus = {0, 1} if len(all_cpus) >= 4 else {0}
+            server_cpus = {2, 3} if len(all_cpus) >= 4 else client_cpus
+            load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
+            workers = args.workers or 2
+            server_workers = None
+        else:  # desktop
+            client_cpus = {0, 1, 2, 3} if len(all_cpus) >= 8 else {0, 1}
+            server_cpus = {4, 5, 6, 7} if len(all_cpus) >= 8 else {2, 3}
+            load_cpus = all_cpus - client_cpus - server_cpus or client_cpus
+            workers = args.workers or None
+            server_workers = None
 
     if hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, load_cpus)
 
     print(f"=== Multi-Proxy Protocol Benchmark ({args.profile.upper()} profile) ===")
-    print(f"client={client_cpus}, server={server_cpus}, load/sink={load_cpus}, workers={workers}")
+    print(f"client={client_cpus} (workers={workers}), server={server_cpus} (workers={server_workers}), load/sink={load_cpus}")
 
     # Launch sink
     sink = multiprocessing.Process(target=run_sink, args=(load_cpus,), daemon=True)
@@ -1187,7 +1209,7 @@ def main():
 
         srv_proc = None
         try:
-            srv_proc, srv_dir = launch_server(args.sing_box, case, server_cpus, workers, xray_bin=args.xray)
+            srv_proc, srv_dir = launch_server(args.sing_box, case, server_cpus, server_workers=server_workers, xray_bin=args.xray)
         except Exception as e:
             print(f"  [SERVER FAIL] Cannot launch reference server: {e}", flush=True)
             continue

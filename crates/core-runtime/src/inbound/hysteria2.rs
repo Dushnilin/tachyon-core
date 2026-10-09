@@ -257,8 +257,8 @@ async fn handle_hy2_connection(
     let reply_handle = tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
             let pid = next_packet_id(&packet_counter_clone);
-            let dest_str = reply.dest.to_string();
-            let pkt = pack_hy2(0, pid, 0, 1, &dest_str, &reply.payload);
+            let src_str = reply.src.to_string();
+            let pkt = pack_hy2(0, pid, 0, 1, &src_str, &reply.payload);
             let _ = conn_udp_send.send_datagram(pkt.into());
         }
     });

@@ -12,7 +12,7 @@ end, plus the server half of the four TCP proxy protocols.
 
 - **Inbounds**: `mixed` (HTTP, SOCKS4/4a, SOCKS5 with UDP ASSOCIATE), `direct`,
   `redirect` (Linux `REDIRECT`), `tproxy` (v4/v6 with `IP_TRANSPARENT`), `tun`
-  (pure-Rust `/dev/net/tun` with GRO/GSO `IFF_VNET_HDR` and auto-route), and the
+  (pure-Rust `/dev/net/tun` with `smoltcp` userspace TCP/IP stack, transparent TCP proxying, UDP NAT with remote/client source preservation, table 2022 policy routing + fwmark, GRO/GSO virtio_net_hdr parsing and TSO segmentation, dual-stack IPv4/IPv6 and ICMP/ICMPv6 echo responder), and the
   server inbounds `vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic`
   and `wireguard`.
 - **Server inbounds** accept the TCP command and the UDP command, over a `tls`

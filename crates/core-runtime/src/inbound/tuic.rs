@@ -174,7 +174,7 @@ async fn handle_tuic_connection(
     let reply_handle = tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
             let pid = next_packet_id(&packet_counter_clone);
-            let pkt = pack_tuic(0, pid, 1, 0, &Target::Ip(reply.dest), &reply.payload);
+            let pkt = pack_tuic(0, pid, 1, 0, &Target::Ip(reply.src), &reply.payload);
             let _ = conn_udp_send.send_datagram(pkt.into());
         }
     });

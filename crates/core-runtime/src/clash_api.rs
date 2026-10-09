@@ -823,6 +823,7 @@ fn connection_json(view: &clash_state::ConnView) -> Value {
         "upload": view.upload,
         "download": view.download,
         "start": rfc3339_utc(view.start.elapsed()),
+        "chains": &view.meta.chains,
         "rule": view.meta.rule,
         "rulePayload": view.meta.rule_payload,
     })

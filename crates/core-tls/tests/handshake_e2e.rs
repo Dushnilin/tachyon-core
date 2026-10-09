@@ -136,6 +136,7 @@ async fn shake(
         verifier,
         reality: None,
         fragment: false,
+        cipher_suites: Vec::new(),
     };
     let mut client = Handshake::new(config).map_err(|e| e.to_string())?;
     let mut sock = client_side;
@@ -311,6 +312,7 @@ async fn application_data_flows_after_the_handshake() {
         verifier: &verifier,
         reality: None,
         fragment: false,
+        cipher_suites: Vec::new(),
     };
     let mut client = Handshake::new(config).expect("a handshake");
     let mut sock = client_side;
@@ -405,6 +407,7 @@ async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
             short_id,
         }),
         fragment: false,
+        cipher_suites: Vec::new(),
     };
     let mut client = Handshake::new(config).expect("a handshake");
     client.start(&mut client_side).await.expect("hello");
@@ -480,4 +483,36 @@ async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
     assert!(time > 1_700_000_000, "a plausible unix time, got {time}");
     // the auth key we used is the one the handshake says it used
     assert_eq!(client.auth_key().expect("an auth key"), auth_key);
+}
+
+#[tokio::test]
+async fn client_cipher_suites_override_emits_only_specified_suites() {
+    let (certs, _) = fixture();
+    let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
+    let template = fingerprints::by_name("chrome").expect("a chrome table");
+
+    let (mut client_side, mut server_side) = tokio::io::duplex(64 * 1024);
+    let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+    let config = Config {
+        template: &template,
+        server_name: "localhost",
+        alpn: &alpn,
+        verifier: &verifier,
+        reality: None,
+        fragment: false,
+        cipher_suites: vec![0x1303], // ChaCha20 only
+    };
+    let mut client = Handshake::new(config).expect("a handshake");
+    client.start(&mut client_side).await.expect("hello");
+
+    let mut header = [0u8; 5];
+    server_side.read_exact(&mut header).await.expect("header");
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let mut body = vec![0u8; len];
+    server_side.read_exact(&mut body).await.expect("body");
+
+    let parsed =
+        core_tls::hello::parse_record(&[&header[..], &body[..]].concat()).expect("parse hello");
+    // Should only have 0x1303 (2 bytes)
+    assert_eq!(parsed.template.cipher_suites, vec![0x13, 0x03]);
 }

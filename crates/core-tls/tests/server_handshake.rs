@@ -71,6 +71,7 @@ async fn our_server_completes_a_handshake_with_rustls_client() {
         chain,
         key,
         alpn: vec![b"h2".to_vec()],
+        cipher_suites: Vec::new(),
     })
     .expect("server config");
     handshake.run(&mut ours).await.expect("handshake");
@@ -165,6 +166,7 @@ async fn refused(input: Vec<u8>) -> String {
         chain,
         key,
         alpn: Vec::new(),
+        cipher_suites: Vec::new(),
     })
     .expect("server config");
     let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
@@ -227,8 +229,37 @@ async fn a_server_without_a_certificate_chain_is_not_built() {
         chain: Vec::new(),
         key,
         alpn: Vec::new(),
+        cipher_suites: Vec::new(),
     })
     .err()
     .expect("an empty chain must not build");
     assert!(err.to_string().contains("chain"), "{err}");
+}
+
+#[tokio::test]
+async fn server_enforces_cipher_suite_preference() {
+    core_tls::install_default_provider();
+    let (chain, key) = load();
+
+    // Server restricted to ChaCha20-Poly1305 (0x1303) only
+    let mut handshake = Handshake::new(Config {
+        chain,
+        key,
+        alpn: Vec::new(),
+        cipher_suites: vec![0x1303],
+    })
+    .expect("server config");
+
+    let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+    // Client offers AES-128 (0x1301) and ChaCha20 (0x1303)
+    let input = hello(&[0x1301, 0x1303], Some(&[0x03, 0x04]), Some([9u8; 32]));
+    theirs.write_all(&input).await.expect("write");
+
+    handshake.read_hello(&mut ours).await.expect("read_hello");
+    // Handshake should have picked 0x1303 because server restricted to it
+    let mut answer = vec![0u8; 128];
+    let n = theirs.read(&mut answer).await.expect("read server hello");
+    let resp = &answer[..n];
+    // Cipher suite is at offset 44 in TLS 1.3 ServerHello
+    assert!(resp.windows(2).any(|w| w == [0x13, 0x03]), "server negotiated 0x1303");
 }

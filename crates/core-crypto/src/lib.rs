@@ -165,6 +165,56 @@ pub fn provider() -> CryptoProvider {
     }
 }
 
+pub fn provider_with_suites(cipher_suites: Vec<SupportedCipherSuite>) -> CryptoProvider {
+    CryptoProvider {
+        cipher_suites,
+        kx_groups: kx::ALL_KX_GROUPS.to_vec(),
+        signature_verification_algorithms: verify::ALGORITHMS,
+        secure_random: &Provider,
+        key_provider: &Provider,
+    }
+}
+
+pub fn resolve_cipher_suite(name: &str) -> Option<SupportedCipherSuite> {
+    match name {
+        "TLS_AES_128_GCM_SHA256" => Some(TLS13_AES_128_GCM_SHA256),
+        "TLS_AES_256_GCM_SHA384" => Some(TLS13_AES_256_GCM_SHA384),
+        "TLS_CHACHA20_POLY1305_SHA256" => Some(TLS13_CHACHA20_POLY1305_SHA256),
+        #[cfg(feature = "tls12")]
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
+        #[cfg(feature = "tls12")]
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
+        #[cfg(feature = "tls12")]
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
+        #[cfg(feature = "tls12")]
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
+        #[cfg(feature = "tls12")]
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+            Some(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+        }
+        #[cfg(feature = "tls12")]
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+            Some(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
+        }
+        _ => None,
+    }
+}
+
+pub fn resolve_cipher_suite_id(name: &str) -> Option<u16> {
+    match name {
+        "TLS_AES_128_GCM_SHA256" => Some(0x1301),
+        "TLS_AES_256_GCM_SHA384" => Some(0x1302),
+        "TLS_CHACHA20_POLY1305_SHA256" => Some(0x1303),
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => Some(0xc02b),
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Some(0xc02f),
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => Some(0xc02c),
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Some(0xc030),
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => Some(0xcca9),
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => Some(0xcca8),
+        _ => None,
+    }
+}
+
 impl SecureRandom for Provider {
     fn fill(&self, bytes: &mut [u8]) -> Result<(), GetRandomFailed> {
         use rand_core::RngCore;

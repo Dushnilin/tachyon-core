@@ -4,7 +4,7 @@
     target_os = "linux",
     not(target_env = "msvc"),
     not(feature = "allocstat"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    target_arch = "x86_64"
 ))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -19,7 +19,7 @@ mod allocstat;
 #[cfg(all(
     target_os = "linux",
     not(target_env = "msvc"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    target_arch = "x86_64"
 ))]
 unsafe extern "C" {
     fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
@@ -556,7 +556,7 @@ fn main() -> ExitCode {
     // which the runtime does before main -- these two calls are what stands.
     #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
     unsafe {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         {
             mi_option_set(15, 0);
             mi_option_set(43, 0);

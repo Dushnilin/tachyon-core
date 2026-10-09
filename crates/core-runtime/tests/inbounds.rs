@@ -332,6 +332,68 @@ async fn tproxy_inbound_non_linux_bind_fails() {
     );
 }
 
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn tun_inbound_non_linux_bind_fails() {
+    let _g = test_guard().await;
+    let cfg = base_cfg(
+        json!([
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": "tun0",
+                "inet4_address": "172.19.0.1/30"
+            }
+        ]),
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    );
+    let err = match core_runtime::start(&cfg).await {
+        Ok(_) => panic!("tun must fail off Linux"),
+        Err(err) => format!("{err:#}"),
+    };
+    assert!(
+        err.to_lowercase().contains("linux"),
+        "unexpected error: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_inbound_linux_open_interface() {
+    let _g = test_guard().await;
+    if !has_net_admin() || !std::path::Path::new("/dev/net/tun").exists() {
+        eprintln!("SKIP tun inbound: needs CAP_NET_ADMIN and /dev/net/tun");
+        return;
+    }
+    let cfg = base_cfg(
+        json!([
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": "tachyon-tst0",
+                "inet4_address": "172.19.100.1/30",
+                "mtu": 1500,
+                "auto_route": false
+            }
+        ]),
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    );
+    let instance = match core_runtime::start(&cfg).await {
+        Ok(i) => i,
+        Err(err) if format!("{err:#}").contains("Operation not permitted")
+            || format!("{err:#}").contains("Permission denied") =>
+        {
+            eprintln!("tun test skipped: {err}");
+            return;
+        }
+        Err(err) => panic!("tun start failed: {err}"),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    instance.shutdown();
+}
+
 #[tokio::test]
 async fn mixed_plain_http_get_forward() {
     let _g = test_guard().await;

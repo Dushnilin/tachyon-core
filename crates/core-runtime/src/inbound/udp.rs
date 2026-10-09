@@ -178,6 +178,7 @@ fn ss_udp_datagram(dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct TunReply {
+    pub src: SocketAddr,
     pub dest: SocketAddr,
     pub payload: Vec<u8>,
 }
@@ -201,7 +202,7 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    async fn send(&self, framed: &[u8], source: SocketAddr) -> std::io::Result<()> {
+    async fn send(&self, framed: &[u8], source: SocketAddr, remote: SocketAddr) -> std::io::Result<()> {
         match self {
             Reply::Socket(socket) => socket.send_to(framed, source).await.map(|_| ()),
             Reply::Stream(writer) => {
@@ -210,6 +211,7 @@ impl Reply {
             }
             Reply::Tun { sender } => sender
                 .send(TunReply {
+                    src: remote,
                     dest: source,
                     payload: framed.to_vec(),
                 })
@@ -434,11 +436,11 @@ impl UdpHub {
             resp.len()
         ));
         if self.frame == DatagramFrame::Raw {
-            reply.send(&resp, source).await?;
+            reply.send(&resp, source, dest).await?;
         } else {
             let mut framed = Vec::new();
             self.frame.apply_into(dest, &resp, &mut framed);
-            reply.send(&framed, source).await?;
+            reply.send(&framed, source, dest).await?;
         }
         Ok(())
     }
@@ -553,7 +555,7 @@ fn spawn_reverse(
                         frame.apply_into(key.1, &buf[..n], &mut out);
                         &out
                     };
-                    if let Err(err) = reply.send(framed, source).await {
+                    if let Err(err) = reply.send(framed, source, key.1).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
                         hub.remove_flow(key).await;
                         return;

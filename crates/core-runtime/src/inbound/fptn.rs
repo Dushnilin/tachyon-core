@@ -361,15 +361,15 @@ async fn handle_websocket_tunnel(
     let client_v4: Ipv4Addr = client_ipv4.parse().unwrap_or(Ipv4Addr::new(10, 88, 0, 2));
     tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
-            let remote_ip = match reply.dest.ip() {
+            let remote_ip = match reply.src.ip() {
                 IpAddr::V4(ip) => ip,
                 _ => continue,
             };
             let pkt = crate::inbound::tun::build_ipv4_udp(
                 remote_ip,
                 client_v4,
+                reply.src.port(),
                 reply.dest.port(),
-                53,
                 &reply.payload,
             );
             if let Ok(batch) = encode_batch(&[pkt]) {

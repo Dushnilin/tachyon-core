@@ -34,9 +34,8 @@ rand_core = { version = "0.6.4", default-features = false, features = ["getrando
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
-[target.'cfg(all(target_os = "linux", not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
-mimalloc = { version = "0.1", default-features = false }
+[target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
 libc.workspace = true
 
-[target.'cfg(all(target_os = "linux", not(target_env = "msvc"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
-libc.workspace = true
+[target.'cfg(all(target_os = "linux", not(target_env = "msvc"), target_arch = "x86_64"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

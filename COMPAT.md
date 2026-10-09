@@ -78,7 +78,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 |---|---|---|
 | `tproxy` (v4/v6), `direct`, `mixed`, `redirect` | done | Tachyon data plane (F1: TCP+UDP, OOB orig-dst, hijack-dns) |
 | `socks`, `http`, `mixed` server, … | planned | server half |
-| `tun` | planned | `stack: system` first, userspace stack later (divergent vs gvisor) |
+| `tun` | done | pure-Rust smoltcp userspace stack (TCP proxy + UDP NAT, table 2022 policy routing + fwmark, GRO/virtio_net_hdr, ICMP/ICMPv6 echo responder) |
 
 ## Version gates
 

@@ -274,6 +274,62 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
+            "tun" => {
+                let inbound = inbound::tun::Tun::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: tun"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "anytls" => {
+                let inbound = inbound::anytls::AnyTls::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: anytls"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "naive" => {
+                let inbound = inbound::naive::Naive::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: naive"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "shadowtls" => {
+                let inbound = inbound::shadowtls::ShadowTls::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: shadowtls"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "fptn" => {
+                let inbound = inbound::fptn::Fptn::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: fptn"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "hysteria2" => {
+                let inbound = inbound::hysteria2::Hysteria2::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: hysteria2"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
+            "tuic" => {
+                let inbound = inbound::tuic::Tuic::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: tuic"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                tasks.push(tokio::spawn(inbound.serve()));
+            }
             other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
         }
     }

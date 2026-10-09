@@ -16,16 +16,19 @@ use std::task::{Context, Poll, ready};
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 
 use super::tls::ServerTls;
+use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
 use crate::inbound::{
-    AnyRead, AnyStream, AnyWrite, ClientConn, Target, drive_framed, parse_listen,
+    AnyRead, AnyStream, AnyWrite, ClientConn, Target, drive_framed, network_includes_udp,
+    parse_listen,
 };
 use crate::logging;
 use crate::outbound::shadowsocks::crypto::{
     AEAD_TAG, Cipher, Method, derive_subkey, master_key, random_bytes,
 };
+use crate::outbound::urltest::parse_duration;
 use crate::route::Router;
 
 /// The 2022 head carries the client's clock; the reference allows 30 seconds.
@@ -33,11 +36,13 @@ const TIMESTAMP_WINDOW_SECS: i64 = 30;
 
 pub struct Shadowsocks {
     listener: TcpListener,
+    udp_socket: Option<Arc<UdpSocket>>,
     tag: String,
     router: Arc<Router>,
     method: Method,
     master_key: Arc<Vec<u8>>,
     tls: Option<Arc<ServerTls>>,
+    udp_timeout: std::time::Duration,
 }
 
 impl Shadowsocks {
@@ -83,13 +88,30 @@ impl Shadowsocks {
         let listener = TcpListener::bind(listen)
             .await
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
+        let want_udp = network_includes_udp(object);
+        let udp_socket = if want_udp {
+            Some(Arc::new(
+                UdpSocket::bind(listen)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{at}: udp bind {}:{}: {e}", listen.0, listen.1))?,
+            ))
+        } else {
+            None
+        };
+        let udp_timeout = parse_duration(
+            object.get("udp_timeout"),
+            DEFAULT_UDP_TIMEOUT,
+            &format!("{at}: udp_timeout"),
+        )?;
         Ok(Self {
             listener,
+            udp_socket,
             tag,
             router,
             method,
             master_key: Arc::new(key),
             tls: ServerTls::from_inbound(obj, &at)?,
+            udp_timeout,
         })
     }
 
@@ -98,6 +120,20 @@ impl Shadowsocks {
     }
 
     pub async fn serve(self) {
+        if let Some(udp) = self.udp_socket {
+            let method = self.method;
+            let master_key = Arc::clone(&self.master_key);
+            let tag = self.tag.clone();
+            let hub = UdpHub::new(
+                Arc::clone(&self.router),
+                self.udp_timeout,
+                DatagramFrame::Shadowsocks,
+            );
+            tokio::spawn(async move {
+                serve_udp(udp, method, master_key, hub, tag).await;
+            });
+        }
+
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
@@ -132,6 +168,64 @@ impl Shadowsocks {
                 }
             }
         }
+    }
+}
+
+async fn serve_udp(
+    sock: Arc<UdpSocket>,
+    method: Method,
+    master_key: Arc<Vec<u8>>,
+    hub: Arc<UdpHub>,
+    tag: String,
+) {
+    let mut buf = vec![0u8; 65535];
+    let reply = Reply::Shadowsocks {
+        socket: Arc::clone(&sock),
+        method,
+        master_key: Arc::clone(&master_key),
+    };
+    loop {
+        let (n, peer) = match sock.recv_from(&mut buf).await {
+            Ok(res) => res,
+            Err(e) => {
+                logging::debug(format_args!("shadowsocks udp recv: {e}"));
+                continue;
+            }
+        };
+        let packet = &mut buf[..n];
+        let salt_len = method.salt_len();
+        if packet.len() < salt_len + 16 + 7 {
+            continue;
+        }
+        let (salt, encrypted) = packet.split_at_mut(salt_len);
+        let subkey = derive_subkey(method, &master_key, salt);
+        let cipher = Cipher::new(method, &subkey.0[..subkey.1]);
+        if cipher.open_slice(0, encrypted).is_err() {
+            continue;
+        }
+        let plaintext = &encrypted[..encrypted.len() - 16];
+        let (destination, addr_len) = match decode_target(plaintext) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let payload = &plaintext[addr_len..];
+
+        let dest_addr = match destination {
+            Target::Ip(addr) => addr,
+            Target::Domain(ref host, port) => {
+                if let Ok(mut addrs) = tokio::net::lookup_host((host.as_str(), port)).await {
+                    if let Some(addr) = addrs.next() {
+                        addr
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+        };
+
+        let _ = hub.handle(reply.clone(), peer, dest_addr, payload, &tag).await;
     }
 }
 
@@ -1208,5 +1302,42 @@ mod tests {
             secs,
             secs / 2.0
         );
+    }
+
+    #[test]
+    fn test_shadowsocks_udp_packet_roundtrip() {
+        let method = Method::ChaCha20Poly1305;
+        let master_key = vec![42u8; 32];
+        let target = Target::Ip("1.2.3.4:53".parse().unwrap());
+        let payload = b"ping dns";
+
+        let mut body = Vec::new();
+        match target {
+            Target::Ip(SocketAddr::V4(v4)) => {
+                body.push(0x01);
+                body.extend_from_slice(&v4.ip().octets());
+                body.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            _ => unreachable!(),
+        }
+        body.extend_from_slice(payload);
+
+        let salt = vec![1u8; method.salt_len()];
+        let subkey = derive_subkey(method, &master_key, &salt);
+        let cipher = Cipher::new(method, &subkey.0[..subkey.1]);
+        cipher.seal(0, &mut body).unwrap();
+
+        let mut packet = salt;
+        packet.extend_from_slice(&body);
+
+        let (recv_salt, encrypted) = packet.split_at_mut(method.salt_len());
+        let recv_subkey = derive_subkey(method, &master_key, recv_salt);
+        let recv_cipher = Cipher::new(method, &recv_subkey.0[..recv_subkey.1]);
+        recv_cipher.open_slice(0, encrypted).unwrap();
+
+        let plaintext = &encrypted[..encrypted.len() - 16];
+        let (decoded_target, addr_len) = decode_target(plaintext).unwrap();
+        assert_eq!(decoded_target, target);
+        assert_eq!(&plaintext[addr_len..], payload);
     }
 }

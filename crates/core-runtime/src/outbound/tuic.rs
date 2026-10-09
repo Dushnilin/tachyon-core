@@ -24,12 +24,12 @@ use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
 use tokio::io::AsyncWriteExt;
 
-const TUIC_VERSION: u8 = 5;
-const CMD_AUTHENTICATE: u8 = 0;
-const CMD_CONNECT: u8 = 1;
-const CMD_PACKET: u8 = 2;
-const CMD_DISSOCIATE: u8 = 3;
-const CMD_HEARTBEAT: u8 = 4;
+pub(crate) const TUIC_VERSION: u8 = 5;
+pub(crate) const CMD_AUTHENTICATE: u8 = 0;
+pub(crate) const CMD_CONNECT: u8 = 1;
+pub(crate) const CMD_PACKET: u8 = 2;
+pub(crate) const CMD_DISSOCIATE: u8 = 3;
+pub(crate) const CMD_HEARTBEAT: u8 = 4;
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(10);
 const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
 const MAX_ADDRESS: usize = 2048;
@@ -514,6 +514,42 @@ fn parse_tuic_packet(body: &[u8]) -> Option<(u16, u16, u8, u8, &[u8])> {
     ))
 }
 
+pub(crate) type TuicPacketParsed<'a> = (u16, u16, u8, u8, Option<Target>, &'a [u8]);
+
+pub(crate) fn parse_tuic_packet_with_target(
+    body: &[u8],
+) -> Option<TuicPacketParsed<'_>> {
+    if body.len() < 8 {
+        return None;
+    }
+    let sid = u16::from_be_bytes(body[0..2].try_into().ok()?);
+    let pid = u16::from_be_bytes(body[2..4].try_into().ok()?);
+    let frag_total = body[4];
+    let frag_id = body[5];
+    let data_len = u16::from_be_bytes(body[6..8].try_into().ok()?) as usize;
+    let rest = &body[8..];
+    if rest.is_empty() {
+        return None;
+    }
+    let (target, addr_len) = if rest[0] == 0xff {
+        (None, 1)
+    } else {
+        let (tgt, len) = crate::outbound::quic::parse_sing_addr_port(rest)?;
+        (Some(tgt), len)
+    };
+    if rest.len() < addr_len + data_len {
+        return None;
+    }
+    Some((
+        sid,
+        pid,
+        frag_id,
+        frag_total,
+        target,
+        &rest[addr_len..addr_len + data_len],
+    ))
+}
+
 fn skip_sing_addr(buf: &[u8]) -> Option<usize> {
     let family = *buf.first()?;
     match family {
@@ -531,12 +567,12 @@ fn skip_sing_addr(buf: &[u8]) -> Option<usize> {
     }
 }
 
-fn next_packet_id(counter: &AtomicU32) -> u16 {
+pub(crate) fn next_packet_id(counter: &AtomicU32) -> u16 {
     let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     (n % 65_535) as u16
 }
 
-fn pack_tuic(
+pub(crate) fn pack_tuic(
     sid: u16,
     pid: u16,
     frag_total: u8,
@@ -557,7 +593,7 @@ fn pack_tuic(
     out
 }
 
-fn pack_tuic_cont(sid: u16, pid: u16, frag_total: u8, frag_id: u8, data: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_tuic_cont(sid: u16, pid: u16, frag_total: u8, frag_id: u8, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(11 + data.len());
     out.push(TUIC_VERSION);
     out.push(CMD_PACKET);

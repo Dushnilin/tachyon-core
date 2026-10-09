@@ -4,6 +4,7 @@
 //! socket with an idle-timeout reverse reader (reference `udpnat.Service`).
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -123,6 +124,8 @@ pub(crate) enum DatagramFrame {
     /// `[len:u16][payload]`, which is what `vmess.Service`'s `serverPacketConn`
     /// reads and writes for the UDP command
     LengthPrefixed,
+    /// `[atyp][addr][port][payload]` (Shadowsocks AEAD UDP payload)
+    Shadowsocks,
 }
 
 impl DatagramFrame {
@@ -140,16 +143,50 @@ impl DatagramFrame {
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
+            DatagramFrame::Shadowsocks => ss_udp_datagram(dest, payload, out),
         }
     }
 }
 
+fn ss_udp_datagram(dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
+    out.reserve(7 + payload.len());
+    match dest.ip() {
+        IpAddr::V4(ip) => {
+            out.push(0x01);
+            out.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            out.push(0x04);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(&dest.port().to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct TunReply {
+    pub dest: SocketAddr,
+    pub payload: Vec<u8>,
+}
+
 /// Where a reply datagram goes: back out of a socket the client is reading
-/// from, or down a stream it is reading a length-prefixed sequence off.
+/// from, down a stream it is reading a length-prefixed sequence off, or back to
+/// the TUN interface.
 #[derive(Clone)]
 pub(crate) enum Reply {
     Socket(Arc<UdpSocket>),
     Stream(Arc<tokio::sync::Mutex<AnyWrite>>),
+    #[allow(dead_code)]
+    Tun {
+        sender: tokio::sync::mpsc::Sender<TunReply>,
+    },
+    Shadowsocks {
+        socket: Arc<UdpSocket>,
+        method: crate::outbound::shadowsocks::crypto::Method,
+        master_key: Arc<Vec<u8>>,
+    },
 }
 
 impl Reply {
@@ -160,9 +197,35 @@ impl Reply {
                 let mut writer = writer.lock().await;
                 writer.write_all(framed).await
             }
+            Reply::Tun { sender } => sender
+                .send(TunReply {
+                    dest: source,
+                    payload: framed.to_vec(),
+                })
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tun reply channel closed")),
+            Reply::Shadowsocks {
+                socket,
+                method,
+                master_key,
+            } => {
+                use crate::outbound::shadowsocks::crypto::{Cipher, derive_subkey, random_bytes};
+                let mut salt = vec![0u8; method.salt_len()];
+                random_bytes(&mut salt)?;
+                let subkey = derive_subkey(*method, master_key, &salt);
+                let cipher = Cipher::new(*method, &subkey.0[..subkey.1]);
+                let mut body = framed.to_vec();
+                cipher
+                    .seal(0, &mut body)
+                    .map_err(|e| io::Error::other(format!("ss udp seal: {e}")))?;
+                let mut packet = salt;
+                packet.extend_from_slice(&body);
+                socket.send_to(&packet, source).await.map(|_| ())
+            }
         }
     }
 }
+
 
 pub(crate) struct UdpHub {
     router: Arc<Router>,

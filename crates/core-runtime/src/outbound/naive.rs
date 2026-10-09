@@ -78,7 +78,7 @@ fn next_step(blocks: usize) -> ReadStep {
 /// data and `pad` zero bytes behind it. The reference splits what it sends at
 /// 65535 bytes first (`writeChunked`), which changes nothing here -- a block is
 /// whatever its header announces.
-struct Padded<S> {
+pub(crate) struct Padded<S> {
     inner: S,
     // write side
     write_blocks: usize,
@@ -95,7 +95,7 @@ struct Padded<S> {
 }
 
 impl<S> Padded<S> {
-    fn new(inner: S) -> Self {
+    pub(crate) fn new(inner: S) -> Self {
         Self {
             inner,
             write_blocks: 0,

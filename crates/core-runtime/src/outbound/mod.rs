@@ -1,5 +1,6 @@
 pub mod anytls;
 pub mod block;
+pub mod chain;
 pub mod dial;
 pub mod direct;
 pub mod fptn;
@@ -13,6 +14,7 @@ pub mod proxy;
 pub mod quic;
 pub mod secure;
 pub mod shadowsocks;
+pub mod shadowtls;
 pub mod snell;
 pub mod transport;
 pub mod tuic;

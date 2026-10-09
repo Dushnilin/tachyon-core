@@ -24,9 +24,9 @@ use crate::outbound::quic::{
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
 
-const AUTH_STATUS_OK: u16 = 233;
-const FRAME_TCP_REQUEST: u64 = 0x401;
-const MAX_ADDRESS: usize = 2048;
+pub(crate) const AUTH_STATUS_OK: u16 = 233;
+pub(crate) const FRAME_TCP_REQUEST: u64 = 0x401;
+pub(crate) const MAX_ADDRESS: usize = 2048;
 const MAX_MESSAGE: usize = 2048;
 const MAX_PADDING: usize = 4096;
 const DEFAULT_HANDSHAKE: Duration = Duration::from_secs(15);
@@ -532,7 +532,7 @@ async fn h3_auth(
     Ok((udp_enabled, send_request, driver))
 }
 
-async fn read_varint_stream(recv: &mut quinn::RecvStream) -> io::Result<u64> {
+pub(crate) async fn read_varint_stream(recv: &mut quinn::RecvStream) -> io::Result<u64> {
     let mut vr = VarintReader::default();
     let mut byte = [0u8; 1];
     loop {
@@ -545,7 +545,7 @@ async fn read_varint_stream(recv: &mut quinn::RecvStream) -> io::Result<u64> {
     }
 }
 
-async fn read_exact_vec(recv: &mut quinn::RecvStream, n: usize) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_exact_vec(recv: &mut quinn::RecvStream, n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     let mut off = 0;
     while off < n {
@@ -606,12 +606,12 @@ fn varint_len(v: u64) -> usize {
     }
 }
 
-fn next_packet_id(counter: &AtomicU32) -> u16 {
+pub(crate) fn next_packet_id(counter: &AtomicU32) -> u16 {
     let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     (n % 65_535) as u16
 }
 
-fn pack_hy2(sid: u32, pid: u16, frag_id: u8, frag_total: u8, dest: &str, data: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_hy2(sid: u32, pid: u16, frag_id: u8, frag_total: u8, dest: &str, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + varint_len(dest.len() as u64) + dest.len() + data.len());
     out.extend_from_slice(&sid.to_be_bytes());
     out.extend_from_slice(&pid.to_be_bytes());
@@ -623,7 +623,7 @@ fn pack_hy2(sid: u32, pid: u16, frag_id: u8, frag_total: u8, dest: &str, data: &
     out
 }
 
-fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
+pub(crate) fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
     if data.len() < 8 {
         return None;
     }
@@ -651,7 +651,7 @@ fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
     ))
 }
 
-type Hy2Packet<'a> = (u32, u16, u8, u8, &'a str, &'a [u8]);
+pub(crate) type Hy2Packet<'a> = (u32, u16, u8, u8, &'a str, &'a [u8]);
 
 fn send_hy2_datagram(
     conn: &quinn::Connection,

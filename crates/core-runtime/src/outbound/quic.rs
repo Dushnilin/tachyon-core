@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use quinn::VarInt;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::inbound::Target;
 use crate::logging;
@@ -383,6 +383,80 @@ pub(crate) fn put_sing_addr_empty(out: &mut Vec<u8>) {
     out.push(0xff);
 }
 
+pub(crate) fn parse_sing_addr_port(slice: &[u8]) -> Option<(Target, usize)> {
+    if slice.is_empty() {
+        return None;
+    }
+    match slice[0] {
+        0x01 => {
+            if slice.len() < 7 {
+                return None;
+            }
+            let ip = std::net::Ipv4Addr::new(slice[1], slice[2], slice[3], slice[4]);
+            let port = u16::from_be_bytes([slice[5], slice[6]]);
+            Some((Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))), 7))
+        }
+        0x02 => {
+            if slice.len() < 19 {
+                return None;
+            }
+            let mut ip_bytes = [0u8; 16];
+            ip_bytes.copy_from_slice(&slice[1..17]);
+            let ip = std::net::Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([slice[17], slice[18]]);
+            Some((Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))), 19))
+        }
+        0x00 => {
+            if slice.len() < 2 {
+                return None;
+            }
+            let len = slice[1] as usize;
+            if slice.len() < 2 + len + 2 {
+                return None;
+            }
+            let host = std::str::from_utf8(&slice[2..2 + len]).ok()?;
+            let port = u16::from_be_bytes([slice[2 + len], slice[3 + len]]);
+            Some((Target::Domain(host.to_string(), port), 4 + len))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) async fn read_sing_addr_port<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Target> {
+    let mut atype = [0u8; 1];
+    reader.read_exact(&mut atype).await?;
+    match atype[0] {
+        0x01 => {
+            let mut buf = [0u8; 6];
+            reader.read_exact(&mut buf).await?;
+            let ip = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+            let port = u16::from_be_bytes([buf[4], buf[5]]);
+            Ok(Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))))
+        }
+        0x02 => {
+            let mut buf = [0u8; 18];
+            reader.read_exact(&mut buf).await?;
+            let mut ip_bytes = [0u8; 16];
+            ip_bytes.copy_from_slice(&buf[..16]);
+            let ip = std::net::Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([buf[16], buf[17]]);
+            Ok(Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))))
+        }
+        0x00 => {
+            let mut len = [0u8; 1];
+            reader.read_exact(&mut len).await?;
+            let mut host = vec![0u8; len[0] as usize];
+            reader.read_exact(&mut host).await?;
+            let mut port_buf = [0u8; 2];
+            reader.read_exact(&mut port_buf).await?;
+            let port = u16::from_be_bytes(port_buf);
+            let host_str = String::from_utf8(host).map_err(io::Error::other)?;
+            Ok(Target::Domain(host_str, port))
+        }
+        other => Err(io::Error::other(format!("invalid address family: {other}"))),
+    }
+}
+
 /// Random alphanumeric padding, half-open `[min, max)`.
 pub(crate) fn random_padding(min: usize, max: usize) -> String {
     debug_assert!(max > min);
@@ -699,7 +773,7 @@ pub(crate) async fn spawn_gecko_relay(
 /// Returns the loopback address quinn should `connect()` to, plus task handles.
 pub(crate) struct SalamanderRelay {
     pub local: SocketAddr,
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for SalamanderRelay {

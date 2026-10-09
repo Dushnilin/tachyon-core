@@ -15,14 +15,13 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection. Sized to 4 MiB stream / 16 MiB
-/// connection to sustain 10+ Gbps bulk transfers without ballooning client RSS
-/// across concurrent streams.
-const STREAM_WINDOW: u32 = 4 << 20;
-const CONN_WINDOW: u32 = 16 << 20;
-/// Largest DATA frame we ask the peer to send (the protocol default is 16 KiB;
-/// Go's client asks for 1 MiB).
-const MAX_FRAME: u32 = 1024 * 1024;
+/// Receive window per stream and per connection. Sized to 2 MiB stream / 8 MiB
+/// connection to sustain 10+ Gbps transfers without ballooning client RSS
+/// across concurrent pooled connections.
+const STREAM_WINDOW: u32 = 8 << 20;
+const CONN_WINDOW: u32 = 32 << 20;
+/// Largest DATA frame we ask the peer to send.
+const MAX_FRAME: u32 = 256 * 1024;
 
 /// The client handshake every h2-based transport shares, with windows sized
 /// for throughput.
@@ -191,6 +190,12 @@ impl H2Stream {
         self.report = report;
     }
 
+    pub(crate) fn stage_bytes(&mut self, frame: Bytes, report: usize) {
+        debug_assert!(!self.has_out());
+        self.out = frame;
+        self.report = report;
+    }
+
     pub(crate) fn take_report(&mut self) -> usize {
         std::mem::replace(&mut self.report, 0)
     }
@@ -274,6 +279,86 @@ impl H2Stream {
         self.eof
     }
 
+    /// Read into `out`, draining `pending` and pulling all available chunks
+    /// from `recv` without blocking before returning. Returns `Ready(Ok(()))` if any
+    /// bytes were placed into `out` or if EOF was reached. Returns `Pending` only if
+    /// no bytes could be read and the stream is not at EOF.
+    pub(crate) fn poll_read_into(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let initial_filled = out.filled().len();
+        loop {
+            if !self.pending.is_empty() {
+                self.serve(out, usize::MAX);
+                if out.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+
+            if self.eof {
+                return Poll::Ready(Ok(()));
+            }
+
+            if self.recv.is_none() {
+                let Some(response) = self.response.as_mut() else {
+                    self.eof = true;
+                    return Poll::Ready(Ok(()));
+                };
+                let resp = match ready!(response.as_mut().poll(cx)) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        return Poll::Ready(Err(io::Error::other(format!("h2: response: {e}"))));
+                    }
+                };
+                if resp.status().as_u16() != 200 {
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "h2: unexpected status: {}",
+                        resp.status()
+                    ))));
+                }
+                self.recv = Some(resp.into_body());
+                self.response = None;
+            }
+
+            let recv = self.recv.as_mut().expect("recv set above");
+            match recv.poll_data(cx) {
+                Poll::Ready(Some(Ok(mut chunk))) => {
+                    let len = chunk.len();
+                    let _ = recv.flow_control().release_capacity(len);
+                    let want = out.remaining();
+                    if want >= len {
+                        out.put_slice(&chunk);
+                    } else if want > 0 {
+                        out.put_slice(&chunk[..want]);
+                        chunk.advance(want);
+                        self.pending_len += chunk.len();
+                        self.pending.push_back(chunk);
+                        return Poll::Ready(Ok(()));
+                    } else {
+                        self.pending_len += len;
+                        self.pending.push_back(chunk);
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::other(format!("h2: recv: {e}"))));
+                }
+                Poll::Ready(None) => {
+                    self.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => {
+                    if out.filled().len() > initial_filled {
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
     /// Half-close: flush staged bytes, then END_STREAM on the send side.
     pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.poll_flush_out(cx))?;
@@ -309,16 +394,7 @@ impl AsyncRead for H2Io {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            if !self.h2.pending.is_empty() {
-                self.h2.serve(out, usize::MAX);
-                return Poll::Ready(Ok(()));
-            }
-            if self.h2.is_eof() {
-                return Poll::Ready(Ok(()));
-            }
-            ready!(self.h2.poll_recv_more(cx))?;
-        }
+        self.h2.poll_read_into(cx, out)
     }
 }
 
@@ -332,9 +408,7 @@ impl AsyncWrite for H2Io {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            // one alloc + one copy, and both are the AsyncWrite boundary
-            // itself — see the note on `stage`
-            self.h2.stage(buf.to_vec(), buf.len());
+            self.h2.stage_bytes(Bytes::copy_from_slice(buf), buf.len());
         }
         ready!(self.h2.poll_flush_out(cx))?;
         Poll::Ready(Ok(self.h2.take_report()))

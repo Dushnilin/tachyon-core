@@ -14,14 +14,22 @@ use crate::logging;
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
+pub mod anytls;
 pub mod direct;
+pub mod fptn;
+pub mod hysteria2;
 pub mod mixed;
+pub mod mux;
+pub mod naive;
 pub mod proxy;
 pub mod redirect;
 pub mod shadowsocks;
+pub mod shadowtls;
 pub mod tls;
 pub mod tproxy;
 pub(crate) mod transport;
+pub mod tuic;
+pub mod tun;
 pub(crate) mod udp;
 pub mod vmess;
 

@@ -373,6 +373,158 @@ pub fn process_response(
     })
 }
 
+/// Result of successfully consuming a handshake initiation as responder.
+pub struct InitiationResult {
+    pub sender_index: u32,
+    pub sender_static_pub: [u8; 32],
+    pub e_pub: [u8; 32],
+    pub ck: [u8; 32],
+    pub h: [u8; 32],
+}
+
+/// Process an incoming handshake initiation as a responder.
+pub fn process_initiation(
+    our_static_priv: &[u8; 32],
+    our_static_pub: &[u8; 32],
+    msg: &[u8],
+) -> Result<InitiationResult, &'static str> {
+    if msg.len() < INITIATION_LEN {
+        return Err("short handshake initiation");
+    }
+    // Verify mac1: keyed by our static public key
+    let m1 = mac(&mac1_key(our_static_pub), &msg[..MAC1_OFFSET_INIT]);
+    if msg[MAC1_OFFSET_INIT..MAC2_OFFSET_INIT] != m1 {
+        return Err("handshake initiation mac1 mismatch");
+    }
+
+    let sender_index = u32::from_le_bytes(msg[4..8].try_into().unwrap());
+    let mut e_pub = [0u8; 32];
+    e_pub.copy_from_slice(&msg[8..40]);
+
+    let ck0 = hash(CONSTRUCTION);
+    let mut h = {
+        let inner = {
+            let mut v = Vec::with_capacity(32 + IDENTIFIER.len());
+            v.extend_from_slice(&ck0);
+            v.extend_from_slice(IDENTIFIER);
+            hash(&v)
+        };
+        let mut v = Vec::with_capacity(32 + 32);
+        v.extend_from_slice(&inner);
+        v.extend_from_slice(our_static_pub);
+        hash(&v)
+    };
+
+    h = hash_concat(&h, &e_pub);
+    let (_, ck1) = mix_key(&ck0, &e_pub);
+
+    // es: DH(our_static_priv, e_pub)
+    let (temp, ck2) = mix_key(&ck1, &dh(our_static_priv, &e_pub));
+    let key = key2(&temp, &ck2);
+    let enc_static = &msg[40..88];
+    let plain_static =
+        aead_open(&key, 0, enc_static, &h).ok_or("initiation static decrypt failed")?;
+    if plain_static.len() != 32 {
+        return Err("invalid decrypted static key length");
+    }
+    let mut sender_static_pub = [0u8; 32];
+    sender_static_pub.copy_from_slice(&plain_static);
+    h = hash_concat(&h, enc_static);
+
+    // ss: DH(our_static_priv, sender_static_pub)
+    let (temp, ck3) = mix_key(&ck2, &dh(our_static_priv, &sender_static_pub));
+    let key_ts = key2(&temp, &ck3);
+    let enc_ts = &msg[88..116];
+    let _ts = aead_open(&key_ts, 0, enc_ts, &h).ok_or("initiation timestamp decrypt failed")?;
+    h = hash_concat(&h, enc_ts);
+
+    Ok(InitiationResult {
+        sender_index,
+        sender_static_pub,
+        e_pub,
+        ck: ck3,
+        h,
+    })
+}
+
+/// Build a handshake response as responder and return the response message
+/// along with the derived transport session.
+pub fn build_response(
+    init_res: &InitiationResult,
+    _our_static_priv: &[u8; 32],
+    psk: Option<&[u8; 32]>,
+    type_word: u32,
+) -> (Vec<u8>, Session) {
+    let r_sender_index = random_u32_nonzero();
+    let e_priv = random_32();
+    let e_pub = PublicKey::from(&StaticSecret::from(e_priv));
+
+    let mut h = hash_concat(&init_res.h, e_pub.as_bytes());
+    let (_, ck1) = mix_key(&init_res.ck, e_pub.as_bytes());
+
+    // ee: DH(e_priv, init_res.e_pub)
+    let (_, ck2) = mix_key(&ck1, &dh(&e_priv, &init_res.e_pub));
+
+    // se: DH(e_priv, init_res.sender_static_pub)
+    let (_, ck3) = mix_key(&ck2, &dh(&e_priv, &init_res.sender_static_pub));
+
+    // psk
+    let zero_psk = [0u8; 32];
+    let psk = psk.unwrap_or(&zero_psk);
+    let (temp, ck4) = mix_key(&ck3, psk);
+
+    let temp2 = key2(&temp, &ck4);
+    let mut m3 = [0u8; 33];
+    m3[..32].copy_from_slice(&temp2);
+    m3[32] = 0x03;
+    let key = hmac(&temp, &m3);
+    h = hash_concat(&h, &temp2);
+
+    let enc_nothing = aead_seal(&key, 0, &[], &h);
+    debug_assert_eq!(enc_nothing.len(), 16);
+    h = hash_concat(&h, &enc_nothing);
+    let _ = h;
+
+    let mut msg = Vec::with_capacity(RESPONSE_LEN);
+    msg.extend_from_slice(&type_word.to_le_bytes());
+    msg.extend_from_slice(&r_sender_index.to_le_bytes());
+    msg.extend_from_slice(&init_res.sender_index.to_le_bytes());
+    msg.extend_from_slice(e_pub.as_bytes());
+    msg.extend_from_slice(&enc_nothing);
+
+    // mac1: keyed by initiator's static public key
+    let m1 = mac(
+        &mac1_key(&init_res.sender_static_pub),
+        &msg[..MAC1_OFFSET_RESP],
+    );
+    msg.extend_from_slice(&m1);
+    // mac2: 16 bytes of zero
+    msg.extend_from_slice(&[0u8; 16]);
+    debug_assert_eq!(msg.len(), RESPONSE_LEN);
+
+    // Data keys (responder): sending = temp3', receiving = temp2'.
+    let temp1 = hmac(&ck4, &[]);
+    let send_key_initiator = hmac(&temp1, &[0x01]);
+    let mut tail = [0u8; 33];
+    tail[..32].copy_from_slice(&send_key_initiator);
+    tail[32] = 0x02;
+    let recv_key_initiator = hmac(&temp1, &tail);
+
+    let session = Session {
+        local_index: r_sender_index,
+        remote_index: init_res.sender_index,
+        send_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key_initiator)),
+        recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key_initiator)),
+        send_counter: 0,
+        recv_max: 0,
+        recv_any: false,
+        recv_bitmap: [0u64; 32],
+        awg_transport: HDR_TRANSPORT,
+    };
+
+    (msg, session)
+}
+
 /// Valid transport counters stop below this (spec `REJECT_AFTER_MESSAGES`).
 const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13) - 1;
 const RECV_WINDOW: u64 = 2048;
@@ -981,5 +1133,51 @@ mod tests {
             &msg[44..60],
             "mirror-created response differs from reference"
         );
+    }
+
+    #[test]
+    fn test_responder_handshake_roundtrip() {
+        let priv_init = [0x33u8; 32];
+        let priv_resp = [0x44u8; 32];
+        let pub_init = *PublicKey::from(&StaticSecret::from(priv_init)).as_bytes();
+        let pub_resp = *PublicKey::from(&StaticSecret::from(priv_resp)).as_bytes();
+
+        let hs = build_initiation(
+            &priv_init,
+            &pub_init,
+            &pub_resp,
+            None,
+            &tai64n_now(),
+            HDR_INIT.0,
+        );
+
+        // Responder consumes initiation
+        let init_res =
+            process_initiation(&priv_resp, &pub_resp, hs.initiation()).expect("process_initiation");
+        assert_eq!(init_res.sender_static_pub, pub_init);
+        assert_eq!(init_res.sender_index, hs.sender_index);
+
+        // Responder builds response
+        let (resp_msg, mut resp_session) =
+            build_response(&init_res, &priv_resp, None, HDR_RESPONSE.0);
+
+        // Initiator consumes response
+        let mut init_session =
+            process_response(&hs, &resp_msg, &pub_init, None).expect("process_response");
+
+        assert_eq!(init_session.remote_index, resp_session.local_index);
+        assert_eq!(resp_session.remote_index, init_session.local_index);
+
+        // Transport: initiator -> responder
+        let plain_msg = b"hello from wireguard client";
+        let sealed_by_init = init_session.seal(plain_msg).expect("init seal");
+        let opened_by_resp = resp_session.open(&sealed_by_init).expect("resp open");
+        assert_eq!(&opened_by_resp[..plain_msg.len()], plain_msg);
+
+        // Transport: responder -> initiator
+        let reply_msg = b"hello from wireguard server";
+        let sealed_by_resp = resp_session.seal(reply_msg).expect("resp seal");
+        let opened_by_init = init_session.open(&sealed_by_resp).expect("init open");
+        assert_eq!(&opened_by_init[..reply_msg.len()], reply_msg);
     }
 }

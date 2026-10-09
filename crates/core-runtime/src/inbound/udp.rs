@@ -126,6 +126,8 @@ pub(crate) enum DatagramFrame {
     LengthPrefixed,
     /// `[atyp][addr][port][payload]` (Shadowsocks AEAD UDP payload)
     Shadowsocks,
+    /// `[len:u16][address][port][payload]` (PacketAddr mode in sing-box / v2fly)
+    PacketAddr,
 }
 
 impl DatagramFrame {
@@ -134,7 +136,7 @@ impl DatagramFrame {
     /// `Raw` needs no framing at all, so the send loops skip this entirely
     /// and hand `send` the recv-buffer slice — a `to_vec()` per datagram
     /// for a header of zero bytes.
-    fn apply_into(self, dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
+    pub(crate) fn apply_into(self, dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
         out.clear();
         match self {
             DatagramFrame::Raw => out.extend_from_slice(payload),
@@ -144,6 +146,15 @@ impl DatagramFrame {
                 out.extend_from_slice(payload);
             }
             DatagramFrame::Shadowsocks => ss_udp_datagram(dest, payload, out),
+            DatagramFrame::PacketAddr => {
+                let mut body =
+                    Vec::with_capacity(crate::outbound::packet::MAX_ADDR_PORT + payload.len());
+                let target = Target::Ip(dest);
+                let _ = crate::outbound::packet::put_addr_port(&mut body, &target);
+                body.extend_from_slice(payload);
+                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                out.extend_from_slice(&body);
+            }
         }
     }
 }
@@ -225,7 +236,6 @@ impl Reply {
         }
     }
 }
-
 
 pub(crate) struct UdpHub {
     router: Arc<Router>,
@@ -477,9 +487,15 @@ where
 pub(crate) fn udp_destination(destination: &Target) -> std::io::Result<SocketAddr> {
     match destination {
         Target::Ip(addr) => Ok(*addr),
-        Target::Domain(host, _) => Err(std::io::Error::other(format!(
-            "the udp command names the destination in its head, and {host:?} is not an address"
-        ))),
+        Target::Domain(host, port) => {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                Ok(SocketAddr::new(ip, *port))
+            } else {
+                Err(std::io::Error::other(format!(
+                    "the udp command names the destination in its head, and {host:?} is not an address"
+                )))
+            }
+        }
     }
 }
 
@@ -606,5 +622,20 @@ mod tests {
             );
             assert_eq!(&framed[2..], &payload[..], "{len}");
         }
+    }
+
+    #[test]
+    fn packetaddr_frame_roundtrip() {
+        let dest = "1.2.3.4:53".parse::<SocketAddr>().expect("addr");
+        let payload = b"dns-packet";
+        let mut framed = Vec::new();
+        DatagramFrame::PacketAddr.apply_into(dest, payload, &mut framed);
+        assert!(framed.len() > 2);
+        let len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+        assert_eq!(len, framed.len() - 2);
+        let (got_target, got_payload) =
+            crate::outbound::packet::take_addr_port(&framed[2..]).expect("take addr port");
+        assert_eq!(got_target, Target::Ip(dest));
+        assert_eq!(got_payload, payload);
     }
 }

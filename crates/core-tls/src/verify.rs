@@ -642,11 +642,8 @@ fn der_content(element: &[u8]) -> Option<(&[u8], &[u8])> {
 /// SPKI hash covers.
 fn der_element(input: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
     let first = *input.get(at + 1)?;
-    let len;
-    let value_at;
-    if first & 0x80 == 0 {
-        len = first as usize;
-        value_at = at + 2;
+    let (len, value_at) = if first & 0x80 == 0 {
+        (first as usize, at + 2)
     } else {
         let count = (first & 0x7f) as usize;
         if count == 0 || count > 4 {
@@ -656,9 +653,8 @@ fn der_element(input: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
         for i in 0..count {
             acc = (acc << 8) | *input.get(at + 2 + i)? as usize;
         }
-        len = acc;
-        value_at = at + 2 + count;
-    }
+        (acc, at + 2 + count)
+    };
     let value_end = value_at.checked_add(len)?;
     let element = input.get(at..value_end)?;
     let rest = input.get(value_end..)?;

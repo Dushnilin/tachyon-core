@@ -90,23 +90,25 @@ pub struct ConnContext {
     pub source_hostname: Option<String>,
     /// `route.find_process`: the process that opened the connection.
     pub process: Option<process::ProcessInfo>,
+    pub udp_timeout: Option<Duration>,
+    pub udp_disable_domain_unmapping: Option<bool>,
+    pub tls_fragment: Option<bool>,
+    pub tls_record_fragment: Option<bool>,
 }
 
 use std::net::IpAddr;
 
-impl ConnContext {
-    pub fn new(
-        inbound: &str,
-        source: SocketAddr,
-        destination: Target,
-        network: &'static str,
-    ) -> Self {
+impl Default for ConnContext {
+    fn default() -> Self {
         Self {
-            inbound: Some(inbound.to_string()),
-            source,
-            destination,
+            inbound: None,
+            source: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            destination: Target::Ip(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            )),
             origin_destination: None,
-            network,
+            network: "tcp",
             protocol: None,
             domain: None,
             auth_user: None,
@@ -122,6 +124,27 @@ impl ConnContext {
             source_mac: None,
             source_hostname: None,
             process: None,
+            udp_timeout: None,
+            udp_disable_domain_unmapping: None,
+            tls_fragment: None,
+            tls_record_fragment: None,
+        }
+    }
+}
+
+impl ConnContext {
+    pub fn new(
+        inbound: &str,
+        source: SocketAddr,
+        destination: Target,
+        network: &'static str,
+    ) -> Self {
+        Self {
+            inbound: Some(inbound.to_string()),
+            source,
+            destination,
+            network,
+            ..Default::default()
         }
     }
 }
@@ -1058,17 +1081,34 @@ fn reject_error(method: RejectMethod, no_drop: bool, flood: &rule::RejectFlood) 
 }
 
 async fn action_resolve(ctx: &mut ConnContext, action: &ResolveAction) -> io::Result<()> {
-    let Target::Domain(host, _) = &ctx.destination else {
-        return Ok(());
+    let host = match &ctx.destination {
+        Target::Domain(host, _) => host.clone(),
+        Target::Ip(_) => match &ctx.domain {
+            Some(d) => d.clone(),
+            None => return Ok(()),
+        },
     };
-    let host = host.clone();
     let Some(dns) = dns::current() else {
         return Err(io::Error::other("resolve action requires dns section"));
     };
-    let addrs = match &action.server {
-        Some(tag) => dns.resolve_via(tag, &host).await?,
-        None => dns.resolve(&host).await?,
+    let resolve_fut = async {
+        match &action.server {
+            Some(tag) => dns.resolve_via_with(tag, &host, action.strategy).await,
+            None => dns.resolve_with(&host, action.strategy).await,
+        }
     };
+    let addrs = if let Some(timeout) = action.timeout {
+        tokio::time::timeout(timeout, resolve_fut)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("resolve timeout for {host}"),
+                )
+            })?
+    } else {
+        resolve_fut.await
+    }?;
     logging::debug(format_args!(
         "route: resolved [{}] for {host}",
         addrs
@@ -1077,6 +1117,9 @@ async fn action_resolve(ctx: &mut ConnContext, action: &ResolveAction) -> io::Re
             .collect::<Vec<_>>()
             .join(" ")
     ));
+    if ctx.ip_version.is_none() && !addrs.is_empty() {
+        ctx.ip_version = Some(if addrs[0].is_ipv6() { 6 } else { 4 });
+    }
     ctx.destination_addresses = addrs;
     Ok(())
 }

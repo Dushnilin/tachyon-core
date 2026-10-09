@@ -1,4 +1,4 @@
-# Runs bench_proto_all.py in Docker: Tachyon vs Sing-box vs Xray vs Mihomo across 20 protocols
+# Runs bench_proto_all.py in Docker: Tachyon vs Sing-box vs Xray vs Mihomo across 39 protocols
 #
 #   .\scripts\bench\bench_proto_all.ps1                         # router profile (1 worker, core 1)
 #   .\scripts\bench\bench_proto_all.ps1 -Profile desktop        # desktop profile (multi-core)

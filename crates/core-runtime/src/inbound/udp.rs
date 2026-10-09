@@ -382,7 +382,15 @@ impl UdpHub {
                 writing: AtomicBool::new(false),
             },
             Decision::Outbound(idx) => {
-                let sock = self.router.connect_udp_index(idx, &ctx.destination).await?;
+                let target = if ctx.udp_disable_domain_unmapping == Some(false)
+                    && let Some(orig) = &ctx.origin_destination
+                {
+                    orig
+                } else {
+                    &ctx.destination
+                };
+                let timeout = ctx.udp_timeout.unwrap_or(self.timeout);
+                let sock = self.router.connect_udp_index(idx, target).await?;
                 let sock = Arc::new(sock);
                 spawn_reverse(
                     Arc::clone(&sock),
@@ -390,7 +398,7 @@ impl UdpHub {
                     self.frame,
                     source,
                     tag,
-                    self.timeout,
+                    timeout,
                     Arc::clone(self),
                     (source, dest),
                 );

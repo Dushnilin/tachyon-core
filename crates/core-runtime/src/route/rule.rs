@@ -49,6 +49,9 @@ pub struct RouteOptions {
     pub override_address: Option<TargetOverride>,
     pub override_port: Option<u16>,
     pub udp_timeout: Option<Duration>,
+    pub udp_disable_domain_unmapping: Option<bool>,
+    pub tls_fragment: Option<bool>,
+    pub tls_record_fragment: Option<bool>,
 }
 
 /// Host part of `override_address` (port embedded in the string is ignored).
@@ -61,6 +64,8 @@ pub enum TargetOverride {
 #[derive(Debug, Clone)]
 pub struct ResolveAction {
     pub server: Option<String>,
+    pub strategy: Option<crate::dns::Strategy>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -1172,13 +1177,21 @@ fn build_action(map: &serde_json::Map<String, Value>, at: &str) -> anyhow::Resul
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let strategy = match map.get("strategy").and_then(Value::as_str) {
+                Some(s) if !s.is_empty() => Some(crate::dns::Strategy::parse(s)?),
+                _ => None,
+            };
+            let timeout = if let Some(v) = map.get("timeout") {
+                let d = parse_duration(Some(v), Duration::ZERO, &format!("{at}: timeout"))?;
+                if d == Duration::ZERO { None } else { Some(d) }
+            } else {
+                None
+            };
             for key in [
-                "strategy",
                 "disable_cache",
                 "disable_optimistic_cache",
                 "rewrite_ttl",
                 "client_subnet",
-                "timeout",
             ] {
                 if map.get(key).is_some_and(|v| !v.is_null()) {
                     crate::logging::warn(format_args!(
@@ -1186,7 +1199,11 @@ fn build_action(map: &serde_json::Map<String, Value>, at: &str) -> anyhow::Resul
                     ));
                 }
             }
-            Ok(Action::Resolve(ResolveAction { server }))
+            Ok(Action::Resolve(ResolveAction {
+                server,
+                strategy,
+                timeout,
+            }))
         }
         other => anyhow::bail!("{at}: unknown rule action: {other}"),
     }
@@ -1229,13 +1246,22 @@ fn build_route_options(
             opts.udp_timeout = None;
         }
     }
+    if let Some(b) = map
+        .get("udp_disable_domain_unmapping")
+        .and_then(Value::as_bool)
+    {
+        opts.udp_disable_domain_unmapping = Some(b);
+    }
+    if let Some(b) = map.get("tls_fragment").and_then(Value::as_bool) {
+        opts.tls_fragment = Some(b);
+    }
+    if let Some(b) = map.get("tls_record_fragment").and_then(Value::as_bool) {
+        opts.tls_record_fragment = Some(b);
+    }
     for key in [
         "network_strategy",
         "fallback_delay",
         "udp_connect",
-        "udp_disable_domain_unmapping",
-        "tls_fragment",
-        "tls_record_fragment",
         "tls_spoof",
         "tls_spoof_method",
     ] {
@@ -1425,6 +1451,18 @@ pub fn apply_route_options(ctx: &mut ConnContext, opts: &RouteOptions) {
             super::Target::Domain(h, _) => super::Target::Domain(h.clone(), port),
         };
     }
+    if let Some(d) = opts.udp_timeout {
+        ctx.udp_timeout = Some(d);
+    }
+    if let Some(b) = opts.udp_disable_domain_unmapping {
+        ctx.udp_disable_domain_unmapping = Some(b);
+    }
+    if let Some(b) = opts.tls_fragment {
+        ctx.tls_fragment = Some(b);
+    }
+    if let Some(b) = opts.tls_record_fragment {
+        ctx.tls_record_fragment = Some(b);
+    }
 }
 
 #[cfg(test)]
@@ -1438,23 +1476,7 @@ mod tests {
             inbound: Some("in".into()),
             source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
             destination: super::super::Target::Domain(host.to_string(), port),
-            origin_destination: None,
-            network: "tcp",
-            protocol: None,
-            domain: None,
-            auth_user: None,
-            client: None,
-            destination_addresses: Vec::new(),
-            fakeip: false,
-            sniff_prefix: Vec::new(),
-            sniff_error: None,
-            sniffer_names: Vec::new(),
-            ip_version: None,
-            route_original_destination: None,
-            matched_rule: None,
-            source_mac: None,
-            source_hostname: None,
-            process: None,
+            ..Default::default()
         }
     }
 
@@ -1796,5 +1818,65 @@ mod tests {
         )
         .expect("rule");
         assert!(!rule.needs_process());
+    }
+
+    #[test]
+    fn resolve_action_options_parsed() {
+        let rule = Rule::build(
+            &json!({
+                "domain": ["example.com"],
+                "action": "resolve",
+                "server": "local-dns",
+                "strategy": "ipv4_only",
+                "timeout": "5s"
+            }),
+            "r",
+            true,
+        )
+        .expect("rule");
+
+        match rule.action() {
+            Action::Resolve(res) => {
+                assert_eq!(res.server.as_deref(), Some("local-dns"));
+                assert_eq!(res.strategy, Some(crate::dns::Strategy::IPv4Only));
+                assert_eq!(res.timeout, Some(Duration::from_secs(5)));
+            }
+            other => panic!("expected Action::Resolve, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn route_options_parsed_and_applied() {
+        let rule = Rule::build(
+            &json!({
+                "domain": ["example.com"],
+                "action": "route-options",
+                "override_address": "1.1.1.1",
+                "override_port": 853,
+                "udp_timeout": "30s",
+                "udp_disable_domain_unmapping": true,
+                "tls_fragment": true,
+                "tls_record_fragment": false,
+            }),
+            "r",
+            true,
+        )
+        .expect("rule");
+
+        let opts = rule.action().route_options().expect("route options");
+        assert_eq!(opts.override_port, Some(853));
+        assert_eq!(opts.udp_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(opts.udp_disable_domain_unmapping, Some(true));
+        assert_eq!(opts.tls_fragment, Some(true));
+        assert_eq!(opts.tls_record_fragment, Some(false));
+
+        let mut ctx = ctx_to("example.com", 443);
+        apply_route_options(&mut ctx, opts);
+
+        assert_eq!(ctx.destination.port(), 853);
+        assert_eq!(ctx.udp_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(ctx.udp_disable_domain_unmapping, Some(true));
+        assert_eq!(ctx.tls_fragment, Some(true));
+        assert_eq!(ctx.tls_record_fragment, Some(false));
     }
 }

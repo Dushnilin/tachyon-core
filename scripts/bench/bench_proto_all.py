@@ -240,6 +240,50 @@ def get_cases(certs):
     tls_c = {"enabled": True, "server_name": "127.0.0.1", "certificate_path": c, "insecure": True}
     tls_xray = {"security": "tls", "tlsSettings": {"serverName": "127.0.0.1", "certificates": [{"certificateFile": c, "usage": "verify"}]}}
 
+    reality_priv = "anm4M_JRrHDFEMLd15B7Styu5bVsNf2U-Do8oIHI5ic"
+    reality_pub = "WwwouxoZF83jB-bByyNfIFYdv7U1Simnrc7Sg3wsxQM"
+    short_id = "0123456789abcdef"
+
+    reality_s = {
+        "enabled": True,
+        "server_name": "localhost",
+        "reality": {
+            "enabled": True,
+            "handshake": {"server": "127.0.0.1", "server_port": SINK_PORT},
+            "private_key": reality_priv,
+            "short_id": [short_id],
+        },
+    }
+    reality_c = {
+        "enabled": True,
+        "server_name": "localhost",
+        "utls": {"enabled": True, "fingerprint": "chrome"},
+        "reality": {
+            "enabled": True,
+            "public_key": reality_pub,
+            "short_id": short_id,
+        },
+    }
+    reality_xray_c = {
+        "security": "reality",
+        "realitySettings": {
+            "serverName": "localhost",
+            "fingerprint": "chrome",
+            "show": False,
+            "publicKey": reality_pub,
+            "shortId": short_id,
+            "spiderX": "",
+        },
+    }
+    reality_mihomo_c = {
+        "servername": "localhost",
+        "client-fingerprint": "chrome",
+        "reality-opts": {
+            "public-key": reality_pub,
+            "short-id": short_id,
+        },
+    }
+
     cases = [
         # --- Shadowsocks ---
         {
@@ -536,7 +580,171 @@ def get_cases(certs):
             "client_sb": {"type": "snell", "server": "127.0.0.1", "server_port": SERVER_PORT, "version": 4, "psk": SNELL_PSK, "obfs_mode": "none"},
             "client_xray": None,
             "client_mihomo": {"type": "snell", "psk": SNELL_PSK, "version": 4},
-        }
+        },
+        # --- Shadowsocks 2022 256/ChaCha ---
+        {
+            "id": "ss2022-aes-256-gcm",
+            "cat": "Shadowsocks",
+            "name": "Shadowsocks 2022 AES-256-GCM",
+            "server": {"type": "shadowsocks", "method": "2022-blake3-aes-256-gcm", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="},
+            "client_sb": {"type": "shadowsocks", "server": "127.0.0.1", "server_port": SERVER_PORT, "method": "2022-blake3-aes-256-gcm", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="},
+            "client_xray": {"protocol": "shadowsocks", "settings": {"servers": [{"address": "127.0.0.1", "port": SERVER_PORT, "method": "2022-blake3-aes-256-gcm", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}]}},
+            "client_mihomo": {"type": "ss", "cipher": "2022-blake3-aes-256-gcm", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="},
+        },
+        {
+            "id": "ss2022-chacha20",
+            "cat": "Shadowsocks",
+            "name": "Shadowsocks 2022 ChaCha20-Poly1305",
+            "server": {"type": "shadowsocks", "method": "2022-blake3-chacha20-poly1305", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="},
+            "client_sb": {"type": "shadowsocks", "server": "127.0.0.1", "server_port": SERVER_PORT, "method": "2022-blake3-chacha20-poly1305", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="},
+            "client_xray": {"protocol": "shadowsocks", "settings": {"servers": [{"address": "127.0.0.1", "port": SERVER_PORT, "method": "2022-blake3-chacha20-poly1305", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}]}},
+            "client_mihomo": {"type": "ss", "cipher": "2022-blake3-chacha20-poly1305", "password": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="},
+        },
+
+        # --- VMess H2 ---
+        {
+            "id": "vmess-h2-tls",
+            "cat": "VMess",
+            "name": "VMess + HTTP/2 + TLS",
+            "server": {"type": "vmess", "users": [{"name": "u", "uuid": UUID, "alterId": 0}], "tls": tls_s, "transport": {"type": "http", "path": "/bench"}},
+            "client_sb": {"type": "vmess", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "security": "auto", "tls": tls_c, "transport": {"type": "http", "path": "/bench"}},
+            "client_xray": {
+                "protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "alterId": 0, "security": "auto"}]}]},
+                "streamSettings": dict(tls_xray, network="h2", httpSettings={"path": "/bench"})
+            },
+            "client_mihomo": {"type": "vmess", "uuid": UUID, "alterId": 0, "cipher": "auto", "network": "h2", "tls": True, "skip-cert-verify": True, "servername": "127.0.0.1", "h2-opts": {"path": "/bench"}},
+        },
+
+        # --- VLESS MUX ---
+        {
+            "id": "vless-tls-h2mux",
+            "cat": "VLESS",
+            "name": "VLESS + TLS + H2MUX",
+            "server": {"type": "vless", "users": [{"name": "u", "uuid": UUID}], "tls": tls_s, "multiplex": {"enabled": True}},
+            "client_sb": {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "tls": tls_c, "multiplex": {"enabled": True, "protocol": "h2mux"}},
+            "client_xray": {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "encryption": "none"}]}]},
+                "streamSettings": tls_xray,
+                "mux": {"enabled": True}
+            },
+            "client_mihomo": {"type": "vless", "uuid": UUID, "tls": True, "skip-cert-verify": True, "servername": "127.0.0.1", "smux": {"enabled": True}},
+        },
+
+        # --- REALITY Protocols ---
+        {
+            "id": "vless-reality-vision",
+            "cat": "REALITY",
+            "name": "VLESS + REALITY + Vision",
+            "server": {"type": "vless", "users": [{"name": "u", "uuid": UUID, "flow": "xtls-rprx-vision"}], "tls": reality_s},
+            "client_sb": {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "flow": "xtls-rprx-vision", "tls": reality_c},
+            "client_xray": {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "flow": "xtls-rprx-vision", "encryption": "none"}]}]},
+                "streamSettings": reality_xray_c
+            },
+            "client_mihomo": dict({"type": "vless", "uuid": UUID, "flow": "xtls-rprx-vision", "tls": True, "skip-cert-verify": True}, **reality_mihomo_c),
+        },
+        {
+            "id": "vless-reality",
+            "cat": "REALITY",
+            "name": "VLESS + REALITY (XTLS)",
+            "server": {"type": "vless", "users": [{"name": "u", "uuid": UUID}], "tls": reality_s},
+            "client_sb": {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT, "uuid": UUID, "tls": reality_c},
+            "client_xray": {
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT, "users": [{"id": UUID, "encryption": "none"}]}]},
+                "streamSettings": reality_xray_c
+            },
+            "client_mihomo": dict({"type": "vless", "uuid": UUID, "tls": True, "skip-cert-verify": True}, **reality_mihomo_c),
+        },
+        {
+            "id": "trojan-reality",
+            "cat": "REALITY",
+            "name": "Trojan + REALITY",
+            "server": {"type": "trojan", "users": [{"name": "u", "password": "bench-pass"}], "tls": reality_s},
+            "client_sb": {"type": "trojan", "server": "127.0.0.1", "server_port": SERVER_PORT, "password": "bench-pass", "tls": reality_c},
+            "client_xray": {
+                "protocol": "trojan",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": SERVER_PORT, "password": "bench-pass"}]},
+                "streamSettings": reality_xray_c
+            },
+            "client_mihomo": dict({"type": "trojan", "password": "bench-pass", "tls": True, "skip-cert-verify": True}, **reality_mihomo_c),
+        },
+
+        # --- Trojan H2 ---
+        {
+            "id": "trojan-h2-tls",
+            "cat": "Trojan",
+            "name": "Trojan + HTTP/2 + TLS",
+            "server": {"type": "trojan", "users": [{"name": "u", "password": "bench-pass"}], "tls": tls_s, "transport": {"type": "http", "path": "/bench"}},
+            "client_sb": {"type": "trojan", "server": "127.0.0.1", "server_port": SERVER_PORT, "password": "bench-pass", "tls": tls_c, "transport": {"type": "http", "path": "/bench"}},
+            "client_xray": {
+                "protocol": "trojan",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": SERVER_PORT, "password": "bench-pass"}]},
+                "streamSettings": dict(tls_xray, network="h2", httpSettings={"path": "/bench"})
+            },
+            "client_mihomo": {"type": "trojan", "password": "bench-pass", "network": "h2", "tls": True, "skip-cert-verify": True, "sni": "127.0.0.1", "h2-opts": {"path": "/bench"}},
+        },
+
+        # --- Modern / Mieru ---
+        {
+            "id": "mieru",
+            "cat": "Modern / Mieru",
+            "name": "Mieru (TCP)",
+            "server": {"type": "mieru", "users": [{"username": "bench-user", "password": "bench-password"}], "transport": "TCP"},
+            "client_sb": {"type": "mieru", "server": "127.0.0.1", "server_port": SERVER_PORT, "username": "bench-user", "password": "bench-password", "transport": "TCP"},
+            "client_xray": None,
+            "client_mihomo": {"type": "mieru", "username": "bench-user", "password": "bench-password", "transport": "TCP"},
+        },
+
+        # --- VPN / Tunnel ---
+        {
+            "id": "shadowtls",
+            "cat": "VPN / Tunnel",
+            "name": "ShadowTLS v3 (TLS SNI Obfs)",
+            "server": {"type": "shadowtls", "version": 3, "password": "bench-shadowtls-pass", "handshake": {"server": "127.0.0.1", "server_port": SINK_PORT}, "detour": "direct"},
+            "client_sb": {"type": "shadowtls", "server": "127.0.0.1", "server_port": SERVER_PORT, "version": 3, "password": "bench-shadowtls-pass", "tls": {"enabled": True, "server_name": "localhost"}},
+            "client_xray": None,
+            "client_mihomo": {"type": "shadow-tls", "version": 3, "password": "bench-shadowtls-pass", "sni": "localhost"},
+        },
+        {
+            "id": "wireguard",
+            "cat": "VPN / Tunnel",
+            "name": "WireGuard (UDP Native)",
+            "server": {"type": "wireguard", "private_key": "a" * 44, "peers": [{"public_key": "b" * 44, "allowed_ips": ["10.0.0.2/32"]}]},
+            "client_sb": {"type": "wireguard", "server": "127.0.0.1", "server_port": SERVER_PORT, "private_key": "b" * 44, "peer_public_key": "a" * 44, "local_address": ["10.0.0.2/32"]},
+            "client_xray": {"protocol": "wireguard", "settings": {"secretKey": "b" * 44, "peers": [{"publicKey": "a" * 44, "endpoint": f"127.0.0.1:{SERVER_PORT}"}]}},
+            "client_mihomo": {"type": "wireguard", "private-key": "b" * 44, "public-key": "a" * 44, "ip": "10.0.0.2"},
+        },
+        {
+            "id": "amneziawg",
+            "cat": "VPN / Tunnel",
+            "name": "AmneziaWG (Obfuscated WG)",
+            "server": {"type": "wireguard", "private_key": "a" * 44, "peers": [{"public_key": "b" * 44, "allowed_ips": ["10.0.0.2/32"]}], "awg": {"jc": 4, "jmin": 40, "jmax": 70, "s1": 20, "s2": 40, "h1": 1, "h2": 2, "h3": 3, "h4": 4}},
+            "client_sb": {"type": "wireguard", "server": "127.0.0.1", "server_port": SERVER_PORT, "private_key": "b" * 44, "peer_public_key": "a" * 44, "local_address": ["10.0.0.2/32"], "awg": {"jc": 4, "jmin": 40, "jmax": 70, "s1": 20, "s2": 40, "h1": 1, "h2": 2, "h3": 3, "h4": 4}},
+            "client_xray": None,
+            "client_mihomo": {"type": "wireguard", "private-key": "b" * 44, "public-key": "a" * 44, "ip": "10.0.0.2"},
+        },
+        {
+            "id": "masque",
+            "cat": "VPN / Tunnel",
+            "name": "MASQUE (HTTP/3 WARP)",
+            "server": {"type": "masque", "uri": "https://localhost/bench", "tls": tls_s},
+            "client_sb": {"type": "masque", "server": "127.0.0.1", "server_port": SERVER_PORT, "uri": "https://localhost/bench", "tls": tls_c},
+            "client_xray": None,
+            "client_mihomo": None,
+        },
+        {
+            "id": "fptn",
+            "cat": "VPN / Tunnel",
+            "name": "FPTN (Fast Packet Tunnel Network)",
+            "server": {"type": "fptn", "users": [{"token": "bench-fptn-token"}], "tls": tls_s},
+            "client_sb": {"type": "fptn", "server": "127.0.0.1", "server_port": SERVER_PORT, "token": "bench-fptn-token", "tls": tls_c},
+            "client_xray": None,
+            "client_mihomo": None,
+        },
     ]
     return cases
 
@@ -860,7 +1068,7 @@ def generate_html_report(results, profile, out_path):
         """
 
     cat_buttons = f"<button class='tab on' onclick=\"filterCat('all')\">Все <i>{len(results)}</i></button>"
-    for cname in ("Shadowsocks", "VMess", "VLESS", "Trojan", "QUIC / H2"):
+    for cname in ("Shadowsocks", "VMess", "VLESS", "REALITY", "Trojan", "QUIC / H2", "Modern / Mieru", "VPN / Tunnel"):
         if cname in cat_counts:
             cat_buttons += f"<button class='tab' onclick=\"filterCat('{cname}')\">{cname} <i>{cat_counts[cname]}</i></button>"
     if xhttp_count > 0:

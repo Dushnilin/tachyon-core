@@ -43,6 +43,7 @@ use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
 use crate::outbound::shadowtls::ShadowTls;
 use crate::outbound::snell::Snell;
+use crate::outbound::tailscale::Tailscale;
 use crate::outbound::tuic::Tuic;
 use crate::outbound::urltest::Urltest;
 use crate::outbound::vmess::Vmess;
@@ -171,6 +172,7 @@ pub enum Outbound {
     Selector(Selector),
     Chain(Chain),
     ShadowTls(ShadowTls),
+    Tailscale(Tailscale),
 }
 
 impl Outbound {
@@ -206,6 +208,7 @@ impl Outbound {
             Outbound::Selector(selector) => selector.connect(router, target).await,
             Outbound::Chain(chain) => chain.connect(router, target).await,
             Outbound::ShadowTls(stls) => stls.connect(target).await.map(Conn::Plain),
+            Outbound::Tailscale(ts) => ts.connect(target).await.map(Conn::Plain),
         }
     }
 
@@ -238,6 +241,7 @@ impl Outbound {
             Outbound::Urltest(urltest) => urltest.connect_udp(router, target).await,
             Outbound::Chain(chain) => chain.connect_udp(router, target).await,
             Outbound::ShadowTls(stls) => stls.connect_udp(target).await,
+            Outbound::Tailscale(ts) => ts.connect_udp(target).await,
             _ => Err(io::Error::other("udp not supported by this outbound")),
         }
     }
@@ -710,9 +714,7 @@ impl Router {
                 "openconnect" => anyhow::bail!(
                     "{at}: openconnect client is not implemented yet (config check parity only)"
                 ),
-                "tailscale" => anyhow::bail!(
-                    "{at}: tailscale client is not implemented yet (config check parity only)"
-                ),
+                "tailscale" => Outbound::Tailscale(Tailscale::build(map, &at)?),
                 _ => anyhow::bail!("{at}: unknown endpoint type: {ty}"),
             };
             let tag = map

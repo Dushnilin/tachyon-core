@@ -26,6 +26,7 @@ core-config = { path = "../core-config", default-features = false }
 core-crypto = { path = "../core-crypto" }
 core-experimental = { path = "../core-experimental" }
 core-tls = { path = "../core-tls" }
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 smoltcp = { workspace = true, features = [

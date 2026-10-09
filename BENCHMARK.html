@@ -133,18 +133,18 @@
         <span class="env-tag">ROUTER 1-CORE (Single-Core)</span>
         <span class="env-val">Docker Linux x86_64 &bull; AMD Ryzen 7 5800X3D (8C/16T)</span>
         <span class="env-pill">1 поток (1 worker / GOMAXPROCS=1)</span>
-        <span class="env-pill">Client CPU: Core 0</span>
-        <span class="env-pill">Server CPU: Core 1</span>
+        <span class="env-pill">Client CPU: Core 0 (1 ядро)</span>
+        <span class="env-pill">Server CPU: 4 ядра (VPS upstream model)</span>
       </div>
     </div>
     <div class="chips">
       <div class="chip"><span>протоколов:</span><b>25</b></div>
-      <div class="chip win"><span>побед tachyon:</span><b>20/25</b></div>
-      <div class="chip loss"><span>побед других:</span><b>1</b></div>
-      <div class="chip tie"><span>паритет:</span><b>4</b></div>
-      <div class="chip win"><span>память tachyon:</span><b>5–56 MB</b></div>
+      <div class="chip win"><span>побед tachyon:</span><b>22/25</b></div>
+      <div class="chip loss"><span>побед других:</span><b>0</b></div>
+      <div class="chip tie"><span>паритет:</span><b>3</b></div>
+      <div class="chip win"><span>память tachyon:</span><b>5–55 MB</b></div>
       <div class="chip win"><span>CPU tachyon:</span><b>0.2–9.5 s/G</b></div>
-      <div class="chip"><span>CPU Go-ядер:</span><b>0.3–10.5 s/G</b></div>
+      <div class="chip"><span>CPU Go-ядер:</span><b>0.2–11.3 s/G</b></div>
     </div>
   </div>
 
@@ -187,45 +187,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>7.21/6.96<span class='unit'>G</span></span>
+                <span class='spd'>6.94/8.40<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>288µs</span> &bull; <span>8.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.21 s/G</span>
+                <span>326µs</span> &bull; <span>8.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.00 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.21/2.49<span class='unit'>G</span></span>
-                <span class='diff win'>+189%</span>
+                <span class='spd'>2.41/2.56<span class='unit'>G</span></span>
+                <span class='diff win'>+228%</span>
               </div>
               <div class='cell-sub'>
-                <span>306µs</span> &bull; <span>44.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.43 s/G</span>
+                <span>342µs</span> &bull; <span>44.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.38 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:34%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:30%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>5.68/5.94<span class='unit'>G</span></span>
-                <span class='diff win'>+21%</span>
+                <span class='spd'>5.57/5.43<span class='unit'>G</span></span>
+                <span class='diff win'>+50%</span>
               </div>
               <div class='cell-sub'>
-                <span>308µs</span> &bull; <span>31.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.44 s/G</span>
+                <span>339µs</span> &bull; <span>30.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.59 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:82%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:66%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.02/2.33<span class='unit'>G</span></span>
-                <span class='diff win'>+209%</span>
+                <span class='spd'>2.21/2.44<span class='unit'>G</span></span>
+                <span class='diff win'>+244%</span>
               </div>
               <div class='cell-sub'>
-                <span>318µs</span> &bull; <span>39.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.67 s/G</span>
+                <span>339µs</span> &bull; <span>39.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.46 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:32%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:29%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +21%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +50%</span></td>
         </tr>
         
         <tr class='case win' data-cat='Shadowsocks' data-k='ss-aes-256-gcm shadowsocks aes-256-gcm'>
@@ -237,45 +237,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>6.31/7.56<span class='unit'>G</span></span>
+                <span class='spd'>6.63/7.57<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>284µs</span> &bull; <span>8.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.13 s/G</span>
+                <span>327µs</span> &bull; <span>8.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.12 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.42/2.41<span class='unit'>G</span></span>
-                <span class='diff win'>+212%</span>
+                <span class='spd'>2.09/2.53<span class='unit'>G</span></span>
+                <span class='diff win'>+199%</span>
               </div>
               <div class='cell-sub'>
-                <span>307µs</span> &bull; <span>44.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.51 s/G</span>
-              </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:32%;background:var(--accent)'></div></div>
-            </td>
-          <td class='num '>
-              <div class='val-row'>
-                <span class='spd'>5.84/5.84<span class='unit'>G</span></span>
-                <span class='diff win'>+29%</span>
-              </div>
-              <div class='cell-sub'>
-                <span>310µs</span> &bull; <span>30.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.46 s/G</span>
-              </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:77%;background:var(--accent)'></div></div>
-            </td>
-          <td class='num '>
-              <div class='val-row'>
-                <span class='spd'>2.36/2.51<span class='unit'>G</span></span>
-                <span class='diff win'>+201%</span>
-              </div>
-              <div class='cell-sub'>
-                <span>317µs</span> &bull; <span>37.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.41 s/G</span>
+                <span>334µs</span> &bull; <span>44.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.37 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:33%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +29%</span></td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>5.82/5.73<span class='unit'>G</span></span>
+                <span class='diff win'>+30%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>341µs</span> &bull; <span>30.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.49 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:76%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.32/2.52<span class='unit'>G</span></span>
+                <span class='diff win'>+200%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>336µs</span> &bull; <span>37.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.40 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:33%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +30%</span></td>
         </tr>
         
         <tr class='case win' data-cat='Shadowsocks' data-k='ss-chacha20-poly1305 shadowsocks chacha20-poly1305'>
@@ -287,45 +287,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>5.70/6.57<span class='unit'>G</span></span>
+                <span class='spd'>5.40/6.22<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>291µs</span> &bull; <span>8.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.30 s/G</span>
+                <span>317µs</span> &bull; <span>8.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.36 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.18/2.14<span class='unit'>G</span></span>
-                <span class='diff win'>+201%</span>
+                <span class='spd'>2.29/2.37<span class='unit'>G</span></span>
+                <span class='diff win'>+162%</span>
               </div>
               <div class='cell-sub'>
-                <span>306µs</span> &bull; <span>44.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.91 s/G</span>
+                <span>332µs</span> &bull; <span>44.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.57 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:33%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:38%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.81/5.00<span class='unit'>G</span></span>
-                <span class='diff win'>+31%</span>
+                <span class='spd'>5.17/4.96<span class='unit'>G</span></span>
+                <span class='diff win'>+20%</span>
               </div>
               <div class='cell-sub'>
-                <span>316µs</span> &bull; <span>30.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.71 s/G</span>
+                <span>325µs</span> &bull; <span>30.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.72 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:76%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:83%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.96/2.25<span class='unit'>G</span></span>
-                <span class='diff win'>+192%</span>
+                <span class='spd'>2.19/2.36<span class='unit'>G</span></span>
+                <span class='diff win'>+163%</span>
               </div>
               <div class='cell-sub'>
-                <span>318µs</span> &bull; <span>38.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.79 s/G</span>
+                <span>338µs</span> &bull; <span>38.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.62 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:34%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:37%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +31%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +20%</span></td>
         </tr>
         
         <tr class='case win' data-cat='Shadowsocks' data-k='ss2022-aes-128-gcm shadowsocks 2022 aes-128-gcm'>
@@ -337,48 +337,48 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>8.19/7.54<span class='unit'>G</span></span>
+                <span class='spd'>8.41/8.15<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>290µs</span> &bull; <span>8.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.14 s/G</span>
+                <span>306µs</span> &bull; <span>8.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.06 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>6.18/6.54<span class='unit'>G</span></span>
-                <span class='diff win'>+25%</span>
+                <span class='spd'>6.80/6.52<span class='unit'>G</span></span>
+                <span class='diff win'>+23%</span>
               </div>
               <div class='cell-sub'>
-                <span>310µs</span> &bull; <span>44.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.31 s/G</span>
+                <span>332µs</span> &bull; <span>44.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.30 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:79%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:80%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.38/4.80<span class='unit'>G</span></span>
-                <span class='diff win'>+70%</span>
+                <span class='spd'>4.34/4.96<span class='unit'>G</span></span>
+                <span class='diff win'>+69%</span>
               </div>
               <div class='cell-sub'>
-                <span>310µs</span> &bull; <span>31.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.78 s/G</span>
+                <span>327µs</span> &bull; <span>32.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.71 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:58%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>5.00/3.67<span class='unit'>G</span></span>
-                <span class='diff win'>+63%</span>
+                <span class='spd'>5.15/5.30<span class='unit'>G</span></span>
+                <span class='diff win'>+58%</span>
               </div>
               <div class='cell-sub'>
-                <span>314µs</span> &bull; <span>48.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.68 s/G</span>
+                <span>333µs</span> &bull; <span>48.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.61 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:61%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +25%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +23%</span></td>
         </tr>
         
-        <tr class='case tie' data-cat='VMess' data-k='vmess vmess (plain)'>
+        <tr class='case win' data-cat='VMess' data-k='vmess vmess (plain)'>
           <td class='name'>
             <div class='name-line'>
               <span class='cn'>VMess (Plain)</span>
@@ -387,45 +387,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>6.39/6.38<span class='unit'>G</span></span>
+                <span class='spd'>5.93/8.43<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>311µs</span> &bull; <span>6.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.33 s/G</span>
+                <span>313µs</span> &bull; <span>7.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.01 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.49/2.47<span class='unit'>G</span></span>
-                <span class='diff win'>+156%</span>
+                <span class='spd'>2.54/2.54<span class='unit'>G</span></span>
+                <span class='diff win'>+231%</span>
               </div>
               <div class='cell-sub'>
-                <span>315µs</span> &bull; <span>45.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.43 s/G</span>
+                <span>340µs</span> &bull; <span>45.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.36 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:38%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:30%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>6.02/6.25<span class='unit'>G</span></span>
-                <span class='diff tie'>~0%</span>
+                <span class='spd'>6.18/6.26<span class='unit'>G</span></span>
+                <span class='diff win'>+34%</span>
               </div>
               <div class='cell-sub'>
-                <span>318µs</span> &bull; <span>31.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.35 s/G</span>
+                <span>344µs</span> &bull; <span>30.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.37 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:97%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:74%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.30/2.46<span class='unit'>G</span></span>
-                <span class='diff win'>+159%</span>
+                <span class='spd'>2.43/2.63<span class='unit'>G</span></span>
+                <span class='diff win'>+220%</span>
               </div>
               <div class='cell-sub'>
-                <span>311µs</span> &bull; <span>38.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.44 s/G</span>
+                <span>338µs</span> &bull; <span>38.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.26 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:38%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:31%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill tie'>ПАРИТЕТ</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +34%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VMess' data-k='vmess-tls vmess + tls'>
@@ -437,45 +437,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>4.59/5.26<span class='unit'>G</span></span>
+                <span class='spd'>4.30/5.81<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>288µs</span> &bull; <span>7.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.61 s/G</span>
+                <span>331µs</span> &bull; <span>7.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.46 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.83/3.39<span class='unit'>G</span></span>
-                <span class='diff win'>+55%</span>
+                <span class='spd'>3.15/3.56<span class='unit'>G</span></span>
+                <span class='diff win'>+63%</span>
               </div>
               <div class='cell-sub'>
-                <span>309µs</span> &bull; <span>47.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.55 s/G</span>
+                <span>340µs</span> &bull; <span>46.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.40 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:64%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:61%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.05/2.07<span class='unit'>G</span></span>
-                <span class='diff win'>+154%</span>
+                <span class='spd'>2.05/2.17<span class='unit'>G</span></span>
+                <span class='diff win'>+167%</span>
               </div>
               <div class='cell-sub'>
-                <span>331µs</span> &bull; <span>33.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.09 s/G</span>
+                <span>351µs</span> &bull; <span>33.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.98 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:39%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:37%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.20/2.19<span class='unit'>G</span></span>
-                <span class='diff win'>+139%</span>
+                <span class='spd'>2.34/2.36<span class='unit'>G</span></span>
+                <span class='diff win'>+146%</span>
               </div>
               <div class='cell-sub'>
-                <span>319µs</span> &bull; <span>39.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.94 s/G</span>
+                <span>339µs</span> &bull; <span>41.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.66 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:41%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:40%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +55%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +63%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VMess' data-k='vmess-ws-tls vmess + ws + tls'>
@@ -487,45 +487,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>4.73/5.31<span class='unit'>G</span></span>
+                <span class='spd'>4.33/5.64<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>293µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.59 s/G</span>
+                <span>342µs</span> &bull; <span>8.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.53 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.95/3.22<span class='unit'>G</span></span>
-                <span class='diff win'>+64%</span>
+                <span class='spd'>2.97/3.34<span class='unit'>G</span></span>
+                <span class='diff win'>+68%</span>
               </div>
               <div class='cell-sub'>
-                <span>314µs</span> &bull; <span>47.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.65 s/G</span>
+                <span>340µs</span> &bull; <span>47.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.54 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:60%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:59%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.95/2.05<span class='unit'>G</span></span>
-                <span class='diff win'>+159%</span>
+                <span class='spd'>1.98/2.03<span class='unit'>G</span></span>
+                <span class='diff win'>+177%</span>
               </div>
               <div class='cell-sub'>
-                <span>335µs</span> &bull; <span>33.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.18 s/G</span>
+                <span>348µs</span> &bull; <span>33.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.22 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:38%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:35%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.05/1.92<span class='unit'>G</span></span>
-                <span class='diff win'>+159%</span>
+                <span class='spd'>2.11/2.21<span class='unit'>G</span></span>
+                <span class='diff win'>+155%</span>
               </div>
               <div class='cell-sub'>
-                <span>335µs</span> &bull; <span>40.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.45 s/G</span>
+                <span>357µs</span> &bull; <span>39.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.87 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:38%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:39%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +64%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +68%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VMess' data-k='vmess-grpc-tls vmess + grpc + tls'>
@@ -537,45 +537,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>2.43/3.28<span class='unit'>G</span></span>
+                <span class='spd'>1.24/3.15<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>347µs</span> &bull; <span>11.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.58 s/G</span>
+                <span>418µs</span> &bull; <span>54.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.65 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>3.12/2.04<span class='unit'>G</span></span>
-                <span class='diff win'>+5%</span>
+                <span class='spd'>1.59/2.28<span class='unit'>G</span></span>
+                <span class='diff win'>+38%</span>
               </div>
               <div class='cell-sub'>
-                <span>480µs</span> &bull; <span>82.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.23 s/G</span>
+                <span>418µs</span> &bull; <span>80.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.79 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:95%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:72%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>0.60/0.96<span class='unit'>G</span></span>
-                <span class='diff win'>+241%</span>
+                <span class='spd'>1.40/1.70<span class='unit'>G</span></span>
+                <span class='diff win'>+85%</span>
               </div>
               <div class='cell-sub'>
-                <span>637µs</span> &bull; <span>42.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>6.03 s/G</span>
+                <span>394µs</span> &bull; <span>36.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>5.03 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:29%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:53%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>0.66/0.61<span class='unit'>G</span></span>
-                <span class='diff win'>+396%</span>
+                <span class='spd'>1.27/1.23<span class='unit'>G</span></span>
+                <span class='diff win'>+148%</span>
               </div>
               <div class='cell-sub'>
-                <span>610µs</span> &bull; <span>71.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>8.05 s/G</span>
+                <span>424µs</span> &bull; <span>71.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>6.90 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:20%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:40%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +5%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +38%</span></td>
         </tr>
         
         <tr class='case tie' data-cat='VLESS' data-k='vless vless (plain)'>
@@ -587,33 +587,33 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>19.62/26.35<span class='unit'>G</span></span>
+                <span class='spd'>23.27/31.94<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>290µs</span> &bull; <span>4.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>0.21 s/G</span>
+                <span>323µs</span> &bull; <span>5.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>0.22 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:95%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>24.92/27.67<span class='unit'>G</span></span>
+                <span class='spd'>24.71/33.47<span class='unit'>G</span></span>
                 <span class='diff tie'>~0%</span>
               </div>
               <div class='cell-sub'>
-                <span>305µs</span> &bull; <span>41.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>0.26 s/G</span>
+                <span>331µs</span> &bull; <span>41.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>0.22 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>7.05/8.59<span class='unit'>G</span></span>
-                <span class='diff win'>+206%</span>
+                <span class='spd'>8.22/9.07<span class='unit'>G</span></span>
+                <span class='diff win'>+252%</span>
               </div>
               <div class='cell-sub'>
-                <span>303µs</span> &bull; <span>29.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.00 s/G</span>
+                <span>318µs</span> &bull; <span>29.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>0.93 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:31%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:27%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='vd'><span class='vpill tie'>ПАРИТЕТ</span></td>
@@ -628,48 +628,48 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>4.01/3.87<span class='unit'>G</span></span>
+                <span class='spd'>4.26/4.14<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>283µs</span> &bull; <span>6.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.21 s/G</span>
+                <span>324µs</span> &bull; <span>6.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.05 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>3.04/3.28<span class='unit'>G</span></span>
-                <span class='diff win'>+22%</span>
+                <span class='spd'>3.24/3.64<span class='unit'>G</span></span>
+                <span class='diff win'>+17%</span>
               </div>
               <div class='cell-sub'>
-                <span>318µs</span> &bull; <span>47.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.61 s/G</span>
+                <span>334µs</span> &bull; <span>46.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.35 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:81%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:85%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.09/2.56<span class='unit'>G</span></span>
-                <span class='diff win'>+56%</span>
+                <span class='spd'>2.13/2.81<span class='unit'>G</span></span>
+                <span class='diff win'>+51%</span>
               </div>
               <div class='cell-sub'>
-                <span>309µs</span> &bull; <span>32.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.31 s/G</span>
+                <span>338µs</span> &bull; <span>32.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.04 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:65%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>3.00/3.45<span class='unit'>G</span></span>
-                <span class='diff win'>+16%</span>
+                <span class='spd'>3.20/3.55<span class='unit'>G</span></span>
+                <span class='diff win'>+19%</span>
               </div>
               <div class='cell-sub'>
-                <span>304µs</span> &bull; <span>40.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.47 s/G</span>
+                <span>345µs</span> &bull; <span>38.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.38 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:86%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:83%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +16%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +17%</span></td>
         </tr>
         
-        <tr class='case win' data-cat='VLESS' data-k='vless-tls-vision vless + tls + vision'>
+        <tr class='case tie' data-cat='VLESS' data-k='vless-tls-vision vless + tls + vision'>
           <td class='name'>
             <div class='name-line'>
               <span class='cn'>VLESS + TLS + Vision</span>
@@ -678,45 +678,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>3.45/3.67<span class='unit'>G</span></span>
+                <span class='spd'>3.38/3.65<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>284µs</span> &bull; <span>7.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.33 s/G</span>
+                <span>319µs</span> &bull; <span>7.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.32 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.94/3.31<span class='unit'>G</span></span>
-                <span class='diff win'>+10%</span>
+                <span class='spd'>3.21/3.54<span class='unit'>G</span></span>
+                <span class='diff tie'>~0%</span>
               </div>
               <div class='cell-sub'>
-                <span>308µs</span> &bull; <span>47.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.58 s/G</span>
+                <span>335µs</span> &bull; <span>46.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.40 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:90%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:96%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.03/2.72<span class='unit'>G</span></span>
-                <span class='diff win'>+34%</span>
+                <span class='spd'>2.18/2.79<span class='unit'>G</span></span>
+                <span class='diff win'>+30%</span>
               </div>
               <div class='cell-sub'>
-                <span>307µs</span> &bull; <span>32.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.15 s/G</span>
+                <span>336µs</span> &bull; <span>32.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.06 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:74%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:76%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>3.00/3.26<span class='unit'>G</span></span>
-                <span class='diff win'>+12%</span>
+                <span class='spd'>3.30/3.49<span class='unit'>G</span></span>
+                <span class='diff tie'>~0%</span>
               </div>
               <div class='cell-sub'>
-                <span>309µs</span> &bull; <span>39.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.62 s/G</span>
+                <span>346µs</span> &bull; <span>39.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.42 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:88%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:95%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +10%</span></td>
+          <td class='vd'><span class='vpill tie'>ПАРИТЕТ</span></td>
         </tr>
         
         <tr class='case win' data-cat='VLESS' data-k='vless-ws-tls vless + ws + tls'>
@@ -728,45 +728,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>3.68/3.69<span class='unit'>G</span></span>
+                <span class='spd'>3.67/3.89<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>289µs</span> &bull; <span>7.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.32 s/G</span>
+                <span>336µs</span> &bull; <span>7.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.18 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.96/3.28<span class='unit'>G</span></span>
-                <span class='diff win'>+12%</span>
+                <span class='spd'>3.06/3.50<span class='unit'>G</span></span>
+                <span class='diff win'>+11%</span>
               </div>
               <div class='cell-sub'>
-                <span>312µs</span> &bull; <span>47.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.61 s/G</span>
+                <span>337µs</span> &bull; <span>46.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.42 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:88%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:89%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.30/2.56<span class='unit'>G</span></span>
-                <span class='diff win'>+44%</span>
+                <span class='spd'>2.34/2.43<span class='unit'>G</span></span>
+                <span class='diff win'>+60%</span>
               </div>
               <div class='cell-sub'>
-                <span>323µs</span> &bull; <span>33.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.34 s/G</span>
+                <span>346µs</span> &bull; <span>32.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.53 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:69%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:62%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.84/2.91<span class='unit'>G</span></span>
-                <span class='diff win'>+26%</span>
+                <span class='spd'>2.78/2.91<span class='unit'>G</span></span>
+                <span class='diff win'>+33%</span>
               </div>
               <div class='cell-sub'>
-                <span>317µs</span> &bull; <span>38.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.91 s/G</span>
+                <span>333µs</span> &bull; <span>40.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.97 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:78%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:74%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +12%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +11%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VLESS' data-k='vless-grpc-tls vless + grpc + tls'>
@@ -778,48 +778,48 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>6.13/4.19<span class='unit'>G</span></span>
+                <span class='spd'>2.60/4.55<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>321µs</span> &bull; <span>38.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.06 s/G</span>
+                <span>396µs</span> &bull; <span>35.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.88 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.17/3.50<span class='unit'>G</span></span>
-                <span class='diff win'>+47%</span>
+                <span class='spd'>1.63/2.52<span class='unit'>G</span></span>
+                <span class='diff win'>+80%</span>
               </div>
               <div class='cell-sub'>
-                <span>359µs</span> &bull; <span>60.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.44 s/G</span>
+                <span>416µs</span> &bull; <span>80.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.39 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:68%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:55%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.99/3.20<span class='unit'>G</span></span>
-                <span class='diff win'>+91%</span>
+                <span class='spd'>1.69/2.84<span class='unit'>G</span></span>
+                <span class='diff win'>+60%</span>
               </div>
               <div class='cell-sub'>
-                <span>333µs</span> &bull; <span>42.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.64 s/G</span>
+                <span>371µs</span> &bull; <span>40.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.92 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:52%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:62%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.19/3.78<span class='unit'>G</span></span>
-                <span class='diff win'>+46%</span>
+                <span class='spd'>1.67/3.19<span class='unit'>G</span></span>
+                <span class='diff win'>+42%</span>
               </div>
               <div class='cell-sub'>
-                <span>345µs</span> &bull; <span>52.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.26 s/G</span>
+                <span>413µs</span> &bull; <span>49.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.65 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:68%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:70%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +46%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +42%</span></td>
         </tr>
         
-        <tr class='case loss' data-cat='VLESS' data-k='vless-xhttp-tls vless + xhttp + tls'>
+        <tr class='case win' data-cat='VLESS' data-k='vless-xhttp-tls vless + xhttp + tls'>
           <td class='name'>
             <div class='name-line'>
               <span class='cn'>VLESS + XHTTP + TLS</span>
@@ -828,36 +828,36 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>1.17/1.14<span class='unit'>G</span></span>
+                <span class='spd'>1.15/4.38<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>484µs</span> &bull; <span>55.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>5.10 s/G</span>
+                <span>408µs</span> &bull; <span>27.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.91 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:51%;background:var(--win-ink)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.90/2.28<span class='unit'>G</span></span>
-                <span class='diff loss'>-94%</span>
+                <span class='spd'>1.27/4.14<span class='unit'>G</span></span>
+                <span class='diff win'>+5%</span>
               </div>
               <div class='cell-sub'>
-                <span>29.7ms</span> &bull; <span>68.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.81 s/G</span>
+                <span>29.7ms</span> &bull; <span>67.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.12 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:94%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.11/1.32<span class='unit'>G</span></span>
-                <span class='diff loss'>-12%</span>
+                <span class='spd'>1.04/1.12<span class='unit'>G</span></span>
+                <span class='diff win'>+291%</span>
               </div>
               <div class='cell-sub'>
-                <span>30.6ms</span> &bull; <span>63.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>6.49 s/G</span>
+                <span>30.8ms</span> &bull; <span>66.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>6.83 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:57%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:25%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
-          <td class='vd'><span class='vpill loss'>SING-BOX +94%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +5%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VLESS' data-k='vless-httpupgrade-tls vless + httpupgrade + tls'>
@@ -869,36 +869,36 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>4.09/3.91<span class='unit'>G</span></span>
+                <span class='spd'>3.47/4.05<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>288µs</span> &bull; <span>7.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.17 s/G</span>
+                <span>303µs</span> &bull; <span>7.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.11 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>3.08/3.41<span class='unit'>G</span></span>
-                <span class='diff win'>+19%</span>
+                <span class='spd'>3.24/3.51<span class='unit'>G</span></span>
+                <span class='diff win'>+15%</span>
               </div>
               <div class='cell-sub'>
-                <span>303µs</span> &bull; <span>47.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.49 s/G</span>
+                <span>339µs</span> &bull; <span>47.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.42 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:83%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:86%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.11/2.59<span class='unit'>G</span></span>
-                <span class='diff win'>+57%</span>
+                <span class='spd'>2.17/2.70<span class='unit'>G</span></span>
+                <span class='diff win'>+49%</span>
               </div>
               <div class='cell-sub'>
-                <span>316µs</span> &bull; <span>32.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.30 s/G</span>
+                <span>347µs</span> &bull; <span>32.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.17 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:66%;background:var(--accent)'></div></div>
             </td>
           <td class='num fail' title='timed out'>FAIL</td>
-          <td class='vd'><span class='vpill win'>TACHYON +19%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +15%</span></td>
         </tr>
         
         <tr class='case win' data-cat='VLESS' data-k='vless-h2-tls vless + http/2 + tls'>
@@ -910,30 +910,39 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>5.31/4.09<span class='unit'>G</span></span>
+                <span class='spd'>2.52/4.27<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>316µs</span> &bull; <span>39.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.09 s/G</span>
+                <span>391µs</span> &bull; <span>42.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.00 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.37/4.14<span class='unit'>G</span></span>
-                <span class='diff win'>+21%</span>
+                <span class='spd'>1.63/2.14<span class='unit'>G</span></span>
+                <span class='diff win'>+99%</span>
               </div>
               <div class='cell-sub'>
-                <span>349µs</span> &bull; <span>53.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.98 s/G</span>
+                <span>408µs</span> &bull; <span>59.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.00 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:82%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:50%;background:var(--accent)'></div></div>
             </td>
-          <td class='num fail' title='[Errno 111] Connection refused'>FAIL</td>
           <td class='num fail' title='nothing listening on 45002'>FAIL</td>
-          <td class='vd'><span class='vpill win'>TACHYON +21%</span></td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>1.63/3.56<span class='unit'>G</span></span>
+                <span class='diff win'>+19%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>409µs</span> &bull; <span>58.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.43 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:83%;background:var(--accent)'></div></div>
+            </td>
+          <td class='vd'><span class='vpill win'>TACHYON +19%</span></td>
         </tr>
         
-        <tr class='case tie' data-cat='Trojan' data-k='trojan-tls trojan + tls'>
+        <tr class='case win' data-cat='Trojan' data-k='trojan-tls trojan + tls'>
           <td class='name'>
             <div class='name-line'>
               <span class='cn'>Trojan + TLS</span>
@@ -942,45 +951,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>2.35/2.07<span class='unit'>G</span></span>
+                <span class='spd'>4.00/3.95<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>364µs</span> &bull; <span>6.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.64 s/G</span>
+                <span>340µs</span> &bull; <span>6.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.17 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.12/1.89<span class='unit'>G</span></span>
-                <span class='diff win'>+10%</span>
+                <span class='spd'>2.78/3.43<span class='unit'>G</span></span>
+                <span class='diff win'>+16%</span>
               </div>
               <div class='cell-sub'>
-                <span>441µs</span> &bull; <span>45.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.17 s/G</span>
+                <span>339µs</span> &bull; <span>46.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.49 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:90%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:85%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.35/1.29<span class='unit'>G</span></span>
-                <span class='diff win'>+74%</span>
+                <span class='spd'>1.92/2.64<span class='unit'>G</span></span>
+                <span class='diff win'>+51%</span>
               </div>
               <div class='cell-sub'>
-                <span>437µs</span> &bull; <span>32.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.83 s/G</span>
+                <span>329µs</span> &bull; <span>33.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.23 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:57%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:66%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.92/2.30<span class='unit'>G</span></span>
-                <span class='diff tie'>~0%</span>
+                <span class='spd'>3.05/3.40<span class='unit'>G</span></span>
+                <span class='diff win'>+17%</span>
               </div>
               <div class='cell-sub'>
-                <span>315µs</span> &bull; <span>39.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.04 s/G</span>
+                <span>337µs</span> &bull; <span>38.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.54 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:97%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:85%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill tie'>ПАРИТЕТ</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +16%</span></td>
         </tr>
         
         <tr class='case tie' data-cat='Trojan' data-k='trojan-ws-tls trojan + ws + tls'>
@@ -992,43 +1001,43 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>1.59/2.49<span class='unit'>G</span></span>
+                <span class='spd'>3.30/3.42<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>445µs</span> &bull; <span>7.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.48 s/G</span>
+                <span>334µs</span> &bull; <span>7.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.47 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.94/1.71<span class='unit'>G</span></span>
-                <span class='diff win'>+28%</span>
-              </div>
-              <div class='cell-sub'>
-                <span>500µs</span> &bull; <span>45.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.20 s/G</span>
-              </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:77%;background:var(--accent)'></div></div>
-            </td>
-          <td class='num '>
-              <div class='val-row'>
-                <span class='spd'>0.94/1.17<span class='unit'>G</span></span>
-                <span class='diff win'>+112%</span>
-              </div>
-              <div class='cell-sub'>
-                <span>346µs</span> &bull; <span>33.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>5.07 s/G</span>
-              </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:46%;background:var(--accent)'></div></div>
-            </td>
-          <td class='num '>
-              <div class='val-row'>
-                <span class='spd'>2.49/2.09<span class='unit'>G</span></span>
+                <span class='spd'>3.18/3.39<span class='unit'>G</span></span>
                 <span class='diff tie'>~0%</span>
               </div>
               <div class='cell-sub'>
-                <span>346µs</span> &bull; <span>39.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.35 s/G</span>
+                <span>348µs</span> &bull; <span>47.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.50 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:99%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.44/2.55<span class='unit'>G</span></span>
+                <span class='diff win'>+34%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>344µs</span> &bull; <span>33.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.35 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:74%;background:var(--accent)'></div></div>
+            </td>
+          <td class='num '>
+              <div class='val-row'>
+                <span class='spd'>2.80/3.08<span class='unit'>G</span></span>
+                <span class='diff win'>+11%</span>
+              </div>
+              <div class='cell-sub'>
+                <span>350µs</span> &bull; <span>39.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.77 s/G</span>
+              </div>
+              <div class='bar-bg'><div class='bar-fill' style='width:90%;background:var(--accent)'></div></div>
             </td>
           <td class='vd'><span class='vpill tie'>ПАРИТЕТ</span></td>
         </tr>
@@ -1042,45 +1051,45 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>5.77/4.25<span class='unit'>G</span></span>
+                <span class='spd'>2.48/3.99<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>309µs</span> &bull; <span>38.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.01 s/G</span>
+                <span>404µs</span> &bull; <span>46.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.14 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.33/3.92<span class='unit'>G</span></span>
-                <span class='diff win'>+33%</span>
+                <span class='spd'>1.49/3.31<span class='unit'>G</span></span>
+                <span class='diff win'>+20%</span>
               </div>
               <div class='cell-sub'>
-                <span>348µs</span> &bull; <span>81.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.20 s/G</span>
+                <span>411µs</span> &bull; <span>80.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.56 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:75%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:82%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.96/2.93<span class='unit'>G</span></span>
-                <span class='diff win'>+94%</span>
+                <span class='spd'>1.62/2.46<span class='unit'>G</span></span>
+                <span class='diff win'>+62%</span>
               </div>
               <div class='cell-sub'>
-                <span>338µs</span> &bull; <span>40.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.88 s/G</span>
+                <span>366µs</span> &bull; <span>39.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.31 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:51%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:61%;background:var(--accent)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>4.05/3.69<span class='unit'>G</span></span>
-                <span class='diff win'>+42%</span>
+                <span class='spd'>1.62/2.12<span class='unit'>G</span></span>
+                <span class='diff win'>+88%</span>
               </div>
               <div class='cell-sub'>
-                <span>356µs</span> &bull; <span>70.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.29 s/G</span>
+                <span>412µs</span> &bull; <span>43.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.07 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:70%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:53%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +33%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +20%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='hysteria2 hysteria 2 (quic)'>
@@ -1092,36 +1101,36 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>3.20/3.57<span class='unit'>G</span></span>
+                <span class='spd'>3.17/4.22<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>363µs</span> &bull; <span>10.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.01 s/G</span>
+                <span>460µs</span> &bull; <span>12.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.03 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.65/1.74<span class='unit'>G</span></span>
-                <span class='diff win'>+105%</span>
+                <span class='spd'>1.77/1.77<span class='unit'>G</span></span>
+                <span class='diff win'>+138%</span>
               </div>
               <div class='cell-sub'>
-                <span>398µs</span> &bull; <span>55.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.17 s/G</span>
+                <span>512µs</span> &bull; <span>52.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.20 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:48%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:41%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.38/2.09<span class='unit'>G</span></span>
-                <span class='diff win'>+50%</span>
+                <span class='spd'>2.25/1.90<span class='unit'>G</span></span>
+                <span class='diff win'>+87%</span>
               </div>
               <div class='cell-sub'>
-                <span>391µs</span> &bull; <span>47.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.04 s/G</span>
+                <span>506µs</span> &bull; <span>46.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.24 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:66%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:53%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +50%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +87%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='tuic tuic v5 (quic)'>
@@ -1133,36 +1142,36 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>3.67/3.67<span class='unit'>G</span></span>
+                <span class='spd'>3.88/4.56<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>358µs</span> &bull; <span>15.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.03 s/G</span>
+                <span>462µs</span> &bull; <span>24.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.88 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.62/2.10<span class='unit'>G</span></span>
-                <span class='diff win'>+40%</span>
+                <span class='spd'>2.54/1.91<span class='unit'>G</span></span>
+                <span class='diff win'>+79%</span>
               </div>
               <div class='cell-sub'>
-                <span>396µs</span> &bull; <span>50.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.03 s/G</span>
+                <span>504µs</span> &bull; <span>50.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.33 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:71%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:55%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.39/2.04<span class='unit'>G</span></span>
-                <span class='diff win'>+53%</span>
+                <span class='spd'>2.35/2.02<span class='unit'>G</span></span>
+                <span class='diff win'>+94%</span>
               </div>
               <div class='cell-sub'>
-                <span>387µs</span> &bull; <span>47.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.09 s/G</span>
+                <span>504µs</span> &bull; <span>45.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>4.11 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:65%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:51%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +40%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +79%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='naive-tls naiveproxy (http/2 tls)'>
@@ -1174,27 +1183,27 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>5.64/4.23<span class='unit'>G</span></span>
+                <span class='spd'>2.44/4.18<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>12µs</span> &bull; <span>40.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.02 s/G</span>
+                <span>13µs</span> &bull; <span>43.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.07 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>1.34/2.59<span class='unit'>G</span></span>
-                <span class='diff win'>+117%</span>
+                <span class='spd'>1.38/2.12<span class='unit'>G</span></span>
+                <span class='diff win'>+97%</span>
               </div>
               <div class='cell-sub'>
-                <span>1.6ms</span> &bull; <span>176.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.17 s/G</span>
+                <span>1.6ms</span> &bull; <span>168.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.91 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:45%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:50%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='num none'>—</td>
-          <td class='vd'><span class='vpill win'>TACHYON +117%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +97%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='naive-quic naiveproxy (http/3 quic)'>
@@ -1206,27 +1215,27 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>0.93/0.90<span class='unit'>G</span></span>
+                <span class='spd'>0.89/0.90<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>12µs</span> &bull; <span>14.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>9.52 s/G</span>
+                <span>14µs</span> &bull; <span>15.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>9.46 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>0.70/0.82<span class='unit'>G</span></span>
-                <span class='diff win'>+13%</span>
+                <span class='spd'>0.60/0.75<span class='unit'>G</span></span>
+                <span class='diff win'>+19%</span>
               </div>
               <div class='cell-sub'>
-                <span>523µs</span> &bull; <span>61.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>10.47 s/G</span>
+                <span>656µs</span> &bull; <span>59.0M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>11.30 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:88%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:83%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='num none'>—</td>
-          <td class='vd'><span class='vpill win'>TACHYON +13%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +19%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='anytls anytls (h2mux tls)'>
@@ -1238,27 +1247,27 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>7.63/6.65<span class='unit'>G</span></span>
+                <span class='spd'>7.05/6.71<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>292µs</span> &bull; <span>38.1M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.27 s/G</span>
+                <span>341µs</span> &bull; <span>37.4M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.28 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>5.82/5.81<span class='unit'>G</span></span>
-                <span class='diff win'>+31%</span>
+                <span class='spd'>5.61/5.64<span class='unit'>G</span></span>
+                <span class='diff win'>+25%</span>
               </div>
               <div class='cell-sub'>
-                <span>324µs</span> &bull; <span>47.7M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.47 s/G</span>
+                <span>358µs</span> &bull; <span>46.3M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>1.52 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:76%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:80%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='num none'>—</td>
-          <td class='vd'><span class='vpill win'>TACHYON +31%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +25%</span></td>
         </tr>
         
         <tr class='case win' data-cat='QUIC / H2' data-k='snell snell (v4/v5)'>
@@ -1270,36 +1279,36 @@
           </td>
           <td class='num col-t-cell'>
               <div class='val-row'>
-                <span class='spd'>3.70/3.51<span class='unit'>G</span></span>
+                <span class='spd'>3.64/3.41<span class='unit'>G</span></span>
                 
               </div>
               <div class='cell-sub'>
-                <span>287µs</span> &bull; <span>6.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.47 s/G</span>
+                <span>322µs</span> &bull; <span>6.8M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>2.51 s/G</span>
               </div>
               <div class='bar-bg'><div class='bar-fill' style='width:100%;background:var(--win-ink)'></div></div>
             </td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.89/2.80<span class='unit'>G</span></span>
-                <span class='diff win'>+28%</span>
+                <span class='spd'>2.68/2.69<span class='unit'>G</span></span>
+                <span class='diff win'>+35%</span>
               </div>
               <div class='cell-sub'>
-                <span>314µs</span> &bull; <span>46.5M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.06 s/G</span>
+                <span>341µs</span> &bull; <span>45.2M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.21 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:78%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:73%;background:var(--accent)'></div></div>
             </td>
           <td class='num none'>—</td>
           <td class='num '>
               <div class='val-row'>
-                <span class='spd'>2.40/2.29<span class='unit'>G</span></span>
-                <span class='diff win'>+54%</span>
+                <span class='spd'>2.28/2.30<span class='unit'>G</span></span>
+                <span class='diff win'>+58%</span>
               </div>
               <div class='cell-sub'>
-                <span>314µs</span> &bull; <span>52.6M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.76 s/G</span>
+                <span>336µs</span> &bull; <span>48.9M</span> &bull; <span class='cpu' title='CPU время на 1 GiB'>3.73 s/G</span>
               </div>
-              <div class='bar-bg'><div class='bar-fill' style='width:64%;background:var(--accent)'></div></div>
+              <div class='bar-bg'><div class='bar-fill' style='width:63%;background:var(--accent)'></div></div>
             </td>
-          <td class='vd'><span class='vpill win'>TACHYON +28%</span></td>
+          <td class='vd'><span class='vpill win'>TACHYON +35%</span></td>
         </tr>
         
       </tbody>

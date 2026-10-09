@@ -21,6 +21,42 @@ fn flag_value(args: &[String], short: &str, long: &str) -> Option<String> {
     None
 }
 
+
+fn positional_args(args: &[String]) -> Vec<String> {
+    let mut positional = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-o"
+            || arg == "--output"
+            || arg == "-d"
+            || arg == "--domain"
+            || arg == "-i"
+            || arg == "--ip"
+        {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--output=")
+            || arg.starts_with("-o=")
+            || arg.starts_with("--domain=")
+            || arg.starts_with("-d=")
+            || arg.starts_with("--ip=")
+            || arg.starts_with("-i=")
+        {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with("-") {
+            index += 1;
+            continue;
+        }
+        positional.push(arg.clone());
+        index += 1;
+    }
+    positional
+}
+
 fn read_input(path: &str) -> Result<Vec<u8>, String> {
     if path == "stdin" || path == "-" {
         let mut buffer = Vec::new();
@@ -73,7 +109,12 @@ fn default_output(source: &str, suffix: &str) -> PathBuf {
 }
 
 fn cmd_rule_set_compile(args: &[String]) -> Result<(), String> {
-    let source = args
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: sing-box rule-set compile [flags] [source-path]");
+        return Ok(());
+    }
+    let positional = positional_args(args);
+    let source = positional
         .first()
         .ok_or("rule-set compile: missing [source-path]")?
         .clone();
@@ -192,7 +233,12 @@ fn document(version: u8, rules: Vec<Value>) -> Value {
 }
 
 fn cmd_rule_set_decompile(args: &[String]) -> Result<(), String> {
-    let source = args
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: sing-box rule-set decompile [flags] [binary-path]");
+        return Ok(());
+    }
+    let positional = positional_args(args);
+    let source = positional
         .first()
         .ok_or("rule-set decompile: missing [binary-path]")?
         .clone();
@@ -212,7 +258,12 @@ fn cmd_rule_set_decompile(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_rule_set_match(args: &[String]) -> Result<(), String> {
-    let source = args
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: sing-box rule-set match [flags] [rule-set-path]");
+        return Ok(());
+    }
+    let positional = positional_args(args);
+    let source = positional
         .first()
         .ok_or("rule-set match: missing [rule-set-path]")?
         .clone();
@@ -362,7 +413,12 @@ fn json_kind(value: &Value) -> &'static str {
 }
 
 fn cmd_rule_set_format(args: &[String]) -> Result<(), String> {
-    let path = args
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: sing-box rule-set format [flags] [rule-set-path]");
+        return Ok(());
+    }
+    let positional = positional_args(args);
+    let path = positional
         .first()
         .ok_or("rule-set format: missing [rule-set-path]")?
         .clone();
@@ -395,7 +451,12 @@ fn cmd_rule_set_format(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_rule_set_upgrade(args: &[String]) -> Result<(), String> {
-    let path = args
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("Usage: sing-box rule-set upgrade [flags] [rule-set-path]");
+        return Ok(());
+    }
+    let positional = positional_args(args);
+    let path = positional
         .first()
         .ok_or("rule-set upgrade: missing [rule-set-path]")?
         .clone();
@@ -430,6 +491,10 @@ pub fn cmd_rule_set(args: &[String]) -> Result<(), String> {
         .first()
         .ok_or("rule-set: missing subcommand (compile, decompile, match, format, upgrade)")?
         .clone();
+    if sub == "-h" || sub == "--help" {
+        println!("Usage: sing-box rule-set [subcommand] (compile, decompile, match, format, upgrade)");
+        return Ok(());
+    }
     let rest: Vec<String> = args[1..].to_vec();
     match sub.as_str() {
         "compile" => cmd_rule_set_compile(&rest),
@@ -440,5 +505,26 @@ pub fn cmd_rule_set(args: &[String]) -> Result<(), String> {
         other => Err(format!(
             "rule-set: unknown subcommand '{other}' (compile, decompile, match, format, upgrade)"
         )),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_positional_args_flag_ordering() {
+        let args1 = vec!["--output".to_string(), "out.json".to_string(), "in.srs".to_string()];
+        assert_eq!(positional_args(&args1), vec!["in.srs".to_string()]);
+        assert_eq!(flag_value(&args1, "-o", "--output"), Some("out.json".to_string()));
+
+        let args2 = vec!["in.srs".to_string(), "-o".to_string(), "out.json".to_string()];
+        assert_eq!(positional_args(&args2), vec!["in.srs".to_string()]);
+        assert_eq!(flag_value(&args2, "-o", "--output"), Some("out.json".to_string()));
+
+        let args3 = vec!["--output=out.json".to_string(), "in.srs".to_string()];
+        assert_eq!(positional_args(&args3), vec!["in.srs".to_string()]);
+        assert_eq!(flag_value(&args3, "-o", "--output"), Some("out.json".to_string()));
     }
 }

@@ -78,6 +78,7 @@ pub struct Config<'a> {
     /// Set for a REALITY client: the session id is sealed with the key this
     /// hello's X25519 exchange produces, and the verifier is told that key.
     pub reality: Option<RealitySeal<'a>>,
+    pub fragment: bool,
 }
 
 /// One handshake. [`Handshake::run`] is the whole thing over a blocking stream.
@@ -228,8 +229,28 @@ impl<'a> Handshake<'a> {
             self.config.verifier.set_reality_auth_key(&key);
         }
         self.transcript.extend_from_slice(&record[5..]);
-        stream.write_all(&record).await?;
-        stream.flush().await
+        if self.config.fragment && record.len() > 100 {
+            let handshake = &record[5..];
+            let split_pos = (handshake.len() / 2).clamp(30, 80);
+            let rec1 = record::plaintext_record(
+                ContentType::Handshake,
+                &handshake[..split_pos],
+                record::VERSION_1_2,
+            )?;
+            let rec2 = record::plaintext_record(
+                ContentType::Handshake,
+                &handshake[split_pos..],
+                record::VERSION_1_2,
+            )?;
+            stream.write_all(&rec1).await?;
+            stream.flush().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            stream.write_all(&rec2).await?;
+            stream.flush().await
+        } else {
+            stream.write_all(&record).await?;
+            stream.flush().await
+        }
     }
 
     /// Read the server's hello and derive the handshake keys, refusing anything
@@ -649,6 +670,7 @@ mod tests {
             alpn: &[],
             verifier: &AcceptsAnything,
             reality: None,
+            fragment: false,
         })
         .expect("handshake");
         let raw = hello::build(

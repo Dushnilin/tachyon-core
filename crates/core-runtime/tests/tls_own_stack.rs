@@ -80,6 +80,7 @@ async fn application_data_goes_out_and_comes_back_through_our_own_stack() {
         alpn: &alpn,
         verifier: &verifier,
         reality: None,
+        fragment: false,
     };
     let mut handshake = Handshake::new(config).expect("a handshake");
     handshake.run(&mut client_io).await.expect("the handshake");
@@ -133,6 +134,7 @@ async fn an_empty_write_seals_nothing() {
         alpn: &alpn,
         verifier: &verifier,
         reality: None,
+        fragment: false,
     };
     let mut handshake = Handshake::new(config).expect("a handshake");
     handshake.run(&mut client_io).await.expect("the handshake");
@@ -184,6 +186,7 @@ async fn pair(
         alpn: &alpn,
         verifier: &verifier,
         reality: None,
+        fragment: false,
     };
     let mut handshake = Handshake::new(config).expect("a handshake");
     handshake.run(&mut client_io).await.expect("the handshake");

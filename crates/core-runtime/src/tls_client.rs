@@ -75,6 +75,81 @@ pub struct Fingerprint {
     pub template: core_tls::hello::Template,
 }
 
+/// Read a pin field: one base64 SHA-256, or a list of them, as the reference
+/// accepts. The value is the same either way - the field says what is hashed,
+/// not how many entries are allowed.
+fn decode_pin_list(
+    tls: &serde_json::Map<String, Value>,
+    field: &str,
+    at: &str,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    let Some(value) = tls.get(field) else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let mut raw = Vec::new();
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("{at}: tls.{field} entries must be strings"))?;
+                raw.push(s.to_string());
+            }
+        }
+        Value::String(s) => raw.push(s.clone()),
+        other => {
+            return Err(anyhow::anyhow!(
+                "{at}: tls.{field} must be a string or a list of strings, got {other}"
+            ));
+        }
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let bytes = base64_decode(entry).ok_or_else(|| {
+            anyhow::anyhow!("{at}: tls.{field} entry {entry:?} is not valid base64")
+        })?;
+        let len = bytes.len();
+        let digest: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("{at}: tls.{field} entry {entry:?} is {len} bytes, a SHA-256 pin is 32")
+        })?;
+        out.push(digest);
+    }
+    Ok(out)
+}
+
+/// Standard base64, with or without padding. The reference writes padded values;
+/// a hand-edited config often loses the padding, and rejecting that would make
+/// the pin unusable rather than merely untidy.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for c in input.bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' {
+            continue;
+        }
+        let v = TABLE.iter().position(|t| *t == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// REALITY: the server's public key and the short id that opens the session id
 /// seal. The verification of the borrowed certificate is not part of this yet,
 /// which is why enabling it is still refused further down.
@@ -94,6 +169,15 @@ pub struct TlsOptions {
     min_tls13: bool,
     max_tls12: bool,
     ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// `certificate_sha256`: SHA-256 over the whole DER end-entity certificate.
+    /// Upstream added this in 1.15; the reference calls the value a "pcs" and it
+    /// is what proxy links carry.
+    certificate_sha256: Vec<[u8; 32]>,
+    /// `certificate_public_key_sha256`: SHA-256 over the SPKI, the public key
+    /// alone. A different value from the above, so it is a second field rather
+    /// than an older spelling of the first - but the only pin field that exists
+    /// before 1.15, and the only one lx accepts.
+    certificate_public_key_sha256: Vec<[u8; 32]>,
     /// Our own ClientHello instead of rustls': a captured browser fingerprint
     /// and the handshake written for it.
     fingerprint: Option<Fingerprint>,
@@ -175,6 +259,10 @@ impl TlsOptions {
             load_pem_certs(&raw, &mut ca_certs)
                 .map_err(|e| anyhow::anyhow!("{at}: tls.certificate_path {path:?}: {e}"))?;
         }
+
+        let certificate_sha256 = decode_pin_list(tls, "certificate_sha256", at)?;
+        let certificate_public_key_sha256 =
+            decode_pin_list(tls, "certificate_public_key_sha256", at)?;
 
         let fingerprint = match tls.get("utls").and_then(Value::as_object) {
             Some(u) if u.get("enabled").and_then(Value::as_bool) == Some(true) => {
@@ -265,6 +353,8 @@ impl TlsOptions {
             min_tls13,
             max_tls12,
             ca_certs,
+            certificate_sha256,
+            certificate_public_key_sha256,
             fragment,
             cipher_suites,
         }))
@@ -534,7 +624,24 @@ impl TlsOptions {
                 }
                 core_tls::verify::WebpkiVerifier::new(Arc::new(store))
             };
-            Box::new(roots.map_err(|e| io::Error::other(format!("trust store: {e}")))?)
+            let base = roots.map_err(|e| io::Error::other(format!("trust store: {e}")))?;
+            // A pin narrows what is trusted, so it wraps the chain check rather
+            // than replacing it: a pinned certificate that does not chain to a
+            // known root is still refused. With no pin configured this stays the
+            // plain verifier and the handshake path is unchanged.
+            let base: Box<dyn core_tls::verify::CertVerifier> =
+                if self.certificate_sha256.is_empty()
+                    && self.certificate_public_key_sha256.is_empty()
+                {
+                    Box::new(base)
+                } else {
+                    Box::new(core_tls::verify::PinVerifier::new(
+                        base.into_inner(),
+                        self.certificate_sha256.clone(),
+                        self.certificate_public_key_sha256.clone(),
+                    ))
+                };
+            base
         };
         let reality = self.reality.as_ref();
         let seal = reality.map(|r| core_tls::client::RealitySeal {

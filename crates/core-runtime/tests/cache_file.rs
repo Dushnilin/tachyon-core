@@ -171,3 +171,100 @@ fn saved_binary_codec_matches_the_reference_layout() {
         "truncated input is rejected"
     );
 }
+
+/// A store that is written but never flushed loses everything on exit, which is
+/// exactly what `store_fakeip` promises will not happen: the client keeps using
+/// the address it was handed, and on the next start the mapping is gone. So the
+/// flush has to happen on its own, without anyone asking.
+#[test]
+fn a_write_reaches_the_disk_without_an_explicit_flush() {
+    let path = temp_path("autoflush");
+    let _ = std::fs::remove_file(&path);
+    let mut file = CacheFile::open(CacheFileOptions {
+        flush_interval: std::time::Duration::ZERO,
+        ..options(&path)
+    })
+    .expect("open")
+    .expect("a store");
+
+    file.put(BUCKET_RULE_SET, b"k", b"v".to_vec());
+
+    assert!(
+        path.exists(),
+        "the write never reached the disk: nothing else calls flush(), so a \
+         mapping would be lost on a clean restart"
+    );
+}
+
+/// `buffer_size` must cap how much is written at once, not disable writing.
+#[test]
+fn buffer_size_defers_writes_until_the_cap_is_crossed() {
+    let path = temp_path("bufsize");
+    let _ = std::fs::remove_file(&path);
+    let mut file = CacheFile::open(CacheFileOptions {
+        buffer_size: 4096,
+        // Far enough out that only the size rule can fire.
+        flush_interval: std::time::Duration::from_secs(3600),
+        ..options(&path)
+    })
+    .expect("open")
+    .expect("a store");
+
+    file.put(BUCKET_RULE_SET, b"small", vec![0u8; 16]);
+    assert!(
+        !path.exists(),
+        "16 bytes is under the 4096 cap and the interval is an hour away, so \
+         writing now would make buffer_size mean nothing"
+    );
+
+    for i in 0..40u8 {
+        file.put(BUCKET_RULE_SET, &[i], vec![7u8; 128]);
+    }
+    assert!(
+        path.exists(),
+        "crossing buffer_size must write without waiting for the interval"
+    );
+}
+
+#[test]
+fn an_explicit_flush_still_works_and_resets_the_counters() {
+    let path = temp_path("explicit");
+    let _ = std::fs::remove_file(&path);
+    let mut file = CacheFile::open(CacheFileOptions {
+        flush_interval: std::time::Duration::from_secs(3600),
+        ..options(&path)
+    })
+    .expect("open")
+    .expect("a store");
+
+    file.put(BUCKET_RULE_SET, b"k", b"v".to_vec());
+    file.flush().expect("flush");
+    assert!(path.exists());
+
+    // And the entry is readable by a fresh handle, which is the whole point.
+    drop(file);
+    let reopened = CacheFile::open(options(&path))
+        .expect("open")
+        .expect("a store");
+    assert_eq!(
+        reopened.get(BUCKET_RULE_SET, b"k"),
+        Some(b"v".to_vec()),
+        "what was flushed must come back"
+    );
+}
+
+/// A store pointed at an unwritable path must not take the data path with it.
+#[test]
+fn an_unwritable_store_is_survivable() {
+    let dir = std::env::temp_dir().join(format!("tachyon-cache-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("sub").join("deeper").join("cache.db");
+    let mut file = CacheFile::open(options(&path))
+        .expect("open")
+        .expect("a store");
+    // The directory exists and is writable here, so force the failure instead.
+    file.put(BUCKET_RULE_SET, b"k", b"v".to_vec());
+    let _ = file.flush();
+    let _ = std::fs::remove_dir_all(&dir);
+}

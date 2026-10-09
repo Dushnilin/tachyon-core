@@ -483,6 +483,11 @@ impl WebpkiVerifier {
     pub fn mozilla_roots() -> io::Result<Self> {
         Self::new(Arc::new(Self::mozilla_store()))
     }
+
+    /// The underlying rustls verifier, for [PinVerifier] to wrap.
+    pub fn into_inner(self) -> Arc<dyn ServerCertVerifier> {
+        self.chain
+    }
 }
 
 impl Debug for WebpkiVerifier {
@@ -502,6 +507,193 @@ impl CertVerifier for WebpkiVerifier {
             .verify_server_cert(leaf, chain, server_name, &[], UnixTime::now())
             .map(|_| ())
             .map_err(|e| bad(format!("certificate chain rejected: {e}")))
+    }
+
+    fn verify_handshake_signature(
+        &self,
+        signed: &[u8],
+        leaf: &CertificateDer<'_>,
+        scheme: u16,
+        signature: &[u8],
+    ) -> io::Result<()> {
+        let algorithm = algorithm_for(scheme).ok_or_else(|| {
+            bad(format!(
+                "signature scheme {scheme:#06x} is not one we accept"
+            ))
+        })?;
+        let cert = webpki::EndEntityCert::try_from(leaf)
+            .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?;
+        cert.verify_signature(algorithm, signed, signature)
+            .map_err(|e| bad(format!("CertificateVerify signature rejected: {e}")))
+    }
+}
+
+/// Trust by certificate fingerprint rather than by chain.
+///
+/// Two pins exist because they answer two different questions.
+/// `certificate_sha256` hashes the whole DER end-entity certificate, which is
+/// what a proxy link carries and what upstream added in 1.15.
+/// `certificate_public_key_sha256` hashes only the SPKI, so a reissued
+/// certificate with the same key still matches - and it is the older field,
+/// present before 1.15 and the only one lx accepts. Neither can stand in for
+/// the other: they are different byte strings over the same certificate.
+///
+/// The chain check still runs. A pin narrows what is trusted, it does not widen
+/// it: presenting a pinned certificate that does not chain to a known root is
+/// exactly the case a pin exists to catch.
+pub struct PinVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    /// SHA-256 over the whole DER leaf, when pinned.
+    certificate_sha256: Vec<[u8; 32]>,
+    /// SHA-256 over the SPKI, when pinned.
+    public_key_sha256: Vec<[u8; 32]>,
+}
+
+impl PinVerifier {
+    pub fn new(
+        inner: Arc<dyn ServerCertVerifier>,
+        certificate_sha256: Vec<[u8; 32]>,
+        public_key_sha256: Vec<[u8; 32]>,
+    ) -> Self {
+        Self {
+            inner,
+            certificate_sha256,
+            public_key_sha256,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.certificate_sha256.is_empty() && self.public_key_sha256.is_empty()
+    }
+}
+
+impl Debug for PinVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinVerifier")
+            .field("certificate_sha256", &self.certificate_sha256.len())
+            .field("public_key_sha256", &self.public_key_sha256.len())
+            .finish()
+    }
+}
+
+/// SHA-256 over the certificate's SubjectPublicKeyInfo, DER bytes and all.
+///
+/// The SPKI is not a field we can address directly: a certificate is
+/// `SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }` and the
+/// SPKI sits inside `tbsCertificate`. So this walks the DER tags far enough to
+/// reach it and hashes the whole element, header included, which is what the
+/// reference hashes too - hashing a stripped inner slice would produce a
+/// different digest and never match a value written by anything else.
+pub fn spki_sha256(der: &[u8]) -> io::Result<[u8; 32]> {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let (cert, _) = der_element(der, 0).ok_or_else(|| bad("certificate does not parse"))?;
+    // Walk into the Certificate's value first: its length covers the whole
+    // element, so re-parsing from offset 0 would hand back the Certificate
+    // itself and the next "element" would be the tbs's own length bytes.
+    let (cert_body, _) = der_content(cert).ok_or_else(|| bad("certificate does not parse"))?;
+    let (tbs, _) = der_element(cert_body, 0).ok_or_else(|| bad("tbsCertificate does not parse"))?;
+    let (body, _) = der_content(tbs).ok_or_else(|| bad("tbsCertificate does not parse"))?;
+
+    // The fields of tbsCertificate, in order:
+    //   [0] version (EXPLICIT, optional), serialNumber INTEGER,
+    //   signature AlgorithmIdentifier, issuer Name, validity Validity,
+    //   subject Name, subjectPublicKeyInfo.
+    // So the SPKI is the 7th element when a version is present and the 6th when
+    // it is not. Counting to it positionally rather than matching tags is what
+    // keeps this honest: issuer, subject and validity are all SEQUENCE, so a
+    // tag match finds the wrong one of the three.
+    let versioned = body.first().is_some_and(|t| *t == 0xa0);
+    let want = if versioned { 6 } else { 5 };
+
+    let mut rest = body;
+    for index in 0..=want {
+        let (element, next) = der_element(rest, 0).ok_or_else(|| {
+            bad("certificate pin: tbsCertificate ends before subjectPublicKeyInfo")
+        })?;
+        if index == want {
+            let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(element).into();
+            return Ok(digest);
+        }
+        rest = next;
+    }
+
+    Err(bad(
+        "certificate pin: subjectPublicKeyInfo not found in the certificate",
+    ))
+}
+
+/// The value part of a DER element, i.e. the element without its tag and length.
+fn der_content(element: &[u8]) -> Option<(&[u8], &[u8])> {
+    let first = *element.get(1)?;
+    let value_at = if first & 0x80 == 0 {
+        2usize
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return None;
+        }
+        2 + count
+    };
+    Some((element.get(value_at..)?, &[]))
+}
+
+/// One DER element starting at : (the whole element, the rest after it).
+/// Returns the element *including* its tag and length, because that is what the
+/// SPKI hash covers.
+fn der_element(input: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
+    let first = *input.get(at + 1)?;
+    let len;
+    let value_at;
+    if first & 0x80 == 0 {
+        len = first as usize;
+        value_at = at + 2;
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return None;
+        }
+        let mut acc = 0usize;
+        for i in 0..count {
+            acc = (acc << 8) | *input.get(at + 2 + i)? as usize;
+        }
+        len = acc;
+        value_at = at + 2 + count;
+    }
+    let value_end = value_at.checked_add(len)?;
+    let element = input.get(at..value_end)?;
+    let rest = input.get(value_end..)?;
+    Some((element, rest))
+}
+
+impl CertVerifier for PinVerifier {
+    fn verify_chain(
+        &self,
+        leaf: &CertificateDer<'_>,
+        chain: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+    ) -> io::Result<()> {
+        self.inner
+            .verify_server_cert(leaf, chain, server_name, &[], UnixTime::now())
+            .map_err(|e| bad(format!("certificate chain rejected: {e}")))?;
+
+        let der = leaf.as_ref();
+        if !self.certificate_sha256.is_empty() {
+            let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(der).into();
+            if !self.certificate_sha256.contains(&digest) {
+                return Err(bad(
+                    "server certificate does not match tls.certificate_sha256",
+                ));
+            }
+        }
+        if !self.public_key_sha256.is_empty() {
+            let digest = spki_sha256(der)?;
+            if !self.public_key_sha256.contains(&digest) {
+                return Err(bad(
+                    "server public key does not match tls.certificate_public_key_sha256",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn verify_handshake_signature(

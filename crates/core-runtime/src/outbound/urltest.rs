@@ -567,3 +567,84 @@ mod tests {
         assert!(parse_duration(Some(&json!("3w")), Duration::ZERO, "t").is_err());
     }
 }
+
+/// A byte size written the way the reference writes it: a number, or a number
+/// with a unit suffix. `buffer_size` is the only user, and it is spelled "1MB"
+/// in configs people copy from the docs, so the suffixes have to work.
+pub(crate) fn parse_size(value: Option<&Value>, at: &str) -> anyhow::Result<usize> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    match value {
+        Value::Number(n) => n
+            .as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| anyhow::anyhow!("{at}: invalid size")),
+        Value::String(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Ok(0);
+            }
+            let split = raw
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(raw.len());
+            let (digits, unit) = raw.split_at(split);
+            let value: f64 = digits
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{at}: invalid size {raw:?}"))?;
+            // Binary, not decimal: these are buffer sizes, and "1MB" meaning
+            // 1000 bytes would put a cap four orders of magnitude below what the
+            // config says.
+            let scale: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+                "" | "b" => 1.0,
+                "k" | "kb" => 1024.0,
+                "m" | "mb" => 1024.0 * 1024.0,
+                "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
+                other => anyhow::bail!("{at}: unknown size unit {other:?}"),
+            };
+            let bytes = value * scale;
+            if bytes < 0.0 || !bytes.is_finite() {
+                anyhow::bail!("{at}: size {raw:?} is out of range");
+            }
+            Ok(bytes as usize)
+        }
+        other => anyhow::bail!("{at}: invalid size value {other}"),
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::parse_size;
+    use serde_json::Value;
+
+    fn parse(raw: &str) -> usize {
+        parse_size(Some(&Value::String(raw.to_string())), "buffer_size").expect("parses")
+    }
+
+    #[test]
+    fn plain_numbers_are_bytes() {
+        assert_eq!(parse("0"), 0);
+        assert_eq!(parse("512"), 512);
+    }
+
+    #[test]
+    fn suffixes_are_binary() {
+        assert_eq!(parse("1KB"), 1024);
+        assert_eq!(parse("1MB"), 1024 * 1024);
+        assert_eq!(parse("1mb"), 1024 * 1024);
+        assert_eq!(parse("2 GB"), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_empty_value_is_zero() {
+        assert_eq!(parse(""), 0);
+    }
+
+    #[test]
+    fn garbage_is_an_error_not_a_silent_zero() {
+        // A size that quietly becomes 0 would turn buffer_size into "never
+        // flush on size", which looks like it works and never does.
+        assert!(parse_size(Some(&Value::String("lots".into())), "buffer_size").is_err());
+        assert!(parse_size(Some(&Value::String("1XB".into())), "buffer_size").is_err());
+    }
+}

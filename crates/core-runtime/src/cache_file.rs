@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 use core_experimental::bbolt::{Db, EntrySpec, NodeSpec};
 use serde_json::Value;
@@ -40,6 +41,12 @@ pub struct CacheFileOptions {
     pub store_dns: bool,
     pub store_rdrc: bool,
     pub rdrc_timeout: Option<Duration>,
+    /// Write out once this many bytes are pending. 0 means "never on size alone",
+    /// which is the reference default.
+    pub buffer_size: usize,
+    /// Write out at least this often. Without it a store that is written once
+    /// and then only read would never reach the disk at all.
+    pub flush_interval: Duration,
 }
 
 impl CacheFileOptions {
@@ -59,6 +66,16 @@ impl CacheFileOptions {
                 .map(str::to_string)
         };
         let flag = |key: &str| obj.get(key).and_then(Value::as_bool).unwrap_or(false);
+        let size = |key: &str| -> anyhow::Result<usize> {
+            let Some(raw) = text(key) else {
+                return Ok(0);
+            };
+            crate::outbound::urltest::parse_size(
+                Some(&Value::String(raw)),
+                &format!("experimental.cache_file.{key}"),
+            )
+            .map_err(|e| anyhow::anyhow!("experimental.cache_file.{key}: {e}"))
+        };
         Ok(Self {
             enabled: flag("enabled"),
             path: text("path").unwrap_or_default(),
@@ -66,6 +83,20 @@ impl CacheFileOptions {
             store_fakeip: flag("store_fakeip"),
             store_dns: flag("store_dns"),
             store_rdrc: flag("store_rdrc"),
+            buffer_size: size("buffer_size")?,
+            // A minute is the reference default. It matters that this is not
+            // zero: the store is what keeps the fakeip mapping alive across a
+            // restart, and a mapping that never reaches the disk makes every
+            // cached address die with "missing fakeip record".
+            flush_interval: match text("flush_interval") {
+                Some(raw) => crate::outbound::urltest::parse_duration(
+                    Some(&Value::String(raw)),
+                    Duration::from_secs(60),
+                    "experimental.cache_file.flush_interval",
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                None => Duration::from_secs(60),
+            },
             rdrc_timeout: match text("rdrc_timeout") {
                 Some(raw) => Some(
                     crate::outbound::urltest::parse_duration(
@@ -86,12 +117,16 @@ impl CacheFileOptions {
 pub type SharedCacheFile = std::sync::Arc<std::sync::Mutex<CacheFile>>;
 
 /// The in-memory mirror of the file, flushed on demand.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CacheFile {
     options: CacheFileOptions,
     path: PathBuf,
     buckets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     dirty: bool,
+    /// Bytes written since the last flush, the measure `buffer_size` bounds.
+    pending: usize,
+    /// When the last flush happened, the measure `flush_interval` bounds.
+    last_flush: Instant,
 }
 
 impl CacheFile {
@@ -120,6 +155,8 @@ impl CacheFile {
             path,
             buckets,
             dirty: false,
+            pending: 0,
+            last_flush: Instant::now(),
         };
         // the reference keys the file by cache_id: a different id starts fresh
         let current = store.get(ID_BUCKET, ID_KEY);
@@ -155,18 +192,51 @@ impl CacheFile {
     }
 
     pub fn put(&mut self, bucket: &str, key: &[u8], value: Vec<u8>) {
+        self.pending += key.len() + value.len();
         self.buckets
             .entry(bucket.to_string())
             .or_default()
             .insert(key_str(key), value);
         self.dirty = true;
+        self.flush_if_due();
     }
 
     pub fn delete(&mut self, bucket: &str, key: &[u8]) {
         if let Some(entries) = self.buckets.get_mut(bucket)
             && entries.remove(&key_str(key)).is_some()
         {
+            self.pending += key.len();
             self.dirty = true;
+            self.flush_if_due();
+        }
+    }
+
+    /// Write out if the pending bytes or the elapsed time says so.
+    ///
+    /// This is what makes the store durable at all. Before, `flush` existed but
+    /// nothing called it: entries accumulated in memory for the life of the
+    /// process and were lost on exit, so `store_fakeip` promised a mapping that
+    /// survived a restart and did not. The time check matters as much as the size
+    /// one - a store written once and then only read would otherwise sit in
+    /// memory forever, and a mapping lost to a clean restart is exactly what
+    /// makes a cached fakeip address die as "missing fakeip record".
+    ///
+    /// A write failure is logged rather than propagated: a store that cannot be
+    /// written must not take down the data path that is using it.
+    fn flush_if_due(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let by_size = self.options.buffer_size > 0 && self.pending >= self.options.buffer_size;
+        let by_time = self.last_flush.elapsed() >= self.options.flush_interval;
+        if !by_size && !by_time {
+            return;
+        }
+        if let Err(error) = self.flush() {
+            logging::warn(format_args!(
+                "cache file {}: write failed ({error}); keeping it in memory",
+                self.path.display()
+            ));
         }
     }
 
@@ -178,7 +248,9 @@ impl CacheFile {
             .unwrap_or_default()
     }
 
-    /// Atomic tmp+mv rewrite; the reference batches, we flush on the interval.
+    /// Atomic tmp+mv rewrite of the whole tree, which is what the reference's
+    /// batching writes too - `buffer_size` and `flush_interval` decide when it
+    /// happens, not how big a piece of it is, so there is nothing to accumulate.
     pub fn flush(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -188,6 +260,8 @@ impl CacheFile {
         core_experimental::bbolt::write(&tmp, &root)?;
         std::fs::rename(&tmp, &self.path)?;
         self.dirty = false;
+        self.pending = 0;
+        self.last_flush = Instant::now();
         Ok(())
     }
 }

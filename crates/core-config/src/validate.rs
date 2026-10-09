@@ -75,6 +75,8 @@ const CACHE_FILE_FIELDS: &[&str] = &[
     "store_rdrc",
     "rdrc_timeout",
     "store_dns",
+    "buffer_size",
+    "flush_interval",
 ];
 const CACHE_FILE_BOOL_FIELDS: &[&str] = &["enabled", "store_fakeip", "store_rdrc", "store_dns"];
 
@@ -1141,6 +1143,7 @@ const TLS_OUT_FIELDS: &[&str] = &[
     "certificate",
     "certificate_path",
     "certificate_public_key_sha256",
+    "certificate_sha256",
     "client_certificate",
     "client_certificate_path",
     "client_key",

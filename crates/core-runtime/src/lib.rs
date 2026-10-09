@@ -352,7 +352,12 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
 pub async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config {}", config_path.display()))?;
-    let root: Value = serde_json::from_str(&raw).with_context(|| "decode config".to_string())?;
+    run_str(&raw).await
+}
+
+/// Run the box from raw JSON configuration string, and block until SIGINT/SIGTERM.
+pub async fn run_str(raw: &str) -> anyhow::Result<()> {
+    let root: Value = serde_json::from_str(raw).with_context(|| "decode config".to_string())?;
     let instance = start(&root).await?;
     wait_for_signal().await;
     logging::info(format_args!("shutting down"));

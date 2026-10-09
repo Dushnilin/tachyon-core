@@ -611,7 +611,14 @@ pub(crate) fn next_packet_id(counter: &AtomicU32) -> u16 {
     (n % 65_535) as u16
 }
 
-pub(crate) fn pack_hy2(sid: u32, pid: u16, frag_id: u8, frag_total: u8, dest: &str, data: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_hy2(
+    sid: u32,
+    pid: u16,
+    frag_id: u8,
+    frag_total: u8,
+    dest: &str,
+    data: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + varint_len(dest.len() as u64) + dest.len() + data.len());
     out.extend_from_slice(&sid.to_be_bytes());
     out.extend_from_slice(&pid.to_be_bytes());

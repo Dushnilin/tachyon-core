@@ -516,9 +516,7 @@ fn parse_tuic_packet(body: &[u8]) -> Option<(u16, u16, u8, u8, &[u8])> {
 
 pub(crate) type TuicPacketParsed<'a> = (u16, u16, u8, u8, Option<Target>, &'a [u8]);
 
-pub(crate) fn parse_tuic_packet_with_target(
-    body: &[u8],
-) -> Option<TuicPacketParsed<'_>> {
+pub(crate) fn parse_tuic_packet_with_target(body: &[u8]) -> Option<TuicPacketParsed<'_>> {
     if body.len() < 8 {
         return None;
     }
@@ -593,7 +591,13 @@ pub(crate) fn pack_tuic(
     out
 }
 
-pub(crate) fn pack_tuic_cont(sid: u16, pid: u16, frag_total: u8, frag_id: u8, data: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_tuic_cont(
+    sid: u16,
+    pid: u16,
+    frag_total: u8,
+    frag_id: u8,
+    data: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(11 + data.len());
     out.push(TUIC_VERSION);
     out.push(CMD_PACKET);

@@ -61,10 +61,7 @@ enum Next<B> {
 }
 
 /// Initialize the connection with this amount of write buffer.
-///
-/// The minimum MAX_FRAME_SIZE is 16kb, so always be able to send a HEADERS
-/// frame that big.
-const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
+const DEFAULT_BUFFER_CAPACITY: usize = 128 * 1_024;
 
 /// Chain payloads bigger than this when vectored I/O is enabled. The remote
 /// will never advertise a max frame size less than this (well, the spec says

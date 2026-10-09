@@ -246,6 +246,7 @@ const KNOWN_INBOUND_TYPES: &[&str] = &[
     "hysteria",
     "snell",
     "cloudflared",
+    "fptn",
 ];
 
 const KNOWN_OUTBOUND_TYPES: &[&str] = &[
@@ -721,6 +722,7 @@ const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
     ("hysteria2", "Hysteria2InboundOptions"),
     ("tuic", "TUICInboundOptions"),
     ("snell", "SnellInboundOptions"),
+    ("fptn", "FPTNInboundOptions"),
 ];
 
 /// Fields each simple inbound type declares beyond `ListenOptions` and the
@@ -850,6 +852,18 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
             "inet4_route_exclude_address",
             "inet6_route_exclude_address",
             "endpoint_independent_nat",
+        ],
+    ),
+    (
+        "fptn",
+        &[
+            "users",
+            "tls",
+            "dns",
+            "dns_ipv6",
+            "ipv4_pool",
+            "ipv6_pool",
+            "obfuscation",
         ],
     ),
 ];

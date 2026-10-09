@@ -16,6 +16,7 @@ use futures_sink::Sink;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::FramedRead as InnerFramedRead;
 use tokio_util::codec::length_delimited;
 
 use std::io;
@@ -41,13 +42,14 @@ where
         // Wrap with writer
         let framed_write = FramedWrite::new(io);
 
-        // Delimit the frames
-        let delimited = length_delimited::Builder::new()
+        // Delimit the frames with 256 KiB read buffer to match bulk transfer throughput
+        let codec = length_delimited::Builder::new()
             .big_endian()
             .length_field_length(3)
             .length_adjustment(9)
             .num_skip(0) // Don't skip the header
-            .new_read(framed_write);
+            .new_codec();
+        let delimited = InnerFramedRead::with_capacity(framed_write, codec, 256 * 1024);
 
         let mut inner = FramedRead::new(delimited);
 

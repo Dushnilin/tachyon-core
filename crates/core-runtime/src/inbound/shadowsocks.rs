@@ -90,11 +90,9 @@ impl Shadowsocks {
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
         let want_udp = network_includes_udp(object);
         let udp_socket = if want_udp {
-            Some(Arc::new(
-                UdpSocket::bind(listen)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{at}: udp bind {}:{}: {e}", listen.0, listen.1))?,
-            ))
+            Some(Arc::new(UdpSocket::bind(listen).await.map_err(|e| {
+                anyhow::anyhow!("{at}: udp bind {}:{}: {e}", listen.0, listen.1)
+            })?))
         } else {
             None
         };
@@ -225,7 +223,9 @@ async fn serve_udp(
             }
         };
 
-        let _ = hub.handle(reply.clone(), peer, dest_addr, payload, &tag).await;
+        let _ = hub
+            .handle(reply.clone(), peer, dest_addr, payload, &tag)
+            .await;
     }
 }
 

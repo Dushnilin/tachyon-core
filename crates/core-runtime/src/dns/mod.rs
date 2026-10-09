@@ -448,7 +448,7 @@ impl DnsService {
                 self.record_reverse(&raw, target.is_fakeip());
                 return codec::set_id(&raw, info.id);
             }
-            Kind::Local => {
+            Kind::Local | Kind::Dhcp | Kind::Resolved => {
                 if mdns::is_local_domain(&info.name)
                     && let Some(mdns_result) = self.local_zone_mdns(query).await
                 {
@@ -790,7 +790,7 @@ impl DnsService {
             let members: Arc<dyn group::Members> = service;
             return group.exchange(members, query).await;
         }
-        if cfg.kind == Kind::Local {
+        if matches!(cfg.kind, Kind::Local | Kind::Dhcp | Kind::Resolved) {
             let (query_msg, info) = codec::parse_query(query)?;
             if mdns::is_local_domain(&info.name)
                 && let Some(mdns_result) = self.local_zone_mdns(query).await

@@ -268,10 +268,7 @@ where
         .await;
     }
     if command == COMMAND_MUX || crate::inbound::mux::is_mux_target(&destination) {
-        logging::info(format_args!(
-            "vless [{}] inbound mux session",
-            user.name
-        ));
+        logging::info(format_args!("vless [{}] inbound mux session", user.name));
         stream.write_all(&RESPONSE_HEAD).await?;
         return crate::inbound::mux::serve_mux(Box::new(stream), peer, local, &tag, &router).await;
     }
@@ -496,9 +493,7 @@ where
         .await;
     }
     if command == COMMAND_MUX || crate::inbound::mux::is_mux_target(&destination) {
-        logging::info(format_args!(
-            "trojan [{name}] inbound mux session"
-        ));
+        logging::info(format_args!("trojan [{name}] inbound mux session"));
         return crate::inbound::mux::serve_mux(Box::new(stream), peer, local, &tag, &router).await;
     }
     if command != COMMAND_TCP {

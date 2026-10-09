@@ -134,7 +134,9 @@ impl Fptn {
                             Some(tls) => match tls.accept(stream).await {
                                 Ok(tls_stream) => Box::new(tls_stream),
                                 Err(err) => {
-                                    logging::debug(format_args!("fptn[{tag}] TLS accept {peer}: {err}"));
+                                    logging::debug(format_args!(
+                                        "fptn[{tag}] TLS accept {peer}: {err}"
+                                    ));
                                     return;
                                 }
                             },
@@ -208,9 +210,7 @@ async fn handle_session(
     }
 }
 
-async fn read_http_header<S: AsyncRead + Unpin>(
-    stream: &mut S,
-) -> io::Result<(String, Vec<u8>)> {
+async fn read_http_header<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(String, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     while buf.len() < 8192 {
@@ -256,9 +256,17 @@ async fn handle_login<S: AsyncRead + AsyncWrite + Unpin>(
     let auth_ok = if users.is_empty() {
         true
     } else if let Ok(val) = serde_json::from_slice::<Value>(&body) {
-        let u = val.get("username").and_then(Value::as_str).unwrap_or_default();
-        let p = val.get("password").and_then(Value::as_str).unwrap_or_default();
-        users.iter().any(|(expected_u, expected_p)| expected_u == u && expected_p == p)
+        let u = val
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let p = val
+            .get("password")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        users
+            .iter()
+            .any(|(expected_u, expected_p)| expected_u == u && expected_p == p)
     } else {
         false
     };
@@ -390,15 +398,7 @@ async fn handle_websocket_tunnel(
                 };
 
                 for pkt in packets {
-                    process_client_packet(
-                        pkt,
-                        tag,
-                        router,
-                        &hub,
-                        &reply_tx,
-                        &stream,
-                    )
-                    .await;
+                    process_client_packet(pkt, tag, router, &hub, &reply_tx, &stream).await;
                 }
             }
             OP_PING => {
@@ -585,8 +585,8 @@ async fn read_ws_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpStream;
     use crate::outbound::fptn::proto::decode_ip_assignment;
+    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn test_fptn_login_and_dns_flow() {
@@ -607,7 +607,8 @@ mod tests {
 
         let router = Router::new(&serde_json::json!({
             "outbounds": [{ "type": "direct", "tag": "direct" }]
-        })).unwrap();
+        }))
+        .unwrap();
 
         let server = Fptn::bind(&cfg, router).await.unwrap();
         let addr = server.local_addr().unwrap();
@@ -618,7 +619,8 @@ mod tests {
         let body = r#"{"username":"alice","password":"secret_password"}"#;
         let req = format!(
             "POST /api/v1/login HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n{body}",
-            addr, body.len()
+            addr,
+            body.len()
         );
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut resp = vec![0u8; 1024];
@@ -661,4 +663,3 @@ mod tests {
         assert!(assigned_v6.starts_with("fc00:88::"));
     }
 }
-

@@ -91,7 +91,10 @@ impl ShadowTls {
 
         let handshake = parse_decoy(object.get("handshake"));
         let mut handshake_for_server_name = HashMap::new();
-        if let Some(map) = object.get("handshake_for_server_name").and_then(Value::as_object) {
+        if let Some(map) = object
+            .get("handshake_for_server_name")
+            .and_then(Value::as_object)
+        {
             for (sni, val) in map {
                 if let Some(decoy) = parse_decoy(Some(val)) {
                     handshake_for_server_name.insert(sni.clone(), decoy);
@@ -412,8 +415,7 @@ async fn handle_connection(
 
     // 4. Client is authenticated: fetch real ServerHello from decoy and forward to client
     if let Some(decoy) = decoy {
-        let mut decoy_stream =
-            TcpStream::connect((decoy.server.as_str(), decoy.port)).await?;
+        let mut decoy_stream = TcpStream::connect((decoy.server.as_str(), decoy.port)).await?;
         decoy_stream.write_all(&raw_client_hello).await?;
         decoy_stream.flush().await?;
 
@@ -513,10 +515,13 @@ mod tests {
             while let Ok((mut sock, _)) = decoy_listener.accept().await {
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 1024];
-                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
                     if n > 0 {
                         // Send mock ServerHello record
-                        let mock_server_hello = [0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
+                        let mock_server_hello =
+                            [0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
                         let _ = sock.write_all(&mock_server_hello).await;
                     }
                 });
@@ -538,7 +543,8 @@ mod tests {
         });
         let router = Router::new(&serde_json::json!({
             "outbounds": [{ "type": "direct", "tag": "direct" }]
-        })).unwrap();
+        }))
+        .unwrap();
         let server = ShadowTls::bind(&cfg, router).await.unwrap();
         let server_addr = server.local_addr().unwrap();
         tokio::spawn(server.serve());
@@ -598,4 +604,3 @@ mod tests {
         record
     }
 }
-

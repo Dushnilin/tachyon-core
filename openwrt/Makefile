@@ -34,16 +34,8 @@ endef
 
 define Package/tachyon-core
 $(call Package/tachyon-core/Default)
-  TITLE+= (Full build, all 39 protocols)
+  TITLE+= (Pure-Rust router edition)
   PROVIDES:=sing-box
-  CONFLICTS:=tachyon-core-lite
-endef
-
-define Package/tachyon-core-lite
-$(call Package/tachyon-core/Default)
-  TITLE+= (Lite build, <=6MB stripped binary for 16-32MB flash)
-  PROVIDES:=sing-box
-  CONFLICTS:=tachyon-core
 endef
 
 define Package/tachyon-core/description
@@ -54,19 +46,8 @@ define Package/tachyon-core/description
  Trojan, Hysteria2, TUIC, and direct steering).
 endef
 
-define Package/tachyon-core-lite/description
- Low-footprint edition of tachyon-core designed for resource-constrained
- OpenWrt devices with 16MB/32MB flash and 128MB RAM.
- Strips desktop/experimental protocols while preserving core routing,
- VLESS/Reality, Shadowsocks, WireGuard, TProxy, TUN and DNS hijacking.
-endef
-
 define Build/Compile/tachyon-core
 	cargo build --release --target $(RUSTC_TARGET_ARCH)-unknown-linux-musl --bin tachyon-core
-endef
-
-define Build/Compile/tachyon-core-lite
-	cargo build --release --no-default-features --features "lite" --target $(RUSTC_TARGET_ARCH)-unknown-linux-musl --bin tachyon-core
 endef
 
 define Package/tachyon-core/install
@@ -85,9 +66,4 @@ define Package/tachyon-core/install
 	$(INSTALL_DATA) ./files/config.json $(1)/etc/tachyon-core/config.json
 endef
 
-define Package/tachyon-core-lite/install
-	$(Package/tachyon-core/install)
-endef
-
 $(eval $(call BuildPackage,tachyon-core))
-$(eval $(call BuildPackage,tachyon-core-lite))

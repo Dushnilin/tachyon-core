@@ -139,10 +139,8 @@ impl Tun {
                 .map_err(|err| anyhow::anyhow!("{at}: open tun {interface_name}: {err}"))?;
             let async_fd = Arc::new(tokio::io::unix::AsyncFd::new(raw_fd)?);
 
-            if auto_route {
-                if let Err(e) = linux::setup_auto_route(&interface_name, strict_route) {
-                    logging::warn(format_args!("inbound tun[{tag}]: auto_route warning: {e}"));
-                }
+            if auto_route && let Err(e) = linux::setup_auto_route(&interface_name, strict_route) {
+                logging::warn(format_args!("inbound tun[{tag}]: auto_route warning: {e}"));
             }
 
             logging::info(format_args!(
@@ -339,27 +337,25 @@ async fn handle_ipv4_packet(
             }
         }
         // TCP
-        6 => {
-            if packet.len() >= ihl + 20 {
-                let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
-                let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
-                let tcp_flags = packet[ihl + 13];
-                let is_syn = (tcp_flags & 0x02) != 0 && (tcp_flags & 0x10) == 0;
-                if is_syn {
-                    let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
-                    let dest = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
-                    logging::info(format_args!(
-                        "inbound tun[{tag}] incoming connection from {source} to {dest}"
-                    ));
-                    let (client_stream, server_stream) = tokio::io::duplex(SOCKET_BUF);
-                    let router = Arc::clone(router);
-                    let tag = tag.to_string();
-                    tokio::spawn(async move {
-                        let client = ClientConn::framed(Box::new(client_stream), source);
-                        let _ = drive_framed(client, source, Target::Ip(dest), &tag, &router).await;
-                    });
-                    drop(server_stream);
-                }
+        6 if packet.len() >= ihl + 20 => {
+            let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+            let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+            let tcp_flags = packet[ihl + 13];
+            let is_syn = (tcp_flags & 0x02) != 0 && (tcp_flags & 0x10) == 0;
+            if is_syn {
+                let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
+                let dest = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
+                logging::info(format_args!(
+                    "inbound tun[{tag}] incoming connection from {source} to {dest}"
+                ));
+                let (client_stream, server_stream) = tokio::io::duplex(SOCKET_BUF);
+                let router = Arc::clone(router);
+                let tag = tag.to_string();
+                tokio::spawn(async move {
+                    let client = ClientConn::framed(Box::new(client_stream), source);
+                    let _ = drive_framed(client, source, Target::Ip(dest), &tag, &router).await;
+                });
+                drop(server_stream);
             }
         }
         _ => {}
@@ -445,12 +441,7 @@ mod linux {
         addrs: &[(Ipv4Addr, u8)],
         gso: bool,
     ) -> io::Result<(RawFd, bool)> {
-        let fd = unsafe {
-            libc::open(
-                b"/dev/net/tun\0".as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK,
-            )
-        };
+        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -521,10 +512,9 @@ mod linux {
         cmd.args(["route", "replace", "default", "dev", iface]);
         let status = cmd.status()?;
         if !status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("ip route replace failed with status {status}"),
-            ));
+            return Err(io::Error::other(format!(
+                "ip route replace failed with status {status}"
+            )));
         }
         if strict {
             let _ = std::process::Command::new("ip")

@@ -17,7 +17,7 @@
 //! (Yacd-meta by default), the way `checkAndDownloadExternalUI` does it.
 //!
 //! Known gaps (roadmap): proxy/rule providers (404 — no provider runtime),
-//! and cache.db persistence of the delay history, fakeip and DNS cache.
+//! and cache.db persistence (the delay history is in-memory only).
 //!
 //! Known deviations (deliberate): HTTP keep-alive loop without `Date`
 //! headers; version string reports `tachyon-core`.
@@ -845,6 +845,24 @@ fn rfc3339_utc(elapsed: Duration) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Clash `DelayHistory.time`: RFC3339 UTC with nanoseconds, trailing
+/// zeros trimmed (`time.RFC3339Nano`).
+pub(crate) fn history_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (year, month, day, hour, minute, second) = civil_from_epoch(now.as_secs());
+    let mut out = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+    let nanos = now.subsec_nanos();
+    if nanos != 0 {
+        let frac: String = format!("{nanos:09}").trim_end_matches('0').to_string();
+        out.push('.');
+        out.push_str(&frac);
+    }
+    out.push('Z');
+    out
+}
+
 /// Howard Hinnant's civil_from_days plus the time of day.
 fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;
@@ -1194,14 +1212,13 @@ fn proxies_view(router: &Router) -> Value {
         .outbound_table()
         .map(|(i, tag, outbound)| (i, tag.to_string(), outbound))
         .collect();
-    let mut all: Vec<String> = entries
+    let all: Vec<String> = entries
         .iter()
         .filter(|(_, _, outbound)| !matches!(outbound, Outbound::Direct(_) | Outbound::Block(_)))
         .map(|(_, tag, _)| tag.clone())
         .collect();
+    // Reference keeps config order and omits direct/reject.
     let default_tag = router.default_tag();
-    // Stable sort puts the default outbound first (reference behaviour).
-    all.sort_by_key(|tag| tag != default_tag);
 
     let mut proxies = serde_json::Map::new();
     proxies.insert(
@@ -1221,24 +1238,28 @@ fn proxies_view(router: &Router) -> Value {
         } else {
             tag.clone()
         };
-        proxies.insert(key, proxy_info_outbound(outbound, &tag));
+        proxies.insert(key, proxy_info_outbound(router, i, outbound, &tag));
     }
     json!({"proxies": Value::Object(proxies)})
 }
 
 fn proxy_info(router: &Router, index: usize, tag: &str) -> Value {
     match router.outbound_table().find(|(i, ..)| *i == index) {
-        Some((_, _, outbound)) => proxy_info_outbound(outbound, tag),
+        Some((_, _, outbound)) => proxy_info_outbound(router, index, outbound, tag),
         None => json!({}),
     }
 }
 
-fn proxy_info_outbound(outbound: &Outbound, tag: &str) -> Value {
+fn proxy_info_outbound(router: &Router, index: usize, outbound: &Outbound, tag: &str) -> Value {
     let mut info = serde_json::Map::new();
     info.insert("type".into(), json!(clash_type_name(outbound)));
     info.insert("name".into(), json!(tag));
     info.insert("udp".into(), json!(udp_capable(outbound)));
-    info.insert("history".into(), json!([]));
+    let history = match router.delay_history(index) {
+        Some((time, delay)) => json!([{ "time": time, "delay": delay }]),
+        None => json!([]),
+    };
+    info.insert("history".into(), history);
     match outbound {
         Outbound::Selector(selector) => {
             info.insert("now".into(), json!(selector.now()));
@@ -1276,11 +1297,15 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
         Outbound::AnyTls(_) => "AnyTLS",
         Outbound::Urltest(_) => "URLTest",
         Outbound::Selector(_) => "Selector",
+        Outbound::Chain(_) => "Chain",
+        Outbound::ShadowTls(_) => "ShadowTLS",
     }
 }
 
 fn udp_capable(outbound: &Outbound) -> bool {
-    !matches!(outbound, Outbound::Socks(_) | Outbound::Http(_))
+    // Reference `SupportsUDP`: the HTTP client is the only one without it
+    // (SOCKS dials UDP via associate).
+    !matches!(outbound, Outbound::Http(_))
 }
 
 /// Reference `urltest.URLTest`: HEAD through the outbound, any HTTP response
@@ -1313,6 +1338,7 @@ async fn delay_test(
                 return None;
             }
         };
+        let dial_ms = start.elapsed();
         let mut stream: crate::inbound::AnyStream = if tls {
             // Reference resets the clock after the dial, before the handshake.
             start = Instant::now();
@@ -1330,17 +1356,25 @@ async fn delay_test(
             format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.ok()?;
         crate::logging::debug(format_args!("delay[{index}]: HEAD sent to {authority}"));
-        let mut byte = [0u8; 1];
-        let mut status = Vec::new();
+        // One read per chunk, not one per byte: the status line crosses a
+        // boxed stream plus a TLS record layer, and the byte-at-a-time loop
+        // paid that round trip once per character on every UI ping click.
+        let mut status = Vec::with_capacity(128);
+        let mut buf = [0u8; 128];
         loop {
-            stream.read_exact(&mut byte).await.ok()?;
-            status.push(byte[0]);
             if status.ends_with(b"\r\n") || status.len() >= 64 {
                 break;
             }
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => status.extend_from_slice(&buf[..n]),
+            }
         }
         let text = String::from_utf8_lossy(&status);
-        crate::logging::debug(format_args!("delay[{index}]: status line {text:?}"));
+        crate::logging::debug(format_args!(
+            "delay[{index}]: dial {}ms status line {text:?}",
+            dial_ms.as_millis()
+        ));
         let _ = text.split_whitespace().nth(1)?;
         u16::try_from(start.elapsed().as_millis()).ok()
     };
@@ -1349,7 +1383,10 @@ async fn delay_test(
         Ok(None) | Ok(Some(0)) => {
             respond_json(stream, 503, "Service Unavailable", &delay_err(), cors).await
         }
-        Ok(Some(delay)) => respond_json(stream, 200, "OK", &json!({"delay": delay}), cors).await,
+        Ok(Some(delay)) => {
+            router.record_delay(index, delay.into());
+            respond_json(stream, 200, "OK", &json!({"delay": delay}), cors).await
+        }
     }
 }
 

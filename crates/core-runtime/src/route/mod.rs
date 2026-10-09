@@ -31,6 +31,7 @@ use crate::inbound::Conn;
 use crate::logging;
 use crate::outbound::anytls::AnyTls;
 use crate::outbound::block::Block;
+use crate::outbound::chain::Chain;
 use crate::outbound::direct::Direct;
 use crate::outbound::fptn::Fptn;
 use crate::outbound::hysteria2::Hysteria2;
@@ -40,6 +41,7 @@ use crate::outbound::openvpn::OpenVpn;
 use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
+use crate::outbound::shadowtls::ShadowTls;
 use crate::outbound::snell::Snell;
 use crate::outbound::tuic::Tuic;
 use crate::outbound::urltest::Urltest;
@@ -144,6 +146,8 @@ pub enum Outbound {
     AnyTls(AnyTls),
     Urltest(Urltest),
     Selector(Selector),
+    Chain(Chain),
+    ShadowTls(ShadowTls),
 }
 
 impl Outbound {
@@ -177,6 +181,8 @@ impl Outbound {
             Outbound::AnyTls(anytls) => anytls.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
+            Outbound::Chain(chain) => chain.connect(router, target).await,
+            Outbound::ShadowTls(stls) => stls.connect(target).await.map(Conn::Plain),
         }
     }
 
@@ -207,6 +213,8 @@ impl Outbound {
             )),
             Outbound::Selector(selector) => selector.connect_udp(router, target).await,
             Outbound::Urltest(urltest) => urltest.connect_udp(router, target).await,
+            Outbound::Chain(chain) => chain.connect_udp(router, target).await,
+            Outbound::ShadowTls(stls) => stls.connect_udp(target).await,
             _ => Err(io::Error::other("udp not supported by this outbound")),
         }
     }
@@ -237,6 +245,8 @@ impl Outbound {
             "anytls" => Ok(Outbound::AnyTls(AnyTls::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
+            "chain" => Ok(Outbound::Chain(Chain::build(obj, at)?)),
+            "shadowtls" => Ok(Outbound::ShadowTls(ShadowTls::build(obj, at)?)),
             other => Err(anyhow::anyhow!(
                 "{at}: outbound type {other:?} not implemented yet"
             )),
@@ -524,6 +534,9 @@ pub struct Router {
     /// walk per connection is only worth it when something will read it.
     find_process: bool,
     probe_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Clash `DelayHistory` slots, one per outbound: reference keeps a
+    /// single record per proxy, replaced by every successful probe.
+    delay_history: Vec<std::sync::Mutex<Option<(String, u32)>>>,
 }
 
 /// A `local` DNS server with `neighbor_domain` answers from the same tables.
@@ -559,6 +572,50 @@ impl Router {
     /// Abort the urltest probe loops (called on instance shutdown).
     pub fn take_probe_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         std::mem::take(&mut *self.probe_tasks.lock().expect("probe tasks"))
+    }
+}
+
+impl Router {
+    /// Clash `DelayHistory`: record a successful probe against `index`.
+    ///
+    /// Selectors and urltest groups resolve to their current selection, so
+    /// one probe updates the whole `now` chain with a single timestamp —
+    /// the observable reference behaviour (a delay run on a member shows up
+    /// on the member, its urltest group and the selector above it).
+    /// Failures never record, matching the reference.
+    pub fn record_delay(&self, index: usize, delay: u32) {
+        let index = self.delay_provenance_index(index);
+        let Some(slot) = self.delay_history.get(index) else {
+            return;
+        };
+        *slot.lock().expect("delay history") = Some((crate::clash_api::history_timestamp(), delay));
+    }
+
+    /// The stored record behind `index`, groups resolving to their member.
+    pub fn delay_history(&self, index: usize) -> Option<(String, u32)> {
+        self.delay_history
+            .get(self.delay_provenance_index(index))?
+            .lock()
+            .expect("delay history")
+            .clone()
+    }
+
+    /// Walk `now` down through selector/urltest chains to the member that
+    /// holds the record.
+    fn delay_provenance_index(&self, index: usize) -> usize {
+        let mut index = index;
+        for _ in 0..self.outbounds.len() {
+            let now_tag = match self.outbounds.get(index) {
+                Some(Outbound::Selector(selector)) => selector.now(),
+                Some(Outbound::Urltest(urltest)) => urltest.now(),
+                _ => break,
+            };
+            match self.tags.get(now_tag) {
+                Some(&next) if next != index => index = next,
+                _ => break,
+            }
+        }
+        index
     }
 }
 
@@ -648,6 +705,7 @@ impl Router {
             match outbound {
                 Outbound::Selector(selector) => selector.resolve(&tags)?,
                 Outbound::Urltest(urltest) => urltest.resolve(&tags)?,
+                Outbound::Chain(chain) => chain.resolve(&tags)?,
                 _ => {}
             }
         }
@@ -721,6 +779,9 @@ impl Router {
             resolver.start();
             neighbor::install(resolver);
         }
+        let delay_history = (0..outbounds.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         let router = Arc::new(Router {
             outbounds,
             tags,
@@ -730,6 +791,7 @@ impl Router {
             rule_sets: Some(registry),
             find_process,
             probe_tasks: std::sync::Mutex::new(Vec::new()),
+            delay_history,
         });
         for outbound in &router.outbounds {
             if let Outbound::Urltest(urltest) = outbound {
@@ -738,6 +800,16 @@ impl Router {
             }
         }
         Ok(router)
+    }
+
+    /// Start listening endpoints (e.g. WireGuard server listeners).
+    pub async fn start_endpoints(&self) -> io::Result<()> {
+        for outbound in &self.outbounds {
+            if let Outbound::WireGuard(wg) = outbound {
+                wg.start_listen().await?;
+            }
+        }
+        Ok(())
     }
 
     /// Index of the outbound `route.final` points at (the direct default).
@@ -1166,9 +1238,9 @@ mod tests {
         assert_eq!(router.defaults().default_mark, Some(7));
         assert_eq!(router.defaults().bind_interface().as_deref(), Some("lo"));
         assert_eq!(
-            dns::default_domain_resolver().as_deref(),
+            router.defaults().default_domain_resolver.as_deref(),
             Some("u"),
-            "route defaults install the global ddr tag"
+            "route defaults install the ddr tag"
         );
 
         // Explicit outbound fields win over route defaults. `routing_mark` is
@@ -1199,9 +1271,45 @@ mod tests {
             }
         }
 
-        // No route section clears a previously installed ddr tag.
-        let _ = Router::new(&json!({"outbounds": [{"type": "direct", "tag": "d"}]})).unwrap();
-        assert_eq!(dns::default_domain_resolver(), None);
+        // No route section defaults to empty ddr tag.
+        let router = Router::new(&json!({"outbounds": [{"type": "direct", "tag": "d"}]})).unwrap();
+        assert_eq!(router.defaults().default_domain_resolver, None);
+    }
+
+    #[test]
+    fn clash_delay_history_records_and_groups_derive() {
+        let router = Router::new(&json!({
+            "outbounds": [
+                {"type": "direct", "tag": "d1"},
+                {"type": "socks", "tag": "dead", "server": "127.0.0.1", "server_port": 1},
+                {"type": "selector", "tag": "sel", "outbounds": ["d1", "dead"]}
+            ],
+            "route": {"final": "d1"}
+        }))
+        .unwrap();
+        let d1 = router.tags["d1"];
+        let sel = router.tags["sel"];
+
+        assert!(router.delay_history(d1).is_none(), "no probe, no record");
+        router.record_delay(d1, 654);
+        let (time, delay) = router.delay_history(d1).expect("recorded");
+        assert_eq!(delay, 654);
+        assert!(time.contains('T') && time.ends_with('Z'), "RFC3339: {time}");
+        let (group_time, group_delay) = router.delay_history(sel).expect("derived");
+        assert_eq!(group_delay, 654, "selector follows its current member");
+        assert_eq!(group_time, time, "same record, one timestamp");
+
+        router
+            .select_member("sel", "dead")
+            .expect("selector switches");
+        assert!(
+            router.delay_history(sel).is_none(),
+            "the new member has no record of its own"
+        );
+
+        router.record_delay(d1, 700);
+        let (_, delay) = router.delay_history(d1).expect("recorded");
+        assert_eq!(delay, 700, "one slot, replaced per probe");
     }
 
     #[test]

@@ -611,7 +611,11 @@ impl Router {
         let Some(slot) = self.delay_history.get(index) else {
             return;
         };
-        *slot.lock().expect("delay history") = Some((crate::clash_api::history_timestamp(), delay));
+        #[cfg(feature = "clash-api")]
+        let ts = crate::clash_api::history_timestamp();
+        #[cfg(not(feature = "clash-api"))]
+        let ts = String::new();
+        *slot.lock().expect("delay history") = Some((ts, delay));
     }
 
     /// The stored record behind `index`, groups resolving to their member.

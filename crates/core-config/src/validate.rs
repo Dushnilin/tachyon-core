@@ -591,11 +591,14 @@ fn check_regex_listable(value: &Value, at: &str) -> Result<(), String> {
                 json_kind(item)
             ));
         };
+        #[cfg(feature = "regex")]
         if let Err(err) = regex::Regex::new(pattern) {
             return Err(format!(
                 "{at}: parse expression {index}: error parsing regexp: {err}"
             ));
         }
+        #[cfg(not(feature = "regex"))]
+        let _ = pattern;
     }
     Ok(())
 }

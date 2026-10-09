@@ -502,12 +502,14 @@ unsafe fn raise_rlimit_nofile() {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-        let max_target = 65535;
-        if rlim.rlim_cur < max_target {
-            let new_cur = max_target.min(rlim.rlim_max.max(max_target));
-            rlim.rlim_cur = new_cur;
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+            let max_target = 65535;
+            if rlim.rlim_cur < max_target {
+                let new_cur = max_target.min(rlim.rlim_max.max(max_target));
+                rlim.rlim_cur = new_cur;
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+            }
         }
     }
 }

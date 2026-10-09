@@ -173,8 +173,8 @@ async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
             let permit = sem.acquire().await.expect("probe pool never closes");
             let ms = probe_member(&shared, &router, member).await;
             drop(permit);
-            // Clash DelayHistory: every successful probe records; failures
-            // do not.
+            // Clash DelayHistory: every successful probe records its
+            // post-dial delay; failures do not.
             if let Some(ms) = ms {
                 router.record_delay(member, ms as u32);
             }
@@ -320,7 +320,10 @@ async fn probe_member(shared: &Shared, router: &Router, member: usize) -> Option
     // history, or the UI shows them as dead while the reference shows them
     // alive. A stalled attempt is cut at STALL and retried on a fresh
     // connection inside the same budget — loss costs one clean re-roll
-    // instead of riding the full retransmission timer.
+    // instead of riding the full retransmission timer. The budget is 14 s
+    // so a heavy member gets its second attempt: a first attempt can burn
+    // 6+ s (dial plus the stall cut), and the 7 s retry guard then needs
+    // ~7 s left to still allow the re-roll.
     //
     // The dial itself is never cancelled: pooled transports (xhttp's H2
     // pool) reserve a slot before dialing and release it only on Ok/Err,
@@ -329,7 +332,7 @@ async fn probe_member(shared: &Shared, router: &Router, member: usize) -> Option
     // whole process over the dead proxy port. The guard before a retry
     // keeps the budget timeout from landing mid-dial either — a dial
     // finishes within its own ~5 s cap, 7 s of budget covers it.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(14);
     for attempt in 1..=3u8 {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining < Duration::from_millis(400)
@@ -427,7 +430,13 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
         if !status.starts_with('2') {
             return ProbeAttempt::Fail;
         }
-        ProbeAttempt::Done(start.elapsed().as_millis() as u64)
+        // The recorded delay starts after the dial, like the clash delay
+        // click and the reference round do: the dial is TCP setup, not the
+        // link the number describes, and including it doubled the history
+        // on fast nodes (measured on the 42-member router group: round
+        // 261-272 ms against the reference's 138-162, clicks 128-170 on
+        // both cores). The full split stays in the debug log above.
+        ProbeAttempt::Done(head_at.saturating_sub(dial_ms).as_millis() as u64)
     };
     probe.await
 }

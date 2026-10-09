@@ -553,24 +553,24 @@ impl TlsOptions {
             } else {
                 (plain, None)
             };
-            let cipher_suites: Vec<u16> = self
-                .cipher_suites
-                .iter()
-                .filter_map(|s| core_crypto::resolve_cipher_suite_id(s))
-                .collect();
-            let config = core_tls::client::Config {
-                template: &template,
-                server_name: if self.disable_sni {
-                    ""
-                } else {
-                    &self.server_name
-                },
-                alpn: &alpn,
-                verifier: &*verifier,
-                reality: seal,
-                fragment: self.fragment,
-                cipher_suites,
-            };
+        let cipher_suites: Vec<u16> = self
+            .cipher_suites
+            .iter()
+            .filter_map(|s| core_crypto::resolve_cipher_suite_id(s))
+            .collect();
+        let config = core_tls::client::Config {
+            template: &template,
+            server_name: if self.disable_sni {
+                ""
+            } else {
+                &self.server_name
+            },
+            alpn: &alpn,
+            verifier: &*verifier,
+            reality: seal,
+            fragment: self.fragment,
+            cipher_suites,
+        };
         let mut handshake = core_tls::client::Handshake::new(config)?;
         let mut stream = stream;
         let result = handshake

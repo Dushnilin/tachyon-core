@@ -12,7 +12,7 @@ pub mod noise;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ use smoltcp::socket::tcp::{
     RecvError as TcpRecvError, Socket as TcpSock, SocketBuffer as TcpBuffer,
 };
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
@@ -136,7 +136,8 @@ struct PeerConfig {
     port: u16,
     public_key: [u8; 32],
     pre_shared_key: Option<[u8; 32]>,
-    allowed_ips: Vec<(u32, u8)>,
+    allowed_ips_v4: Vec<(u32, u8)>,
+    allowed_ips_v6: Vec<(u128, u8)>,
     keepalive: Option<(u32, u32)>,
 }
 
@@ -148,7 +149,8 @@ struct WgConfig {
     listen_port: u16,
     mtu: usize,
     local_cidrs: Vec<IpCidr>,
-    local_addr: Ipv4Addr,
+    local_addr_v4: Option<Ipv4Addr>,
+    local_addr_v6: Option<Ipv6Addr>,
     peers: Vec<PeerConfig>,
     udp_timeout: Duration,
     /// AmneziaWG obfuscation; `None` for a plain WireGuard endpoint.
@@ -243,19 +245,31 @@ impl WireGuard {
                     local_cidrs.push(cidr);
                 } else if let Ok(ip) = raw.parse::<Ipv4Addr>() {
                     local_cidrs.push(IpCidr::new(IpAddress::from(ip), 32));
+                } else if let Ok(ip) = raw.parse::<Ipv6Addr>() {
+                    local_cidrs.push(IpCidr::new(IpAddress::from(ip), 128));
                 } else {
                     anyhow::bail!("{at}.address[{i}]: invalid address {raw:?}");
                 }
             }
         }
-        let local_addr = local_cidrs
-            .first()
-            .map(|c| match c.address() {
-                IpAddress::Ipv4(ip) => ip,
-            })
-            .ok_or_else(|| anyhow::anyhow!("{at}: missing ipv4 address"))?;
-        if local_cidrs.is_empty() {
-            anyhow::bail!("{at}: missing ipv4 address");
+        let mut local_addr_v4 = None;
+        let mut local_addr_v6 = None;
+        for c in &local_cidrs {
+            match c.address() {
+                IpAddress::Ipv4(ip) => {
+                    if local_addr_v4.is_none() {
+                        local_addr_v4 = Some(ip);
+                    }
+                }
+                IpAddress::Ipv6(ip) => {
+                    if local_addr_v6.is_none() {
+                        local_addr_v6 = Some(ip);
+                    }
+                }
+            }
+        }
+        if local_addr_v4.is_none() && local_addr_v6.is_none() {
+            anyhow::bail!("{at}: missing ip address");
         }
 
         let mut peers = Vec::new();
@@ -298,30 +312,46 @@ impl WireGuard {
                     Some(Value::String(s)) => Some(b64_key(s, &peer_at)?),
                     Some(_) => anyhow::bail!("{peer_at}.pre_shared_key: must be a string"),
                 };
-                let mut allowed_ips = Vec::new();
+                let mut allowed_ips_v4 = Vec::new();
+                let mut allowed_ips_v6 = Vec::new();
                 if let Some(Value::Array(list)) = peer.get("allowed_ips") {
                     for (k, entry) in list.iter().enumerate() {
                         let raw = entry.as_str().ok_or_else(|| {
                             anyhow::anyhow!("{peer_at}.allowed_ips[{k}]: must be a string")
                         })?;
                         if let Ok(cidr) = raw.parse::<IpCidr>() {
-                            let (net, bits) = match cidr.address() {
-                                IpAddress::Ipv4(ip) => (u32::from(ip), cidr.prefix_len()),
-                            };
-                            let net = if bits == 0 {
-                                0
-                            } else {
-                                net & u32::MAX << (32 - bits)
-                            };
-                            allowed_ips.push((net, bits));
+                            match cidr.address() {
+                                IpAddress::Ipv4(ip) => {
+                                    let net = u32::from(ip);
+                                    let bits = cidr.prefix_len();
+                                    let net = if bits == 0 {
+                                        0
+                                    } else {
+                                        net & (u32::MAX << (32 - bits))
+                                    };
+                                    allowed_ips_v4.push((net, bits));
+                                }
+                                IpAddress::Ipv6(ip) => {
+                                    let net = u128::from(ip);
+                                    let bits = cidr.prefix_len();
+                                    let net = if bits == 0 {
+                                        0
+                                    } else {
+                                        net & (u128::MAX << (128 - bits))
+                                    };
+                                    allowed_ips_v6.push((net, bits));
+                                }
+                            }
                         } else if let Ok(ip) = raw.parse::<Ipv4Addr>() {
-                            allowed_ips.push((u32::from(ip), 32));
+                            allowed_ips_v4.push((u32::from(ip), 32));
+                        } else if let Ok(ip) = raw.parse::<Ipv6Addr>() {
+                            allowed_ips_v6.push((u128::from(ip), 128));
                         } else {
                             anyhow::bail!("{peer_at}.allowed_ips[{k}]: invalid prefix {raw:?}");
                         }
                     }
                 }
-                if allowed_ips.is_empty() {
+                if allowed_ips_v4.is_empty() && allowed_ips_v6.is_empty() {
                     anyhow::bail!("{peer_at}: missing allowed ips");
                 }
                 let keepalive = parse_keepalive(
@@ -333,7 +363,8 @@ impl WireGuard {
                     port,
                     public_key,
                     pre_shared_key,
-                    allowed_ips,
+                    allowed_ips_v4,
+                    allowed_ips_v6,
                     keepalive,
                 });
             }
@@ -349,7 +380,8 @@ impl WireGuard {
                 listen_port,
                 mtu,
                 local_cidrs,
-                local_addr,
+                local_addr_v4,
+                local_addr_v6,
                 peers,
                 udp_timeout,
                 awg,
@@ -378,6 +410,16 @@ impl WireGuard {
             .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
         let _ = socket2::SockRef::from(&sock)
             .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+        let sock_v6 = match UdpSocket::bind(("[::]", self.cfg.listen_port)).await {
+            Ok(s) => {
+                let _ = socket2::SockRef::from(&s)
+                    .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+                let _ = socket2::SockRef::from(&s)
+                    .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+                Some(Arc::new(s))
+            }
+            Err(_) => None,
+        };
         if self.cfg.listen_port > 0 {
             logging::info(format_args!(
                 "wireguard[{}]: server listening on udp 0.0.0.0:{}",
@@ -391,7 +433,7 @@ impl WireGuard {
         });
         let cfg = Arc::new(self.cfg.clone());
         tokio::spawn(async move {
-            if let Err(e) = run(cfg, Arc::new(sock), rx).await {
+            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx).await {
                 logging::error(format_args!("wireguard stack exited: {e}"));
             }
         });
@@ -408,11 +450,6 @@ impl WireGuard {
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
         let dst = resolve_target(target).await?;
-        if !dst.is_ipv4() {
-            return Err(io::Error::other(
-                "wireguard: ipv6 targets are not supported yet",
-            ));
-        }
         let shared = self.shared().await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (local, remote) = tokio::io::duplex(CALLER_BUF);
@@ -487,11 +524,6 @@ impl WireGuard {
 
     pub async fn connect_udp(&self, target: &Target) -> io::Result<UdpSocket> {
         let dst = resolve_target(target).await?;
-        if !dst.is_ipv4() {
-            return Err(io::Error::other(
-                "wireguard: ipv6 targets are not supported yet",
-            ));
-        }
         let shared = self.shared().await?;
         let (local, peer) = udp_loopback_pair().await?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -708,12 +740,12 @@ impl Device for WgDevice {
     }
 }
 
-/// Longest-prefix match over the peer `allowed_ips` tables.
-fn lpm_in(peers: &[PeerRt], ip: Ipv4Addr) -> Option<usize> {
+/// Longest-prefix match over the peer `allowed_ips_v4` tables.
+fn lpm_v4(peers: &[PeerRt], ip: Ipv4Addr) -> Option<usize> {
     let addr = u32::from(ip);
     let mut best: Option<(u8, usize)> = None;
     for (i, peer) in peers.iter().enumerate() {
-        for &(net, bits) in &peer.endpoint.allowed_ips {
+        for &(net, bits) in &peer.endpoint.allowed_ips_v4 {
             let hit = bits == 0 || (addr >> (32 - bits as u32)) == (net >> (32 - bits as u32));
             if hit && best.is_none_or(|(b, _)| bits > b) {
                 best = Some((bits, i));
@@ -723,9 +755,32 @@ fn lpm_in(peers: &[PeerRt], ip: Ipv4Addr) -> Option<usize> {
     best.map(|(_, i)| i)
 }
 
+/// Longest-prefix match over the peer `allowed_ips_v6` tables.
+fn lpm_v6(peers: &[PeerRt], ip: Ipv6Addr) -> Option<usize> {
+    let addr = u128::from(ip);
+    let mut best: Option<(u8, usize)> = None;
+    for (i, peer) in peers.iter().enumerate() {
+        for &(net, bits) in &peer.endpoint.allowed_ips_v6 {
+            let hit = bits == 0 || (addr >> (128 - bits as u32)) == (net >> (128 - bits as u32));
+            if hit && best.is_none_or(|(b, _)| bits > b) {
+                best = Some((bits, i));
+            }
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+fn lpm_ip(peers: &[PeerRt], ip: IpAddr) -> Option<usize> {
+    match ip {
+        IpAddr::V4(v4) => lpm_v4(peers, v4),
+        IpAddr::V6(v6) => lpm_v6(peers, v6),
+    }
+}
+
 struct Stack {
     cfg: Arc<WgConfig>,
     sock: Arc<UdpSocket>,
+    sock_v6: Option<Arc<UdpSocket>>,
     device: WgDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -738,8 +793,8 @@ struct Stack {
 }
 
 impl Stack {
-    fn lpm(&self, ip: Ipv4Addr) -> Option<usize> {
-        lpm_in(&self.peers, ip)
+    fn lpm(&self, ip: IpAddr) -> Option<usize> {
+        lpm_ip(&self.peers, ip)
     }
 
     fn alloc_port(&mut self) -> u16 {
@@ -756,7 +811,20 @@ impl Stack {
         let Some(addr) = self.peers[pi].resolved else {
             return;
         };
-        if let Err(e) = self.sock.try_send_to(bytes, addr)
+        let sock = match addr {
+            SocketAddr::V6(_) => match &self.sock_v6 {
+                Some(s) => s,
+                None => {
+                    logging::debug(format_args!(
+                        "wireguard[{}]: no ipv6 socket for {addr}",
+                        self.cfg.tag
+                    ));
+                    return;
+                }
+            },
+            SocketAddr::V4(_) => &self.sock,
+        };
+        if let Err(e) = sock.try_send_to(bytes, addr)
             && e.kind() != io::ErrorKind::WouldBlock
         {
             logging::debug(format_args!("wireguard[{}]: udp send: {e}", self.cfg.tag));
@@ -806,8 +874,14 @@ impl Stack {
     }
 
     fn send_handshake_resp(&self, pi: usize, resp: &[u8], src: SocketAddr) {
+        let sock = match src {
+            SocketAddr::V6(_) => self.sock_v6.as_ref(),
+            SocketAddr::V4(_) => Some(&self.sock),
+        };
         let Some(params) = self.cfg.awg.as_ref() else {
-            let _ = self.sock.try_send_to(resp, src);
+            if let Some(s) = sock {
+                let _ = s.try_send_to(resp, src);
+            }
             return;
         };
         let pad = params.padding(awg::RESPONSE);
@@ -824,7 +898,9 @@ impl Stack {
             let nonce = pkt[..12].to_vec();
             awg::mask_header(key, &nonce, &mut pkt[pad..pad + resp.len()]);
         }
-        let _ = self.sock.try_send_to(&pkt, src);
+        if let Some(s) = sock {
+            let _ = s.try_send_to(&pkt, src);
+        }
     }
 
     /// Seal one transport datagram with AWG 3.x dressing: content padding or
@@ -905,15 +981,8 @@ impl Stack {
         let host = self.peers[pi].endpoint.host.clone();
         let port = self.peers[pi].endpoint.port;
         match resolve_host(&host, port).await {
-            Ok(addr) if addr.is_ipv4() => {
+            Ok(addr) => {
                 self.peers[pi].resolved = Some(addr);
-            }
-            Ok(_) => {
-                logging::warn(format_args!(
-                    "wireguard[{}]: peer {host}: ipv6 endpoints are not supported yet",
-                    self.cfg.tag
-                ));
-                self.peers[pi].resolve_at = Some(Instant::now() + RESOLVE_RETRY);
             }
             Err(e) => {
                 logging::warn(format_args!(
@@ -975,11 +1044,7 @@ impl Stack {
                 to_caller,
                 resp,
             } => {
-                let IpAddr::V4(dst_ip) = dst.ip() else {
-                    let _ = resp.send(Err("ipv6 target not supported".into()));
-                    return;
-                };
-                let Some(pi) = self.lpm(dst_ip) else {
+                let Some(pi) = self.lpm(dst.ip()) else {
                     let _ = resp.send(Err(format!("no wireguard peer for {dst}")));
                     return;
                 };
@@ -991,11 +1056,12 @@ impl Stack {
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
                 )));
-                if let Err(e) = socket.connect(
-                    self.iface.context(),
-                    (IpAddress::from(dst_ip), dst.port()),
-                    port,
-                ) {
+                let smol_addr = match dst.ip() {
+                    IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+                    IpAddr::V6(v6) => IpAddress::Ipv6(v6),
+                };
+                if let Err(e) = socket.connect(self.iface.context(), (smol_addr, dst.port()), port)
+                {
                     let _ = resp.send(Err(format!("wireguard connect: {e:?}")));
                     return;
                 }
@@ -1041,11 +1107,7 @@ impl Stack {
                 }
             }
             Cmd::UdpOpen { target, resp } => {
-                let IpAddr::V4(target_ip) = target.ip() else {
-                    let _ = resp.send(Err("ipv6 target not supported".into()));
-                    return;
-                };
-                let Some(pi) = self.lpm(target_ip) else {
+                let Some(pi) = self.lpm(target.ip()) else {
                     let _ = resp.send(Err(format!("no wireguard peer for {target}")));
                     return;
                 };
@@ -1067,12 +1129,21 @@ impl Stack {
                     return;
                 };
                 let pi = sess.peer;
-                let IpAddr::V4(target_ip) = sess.target.ip() else {
-                    return;
-                };
                 let dport = sess.target.port();
-                let src = self.cfg.local_addr;
-                let pkt = build_ipv4_udp(src, target_ip, port, dport, &bytes);
+                let pkt = match sess.target.ip() {
+                    IpAddr::V4(target_ip) => {
+                        let Some(src) = self.cfg.local_addr_v4 else {
+                            return;
+                        };
+                        build_ipv4_udp(src, target_ip, port, dport, &bytes)
+                    }
+                    IpAddr::V6(target_ip) => {
+                        let Some(src) = self.cfg.local_addr_v6 else {
+                            return;
+                        };
+                        build_ipv6_udp(src, target_ip, port, dport, &bytes)
+                    }
+                };
                 let _ = self.xmit_to_peer(pi, pkt);
             }
             Cmd::UdpClose { port } => {
@@ -1291,18 +1362,33 @@ impl Stack {
         if plain.is_empty() {
             return; // keepalive
         }
-        let Some((src_ip, dst, proto, hdr_len)) = ipv4_info(&plain) else {
+        let Some((src_ip, dst, proto, hdr_len)) = ip_info(&plain) else {
             self.recycle(plain);
             return;
         };
-        let src_u32 = u32::from(src_ip);
-        let allowed = self.peers[pi]
-            .endpoint
-            .allowed_ips
-            .iter()
-            .any(|&(net, bits)| {
-                bits == 0 || (src_u32 >> (32 - bits as u32)) == (net >> (32 - bits as u32))
-            });
+        let allowed = match src_ip {
+            IpAddr::V4(v4) => {
+                let src_u32 = u32::from(v4);
+                self.peers[pi]
+                    .endpoint
+                    .allowed_ips_v4
+                    .iter()
+                    .any(|&(net, bits)| {
+                        bits == 0 || (src_u32 >> (32 - bits as u32)) == (net >> (32 - bits as u32))
+                    })
+            }
+            IpAddr::V6(v6) => {
+                let src_u128 = u128::from(v6);
+                self.peers[pi]
+                    .endpoint
+                    .allowed_ips_v6
+                    .iter()
+                    .any(|&(net, bits)| {
+                        bits == 0
+                            || (src_u128 >> (128 - bits as u32)) == (net >> (128 - bits as u32))
+                    })
+            }
+        };
         if !allowed {
             logging::debug(format_args!(
                 "wireguard[{}]: cryptokey routing dropped packet with src {src_ip} from peer {pi}",
@@ -1311,7 +1397,11 @@ impl Stack {
             self.recycle(plain);
             return;
         }
-        if dst != self.cfg.local_addr {
+        let is_local = match dst {
+            IpAddr::V4(v4) => self.cfg.local_addr_v4 == Some(v4),
+            IpAddr::V6(v6) => self.cfg.local_addr_v6 == Some(v6),
+        };
+        if !is_local {
             if let Some(dest_pi) = self.lpm(dst)
                 && dest_pi != pi
             {
@@ -1326,7 +1416,7 @@ impl Stack {
             let dport = u16::from_be_bytes([plain[hdr_len + 2], plain[hdr_len + 3]]);
             let sender = match self.udp.get(&dport) {
                 Some(sess)
-                    if sess.target.ip() == IpAddr::V4(src_ip)
+                    if sess.target.ip() == src_ip
                         && (sess.target.port() == sport || sess.target.port() == 0) =>
                 {
                     Some(sess.to_caller.clone())
@@ -1352,7 +1442,7 @@ impl Stack {
 
     async fn flush_device_tx(&mut self) {
         while let Some(pkt) = self.device.tx.pop_front() {
-            let pkt = match ipv4_dst(&pkt).and_then(|dst| self.lpm(dst)) {
+            let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
                 Some(pi) => self.xmit_to_peer(pi, pkt),
                 None => Some(pkt),
             };
@@ -1633,6 +1723,7 @@ impl Stack {
 async fn run(
     cfg: Arc<WgConfig>,
     sock: Arc<UdpSocket>,
+    sock_v6: Option<Arc<UdpSocket>>,
     mut rx: mpsc::Receiver<Cmd>,
 ) -> io::Result<()> {
     let mtu = cfg.mtu;
@@ -1647,15 +1738,19 @@ async fn run(
             let _ = list.push(*cidr);
         }
     });
-    // Medium::Ip never consults the gateway, but a default route is required
+    // Medium::Ip never consults the gateway, but default routes are required
     // so non-local destinations egress instead of being dropped.
     let _ = iface
         .routes_mut()
         .add_default_ipv4_route(Ipv4Address::UNSPECIFIED);
+    let _ = iface
+        .routes_mut()
+        .add_default_ipv6_route(Ipv6Address::UNSPECIFIED);
 
     let mut stack = Stack {
         cfg,
         sock,
+        sock_v6,
         device,
         iface,
         sockets: SocketSet::new(Vec::new()),
@@ -1671,9 +1766,16 @@ async fn run(
     stack.peers = peer_cfgs.into_iter().map(PeerRt::new).collect();
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut buf_v6 = vec![0u8; MAX_DATAGRAM];
     loop {
         while let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) {
             stack.process_inbound(&buf[..n], src);
+        }
+        let s6_recv = stack.sock_v6.clone();
+        if let Some(s6) = &s6_recv {
+            while let Ok((n, src)) = s6.try_recv_from(&mut buf_v6) {
+                stack.process_inbound(&buf_v6[..n], src);
+            }
         }
         while let Ok(cmd) = rx.try_recv() {
             stack.process_cmd(cmd);
@@ -1684,6 +1786,7 @@ async fn run(
         stack.maintain_peers().await;
         let deadline = stack.next_deadline();
         let sock = Arc::clone(&stack.sock);
+        let s6_opt = stack.sock_v6.as_ref().map(Arc::clone);
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(cmd) => stack.process_cmd(cmd),
@@ -1691,6 +1794,15 @@ async fn run(
             },
             res = sock.recv_from(&mut buf) => match res {
                 Ok((n, src)) => stack.process_inbound(&buf[..n], src),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            },
+            res = async {
+                match &s6_opt {
+                    Some(s) => s.recv_from(&mut buf_v6).await,
+                    None => std::future::pending().await,
+                }
+            } => match res {
+                Ok((n, src)) => stack.process_inbound(&buf_v6[..n], src),
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             },
             _ = tokio::time::sleep_until(deadline) => {}
@@ -1771,20 +1883,109 @@ fn build_ipv4_udp(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload:
     pkt
 }
 
-/// Parse an IPv4 packet header: `(src, dst, protocol, header_len)`.
-fn ipv4_info(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
-        return None;
+fn ipv6_udp_checksum(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in src.octets().chunks(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
-    let hdr_len = (pkt[0] & 0x0f) as usize * 4;
-    if hdr_len < 20 || pkt.len() < hdr_len {
-        return None;
+    for chunk in dst.octets().chunks(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
-    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    Some((src, dst, pkt[9], hdr_len))
+    let ulen = (8 + payload.len()) as u32;
+    sum += (ulen >> 16) & 0xffff;
+    sum += ulen & 0xffff;
+    sum += 17u32; // next header (UDP)
+
+    sum += sport as u32;
+    sum += dport as u32;
+    sum += ulen & 0xffff;
+
+    for chunk in payload.chunks(2) {
+        let b1 = chunk[0];
+        let b2 = *chunk.get(1).unwrap_or(&0);
+        sum += u16::from_be_bytes([b1, b2]) as u32;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let res = !(sum as u16);
+    if res == 0 { 0xffff } else { res }
 }
 
+/// Wrap a payload into an IPv6/UDP packet with RFC-compliant checksum.
+fn build_ipv6_udp(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let ulen = 8 + payload.len();
+    let total = 40 + ulen;
+    let mut pkt = Vec::with_capacity(total);
+    pkt.extend_from_slice(&[
+        0x60, 0x00, 0x00, 0x00, // Version 6, Traffic Class 0, Flow Label 0
+    ]);
+    pkt.extend_from_slice(&(ulen as u16).to_be_bytes()); // Payload Length
+    pkt.push(17); // Next Header: UDP
+    pkt.push(64); // Hop Limit
+    pkt.extend_from_slice(&src.octets());
+    pkt.extend_from_slice(&dst.octets());
+    pkt.extend_from_slice(&sport.to_be_bytes());
+    pkt.extend_from_slice(&dport.to_be_bytes());
+    pkt.extend_from_slice(&(ulen as u16).to_be_bytes());
+    let csum = ipv6_udp_checksum(src, dst, sport, dport, payload);
+    pkt.extend_from_slice(&csum.to_be_bytes());
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+/// Parse an IP packet header (v4 or v6): `(src, dst, protocol, header_len)`.
+fn ip_info(pkt: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
+    if pkt.is_empty() {
+        return None;
+    }
+    match pkt[0] >> 4 {
+        4 => {
+            if pkt.len() < 20 {
+                return None;
+            }
+            let hdr_len = (pkt[0] & 0x0f) as usize * 4;
+            if hdr_len < 20 || pkt.len() < hdr_len {
+                return None;
+            }
+            let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+            let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+            Some((IpAddr::V4(src), IpAddr::V4(dst), pkt[9], hdr_len))
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return None;
+            }
+            let mut src = [0u8; 16];
+            src.copy_from_slice(&pkt[8..24]);
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&pkt[24..40]);
+            let proto = pkt[6]; // Next Header
+            Some((
+                IpAddr::V6(Ipv6Addr::from(src)),
+                IpAddr::V6(Ipv6Addr::from(dst)),
+                proto,
+                40,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn ip_dst(pkt: &[u8]) -> Option<IpAddr> {
+    ip_info(pkt).map(|(_, dst, _, _)| dst)
+}
+
+#[allow(dead_code)]
+fn ipv4_info(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
+    match ip_info(pkt)? {
+        (IpAddr::V4(src), IpAddr::V4(dst), proto, hdr) => Some((src, dst, proto, hdr)),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
 fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
     ipv4_info(pkt).map(|(_, dst, _, _)| dst)
 }
@@ -1817,12 +2018,32 @@ mod tests {
     #[test]
     fn build_valid_endpoint() {
         let wg = WireGuard::build(&wg_obj(json!({})), "endpoints[0]").expect("build");
-        assert_eq!(wg.cfg.local_addr, Ipv4Addr::new(10, 66, 66, 2));
+        assert_eq!(wg.cfg.local_addr_v4, Some(Ipv4Addr::new(10, 66, 66, 2)));
+        assert_eq!(wg.cfg.local_addr_v6, None);
         assert_eq!(wg.cfg.mtu, DEFAULT_MTU);
         assert_eq!(wg.cfg.peers.len(), 1);
         assert_eq!(wg.cfg.peers[0].port, DEFAULT_PORT);
         assert_eq!(wg.cfg.peers[0].keepalive, Some((25, 25)));
-        assert_eq!(wg.cfg.peers[0].allowed_ips, vec![(0, 0)]);
+        assert_eq!(wg.cfg.peers[0].allowed_ips_v4, vec![(0, 0)]);
+        assert!(wg.cfg.peers[0].allowed_ips_v6.is_empty());
+    }
+
+    #[test]
+    fn build_valid_endpoint_ipv6() {
+        let obj = wg_obj(json!({
+            "address": ["fd00::2/64", "10.66.66.2/24"],
+            "peers": [{
+                "address": "[::1]",
+                "port": 51820,
+                "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "allowed_ips": ["::/0", "0.0.0.0/0"]
+            }]
+        }));
+        let wg = WireGuard::build(&obj, "endpoints[0]").expect("build ipv6");
+        assert_eq!(wg.cfg.local_addr_v4, Some(Ipv4Addr::new(10, 66, 66, 2)));
+        assert!(wg.cfg.local_addr_v6.is_some());
+        assert_eq!(wg.cfg.peers[0].allowed_ips_v4, vec![(0, 0)]);
+        assert_eq!(wg.cfg.peers[0].allowed_ips_v6, vec![(0, 0)]);
     }
 
     #[test]
@@ -1889,7 +2110,8 @@ mod tests {
                 port: 1,
                 public_key: [1; 32],
                 pre_shared_key: None,
-                allowed_ips: vec![(0, 0)],
+                allowed_ips_v4: vec![(0, 0)],
+                allowed_ips_v6: vec![(0, 0)],
                 keepalive: None,
             }),
             PeerRt::new(PeerConfig {
@@ -1897,7 +2119,8 @@ mod tests {
                 port: 2,
                 public_key: [2; 32],
                 pre_shared_key: None,
-                allowed_ips: vec![(u32::from(Ipv4Addr::new(10, 1, 0, 0)), 16)],
+                allowed_ips_v4: vec![(u32::from(Ipv4Addr::new(10, 1, 0, 0)), 16)],
+                allowed_ips_v6: Vec::new(),
                 keepalive: None,
             }),
             PeerRt::new(PeerConfig {
@@ -1905,14 +2128,19 @@ mod tests {
                 port: 3,
                 public_key: [3; 32],
                 pre_shared_key: None,
-                allowed_ips: vec![(u32::from(Ipv4Addr::new(10, 1, 2, 0)), 24)],
+                allowed_ips_v4: vec![(u32::from(Ipv4Addr::new(10, 1, 2, 0)), 24)],
+                allowed_ips_v6: Vec::new(),
                 keepalive: None,
             }),
         ];
-        assert_eq!(lpm_in(&peers, Ipv4Addr::new(8, 8, 8, 8)), Some(0));
-        assert_eq!(lpm_in(&peers, Ipv4Addr::new(10, 1, 9, 9)), Some(1));
-        assert_eq!(lpm_in(&peers, Ipv4Addr::new(10, 1, 2, 7)), Some(2));
-        assert_eq!(lpm_in(&peers, Ipv4Addr::new(10, 2, 0, 1)), Some(0));
+        assert_eq!(lpm_v4(&peers, Ipv4Addr::new(8, 8, 8, 8)), Some(0));
+        assert_eq!(lpm_v4(&peers, Ipv4Addr::new(10, 1, 9, 9)), Some(1));
+        assert_eq!(lpm_v4(&peers, Ipv4Addr::new(10, 1, 2, 7)), Some(2));
+        assert_eq!(lpm_v4(&peers, Ipv4Addr::new(10, 2, 0, 1)), Some(0));
+        assert_eq!(
+            lpm_v6(&peers, "2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1922,9 +2150,9 @@ mod tests {
         let payload = b"hello tunnel";
         let pkt = build_ipv4_udp(src, dst, 40000, 53, payload);
         assert_eq!(pkt.len(), 20 + 8 + payload.len());
-        let (got_src, got_dst, proto, hdr) = ipv4_info(&pkt).expect("parse");
-        assert_eq!(got_src, src);
-        assert_eq!(got_dst, dst);
+        let (got_src, got_dst, proto, hdr) = ip_info(&pkt).expect("parse");
+        assert_eq!(got_src, IpAddr::V4(src));
+        assert_eq!(got_dst, IpAddr::V4(dst));
         assert_eq!(proto, 17);
         assert_eq!(hdr, 20);
         let sport = u16::from_be_bytes([pkt[20], pkt[21]]);
@@ -1934,8 +2162,29 @@ mod tests {
         let csum = u16::from_be_bytes([pkt[10], pkt[11]]);
         assert_ne!(csum, 0);
         assert_eq!(ipv4_checksum(&pkt[..20]), 0);
-        assert_eq!(ipv4_dst(&pkt), Some(dst));
-        assert!(ipv4_info(&[0u8; 10]).is_none());
+        assert_eq!(ip_dst(&pkt), Some(IpAddr::V4(dst)));
+        assert!(ip_info(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn ipv6_udp_roundtrip() {
+        let src: Ipv6Addr = "fd00::1".parse().unwrap();
+        let dst: Ipv6Addr = "fd00::2".parse().unwrap();
+        let payload = b"hello ipv6 tunnel";
+        let pkt = build_ipv6_udp(src, dst, 40000, 53, payload);
+        assert_eq!(pkt.len(), 40 + 8 + payload.len());
+        let (got_src, got_dst, proto, hdr) = ip_info(&pkt).expect("parse");
+        assert_eq!(got_src, IpAddr::V6(src));
+        assert_eq!(got_dst, IpAddr::V6(dst));
+        assert_eq!(proto, 17);
+        assert_eq!(hdr, 40);
+        let sport = u16::from_be_bytes([pkt[40], pkt[41]]);
+        let dport = u16::from_be_bytes([pkt[42], pkt[43]]);
+        assert_eq!((sport, dport), (40000, 53));
+        assert_eq!(&pkt[48..], payload);
+        let csum = u16::from_be_bytes([pkt[46], pkt[47]]);
+        assert_ne!(csum, 0);
+        assert_eq!(ip_dst(&pkt), Some(IpAddr::V6(dst)));
     }
 
     fn b64(data: &[u8]) -> String {

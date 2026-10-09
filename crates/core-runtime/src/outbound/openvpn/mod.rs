@@ -342,9 +342,10 @@ impl OpenVpn {
             }
         }
         let local_addr = local_cidrs
-            .first()
-            .map(|cidr| match cidr.address() {
-                IpAddress::Ipv4(ip) => ip,
+            .iter()
+            .find_map(|cidr| match cidr.address() {
+                IpAddress::Ipv4(ip) => Some(ip),
+                _ => None,
             })
             .ok_or_else(|| anyhow::anyhow!("{at}: missing ipv4 address"))?;
 

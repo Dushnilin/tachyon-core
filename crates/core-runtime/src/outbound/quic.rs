@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -542,6 +542,7 @@ const GECKO_MIN_CHUNKS: usize = 2;
 const GECKO_MAX_CHUNKS: usize = 8;
 const GECKO_DEFAULT_MIN_PACKET: usize = 512;
 const GECKO_DEFAULT_MAX_PACKET: usize = 1200;
+#[allow(dead_code)]
 const GECKO_MAX_ON_WIRE: usize = 2048;
 const GECKO_REASSEMBLY_TTL: Duration = Duration::from_secs(8);
 const GECKO_MAX_REASSEMBLY: usize = 4096;
@@ -695,92 +696,35 @@ fn random_below(limit: usize) -> usize {
     (u64::from_le_bytes(bytes) % limit as u64) as usize
 }
 
-/// Two-socket relay that applies gecko on top of salamander, in both
-/// directions. The salamander password is the same; only the framing differs.
-pub(crate) async fn spawn_gecko_relay(
-    server: SocketAddr,
-    password: Vec<u8>,
-    endpoint_local: SocketAddr,
-    min_packet_size: usize,
-    max_packet_size: usize,
-) -> io::Result<SalamanderRelay> {
-    let min_packet_size = if min_packet_size == 0 {
-        GECKO_DEFAULT_MIN_PACKET
-    } else {
-        min_packet_size
-    };
-    let max_packet_size = if max_packet_size == 0 {
-        GECKO_DEFAULT_MAX_PACKET
-    } else {
-        max_packet_size
-    };
-    if min_packet_size > max_packet_size || max_packet_size > GECKO_MAX_ON_WIRE {
-        return Err(io::Error::other("gecko: invalid packet size range"));
+/// Randomly pick a port uniformly from a slice of inclusive `(start, end)` ranges.
+pub(crate) fn pick_port_from_ranges(ranges: &[(u16, u16)]) -> u16 {
+    if ranges.is_empty() {
+        return 0;
     }
-    let ep_bind = if server.is_ipv4() {
-        "127.0.0.1:0"
-    } else {
-        "[::1]:0"
-    };
-    let sock_ep = Arc::new(tokio::net::UdpSocket::bind(ep_bind).await?);
-    sock_ep.connect(endpoint_local).await?;
-    let local = sock_ep.local_addr()?;
-
-    let srv_bind = if server.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let sock_srv = Arc::new(tokio::net::UdpSocket::bind(srv_bind).await?);
-    sock_srv.connect(server).await?;
-
-    let pw_up = password.clone();
-    let sock_ep_up = Arc::clone(&sock_ep);
-    let sock_srv_up = Arc::clone(&sock_srv);
-    let up = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65_535];
-        let mut message_id = 0u8;
-        loop {
-            let Ok(n) = sock_ep_up.recv(&mut buf).await else {
-                break;
-            };
-            message_id = message_id.wrapping_add(1);
-            for frame in gecko_frames(&buf[..n], message_id, min_packet_size, max_packet_size) {
-                let sealed = salamander_seal(&pw_up, &frame);
-                if sock_srv_up.send(&sealed).await.is_err() {
-                    return;
-                }
-            }
+    let total: u32 = ranges
+        .iter()
+        .map(|(s, e)| (e.saturating_sub(*s) + 1) as u32)
+        .sum();
+    if total == 0 {
+        return ranges[0].0;
+    }
+    let mut b = [0u8; 4];
+    let _ = getrandom::fill(&mut b);
+    let mut idx = (u32::from_le_bytes(b) % total) as usize;
+    for &(start, end) in ranges {
+        let count = (end.saturating_sub(start) + 1) as usize;
+        if idx < count {
+            return start + idx as u16;
         }
-    });
-    let down = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65_535];
-        let mut reassembler = GeckoReassembler::new();
-        loop {
-            let Ok(n) = sock_srv.recv(&mut buf).await else {
-                break;
-            };
-            let Some(plain) = salamander_open(&password, &buf[..n]) else {
-                continue;
-            };
-            let Some(packet) = reassembler.accept(&plain) else {
-                continue;
-            };
-            if sock_ep.send(&packet).await.is_err() {
-                break;
-            }
-        }
-    });
-    Ok(SalamanderRelay {
-        local,
-        handles: vec![up, down],
-    })
+        idx -= count;
+    }
+    ranges[0].0
 }
 
-/// Two-socket salamander relay in front of a quinn endpoint.
+/// Two-socket salamander/hop relay in front of a quinn endpoint.
 ///
 /// * `sock_ep` — loopback, connected to the endpoint's local addr (plaintext side).
-/// * `sock_srv` — wildcard, connected to the real server (sealed side).
+/// * `sock_srv` — wildcard, connected/directed to the real server (sealed or hopped side).
 ///
 /// Returns the loopback address quinn should `connect()` to, plus task handles.
 pub(crate) struct SalamanderRelay {
@@ -796,12 +740,19 @@ impl Drop for SalamanderRelay {
     }
 }
 
-pub(crate) async fn spawn_salamander_relay(
-    server: SocketAddr,
-    password: Vec<u8>,
+/// Unified QUIC relay supporting port hopping, salamander obfs, and gecko fragmentation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_hop_relay(
+    server_ip: IpAddr,
+    port_ranges: Vec<(u16, u16)>,
+    initial_port: u16,
+    hop_interval: Option<Duration>,
+    hop_interval_max: Option<Duration>,
+    obfs_password: Option<Vec<u8>>,
+    gecko: Option<(usize, usize)>,
     endpoint_local: SocketAddr,
 ) -> io::Result<SalamanderRelay> {
-    let ep_bind = if server.is_ipv4() {
+    let ep_bind = if server_ip.is_ipv4() {
         "127.0.0.1:0"
     } else {
         "[::1]:0"
@@ -812,7 +763,7 @@ pub(crate) async fn spawn_salamander_relay(
     sock_ep.connect(endpoint_local).await?;
     let local = sock_ep.local_addr()?;
 
-    let srv_bind = if server.is_ipv4() {
+    let srv_bind = if server_ip.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
@@ -820,41 +771,177 @@ pub(crate) async fn spawn_salamander_relay(
     let sock_srv = Arc::new(tokio::net::UdpSocket::bind(srv_bind).await?);
     let _ = socket2::SockRef::from(&*sock_srv).set_recv_buffer_size(UDP_SOCKET_BUFFER);
     let _ = socket2::SockRef::from(&*sock_srv).set_send_buffer_size(UDP_SOCKET_BUFFER);
-    sock_srv.connect(server).await?;
 
-    let pw_up = password.clone();
+    let current_target = Arc::new(std::sync::RwLock::new(SocketAddr::new(
+        server_ip,
+        initial_port,
+    )));
+    let mut handles = Vec::new();
+
+    if let Some(interval) = hop_interval
+        && !port_ranges.is_empty()
+        && interval > Duration::ZERO
+    {
+        let target = Arc::clone(&current_target);
+        let ranges = port_ranges.clone();
+        let hop_h = tokio::spawn(async move {
+            loop {
+                let sleep_dur = match hop_interval_max {
+                    Some(max) if max > interval => {
+                        let range_ms = (max - interval).as_millis() as u64;
+                        if range_ms > 0 {
+                            let mut b = [0u8; 8];
+                            let _ = getrandom::fill(&mut b);
+                            let add_ms = u64::from_le_bytes(b) % range_ms;
+                            interval + Duration::from_millis(add_ms)
+                        } else {
+                            interval
+                        }
+                    }
+                    _ => interval,
+                };
+                tokio::time::sleep(sleep_dur).await;
+                let next_port = pick_port_from_ranges(&ranges);
+                if let Ok(mut g) = target.write() {
+                    *g = SocketAddr::new(server_ip, next_port);
+                    logging::debug(format_args!("hysteria2: hopped port to {next_port}"));
+                }
+            }
+        });
+        handles.push(hop_h);
+    }
+
+    let pw_up = obfs_password.clone();
     let sock_ep_up = Arc::clone(&sock_ep);
     let sock_srv_up = Arc::clone(&sock_srv);
+    let target_up = Arc::clone(&current_target);
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; 65_535];
+        let mut message_id = 0u8;
         loop {
             let Ok(n) = sock_ep_up.recv(&mut buf).await else {
                 break;
             };
-            let sealed = salamander_seal(&pw_up, &buf[..n]);
-            if sock_srv_up.send(&sealed).await.is_err() {
+            let dst = *target_up.read().unwrap();
+            if let Some((min_packet, max_packet)) = gecko {
+                let min_p = if min_packet == 0 {
+                    GECKO_DEFAULT_MIN_PACKET
+                } else {
+                    min_packet
+                };
+                let max_p = if max_packet == 0 {
+                    GECKO_DEFAULT_MAX_PACKET
+                } else {
+                    max_packet
+                };
+                message_id = message_id.wrapping_add(1);
+                for frame in gecko_frames(&buf[..n], message_id, min_p, max_p) {
+                    let packet = if let Some(ref pw) = pw_up {
+                        salamander_seal(pw, &frame)
+                    } else {
+                        frame
+                    };
+                    if sock_srv_up.send_to(&packet, dst).await.is_err() {
+                        return;
+                    }
+                }
+            } else if let Some(ref pw) = pw_up {
+                let sealed = salamander_seal(pw, &buf[..n]);
+                if sock_srv_up.send_to(&sealed, dst).await.is_err() {
+                    break;
+                }
+            } else if sock_srv_up.send_to(&buf[..n], dst).await.is_err() {
                 break;
             }
         }
     });
+    handles.push(up);
+
+    let pw_down = obfs_password.clone();
+    let sock_ep_down = Arc::clone(&sock_ep);
+    let sock_srv_down = Arc::clone(&sock_srv);
     let down = tokio::spawn(async move {
         let mut buf = vec![0u8; 65_535];
+        let mut reassembler = GeckoReassembler::new();
         loop {
-            let Ok(n) = sock_srv.recv(&mut buf).await else {
+            let Ok((n, src)) = sock_srv_down.recv_from(&mut buf).await else {
                 break;
             };
-            let Some(plain) = salamander_open(&password, &buf[..n]) else {
+            if src.ip() != server_ip {
                 continue;
-            };
-            if sock_ep.send(&plain).await.is_err() {
+            }
+            if gecko.is_some() {
+                let plain_data = if let Some(ref pw) = pw_down {
+                    let Some(p) = salamander_open(pw, &buf[..n]) else {
+                        continue;
+                    };
+                    p
+                } else {
+                    buf[..n].to_vec()
+                };
+                let Some(packet) = reassembler.accept(&plain_data) else {
+                    continue;
+                };
+                if sock_ep_down.send(&packet).await.is_err() {
+                    break;
+                }
+            } else if let Some(ref pw) = pw_down {
+                let Some(plain) = salamander_open(pw, &buf[..n]) else {
+                    continue;
+                };
+                if sock_ep_down.send(&plain).await.is_err() {
+                    break;
+                }
+            } else if sock_ep_down.send(&buf[..n]).await.is_err() {
                 break;
             }
         }
     });
-    Ok(SalamanderRelay {
-        local,
-        handles: vec![up, down],
-    })
+    handles.push(down);
+
+    Ok(SalamanderRelay { local, handles })
+}
+
+/// Two-socket relay that applies gecko on top of salamander, in both
+/// directions. The salamander password is the same; only the framing differs.
+#[allow(dead_code)]
+pub(crate) async fn spawn_gecko_relay(
+    server: SocketAddr,
+    password: Vec<u8>,
+    endpoint_local: SocketAddr,
+    min_packet_size: usize,
+    max_packet_size: usize,
+) -> io::Result<SalamanderRelay> {
+    spawn_hop_relay(
+        server.ip(),
+        Vec::new(),
+        server.port(),
+        None,
+        None,
+        Some(password),
+        Some((min_packet_size, max_packet_size)),
+        endpoint_local,
+    )
+    .await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn spawn_salamander_relay(
+    server: SocketAddr,
+    password: Vec<u8>,
+    endpoint_local: SocketAddr,
+) -> io::Result<SalamanderRelay> {
+    spawn_hop_relay(
+        server.ip(),
+        Vec::new(),
+        server.port(),
+        None,
+        None,
+        Some(password),
+        None,
+        endpoint_local,
+    )
+    .await
 }
 
 /// Adapter so `HmacSha256Key` can be wrapped without orphan-rule issues at

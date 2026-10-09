@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use smoltcp::socket::tcp::{
     RecvError as TcpRecvError, Socket as TcpSock, SocketBuffer as TcpBuffer,
 };
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::logging;
@@ -50,8 +50,10 @@ const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 pub(crate) struct StackCfg {
     pub tag: String,
     pub mtu: usize,
-    pub local_addr: Ipv4Addr,
-    pub local_cidr: IpCidr,
+    pub local_addr: Option<Ipv4Addr>,
+    pub local_cidr: Option<IpCidr>,
+    pub local_addr_v6: Option<Ipv6Addr>,
+    pub local_cidr_v6: Option<IpCidr>,
     pub idle_timeout: Option<Duration>,
 }
 
@@ -297,13 +299,21 @@ impl Stack {
                 to_caller,
                 resp,
             } => {
-                if !dst.is_ipv4() {
-                    let _ = resp.send(Err("masque: ipv6 target not supported".into()));
-                    return;
-                }
-                let IpAddr::V4(dst_ip) = dst.ip() else {
-                    let _ = resp.send(Err("masque: ipv6 target not supported".into()));
-                    return;
+                let smol_addr = match dst.ip() {
+                    IpAddr::V4(v4) => {
+                        if self.cfg.local_addr.is_none() {
+                            let _ = resp.send(Err("masque: no ipv4 configured on tunnel".into()));
+                            return;
+                        }
+                        IpAddress::Ipv4(v4)
+                    }
+                    IpAddr::V6(v6) => {
+                        if self.cfg.local_addr_v6.is_none() {
+                            let _ = resp.send(Err("masque: no ipv6 configured on tunnel".into()));
+                            return;
+                        }
+                        IpAddress::Ipv6(v6)
+                    }
                 };
                 let port = self.alloc_port();
                 let mut socket = TcpSock::new(
@@ -313,11 +323,8 @@ impl Stack {
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
                 )));
-                if let Err(e) = socket.connect(
-                    self.iface.context(),
-                    (IpAddress::from(dst_ip), dst.port()),
-                    port,
-                ) {
+                if let Err(e) = socket.connect(self.iface.context(), (smol_addr, dst.port()), port)
+                {
                     let _ = resp.send(Err(format!("masque connect: {e:?}")));
                     return;
                 }
@@ -362,9 +369,16 @@ impl Stack {
                 }
             }
             Cmd::UdpOpen { target, resp } => {
-                if !target.is_ipv4() {
-                    let _ = resp.send(Err("masque: ipv6 target not supported".into()));
-                    return;
+                match target.ip() {
+                    IpAddr::V4(_) if self.cfg.local_addr.is_none() => {
+                        let _ = resp.send(Err("masque: no ipv4 configured on tunnel".into()));
+                        return;
+                    }
+                    IpAddr::V6(_) if self.cfg.local_addr_v6.is_none() => {
+                        let _ = resp.send(Err("masque: no ipv6 configured on tunnel".into()));
+                        return;
+                    }
+                    _ => {}
                 }
                 let port = self.alloc_port();
                 let (tx, rx) = mpsc::channel(REPLY_QUEUE);
@@ -381,12 +395,21 @@ impl Stack {
                 let Some(sess) = self.udp.get(&port) else {
                     return;
                 };
-                let IpAddr::V4(target_ip) = sess.target.ip() else {
-                    return;
-                };
                 let dport = sess.target.port();
-                let src = self.cfg.local_addr;
-                let pkt = build_ipv4_udp(src, target_ip, port, dport, &bytes);
+                let pkt = match sess.target.ip() {
+                    IpAddr::V4(target_ip) => {
+                        let Some(src) = self.cfg.local_addr else {
+                            return;
+                        };
+                        build_ipv4_udp(src, target_ip, port, dport, &bytes)
+                    }
+                    IpAddr::V6(target_ip) => {
+                        let Some(src) = self.cfg.local_addr_v6 else {
+                            return;
+                        };
+                        build_ipv6_udp(src, target_ip, port, dport, &bytes)
+                    }
+                };
                 self.out_q.push_back(pkt);
             }
             Cmd::UdpClose { port } => {
@@ -398,17 +421,24 @@ impl Stack {
     /// Demux incoming tunnel packets: our virtual UDP sessions first, the
     /// smoltcp interface for everything else.
     fn on_tunnel_packet(&mut self, pkt: Vec<u8>) {
-        let Some((src, dst, proto, hdr_len)) = ipv4_info(&pkt) else {
+        let Some((src, dst, proto, hdr_len)) = ip_info(&pkt) else {
             return;
         };
-        if !cidr_contains_v4(self.cfg.local_cidr, dst) {
+        let belongs = match dst {
+            IpAddr::V4(v4) => self.cfg.local_cidr.is_some_and(|c| cidr_contains_v4(c, v4)),
+            IpAddr::V6(v6) => self
+                .cfg
+                .local_cidr_v6
+                .is_some_and(|c| cidr_contains_v6(c, v6)),
+        };
+        if !belongs {
             return;
         }
         if proto == 17 && pkt.len() >= hdr_len + 8 {
             let sport = u16::from_be_bytes([pkt[hdr_len], pkt[hdr_len + 1]]);
             let dport = u16::from_be_bytes([pkt[hdr_len + 2], pkt[hdr_len + 3]]);
             if let Some(sess) = self.udp.get(&dport)
-                && sess.target.ip() == IpAddr::V4(src)
+                && sess.target.ip() == src
                 && (sess.target.port() == sport || sess.target.port() == 0)
             {
                 let payload = pkt[hdr_len + 8..].to_vec();
@@ -632,13 +662,25 @@ pub(crate) async fn run(
     iconfig.random_seed = u64::from_le_bytes(seed);
     let mut iface = Interface::new(iconfig, &mut device, SmolInstant::now());
     iface.update_ip_addrs(|list| {
-        let _ = list.push(cfg.local_cidr);
+        if let Some(cidr) = cfg.local_cidr {
+            let _ = list.push(cidr);
+        }
+        if let Some(cidr_v6) = cfg.local_cidr_v6 {
+            let _ = list.push(cidr_v6);
+        }
     });
     // Medium::Ip never consults the gateway, but a default route is required
     // so non-local destinations egress instead of being dropped.
-    let _ = iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::UNSPECIFIED);
+    if cfg.local_cidr.is_some() {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::UNSPECIFIED);
+    }
+    if cfg.local_cidr_v6.is_some() {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Address::UNSPECIFIED);
+    }
 
     let mut stack = Stack {
         cfg,
@@ -762,25 +804,127 @@ fn cidr_contains_v4(cidr: IpCidr, ip: Ipv4Addr) -> bool {
             if bits == 0 {
                 return true;
             }
-            let mask = u32::MAX << (32 - bits as u32);
-            (u32::from(net) & mask) == (u32::from(ip) & mask)
+            let net_u32 = u32::from(net);
+            let ip_u32 = u32::from(ip);
+            if bits >= 32 {
+                return net_u32 == ip_u32;
+            }
+            let shift = 32 - bits as u32;
+            (ip_u32 >> shift) == (net_u32 >> shift)
         }
         _ => false,
     }
 }
 
-/// Parse an IPv4 packet header: `(src, dst, protocol, header_len)`.
-fn ipv4_info(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+/// Membership test for an IPv6 address in the stack's local prefix.
+fn cidr_contains_v6(cidr: IpCidr, ip: Ipv6Addr) -> bool {
+    #[allow(unreachable_patterns)]
+    match cidr.address() {
+        IpAddress::Ipv6(net) => {
+            let bits = cidr.prefix_len();
+            if bits == 0 {
+                return true;
+            }
+            let net_u128 = u128::from_be_bytes(net.octets());
+            let ip_u128 = u128::from(ip);
+            if bits >= 128 {
+                return net_u128 == ip_u128;
+            }
+            let shift = 128 - bits as u32;
+            (ip_u128 >> shift) == (net_u128 >> shift)
+        }
+        _ => false,
+    }
+}
+
+fn ipv6_udp_checksum(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in src.octets().chunks(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    for chunk in dst.octets().chunks(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    let ulen = (8 + payload.len()) as u32;
+    sum += (ulen >> 16) & 0xffff;
+    sum += ulen & 0xffff;
+    sum += 17u32; // next header (UDP)
+
+    sum += sport as u32;
+    sum += dport as u32;
+    sum += ulen & 0xffff;
+
+    for chunk in payload.chunks(2) {
+        let b1 = chunk[0];
+        let b2 = *chunk.get(1).unwrap_or(&0);
+        sum += u16::from_be_bytes([b1, b2]) as u32;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let res = !(sum as u16);
+    if res == 0 { 0xffff } else { res }
+}
+
+/// Wrap a payload into an IPv6/UDP packet with RFC-compliant checksum.
+fn build_ipv6_udp(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let ulen = 8 + payload.len();
+    let total = 40 + ulen;
+    let mut pkt = Vec::with_capacity(total);
+    pkt.extend_from_slice(&[
+        0x60, 0x00, 0x00, 0x00, // Version 6, Traffic Class 0, Flow Label 0
+    ]);
+    pkt.extend_from_slice(&(ulen as u16).to_be_bytes()); // Payload Length
+    pkt.push(17); // Next Header: UDP
+    pkt.push(64); // Hop Limit
+    pkt.extend_from_slice(&src.octets());
+    pkt.extend_from_slice(&dst.octets());
+    pkt.extend_from_slice(&sport.to_be_bytes());
+    pkt.extend_from_slice(&dport.to_be_bytes());
+    pkt.extend_from_slice(&(ulen as u16).to_be_bytes());
+    let csum = ipv6_udp_checksum(src, dst, sport, dport, payload);
+    pkt.extend_from_slice(&csum.to_be_bytes());
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+/// Parse an IP packet header (v4 or v6): `(src, dst, protocol, header_len)`.
+fn ip_info(pkt: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
+    if pkt.is_empty() {
         return None;
     }
-    let hdr_len = (pkt[0] & 0x0f) as usize * 4;
-    if hdr_len < 20 || pkt.len() < hdr_len {
-        return None;
+    match pkt[0] >> 4 {
+        4 => {
+            if pkt.len() < 20 {
+                return None;
+            }
+            let hdr_len = (pkt[0] & 0x0f) as usize * 4;
+            if hdr_len < 20 || pkt.len() < hdr_len {
+                return None;
+            }
+            let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+            let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+            Some((IpAddr::V4(src), IpAddr::V4(dst), pkt[9], hdr_len))
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return None;
+            }
+            let mut src = [0u8; 16];
+            src.copy_from_slice(&pkt[8..24]);
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&pkt[24..40]);
+            let proto = pkt[6]; // Next Header
+            Some((
+                IpAddr::V6(Ipv6Addr::from(src)),
+                IpAddr::V6(Ipv6Addr::from(dst)),
+                proto,
+                40,
+            ))
+        }
+        _ => None,
     }
-    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    Some((src, dst, pkt[9], hdr_len))
 }
 
 #[cfg(test)]
@@ -794,9 +938,9 @@ mod tests {
         let payload = b"hello connect-ip";
         let pkt = build_ipv4_udp(src, dst, 40000, 53, payload);
         assert_eq!(pkt.len(), 20 + 8 + payload.len());
-        let (got_src, got_dst, proto, hdr) = ipv4_info(&pkt).expect("parse");
-        assert_eq!(got_src, src);
-        assert_eq!(got_dst, dst);
+        let (got_src, got_dst, proto, hdr) = ip_info(&pkt).expect("parse");
+        assert_eq!(got_src, IpAddr::V4(src));
+        assert_eq!(got_dst, IpAddr::V4(dst));
         assert_eq!(proto, 17);
         assert_eq!(hdr, 20);
         let sport = u16::from_be_bytes([pkt[20], pkt[21]]);
@@ -804,7 +948,25 @@ mod tests {
         assert_eq!((sport, dport), (40000, 53));
         assert_eq!(&pkt[28..], payload);
         assert_eq!(ipv4_checksum(&pkt[..20]), 0);
-        assert!(ipv4_info(&[0u8; 10]).is_none());
+        assert!(ip_info(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn ipv6_udp_roundtrip() {
+        let src = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+        let dst = "2001:db8::2".parse::<Ipv6Addr>().unwrap();
+        let payload = b"hello ipv6 connect-ip";
+        let pkt = build_ipv6_udp(src, dst, 40000, 53, payload);
+        assert_eq!(pkt.len(), 40 + 8 + payload.len());
+        let (got_src, got_dst, proto, hdr) = ip_info(&pkt).expect("parse");
+        assert_eq!(got_src, IpAddr::V6(src));
+        assert_eq!(got_dst, IpAddr::V6(dst));
+        assert_eq!(proto, 17);
+        assert_eq!(hdr, 40);
+        let sport = u16::from_be_bytes([pkt[40], pkt[41]]);
+        let dport = u16::from_be_bytes([pkt[42], pkt[43]]);
+        assert_eq!((sport, dport), (40000, 53));
+        assert_eq!(&pkt[48..], payload);
     }
 
     #[test]
@@ -815,6 +977,13 @@ mod tests {
         let host: IpCidr = "172.16.0.2/32".parse().expect("cidr");
         assert!(cidr_contains_v4(host, Ipv4Addr::new(172, 16, 0, 2)));
         assert!(!cidr_contains_v4(host, Ipv4Addr::new(172, 16, 0, 3)));
+
+        let cidr_v6: IpCidr = "2001:db8::/64".parse().expect("cidr");
+        assert!(cidr_contains_v6(cidr_v6, "2001:db8::1".parse().unwrap()));
+        assert!(!cidr_contains_v6(cidr_v6, "2001:db9::1".parse().unwrap()));
+        let host_v6: IpCidr = "2001:db8::1/128".parse().expect("cidr");
+        assert!(cidr_contains_v6(host_v6, "2001:db8::1".parse().unwrap()));
+        assert!(!cidr_contains_v6(host_v6, "2001:db8::2".parse().unwrap()));
     }
 
     /// Reference keep-alive: ping once per idle window, die after a window

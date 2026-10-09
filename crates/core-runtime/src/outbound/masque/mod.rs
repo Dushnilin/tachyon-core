@@ -24,7 +24,7 @@ mod static_tables;
 mod tls;
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
@@ -91,8 +91,10 @@ pub(crate) struct MasqueCfg {
     pub auto_mode: bool,
     pub auto_h3_delay: Duration,
     pub mtu: usize,
-    pub local_addr: Ipv4Addr,
-    pub local_cidr: IpCidr,
+    pub local_addr: Option<Ipv4Addr>,
+    pub local_cidr: Option<IpCidr>,
+    pub local_addr_v6: Option<Ipv6Addr>,
+    pub local_cidr_v6: Option<IpCidr>,
     pub keep_alive: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub udp_timeout: Duration,
@@ -290,6 +292,8 @@ fn fold_legacy(mut obj: Map<String, Value>, at: &str) -> anyhow::Result<Map<Stri
 fn parse_masque_prefix(raw: &str, at: &str) -> anyhow::Result<IpCidr> {
     let full = if raw.contains('/') {
         raw.to_string()
+    } else if raw.contains(':') {
+        format!("{raw}/128")
     } else {
         format!("{raw}/32")
     };
@@ -357,16 +361,24 @@ impl Masque {
         if ip_raw.is_empty() && ipv6_raw.is_empty() {
             anyhow::bail!("{at}: masque: at least one of ip/ipv6 is required");
         }
-        if !ipv6_raw.is_empty() {
-            logging::warn(format_args!(
-                "masque {at}: ipv6 is not implemented yet (ignored)"
-            ));
-        }
-        if ip_raw.is_empty() {
-            anyhow::bail!("{at}: masque: ipv6-only ip configuration is not supported yet");
-        }
-        let local_cidr = parse_masque_prefix(ip_raw, at)?;
-        let IpAddress::Ipv4(local_addr) = local_cidr.address();
+        let (local_addr, local_cidr) = if !ip_raw.is_empty() {
+            let cidr = parse_masque_prefix(ip_raw, at)?;
+            match cidr.address() {
+                IpAddress::Ipv4(ip) => (Some(ip), Some(cidr)),
+                _ => anyhow::bail!("{at}: invalid ipv4 prefix in `ip`"),
+            }
+        } else {
+            (None, None)
+        };
+        let (local_addr_v6, local_cidr_v6) = if !ipv6_raw.is_empty() {
+            let cidr = parse_masque_prefix(ipv6_raw, at)?;
+            match cidr.address() {
+                IpAddress::Ipv6(ip) => (Some(ip), Some(cidr)),
+                _ => anyhow::bail!("{at}: invalid ipv6 prefix in `ipv6`"),
+            }
+        } else {
+            (None, None)
+        };
 
         let keys = parse_keys(&obj, &profile, at)?;
 
@@ -410,6 +422,8 @@ impl Masque {
                 mtu,
                 local_addr,
                 local_cidr,
+                local_addr_v6,
+                local_cidr_v6,
                 keep_alive,
                 idle_timeout,
                 udp_timeout: DEFAULT_UDP_TIMEOUT,
@@ -639,6 +653,8 @@ impl Masque {
             mtu: self.cfg.mtu,
             local_addr: self.cfg.local_addr,
             local_cidr: self.cfg.local_cidr,
+            local_addr_v6: self.cfg.local_addr_v6,
+            local_cidr_v6: self.cfg.local_cidr_v6,
             idle_timeout: self.cfg.idle_timeout,
         });
         tokio::spawn(async move {
@@ -657,11 +673,6 @@ impl Masque {
             ));
         }
         let dst = resolve_target(target).await?;
-        if !dst.is_ipv4() {
-            return Err(io::Error::other(
-                "masque: ipv6 targets are not supported yet",
-            ));
-        }
         let shared = self.shared().await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (local, remote) = tokio::io::duplex(CALLER_BUF);
@@ -741,11 +752,6 @@ impl Masque {
             ));
         }
         let dst = resolve_target(target).await?;
-        if !dst.is_ipv4() {
-            return Err(io::Error::other(
-                "masque: ipv6 targets are not supported yet",
-            ));
-        }
         let shared = self.shared().await?;
         let (local, peer) = udp_loopback_pair().await?;
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -868,11 +874,33 @@ mod tests {
         assert_eq!(m.cfg.network, "h3");
         assert!(m.cfg.auto_mode);
         assert_eq!(m.cfg.mtu, DEFAULT_MTU);
-        assert_eq!(m.cfg.local_addr, Ipv4Addr::new(172, 16, 0, 2));
+        assert_eq!(m.cfg.local_addr, Some(Ipv4Addr::new(172, 16, 0, 2)));
+        assert_eq!(m.cfg.local_addr_v6, None);
         assert_eq!(m.cfg.keep_alive, Some(DEFAULT_KEEP_ALIVE));
         assert!(m.cfg.idle_timeout.is_none());
         assert!((m.cfg.allow_tcp, m.cfg.allow_udp) == (true, true));
         assert_eq!(m.cfg.uri, profile::CLOUDFLARE_CONNECT_URI);
+    }
+
+    #[test]
+    fn build_with_ipv6() {
+        let m = Masque::build(
+            &obj(json!({
+                "ip": "172.16.0.2/32",
+                "ipv6": "2606:4700:110:85f8:9410:3b14:6cf1:a62b/128",
+            })),
+            "outbounds[0]",
+        )
+        .expect("build with ipv6");
+        assert_eq!(m.cfg.local_addr, Some(Ipv4Addr::new(172, 16, 0, 2)));
+        assert_eq!(
+            m.cfg.local_addr_v6,
+            Some(
+                "2606:4700:110:85f8:9410:3b14:6cf1:a62b"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+            )
+        );
     }
 
     #[test]

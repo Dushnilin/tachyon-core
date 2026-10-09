@@ -17,8 +17,8 @@ use crate::outbound::proxy::server_endpoint;
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
     PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay, VarintReader,
-    bind_udp, bind_udp_loopback, dest_string, io_from_datagram, io_from_quinn, put_varint,
-    random_padding, read_varint, resolve_host, spawn_gecko_relay, spawn_salamander_relay,
+    bind_udp, bind_udp_loopback, dest_string, io_from_datagram, io_from_quinn,
+    pick_port_from_ranges, put_varint, random_padding, read_varint, resolve_host, spawn_hop_relay,
     udp_loopback_pair,
 };
 use crate::outbound::urltest::parse_duration;
@@ -37,6 +37,9 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 pub struct Hysteria2 {
     server: String,
     port: u16,
+    server_port_ranges: Vec<(u16, u16)>,
+    hop_interval: Duration,
+    hop_interval_max: Option<Duration>,
     password: String,
     receive_bps: u64,
     want_tcp: bool,
@@ -52,7 +55,7 @@ pub struct Hysteria2 {
 
 impl Hysteria2 {
     pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
-        let (server, mut port) = server_endpoint(obj, at)?;
+        let (server, port) = server_endpoint(obj, at)?;
 
         if obj
             .get("realm")
@@ -102,29 +105,59 @@ impl Hysteria2 {
             Some(_) => anyhow::bail!("{at}: obfs must be an object"),
         };
 
-        if let Some(ports) = obj.get("server_ports") {
-            let first = match ports {
-                Value::String(s) => Some(s.as_str()),
-                Value::Array(a) => a.first().and_then(Value::as_str),
-                _ => None,
+        let (server_port_ranges, port) = if let Some(ports) = obj.get("server_ports") {
+            let mut ranges = Vec::new();
+            let list = match ports {
+                Value::String(s) => vec![s.as_str()],
+                Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
             };
-            if let Some(range) = first {
-                let start = range.split(':').next().unwrap_or("");
-                if let Ok(p) = start.parse::<u16>()
-                    && p != 0
-                {
-                    port = p;
-                    logging::warn(format_args!(
-                        "{at}: server_ports port hopping is not implemented; using port {p}"
-                    ));
+            for r in list {
+                let (start, end) =
+                    if let Some((a, b)) = r.split_once(':').or_else(|| r.split_once('-')) {
+                        if let (Ok(s), Ok(e)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
+                            (s, e)
+                        } else {
+                            continue;
+                        }
+                    } else if let Ok(p) = r.trim().parse::<u16>() {
+                        (p, p)
+                    } else {
+                        continue;
+                    };
+                if start > 0 && end >= start {
+                    ranges.push((start, end));
                 }
             }
-        }
-        if obj.get("hop_interval").is_some() || obj.get("hop_interval_max").is_some() {
-            logging::warn(format_args!(
-                "{at}: hop_interval is not implemented (ignored)"
-            ));
-        }
+            let first_port = ranges.first().map(|&(s, _)| s).unwrap_or(port);
+            (ranges, first_port)
+        } else {
+            (Vec::new(), port)
+        };
+
+        let hop_interval = if !server_port_ranges.is_empty() {
+            parse_duration(
+                obj.get("hop_interval"),
+                Duration::from_secs(30),
+                &format!("{at}.hop_interval"),
+            )?
+        } else {
+            parse_duration(
+                obj.get("hop_interval"),
+                Duration::ZERO,
+                &format!("{at}.hop_interval"),
+            )?
+        };
+
+        let hop_interval_max = if let Some(v) = obj.get("hop_interval_max") {
+            Some(parse_duration(
+                Some(v),
+                hop_interval,
+                &format!("{at}.hop_interval_max"),
+            )?)
+        } else {
+            None
+        };
 
         let password = obj
             .get("password")
@@ -165,6 +198,9 @@ impl Hysteria2 {
         Ok(Self {
             server,
             port,
+            server_port_ranges,
+            hop_interval,
+            hop_interval_max,
             password,
             receive_bps,
             want_tcp: network_includes_tcp(obj),
@@ -178,9 +214,37 @@ impl Hysteria2 {
         })
     }
 
+    fn pick_port(&self) -> u16 {
+        if self.server_port_ranges.is_empty() {
+            self.port
+        } else {
+            pick_port_from_ranges(&self.server_port_ranges)
+        }
+    }
+
+    fn next_hop_interval(&self) -> Duration {
+        match self.hop_interval_max {
+            Some(max) if max > self.hop_interval => {
+                let range_ms = (max - self.hop_interval).as_millis() as u64;
+                if range_ms > 0 {
+                    let mut b = [0u8; 8];
+                    let _ = getrandom::fill(&mut b);
+                    let add_ms = u64::from_le_bytes(b) % range_ms;
+                    self.hop_interval + Duration::from_millis(add_ms)
+                } else {
+                    self.hop_interval
+                }
+            }
+            _ => self.hop_interval,
+        }
+    }
+
     async fn shared(&self) -> io::Result<Arc<Hy2Shared>> {
         let mut pool = self.shared.lock().await;
-        pool.retain(|s| s.conn.close_reason().is_none());
+        let now = std::time::Instant::now();
+        pool.retain(|s| {
+            s.conn.close_reason().is_none() && s.hop_deadline.is_none_or(|dl| now < dl)
+        });
         let best = pool
             .iter()
             .enumerate()
@@ -203,8 +267,10 @@ impl Hysteria2 {
     }
 
     async fn dial(&self) -> io::Result<Arc<Hy2Shared>> {
-        let addr = resolve_host(&self.server, self.port).await?;
-        let sock = if self.obfs_password.is_some() {
+        let port = self.pick_port();
+        let addr = resolve_host(&self.server, port).await?;
+        let need_relay = !self.server_port_ranges.is_empty() || self.obfs_password.is_some();
+        let sock = if need_relay {
             bind_udp_loopback(addr.is_ipv4())?
         } else {
             bind_udp(addr)?
@@ -224,21 +290,20 @@ impl Hysteria2 {
         client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
-        let relay = if let Some(pw) = &self.obfs_password {
-            let relay = match self.gecko {
-                Some((min_packet_size, max_packet_size)) => {
-                    spawn_gecko_relay(
-                        addr,
-                        pw.clone(),
-                        endpoint.local_addr()?,
-                        min_packet_size,
-                        max_packet_size,
-                    )
-                    .await
-                }
-                None => spawn_salamander_relay(addr, pw.clone(), endpoint.local_addr()?).await,
-            }
-            .map_err(|e| io::Error::other(format!("hysteria2: obfs relay: {e}")))?;
+        let relay = if need_relay {
+            let hop_interval = (!self.server_port_ranges.is_empty()).then_some(self.hop_interval);
+            let relay = spawn_hop_relay(
+                addr.ip(),
+                self.server_port_ranges.clone(),
+                port,
+                hop_interval,
+                self.hop_interval_max,
+                self.obfs_password.clone(),
+                self.gecko,
+                endpoint.local_addr()?,
+            )
+            .await
+            .map_err(|e| io::Error::other(format!("hysteria2: relay: {e}")))?;
             Some(relay)
         } else {
             None
@@ -282,12 +347,19 @@ impl Hysteria2 {
         };
 
         let udp_enabled = server_udp && self.want_udp;
+        let hop_deadline = if !self.server_port_ranges.is_empty() {
+            Some(std::time::Instant::now() + self.next_hop_interval())
+        } else {
+            None
+        };
+
         Ok(Arc::new(Hy2Shared {
             endpoint,
             conn,
             _send_request: send_request,
             _h3_driver: driver,
             _relay: relay,
+            hop_deadline,
             udp_enabled,
             next_session: AtomicU32::new(0),
             sessions: std::sync::Mutex::new(HashMap::new()),
@@ -397,6 +469,7 @@ struct Hy2Shared {
     _send_request: H3SendRequest,
     _h3_driver: tokio::task::JoinHandle<()>,
     _relay: Option<SalamanderRelay>,
+    hop_deadline: Option<std::time::Instant>,
     udp_enabled: bool,
     next_session: AtomicU32,
     sessions: std::sync::Mutex<HashMap<u32, Arc<UdpSession>>>,

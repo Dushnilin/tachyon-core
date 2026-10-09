@@ -319,8 +319,10 @@ impl Fptn {
         let stack_cfg = Arc::new(StackCfg {
             tag: self.cfg.tag.clone(),
             mtu: self.cfg.mtu,
-            local_addr,
-            local_cidr: IpCidr::new(IpAddress::Ipv4(local_addr), 32),
+            local_addr: Some(local_addr),
+            local_cidr: Some(IpCidr::new(IpAddress::Ipv4(local_addr), 32)),
+            local_addr_v6: None,
+            local_cidr_v6: None,
             idle_timeout: None,
         });
         let conn = FptnConn::new(ws);

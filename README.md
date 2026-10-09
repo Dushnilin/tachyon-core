@@ -4,7 +4,7 @@
 
 [![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
 [![Rust](https://img.shields.io/badge/Rust-1.89+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Binary Size](https://img.shields.io/badge/Binary-~11_MiB_Full_|_~5.7_MiB_Lite-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core)
+[![Binary Size](https://img.shields.io/badge/Binary-10.0_--_12.8_MiB-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core/releases/tag/v0.0.1)
 [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981?style=for-the-badge&logo=speedtest)](https://github.com/Dushnilin/tachyon-core)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981?style=for-the-badge&logo=speedtest)](BENCHMARK.md)
 [![Interactive Report](https://img.shields.io/badge/Dashboard-HTML_Report-6366F1?style=for-the-badge&logo=html5&logoColor=white)](BENCHMARK.html)
@@ -23,24 +23,24 @@
 
 **tachyon-core** — прокси-ядро для роутеров и встраиваемых систем, написанное с нуля на чистом **Rust**. Берёт **тот же JSON-конфиг** и **тот же CLI**, что и sing-box, но без рантайма Go: тот же файл `/etc/sing-box/config.json`, те же `check -c` / `version` / `run`, тот же бинарник, который при установке под именем `sing-box` отдаёт совместимую версию.
 
-Поддерживается весь набор [sing-box-lx](https://github.com/Leadaxe/sing-box-lx): XHTTP, AmneziaWG 2.0/3.x, MASQUE/WARP, uTLS, REALITY, ShadowTLS, DNS-группы, постквантовое шифрование.
+Поддерживается весь набор [sing-box-lx](https://github.com/Leadaxe/sing-box-lx): XHTTP, AmneziaWG 2.0/3.x, MASQUE/WARP, uTLS, REALITY, ShadowTLS, DNS-группы, постквантовое шифрование, нативный Tailscale и zero-copy mmap rule-sets.
 
 Замеры — на реальных статических musl-сборках против эталонных Go-ядер (`sing-box-lx` 1.14.2-lx.12, `Xray-core`, `Mihomo`) и модульного C-стека `steer`, в одноядерном роутерном профиле (1 worker, CPU pinning). Полные графики: **[BENCHMARK.md](BENCHMARK.md)** и **[BENCHMARK.html](BENCHMARK.html)**.
 
 **Средние цифры по всем целевым архитектурам:**
 
-| | tachyon Full | tachyon Lite | Go-ядра (sing-box-lx / Xray / Mihomo) | Преимущество |
-|---|:---:|:---:|:---:|:---:|
-| **Размер бинарника** | **~11 MiB** | **~5.7 MiB** | ~70 MiB | **в ~6.5× меньше** (Lite — в ~12×) |
-| **RAM в простое** | **4.2 MiB** | 4.0 MiB | ~41 MiB | **в ~10× меньше** |
-| **RAM под нагрузкой** | **~10 MiB** | ~8 MiB | ~65 MiB | **в ~6 раз меньше** |
-| **Паузы GC** | **0.00 ms** | 0.00 ms | 2–15 ms | **нет джиттера вообще** |
-| **Холодный старт** | **22 ms** | ~20 ms | ~210 ms | **в 7–12 раз быстрее** |
-| **Зависимости от C / CGO** | **0** | 0 | CGO / BoringSSL | **собирается под любой MIPS** |
+| | tachyon-core | Go-ядра (sing-box-lx / Xray / Mihomo) | Преимущество |
+|---|:---:|:---:|:---:|
+| **Размер бинарника** | **10.0–12.8 MiB** (4.7–5.3 МБ в архиве) | ~70 MiB | **в ~6.5× меньше** |
+| **RAM в простое** | **4.2 MiB** | ~41 MiB | **в ~10× меньше** |
+| **RAM под нагрузкой** | **~10 MiB** | ~65 MiB | **в ~6 раз меньше** |
+| **Паузы GC** | **0.00 ms** | 2–15 ms | **нет джиттера вообще** |
+| **Холодный старт** | **22 ms** | ~210 ms | **в 7–12 раз быстрее** |
+| **Зависимости от C / CGO** | **0** | CGO / BoringSSL | **собирается под любой MIPS** |
 
 > **Прямое преимущество №1 — память.** ~10× меньше в простое на роутере с 128 МБ — это разница между «OOM-киллер в неподходящий момент» и запасом для conntrack, Wi-Fi и LuCI.
 >
-> **Прямое преимущество №2 — флеш.** ~11 MiB против ~70 MiB: ядро ставится во внутреннюю память `/usr/bin/` роутера с 16/32/128 МБ, без USB-накопителя и extroot. Go-бинарник туда физически не влезает.
+> **Прямое преимущество №2 — флеш.** 10.0–12.8 MiB (4.7–5.3 МБ в архиве) против ~70 MiB: ядро ставится во внутреннюю память `/usr/bin/` роутера с 16/32/128 МБ, без USB-накопителя и extroot. Go-бинарник туда физически не влезает.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
@@ -71,8 +71,7 @@
 
 | Ядро | Бинарник | Холодный старт | RAM (Idle / Peak) | Задержка p50 / p99 | Пропускная | CPU |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **tachyon-core (Full)** | **11.61 MiB** | **22.3 ms** 🥇 | **4.2 / 4.6 MiB** 🥇 | **170.0 / 221.4 µs** 🥇 | **51.7 Gbps** | 0.163 s/G |
-| **tachyon-core (Lite)** | **< 6.00 MiB** | ~20 ms | 4.0 / 4.4 MiB | 170.0 / 221.4 µs | 51.7 Gbps | 0.163 s/G |
+| **tachyon-core** | **11.61 MiB** | **22.3 ms** 🥇 | **4.2 / 4.6 MiB** 🥇 | **170.0 / 221.4 µs** 🥇 | **51.7 Gbps** | 0.163 s/G |
 | `steer` (C, 3 процесса) | 1.76 MiB | 141.9 ms | 5.1 / 5.4 MiB | 173.6 / 221.7 µs | 8.0–9.6 Gbps | 1.067 s/G |
 | `xray-core` (Go, XTLS) | 34.88 MiB | 161.1 ms | 25.0 / 25.6 MiB | 183.9 / 233.4 µs | 53.1 Gbps | 0.158 s/G |
 | `mihomo` (Go, Clash Meta) | 59.12 MiB | 211.3 ms | 32.9 / 33.9 MiB | 188.5 / 251.3 µs | 48.2 Gbps | 0.174 s/G |
@@ -178,13 +177,10 @@ tachyon-core rule-set compile rules.json -o rules.srs            # SRS v5, об�
 Требуется Rust 1.89+ (редакция 2024).
 
 ```bash
-# Полная сборка (Full: все протоколы, Clash API, DNS-группы, SRS v5, ~11 MiB)
+# Сборка релизного бинарника (все протоколы, Clash API, DNS-группы, Tailscale, mmap, ~11 MiB)
 cargo build --workspace --release
 
-# Lite-сборка (~5.7 MiB) для роутеров с 16–32 МБ флеша
-cargo build -p core-cli --release --profile lite --no-default-features --features lite
-
-# Проверка лимитов размера (Full <= 12 MiB, Lite <= 6 MiB) и тесты
+# Проверка лимитов размера (<= 12 MiB) и запуск тестов
 bash scripts/size.sh
 cargo test --workspace
 
@@ -195,7 +191,7 @@ cargo zigbuild --target armv7-unknown-linux-musleabihf --release # ARMv7: IPQ401
 cargo zigbuild --target x86_64-unknown-linux-musl --release      # Мини-ПК, Proxmox, x86-роутеры
 ```
 
-Символы вырезаются автоматически (`strip = "symbols"`): ~11 MiB Full, ~5.7 MiB Lite.
+Символы вырезаются автоматически (`strip = "symbols"`): **10.0–12.8 MiB** (в архиве 4.7–5.3 МБ).
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
@@ -217,7 +213,7 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release      # Мини-ПК
 | **F7** | lx daemon и метрики: совместимость со службой Windows и демоном `lxd`, расширенная телеметрия | Запланировано |
 | **F8** | libbox / Android: UniFFI/JNI биндинги | Запланировано |
 | **F9** | MIPS-спайк: таргеты `mipsel`/`mips` softfloat musl через `-Zbuild-std` | **В разработке** (сборка в CI есть) |
-| **F10** | Интеграция в Tachyon: автоинсталлятор, переключение ядра в LuCI в один клик, Lite-сборка | Запланировано |
+| **F10** | Интеграция в Tachyon: автоинсталлятор, переключение ядра в LuCI в один клик | Запланировано |
 | **F11** | **Собственная система конфигурации и хранения данных на флеше** | **Декабрь 2026** |
 | **F12** | **Отказ от совместимости с конфигами sing-box** | **1 января 2027** |
 

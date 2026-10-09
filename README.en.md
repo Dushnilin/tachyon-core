@@ -4,7 +4,7 @@
 
 [![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
 [![Rust](https://img.shields.io/badge/Rust-1.89+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Binary Size](https://img.shields.io/badge/Binary-~11_MiB_Full_|_~5.7_MiB_Lite-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core)
+[![Binary Size](https://img.shields.io/badge/Binary-10.0_--_12.8_MiB-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core/releases/tag/v0.0.1)
 [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981?style=for-the-badge&logo=speedtest)](https://github.com/Dushnilin/tachyon-core)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981?style=for-the-badge&logo=speedtest)](BENCHMARK.md)
 [![Interactive Report](https://img.shields.io/badge/Dashboard-HTML_Report-6366F1?style=for-the-badge&logo=html5&logoColor=white)](BENCHMARK.html)
@@ -23,24 +23,24 @@
 
 **tachyon-core** is a proxy core for routers and embedded systems, written from scratch in pure **Rust**. It takes the **same JSON config** and the **same CLI** as sing-box, but without the Go runtime: the same `/etc/sing-box/config.json`, the same `check -c` / `version` / `run`, and the same binary, which reports a compatible version string when installed under the name `sing-box`.
 
-The full [sing-box-lx](https://github.com/Leadaxe/sing-box-lx) feature set is supported: XHTTP, AmneziaWG 2.0/3.x, MASQUE/WARP, uTLS, REALITY, ShadowTLS, DNS groups, and post-quantum encryption.
+The full [sing-box-lx](https://github.com/Leadaxe/sing-box-lx) feature set is supported: XHTTP, AmneziaWG 2.0/3.x, MASQUE/WARP, uTLS, REALITY, ShadowTLS, DNS groups, post-quantum encryption, native Tailscale, and zero-copy mmap rule-sets.
 
 All numbers come from real static musl builds measured against reference Go cores (`sing-box-lx` 1.14.2-lx.12, `Xray-core`, `Mihomo`) and the modular C stack `steer`, in a single-core router profile (1 worker, CPU pinning). Full graphs: **[BENCHMARK.md](BENCHMARK.md)** and **[BENCHMARK.html](BENCHMARK.html)**.
 
 **Averages across all target architectures:**
 
-| | tachyon Full | tachyon Lite | Go cores (sing-box-lx / Xray / Mihomo) | Advantage |
-|---|:---:|:---:|:---:|:---:|
-| **Binary size** | **~11 MiB** | **~5.7 MiB** | ~70 MiB | **~6.5× smaller** (Lite ~12×) |
-| **Idle RAM** | **4.2 MiB** | 4.0 MiB | ~41 MiB | **~10× less** |
-| **RAM under load** | **~10 MiB** | ~8 MiB | ~65 MiB | **~6× less** |
-| **GC pauses** | **0.00 ms** | 0.00 ms | 2–15 ms | **no jitter at all** |
-| **Cold start** | **22 ms** | ~20 ms | ~210 ms | **7–12× faster** |
-| **C / CGO dependencies** | **0** | 0 | CGO / BoringSSL | **builds on any MIPS** |
+| | tachyon-core | Go cores (sing-box-lx / Xray / Mihomo) | Advantage |
+|---|:---:|:---:|:---:|
+| **Binary size** | **10.0–12.8 MiB** (4.7–5.3 MB in archive) | ~70 MiB | **~6.5× smaller** |
+| **Idle RAM** | **4.2 MiB** | ~41 MiB | **~10× less** |
+| **RAM under load** | **~10 MiB** | ~65 MiB | **~6× less** |
+| **GC pauses** | **0.00 ms** | 2–15 ms | **no jitter at all** |
+| **Cold start** | **22 ms** | ~210 ms | **7–12× faster** |
+| **C / CGO dependencies** | **0** | CGO / BoringSSL | **builds on any MIPS** |
 
 > **Direct advantage #1 — memory.** ~10× less at idle on a 128 MB router is the difference between "OOM-killer at the worst possible moment" and having headroom for conntrack, Wi-Fi, and LuCI.
 >
-> **Direct advantage #2 — flash.** ~11 MiB against ~70 MiB: the core installs straight into the internal `/usr/bin/` flash of a 16/32/128 MB router, with no USB drive and no extroot. A Go binary physically does not fit.
+> **Direct advantage #2 — flash.** 10.0–12.8 MiB (4.7–5.3 MB in archive) against ~70 MiB: the core installs straight into the internal `/usr/bin/` flash of a 16/32/128 MB router, with no USB drive and no extroot. A Go binary physically does not fit.
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
@@ -71,8 +71,7 @@ All numbers come from real static musl builds measured against reference Go core
 
 | Core | Binary | Cold start | RAM (Idle / Peak) | Latency p50 / p99 | Throughput | CPU |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **tachyon-core (Full)** | **11.61 MiB** | **22.3 ms** 🥇 | **4.2 / 4.6 MiB** 🥇 | **170.0 / 221.4 µs** 🥇 | **51.7 Gbps** | 0.163 s/G |
-| **tachyon-core (Lite)** | **< 6.00 MiB** | ~20 ms | 4.0 / 4.4 MiB | 170.0 / 221.4 µs | 51.7 Gbps | 0.163 s/G |
+| **tachyon-core** | **11.61 MiB** | **22.3 ms** 🥇 | **4.2 / 4.6 MiB** 🥇 | **170.0 / 221.4 µs** 🥇 | **51.7 Gbps** | 0.163 s/G |
 | `steer` (C, 3 procs) | 1.76 MiB | 141.9 ms | 5.1 / 5.4 MiB | 173.6 / 221.7 µs | 8.0–9.6 Gbps | 1.067 s/G |
 | `xray-core` (Go, XTLS) | 34.88 MiB | 161.1 ms | 25.0 / 25.6 MiB | 183.9 / 233.4 µs | 53.1 Gbps | 0.158 s/G |
 | `mihomo` (Go, Clash Meta) | 59.12 MiB | 211.3 ms | 32.9 / 33.9 MiB | 188.5 / 251.3 µs | 48.2 Gbps | 0.174 s/G |
@@ -178,13 +177,10 @@ tachyon-core rule-set compile rules.json -o rules.srs            # SRS v5, both 
 Requires Rust 1.89+ (edition 2024).
 
 ```bash
-# Full build (all protocols, Clash API, DNS groups, SRS v5, ~11 MiB)
+# Release build (all protocols, Clash API, DNS groups, Tailscale, mmap, ~11 MiB)
 cargo build --workspace --release
 
-# Lite build (~5.7 MiB) for routers with 16-32 MB flash
-cargo build -p core-cli --release --profile lite --no-default-features --features lite
-
-# Size limit check (Full <= 12 MiB, Lite <= 6 MiB) and the test suite
+# Size limit check (<= 12 MiB) and the test suite
 bash scripts/size.sh
 cargo test --workspace
 
@@ -195,7 +191,7 @@ cargo zigbuild --target armv7-unknown-linux-musleabihf --release # ARMv7: IPQ401
 cargo zigbuild --target x86_64-unknown-linux-musl --release      # Mini-PCs, Proxmox, x86 routers
 ```
 
-Symbols are stripped automatically (`strip = "symbols"`): ~11 MiB Full, ~5.7 MiB Lite.
+Symbols are stripped automatically (`strip = "symbols"`): **10.0–12.8 MiB** (4.7–5.3 MB in archive).
 
 <p align="center">
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
@@ -217,7 +213,7 @@ Features are split into phases with automatic differential testing against the r
 | **F7** | lx daemon and metrics: Windows service and `lxd` daemon compatibility, extended telemetry | Planned |
 | **F8** | libbox / Android: UniFFI/JNI bindings | Planned |
 | **F9** | MIPS spike: `mipsel`/`mips` softfloat musl targets via `-Zbuild-std` | **In progress** (CI builds exist) |
-| **F10** | Tachyon integration: autoinstaller, one-click core switch in LuCI, Lite build | Planned |
+| **F10** | Tachyon integration: autoinstaller, one-click core switch in LuCI | Planned |
 | **F11** | **Native configuration system and on-flash data storage** | **December 2026** |
 | **F12** | **Drop compatibility with sing-box configs** | **1 January 2027** |
 

@@ -368,6 +368,7 @@ pub fn clash_meta(
         chains.push(tag.to_string());
         index = match outbound {
             crate::route::Outbound::Selector(selector) => router.index_of(selector.now()),
+            crate::route::Outbound::Urltest(urltest) => router.index_of(urltest.now()),
             _ => None,
         };
     }

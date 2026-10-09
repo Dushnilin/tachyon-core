@@ -2,15 +2,18 @@
 //! each and routes through the lowest-latency one, re-probing on an interval.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::inbound::{AnyStream, Conn, Target};
+use crate::logging;
 use crate::route::Router;
 use crate::tls_client;
 
@@ -149,13 +152,40 @@ impl Urltest {
     }
 }
 
-async fn probe_all(shared: &Shared, router: &Router) {
+async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
     let Some(members) = shared.resolved.get() else {
         return;
     };
-    let mut results: Vec<Option<u64>> = Vec::with_capacity(members.len());
-    for member in members {
-        results.push(probe_member(shared, router, *member).await);
+    // Reference probes every member concurrently and records each result as
+    // it lands, so the clash history fills while the round is still running.
+    // The pool is capped at 8: a 42-member subscription round all at once
+    // saturates a router CPU and blows the per-probe budget, and the
+    // statuses the UI shows would never fill — the same nodes answer in
+    // ~1s when tested one at a time.
+    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut set = tokio::task::JoinSet::new();
+    for (pos, member) in members.iter().enumerate() {
+        let shared = Arc::clone(shared);
+        let router = Arc::clone(router);
+        let sem = Arc::clone(&sem);
+        let member = *member;
+        set.spawn(async move {
+            let permit = sem.acquire().await.expect("probe pool never closes");
+            let ms = probe_member(&shared, &router, member).await;
+            drop(permit);
+            // Clash DelayHistory: every successful probe records; failures
+            // do not.
+            if let Some(ms) = ms {
+                router.record_delay(member, ms as u32);
+            }
+            (pos, ms)
+        });
+    }
+    let mut results: Vec<Option<u64>> = vec![None; members.len()];
+    while let Some(joined) = set.join_next().await {
+        if let Ok((pos, ms)) = joined {
+            results[pos] = ms;
+        }
     }
     let mut latencies = shared.latencies.lock().expect("latencies lock");
     latencies.clone_from(&results);
@@ -180,48 +210,223 @@ async fn probe_all(shared: &Shared, router: &Router) {
     }
 }
 
+/// Logs every completed read/write of a probe connection with its size and
+/// the gap since the previous one: a stalled TLS handshake shows up as one
+/// huge `r` gap, a paced one as a run of small `r` entries.
+///
+/// With `watchdog`, an I/O gap past [`STALL`] aborts the attempt instead of
+/// riding out the TCP retransmission timer — a fresh connection rolls the
+/// dice again and usually answers in one clean RTT. The deadline lives in a
+/// `Sleep` polled alongside the I/O: a parked read gets no poll, so a
+/// check-on-poll guard would never fire exactly when it is needed.
+struct Tap {
+    inner: AnyStream,
+    member: usize,
+    last: Instant,
+    watchdog: bool,
+    stall: Pin<Box<tokio::time::Sleep>>,
+}
+
+const STALL: Duration = Duration::from_millis(1200);
+
+impl Tap {
+    fn new(inner: AnyStream, member: usize, watchdog: bool) -> Self {
+        Self {
+            inner,
+            member,
+            last: Instant::now(),
+            watchdog,
+            stall: Box::pin(tokio::time::sleep(STALL)),
+        }
+    }
+
+    fn mark(&mut self, dir: &str, n: usize) {
+        let now = Instant::now();
+        let gap = now.duration_since(self.last).as_millis();
+        self.last = now;
+        if self.watchdog {
+            self.stall
+                .as_mut()
+                .reset(tokio::time::Instant::now() + STALL);
+        }
+        logging::debug(format_args!(
+            "urltest tap[{}]: {dir}{n} +{gap}ms",
+            self.member
+        ));
+    }
+}
+
+impl AsyncRead for Tap {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(&res, Poll::Ready(Ok(()))) {
+            let n = buf.filled().len() - before;
+            if n > 0 {
+                this.mark("r", n);
+            }
+            return res;
+        }
+        if this.watchdog && res.is_pending() && this.stall.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "probe read stalled",
+            )));
+        }
+        res
+    }
+}
+
+impl AsyncWrite for Tap {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            if *n > 0 {
+                this.mark("w", *n);
+            }
+            return res;
+        }
+        if this.watchdog && res.is_pending() && this.stall.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "probe write stalled",
+            )));
+        }
+        res
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 async fn probe_member(shared: &Shared, router: &Router, member: usize) -> Option<u64> {
+    // Reference has recorded a 6390 ms probe, so its budget is at least
+    // ~6.4 s; nodes that answer solo in 5-6 s must still fill the clash
+    // history, or the UI shows them as dead while the reference shows them
+    // alive. A stalled attempt is cut at STALL and retried on a fresh
+    // connection inside the same budget — loss costs one clean re-roll
+    // instead of riding the full retransmission timer.
+    //
+    // The dial itself is never cancelled: pooled transports (xhttp's H2
+    // pool) reserve a slot before dialing and release it only on Ok/Err,
+    // so a dropped connect leaks the reservation, every later connect
+    // through that member parks forever, and the watchdog restarts the
+    // whole process over the dead proxy port. The guard before a retry
+    // keeps the budget timeout from landing mid-dial either — a dial
+    // finishes within its own ~5 s cap, 7 s of budget covers it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for attempt in 1..=3u8 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_millis(400)
+            || (attempt > 1 && remaining < Duration::from_secs(7))
+        {
+            break;
+        }
+        match tokio::time::timeout(remaining, probe_once(shared, router, member, attempt)).await {
+            Ok(ProbeAttempt::Done(ms)) => return Some(ms),
+            Ok(ProbeAttempt::Retry) => {}
+            Ok(ProbeAttempt::Fail) | Err(_) => break,
+        }
+    }
+    None
+}
+
+/// One probe attempt: `Retry` only for losses a fresh connection can dodge,
+/// `Fail` for answers that will not change on a re-roll.
+enum ProbeAttempt {
+    Done(u64),
+    Retry,
+    Fail,
+}
+
+async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8) -> ProbeAttempt {
     let start = Instant::now();
     let target = Target::Domain(shared.probe.host.clone(), shared.probe.port);
     let probe = async {
         let Ok(Conn::Plain(stream)) = router.connect_index(member, &target).await else {
-            return None;
+            logging::debug(format_args!(
+                "urltest probe[{member}]/a{attempt}: dial failed after {}ms",
+                start.elapsed().as_millis()
+            ));
+            return ProbeAttempt::Fail;
         };
+        let dial_ms = start.elapsed();
+        let watchdog = attempt < 3;
+        let tapped: AnyStream = Box::new(Tap::new(stream, member, watchdog));
         let mut stream: AnyStream = if shared.probe.tls {
-            tls_client::wrap_probe(stream, &shared.probe.host)
-                .await
-                .ok()?
+            match tls_client::wrap_probe(tapped, &shared.probe.host).await {
+                Ok(s) => s,
+                Err(e) => {
+                    logging::debug(format_args!(
+                        "urltest probe[{member}]/a{attempt}: tls failed after {}ms: {e}",
+                        dial_ms.as_millis()
+                    ));
+                    return if e.kind() == io::ErrorKind::TimedOut {
+                        ProbeAttempt::Retry
+                    } else {
+                        ProbeAttempt::Fail
+                    };
+                }
+            }
         } else {
-            stream
+            tapped
         };
+        let tls_at = start.elapsed();
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             shared.probe.path, shared.probe.host
         );
-        stream.write_all(request.as_bytes()).await.ok()?;
-        let mut head = Vec::with_capacity(128);
-        let mut byte = [0u8; 1];
-        loop {
-            stream.read_exact(&mut byte).await.ok()?;
-            head.push(byte[0]);
-            if head.ends_with(b"\r\n\r\n") {
-                break;
+        if stream.write_all(request.as_bytes()).await.is_err() {
+            return ProbeAttempt::Retry;
+        }
+        // One read per chunk, not one per byte: the head crosses a boxed
+        // stream plus a TLS record layer, and a byte-at-a-time loop pays
+        // that round trip ~200 times for every probe in the round.
+        let mut head = Vec::with_capacity(256);
+        let mut buf = [0u8; 1024];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return ProbeAttempt::Retry,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
             }
             if head.len() > 16 * 1024 {
-                return None;
+                return ProbeAttempt::Fail;
             }
         }
+        let head_at = start.elapsed();
+        logging::debug(format_args!(
+            "urltest probe[{member}]/a{attempt}: dial {}ms tls {}ms req {}ms total {}ms",
+            dial_ms.as_millis(),
+            tls_at.saturating_sub(dial_ms).as_millis(),
+            head_at.saturating_sub(tls_at).as_millis(),
+            head_at.as_millis()
+        ));
         let head = String::from_utf8_lossy(&head);
-        let status = head.lines().next()?.split_whitespace().nth(1)?;
+        let Some(status) = head.lines().next().and_then(|line| line.split_whitespace().nth(1))
+        else {
+            return ProbeAttempt::Fail;
+        };
         if !status.starts_with('2') {
-            return None;
+            return ProbeAttempt::Fail;
         }
-        Some(())
+        ProbeAttempt::Done(start.elapsed().as_millis() as u64)
     };
-    match tokio::time::timeout(Duration::from_secs(5), probe).await {
-        Ok(Some(())) => Some(start.elapsed().as_millis() as u64),
-        _ => None,
-    }
+    probe.await
 }
 
 fn parse_probe_url(url: &str, at: &str) -> anyhow::Result<UrlProbe> {

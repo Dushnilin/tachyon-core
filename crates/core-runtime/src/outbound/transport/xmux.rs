@@ -270,6 +270,14 @@ impl Pool {
         })
     }
 
+    pub(crate) fn max_connections(&self) -> usize {
+        if self.connections > 0 {
+            self.connections as usize
+        } else {
+            3
+        }
+    }
+
     /// A pooled connection that is free and not retired, or `None` so the caller
     /// dials a fresh one.
     pub(crate) async fn acquire(self: &Arc<Self>) -> Option<Arc<Client>> {

@@ -21,6 +21,25 @@ use crate::inbound::AnyStream;
 
 use super::h2io::{H2Io, H2Stream};
 
+/// Go's `url.PathEscape` (encodePathSegment): unreserved plus
+/// `$&+=:@` kept raw, everything else — notably `/` — percent-encoded.
+fn path_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@'
+            );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 pub(super) async fn connect(
     stream: AnyStream,
     service_name: &str,
@@ -40,7 +59,11 @@ pub(super) async fn connect(
         .map_err(|e| io::Error::other(format!("grpc: h2 ready: {e}")))?;
 
     let scheme = if secure { "https" } else { "http" };
-    let path = format!("/{service_name}/Tun");
+    // Reference client behaviour: the service name goes through Go's
+    // `url.PathEscape` before hitting `:path` — Xray's server matches the
+    // escaped form (`/api%2Ftest/Tun`) and rejects the raw slash, while
+    // servers that compare decoded paths accept both.
+    let path = format!("/{}/Tun", path_escape(service_name));
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("{scheme}://{authority}{path}"))
@@ -314,6 +337,17 @@ mod tests {
                 pending.push_front(front);
             }
         }
+    }
+
+    /// `:path` carries the Go-escaped service name — Xray matches the
+    /// escaped form and hangs up on the raw slash.
+    #[test]
+    fn service_name_escapes_the_slash() {
+        assert_eq!(path_escape("api/test"), "api%2Ftest");
+        assert_eq!(path_escape("plain"), "plain");
+        assert_eq!(path_escape("a b"), "a%20b");
+        assert_eq!(path_escape("a?b,c;d"), "a%3Fb%2Cc%3Bd");
+        assert_eq!(path_escape("k:v@w"), "k:v@w");
     }
 
     #[test]

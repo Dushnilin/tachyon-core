@@ -12,7 +12,7 @@
 
 mod http;
 mod obfs;
-mod proto;
+pub(crate) mod proto;
 mod reality;
 mod tls;
 mod ws;

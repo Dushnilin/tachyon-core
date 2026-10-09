@@ -157,6 +157,52 @@ async fn a_configured_protocol_header_is_replaced() {
     );
 }
 
+/// The reference leaves a single Host line on the wire (Go write-excludes
+/// Header["Host"]); a second one makes picky servers answer 400 and the
+/// whole node reads as dead in the clash UI.
+#[tokio::test]
+async fn a_host_header_is_written_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = tokio::spawn(async move { ws_server(listener).await });
+    let transport = Transport {
+        kind: Kind::Ws {
+            path: "/p".into(),
+            host: None,
+            headers: vec![("Host".into(), "cdn.example.com".into())],
+            max_early_data: 0,
+        },
+    };
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    drop(
+        transport
+            .connect(
+                tcp,
+                None,
+                "example.com",
+                port,
+                b"",
+                &crate::outbound::dial::DialOptions::default(),
+            )
+            .await
+            .expect("handshake"),
+    );
+    let head = server.await.expect("join");
+    assert_eq!(
+        head.matches("Host:").count(),
+        1,
+        "exactly one Host line, got:\n{head}"
+    );
+    assert!(
+        head.contains("Host: cdn.example.com\r\n"),
+        "the configured Host wins, got:\n{head}"
+    );
+}
+
 /// A socket that hands out at most `piece` bytes per read, so a websocket frame
 /// is guaranteed to land across many reads. `widest` records the largest buffer
 /// a read was ever asked for: that is how the direct path is told apart from

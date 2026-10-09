@@ -134,6 +134,17 @@ fn authority(host: &str, port: u16) -> String {
     }
 }
 
+/// A `Host` entry inside the transport headers. The reference hands these to
+/// Go's http stack, which writes exactly one Host line (Header["Host"] is a
+/// write-excluded special case); writing both would make picky servers
+/// answer 400 on the handshake.
+fn headers_host(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.as_str())
+}
+
 impl Transport {
     /// Parse the outbound `transport` object (absent/null → no transport).
     pub(crate) fn parse(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
@@ -304,7 +315,10 @@ impl Transport {
                 headers,
                 max_early_data,
             } => {
-                let host = host.as_deref().unwrap_or(server);
+                let host = host
+                    .as_deref()
+                    .or_else(|| headers_host(headers))
+                    .unwrap_or(server);
                 ws_handshake(stream, path, host, headers, early, *max_early_data).await?
             }
             Kind::HttpUpgrade {
@@ -312,7 +326,10 @@ impl Transport {
                 host,
                 headers,
             } => {
-                let host = host.as_deref().unwrap_or(server);
+                let host = host
+                    .as_deref()
+                    .or_else(|| headers_host(headers))
+                    .unwrap_or(server);
                 (httpupgrade_handshake(stream, path, host, headers).await?, 0)
             }
             Kind::Grpc { service_name } => {
@@ -425,6 +442,9 @@ async fn read_response_head(stream: &mut AnyStream) -> io::Result<String> {
 
 fn append_headers(request: &mut String, headers: &[(String, String)]) {
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         request.push_str(name);
         request.push_str(": ");
         request.push_str(value);
@@ -461,6 +481,9 @@ async fn ws_handshake(
     // the early data owns the protocol header, so a configured one is dropped
     let carried = early.len().min(max_early_data);
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         if carried > 0 && name.eq_ignore_ascii_case("sec-websocket-protocol") {
             continue;
         }

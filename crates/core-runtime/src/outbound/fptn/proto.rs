@@ -286,6 +286,19 @@ pub(crate) fn decode_ip_assignment(buf: &[u8]) -> io::Result<(String, String)> {
     Ok((v4, v6))
 }
 
+/// `Message{msg_type=MSG_IP_ASSIGNMENT, ip_addresses{address_ipv4, address_ipv6}}`.
+pub(crate) fn encode_ip_assignment(ipv4: &str, ipv6: &str) -> Vec<u8> {
+    let mut assignment = Vec::new();
+    put_bytes_field(&mut assignment, 1, ipv4.as_bytes());
+    put_bytes_field(&mut assignment, 2, ipv6.as_bytes());
+
+    let mut msg = Vec::new();
+    put_field_varint(&mut msg, 1, PROTOCOL_VERSION);
+    put_field_varint(&mut msg, 2, MSG_IP_ASSIGNMENT);
+    put_bytes_field(&mut msg, 5, &assignment);
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

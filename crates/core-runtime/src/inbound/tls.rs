@@ -168,6 +168,79 @@ impl ServerTls {
         })
     }
 
+    /// Build a quinn ServerConfig for QUIC server inbounds (hysteria2, tuic).
+    pub fn build_quic_server_config(
+        tls: &Value,
+        default_alpn: &[&[u8]],
+        at: &str,
+    ) -> anyhow::Result<quinn::ServerConfig> {
+        let object = tls
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{at}: tls: must be a JSON object"))?;
+
+        let certificate = match object.get("certificate_path").and_then(Value::as_str) {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{at}: tls: read certificate: {e}"))?,
+            None => listable(object, "certificate")
+                .ok_or_else(|| anyhow::anyhow!("{at}: tls: missing certificate"))?,
+        };
+        let key_pem = match object.get("key_path").and_then(Value::as_str) {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{at}: tls: read key: {e}"))?,
+            None => {
+                listable(object, "key").ok_or_else(|| anyhow::anyhow!("{at}: tls: missing key"))?
+            }
+        };
+
+        let certs: Vec<_> = rustls_pemfile::certs(&mut certificate.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("{at}: tls: parse certificate: {e}"))?;
+        if certs.is_empty() {
+            anyhow::bail!("{at}: tls: the certificate holds no certificate");
+        }
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{at}: tls: parse key: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("{at}: tls: the key file holds no key"))?;
+
+        core_tls::install_default_provider();
+        let mut cfg = core_tls::rustls::ServerConfig::builder_with_provider(
+            core_tls::quic::configured_provider(),
+        )
+        .with_protocol_versions(&[&core_tls::rustls::version::TLS13])
+        .map_err(|e| anyhow::anyhow!("{at}: tls: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("{at}: tls: {e}"))?;
+
+        let alpn: Vec<Vec<u8>> = match object.get("alpn") {
+            None => default_alpn.iter().map(|p| p.to_vec()).collect(),
+            Some(Value::String(one)) => vec![one.as_bytes().to_vec()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| name.as_bytes().to_vec())
+                .collect(),
+            Some(_) => anyhow::bail!("{at}: tls: alpn: must be a string or a list"),
+        };
+        if !alpn.is_empty() {
+            cfg.alpn_protocols = alpn;
+        }
+
+        let crypto = core_tls::quic::QuicServerConfig::try_from(cfg)
+            .map_err(|e| anyhow::anyhow!("{at}: quic tls: {e:?}"))?;
+
+        let mut server_config = quinn::ServerConfig::new(
+            Arc::new(crypto),
+            Arc::new(core_tls::quic::HandshakeTokenKeyRustCrypto::new([7u8; 64])),
+        );
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(30)).unwrap(),
+        ));
+        server_config.transport_config(Arc::new(transport));
+        Ok(server_config)
+    }
+
     /// Run the handshake over `stream` and hand back a stream that carries
     /// application data.
     pub async fn accept<S>(&self, mut stream: S) -> io::Result<TlsStream<S>>

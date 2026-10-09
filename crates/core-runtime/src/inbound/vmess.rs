@@ -372,6 +372,13 @@ where
             },
         })
     };
+    if request.command == 3 || crate::inbound::mux::is_mux_target(&request.destination) {
+        logging::info(format_args!(
+            "vmess [{}] inbound mux session",
+            request.user.name
+        ));
+        return crate::inbound::mux::serve_mux(framed, peer, local, &tag, &router).await;
+    }
     logging::info(format_args!(
         "vmess [{}] inbound connection to {}",
         request.user.name, request.destination

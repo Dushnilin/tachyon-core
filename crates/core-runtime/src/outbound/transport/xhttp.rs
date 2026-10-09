@@ -353,7 +353,9 @@ impl H2Pool {
                     return H2Acquire::NeedDial;
                 }
 
-                if guard.clients.is_empty() {
+                if guard.clients.is_empty()
+                    || (guard.clients.len() < max_conns && guard.active_dials > 0)
+                {
                     drop(guard);
                     self.notify.notified().await;
                     continue;
@@ -363,7 +365,9 @@ impl H2Pool {
                     .clients
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, c)| c.active_streams.load(std::sync::atomic::Ordering::Relaxed))
+                    .min_by_key(|(_, c)| {
+                        c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
+                    })
                     .expect("non-empty");
 
                 let client = best.client.clone();
@@ -393,13 +397,14 @@ impl H2Pool {
     pub(crate) async fn finish_dial(
         &self,
         client: Option<h2::client::SendRequest<Bytes>>,
+        max_conns: usize,
     ) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
         let mut guard = self.state.lock().await;
         guard.active_dials = guard.active_dials.saturating_sub(1);
         let mut counter = None;
         if let Some(c) = client {
             let cnt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-            if guard.clients.len() >= 8 {
+            if guard.clients.len() >= max_conns {
                 guard.clients.remove(0);
             }
             guard.clients.push(PooledClient {
@@ -510,7 +515,8 @@ impl XhttpConfig {
             true,
         )?;
 
-        let acq = self.h2_pool.acquire(8).await;
+        let max_conns = self.pool.max_connections();
+        let acq = self.h2_pool.acquire(max_conns).await;
         match acq {
             H2Acquire::Ready(mut send_req, counter) => {
                 let (response, send) = send_req
@@ -553,7 +559,7 @@ impl XhttpConfig {
                     Ok(send_request) => {
                         let counter = self
                             .h2_pool
-                            .finish_dial(Some(send_request.clone()))
+                            .finish_dial(Some(send_request.clone()), max_conns)
                             .await
                             .expect("counter present");
                         let mut send_req = send_request
@@ -572,7 +578,7 @@ impl XhttpConfig {
                         })))
                     }
                     Err(e) => {
-                        self.h2_pool.finish_dial(None).await;
+                        self.h2_pool.finish_dial(None, max_conns).await;
                         Err(e)
                     }
                 }
@@ -651,7 +657,10 @@ pub(crate) async fn connect(
             }
         });
 
-        cfg.h2_pool.finish_dial(Some(send_request.clone())).await;
+        let max_conns = cfg.pool.max_connections();
+        cfg.h2_pool
+            .finish_dial(Some(send_request.clone()), max_conns)
+            .await;
 
         let mut send_request = send_request
             .ready()
@@ -952,8 +961,7 @@ struct SplitConn {
     session_id: String,
 }
 
-type InFlight =
-    Option<tokio::sync::oneshot::Receiver<io::Result<(PostWriter, usize)>>>;
+type InFlight = Option<tokio::sync::oneshot::Receiver<io::Result<(PostWriter, usize)>>>;
 
 /// One packet-up write in progress: the writer plus its bounded POST run.
 struct PacketsState {
@@ -1118,8 +1126,7 @@ impl AsyncWrite for XhttpConn {
                 match std::future::Future::poll(
                     Pin::new(state.in_flight.as_mut().expect("set above")),
                     cx,
-                )
-                {
+                ) {
                     Poll::Ready(Ok(Ok((writer, n)))) => {
                         state.writer = Some(writer);
                         state.in_flight = None;

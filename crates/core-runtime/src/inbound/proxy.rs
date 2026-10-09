@@ -267,6 +267,14 @@ where
         )
         .await;
     }
+    if command == COMMAND_MUX || crate::inbound::mux::is_mux_target(&destination) {
+        logging::info(format_args!(
+            "vless [{}] inbound mux session",
+            user.name
+        ));
+        stream.write_all(&RESPONSE_HEAD).await?;
+        return crate::inbound::mux::serve_mux(Box::new(stream), peer, local, &tag, &router).await;
+    }
     if command != COMMAND_TCP {
         return Err(io::Error::other(format!(
             "command {command} is not implemented by this server"
@@ -486,6 +494,12 @@ where
             &router,
         )
         .await;
+    }
+    if command == COMMAND_MUX || crate::inbound::mux::is_mux_target(&destination) {
+        logging::info(format_args!(
+            "trojan [{name}] inbound mux session"
+        ));
+        return crate::inbound::mux::serve_mux(Box::new(stream), peer, local, &tag, &router).await;
     }
     if command != COMMAND_TCP {
         return Err(io::Error::other(format!(

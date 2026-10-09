@@ -21,7 +21,7 @@ use crate::inbound::{AnyStream, Target};
 
 /// `mux.Destination`
 pub const MUX_DESTINATION: &str = "sp.mux.sing-box.arpa";
-const MUX_PORT: u16 = 444;
+pub const MUX_PORT: u16 = 444;
 
 const PROTOCOL_H2MUX: u8 = 2;
 const PROTOCOL_SMUX: u8 = 0;

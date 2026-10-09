@@ -44,6 +44,7 @@ pub enum Cmd {
     TcpClose {
         id: u32,
     },
+    #[allow(clippy::type_complexity)]
     UdpOpen {
         target: SocketAddr,
         resp: oneshot::Sender<Result<(u16, mpsc::Receiver<Vec<u8>>), String>>,
@@ -294,7 +295,10 @@ pub fn spawn_tailscale_engine(
                     Cmd::UdpClose { port } => {
                         udp_sessions.remove(&port);
                     }
-                    Cmd::UpdatePeers { peers: new_peers, derp_map: _ } => {
+                    Cmd::UpdatePeers {
+                        peers: new_peers,
+                        derp_map: _,
+                    } => {
                         _peers = new_peers;
                         logging::debug(format_args!(
                             "tailscale[{}]: updated peer table with {} nodes",
@@ -309,6 +313,7 @@ pub fn spawn_tailscale_engine(
             for conn in tcp_conns.values_mut() {
                 let socket = sockets.get_mut::<TcpSock>(conn.handle);
                 if socket.state() == TcpState::Established {
+                    #[allow(clippy::collapsible_if)]
                     if let Some(resp) = conn.resp.take() {
                         let _ = resp.send(Ok(()));
                     }
@@ -360,13 +365,11 @@ pub fn spawn_tailscale_engine(
                     TcpState::Closed | TcpState::TimeWait => {
                         closed_ids.push(*id);
                     }
-                    TcpState::SynSent => {
-                        if conn.created.elapsed() > CONNECT_TIMEOUT {
-                            if let Some(resp) = conn.resp.take() {
-                                let _ = resp.send(Err("connect timed out".to_string()));
-                            }
-                            closed_ids.push(*id);
+                    TcpState::SynSent if conn.created.elapsed() > CONNECT_TIMEOUT => {
+                        if let Some(resp) = conn.resp.take() {
+                            let _ = resp.send(Err("connect timed out".to_string()));
                         }
+                        closed_ids.push(*id);
                     }
                     _ => {}
                 }

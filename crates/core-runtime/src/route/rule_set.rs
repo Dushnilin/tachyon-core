@@ -32,6 +32,7 @@ struct RuleSetBody {
     index: RuleSetIndex,
     fallbacks: Fallbacks,
     count: usize,
+    mmap: Option<Arc<super::mmap_set::MmapRuleSet>>,
 }
 
 impl RuleSet {
@@ -44,6 +45,21 @@ impl RuleSet {
                 index,
                 fallbacks,
                 count,
+                mmap: None,
+            }),
+        }
+    }
+
+    /// Construct a rule set backed directly by memory-mapped TSRS binary.
+    pub fn new_with_mmap(tags: Vec<String>, mmap: Arc<super::mmap_set::MmapRuleSet>) -> Self {
+        let count = mmap.rule_count();
+        Self {
+            tags,
+            body: RwLock::new(RuleSetBody {
+                index: RuleSetIndex::default(),
+                fallbacks: Fallbacks::default(),
+                count,
+                mmap: Some(mmap),
             }),
         }
     }
@@ -59,14 +75,24 @@ impl RuleSet {
     }
 
     /// `adapter.RuleSet.Match`: any headless rule of the set matches. The
-    /// simple rules answer from the compiled pools; `logical` and `invert`
-    /// rules from the compiled fallback tree.
+    /// simple rules answer from the compiled pools or direct mmap tables;
+    /// `logical` and `invert` rules from the compiled fallback tree.
     pub fn matches(&self, ctx: &ConnContext) -> bool {
-        self.with(|body| body.index.matches(ctx) || body.fallbacks.matches(ctx))
+        self.with(|body| {
+            if let Some(mmap) = &body.mmap {
+                mmap.matches(ctx) || body.fallbacks.matches(ctx)
+            } else {
+                body.index.matches(ctx) || body.fallbacks.matches(ctx)
+            }
+        })
     }
 
     pub fn rule_count(&self) -> usize {
         self.with(|body| body.count)
+    }
+
+    pub fn mmap(&self) -> Option<Arc<super::mmap_set::MmapRuleSet>> {
+        self.with(|body| body.mmap.clone())
     }
 
     /// `RemoteRuleSet.loadBytes`: swap the rule list in one step.
@@ -81,6 +107,23 @@ impl RuleSet {
             index,
             fallbacks,
             count,
+            mmap: None,
+        };
+        match self.body.write() {
+            Ok(mut current) => *current = body,
+            Err(poisoned) => *poisoned.into_inner() = body,
+        }
+    }
+
+    /// Atomically swap the rule-set pointer to a newly mmap'ed TSRS image.
+    /// Zero heap allocation and instantaneous lock transition.
+    pub fn replace_mmap(&self, mmap: Arc<super::mmap_set::MmapRuleSet>) {
+        let count = mmap.rule_count();
+        let body = RuleSetBody {
+            index: RuleSetIndex::default(),
+            fallbacks: Fallbacks::default(),
+            count,
+            mmap: Some(mmap),
         };
         match self.body.write() {
             Ok(mut current) => *current = body,

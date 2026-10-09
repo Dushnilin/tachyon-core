@@ -23,6 +23,36 @@ fn url_hash(url: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Default path for caching mmap-able .tsrs binary images.
+/// On Linux/OpenWrt this points to `/tmp/tachyon-rulesets/` (tmpfs in RAM),
+/// which prevents wearing down SPI flash storage.
+pub fn default_tsrs_cache_path(tag: &str) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::path::PathBuf::from(format!("/tmp/tachyon-rulesets/{tag}.tsrs"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join(format!("tachyon-rulesets/{tag}.tsrs"))
+    }
+}
+
 /// Reference default: 24h when `update_interval` is absent.
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -60,6 +90,16 @@ pub struct RemoteSpec {
     pub client: HttpClient,
     /// `format`, when the config pinned one.
     pub format: Option<String>,
+    /// Zero-copy mmap binary rule-set toggle.
+    pub mmap: bool,
+    /// Incremental binary delta updates toggle.
+    pub delta_update: bool,
+    /// Cache update interval (e.g. "1h"). Overrides update_interval when set.
+    pub cache_interval: Duration,
+    /// Custom path to cache .tsrs binary file (default: /tmp/tachyon-rulesets/<tag>.tsrs).
+    pub cache_file: Option<String>,
+    /// Mmap mode: "auto" | "mmap" | "memory".
+    pub mode: crate::route::mmap_set::MmapMode,
 }
 
 /// The live state of one remote set: the shared set plus the fetch bookkeeping.
@@ -78,6 +118,33 @@ impl RemoteRuleSet {
         &self.tags[0]
     }
 
+    pub fn tsrs_cache_path(&self) -> std::path::PathBuf {
+        if let Some(path) = &self.spec.cache_file {
+            std::path::PathBuf::from(path)
+        } else {
+            default_tsrs_cache_path(self.tag())
+        }
+    }
+
+    fn compile_and_cache_mmap(
+        &self,
+        rules: &[Value],
+        cache_path: &std::path::Path,
+    ) -> io::Result<crate::route::mmap_set::MmapRuleSet> {
+        let mut compiler = crate::route::mmap_set::RuleSetCompiler::new();
+        let bytes = compiler
+            .compile(rules)
+            .map_err(|e| io::Error::other(format!("compile tsrs: {e}")))?;
+        if let Some(parent) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp_path = cache_path.with_extension("tmp");
+        std::fs::write(&tmp_path, &bytes)?;
+        std::fs::rename(&tmp_path, cache_path)?;
+        crate::route::mmap_set::MmapRuleSet::open_with_mode(cache_path, self.spec.mode)
+            .map_err(|e| io::Error::other(format!("open tsrs: {e}")))
+    }
+
     /// `RemoteRuleSet.StartContext`: cache file, then initial path, then the
     /// first fetch. A cache entry saved from a different URL is refetched.
     pub async fn start(
@@ -86,31 +153,102 @@ impl RemoteRuleSet {
         cache: Option<&SharedCacheFile>,
     ) -> io::Result<()> {
         let mut loaded = false;
-        if let Some(cache) = cache {
-            match self.restore_from_cache(cache) {
-                Ok(true) => loaded = true,
-                Ok(false) => {}
+        let tsrs_path = self.tsrs_cache_path();
+        let use_mmap = self.spec.mmap || self.spec.mode.should_use_mmap();
+
+        if use_mmap && tsrs_path.exists() {
+            match crate::route::mmap_set::MmapRuleSet::open_with_mode(&tsrs_path, self.spec.mode) {
+                Ok(mmap_set) => {
+                    self.set.replace_mmap(Arc::new(mmap_set));
+                    loaded = true;
+                    logging::info(format_args!(
+                        "restored rule-set {} via mmap from {}",
+                        self.tag(),
+                        tsrs_path.display()
+                    ));
+                }
                 Err(error) => {
                     logging::warn(format_args!(
-                        "restore cached rule-set, will refetch: {error}"
+                        "open cached mmap rule-set {}: {error}, will refetch",
+                        tsrs_path.display()
                     ));
                 }
             }
         }
-        if let Some(path) = &self.spec.initial_path {
-            match std::fs::read(path) {
-                Ok(data) => match parse_payload(&data, self.spec.format.as_deref()) {
-                    Ok(rules) => {
-                        self.set.replace_rules(rules);
-                        loaded = true;
-                        logging::info(format_args!("loaded rule-set {} from {}", self.tag(), path));
+
+        #[allow(clippy::collapsible_if)]
+        if !loaded {
+            if let Some(cache) = cache {
+                match self.restore_from_cache(cache) {
+                    Ok(true) => loaded = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        logging::warn(format_args!(
+                            "restore cached rule-set, will refetch: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        #[allow(clippy::collapsible_if)]
+        if !loaded {
+            if let Some(path) = &self.spec.initial_path {
+                match std::fs::read(path) {
+                    Ok(data) => {
+                        if data.starts_with(b"TSRS") {
+                            match crate::route::mmap_set::MmapRuleSet::open_with_mode(
+                                path,
+                                self.spec.mode,
+                            ) {
+                                Ok(mmap_set) => {
+                                    self.set.replace_mmap(Arc::new(mmap_set));
+                                    loaded = true;
+                                    logging::info(format_args!(
+                                        "loaded rule-set {} via mmap from {}",
+                                        self.tag(),
+                                        path
+                                    ));
+                                }
+                                Err(error) => logging::warn(format_args!(
+                                    "load initial mmap rule-set from {path}: {error}"
+                                )),
+                            }
+                        } else {
+                            match parse_payload(&data, self.spec.format.as_deref()) {
+                                Ok(rules) => {
+                                    #[allow(clippy::collapsible_if)]
+                                    if use_mmap {
+                                        if let Ok(mmap_set) =
+                                            self.compile_and_cache_mmap(&rules, &tsrs_path)
+                                        {
+                                            self.set.replace_mmap(Arc::new(mmap_set));
+                                            loaded = true;
+                                            logging::info(format_args!(
+                                                "loaded rule-set {} (compiled to mmap) from {}",
+                                                self.tag(),
+                                                path
+                                            ));
+                                        }
+                                    }
+                                    if !loaded {
+                                        self.set.replace_rules(rules);
+                                        loaded = true;
+                                        logging::info(format_args!(
+                                            "loaded rule-set {} from {}",
+                                            self.tag(),
+                                            path
+                                        ));
+                                    }
+                                }
+                                Err(error) => logging::warn(format_args!(
+                                    "load initial rule-set from {path}: {error}"
+                                )),
+                            }
+                        }
                     }
                     Err(error) => {
                         logging::warn(format_args!("load initial rule-set from {path}: {error}"))
                     }
-                },
-                Err(error) => {
-                    logging::warn(format_args!("load initial rule-set from {path}: {error}"))
                 }
             }
         }
@@ -175,12 +313,85 @@ impl RemoteRuleSet {
     }
 
     /// `RemoteRuleSet.fetch`: conditional GET, 304 keeps the current rules.
+    /// Supports incremental binary delta updates (`.delta`) and zero-copy mmap.
     pub async fn fetch(
         &mut self,
         router: &Router,
         is_start: bool,
         cache: Option<&SharedCacheFile>,
     ) -> io::Result<()> {
+        let tsrs_path = self.tsrs_cache_path();
+        let use_mmap = self.spec.mmap || self.spec.mode.should_use_mmap();
+
+        // 1. Try delta update if mmap and delta_update enabled, and base .tsrs exists
+        #[allow(clippy::collapsible_if)]
+        if use_mmap && self.spec.delta_update && tsrs_path.exists() {
+            if let Ok(base_bytes) = std::fs::read(&tsrs_path) {
+                if base_bytes.starts_with(b"TSRS") {
+                    let base_sha = sha256_digest(&base_bytes);
+                    let delta_url = format!("{}.delta", self.spec.url);
+                    let mut delta_headers = Vec::new();
+                    delta_headers.push(("X-Base-SHA256".to_string(), hex_encode(&base_sha)));
+                    if let Some(etag) = &self.etag {
+                        delta_headers.push(("If-None-Match".to_string(), etag.clone()));
+                    }
+
+                    #[allow(clippy::collapsible_if)]
+                    if let Ok(delta_resp) = self
+                        .spec
+                        .client
+                        .get(router, &delta_url, &delta_headers)
+                        .await
+                    {
+                        if delta_resp.status == 200 && delta_resp.body.starts_with(b"TDLT") {
+                            match crate::route::mmap_set::apply_delta(&base_bytes, &delta_resp.body)
+                            {
+                                Ok(new_bytes) => {
+                                    let tmp_path = tsrs_path.with_extension("tmp");
+                                    if let Some(parent) = tsrs_path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    let _ = std::fs::write(&tmp_path, &new_bytes);
+                                    if std::fs::rename(&tmp_path, &tsrs_path).is_ok() {
+                                        match crate::route::mmap_set::MmapRuleSet::open_with_mode(
+                                            &tsrs_path,
+                                            self.spec.mode,
+                                        ) {
+                                            Ok(mmap_set) => {
+                                                self.set.replace_mmap(Arc::new(mmap_set));
+                                                if let Some(etag) = delta_resp.header("etag") {
+                                                    self.etag = Some(etag.to_string());
+                                                }
+                                                self.last_updated =
+                                                    Some(std::time::SystemTime::now());
+                                                logging::info(format_args!(
+                                                    "atomically updated rule-set {} via delta patch ({} bytes)",
+                                                    self.tag(),
+                                                    delta_resp.body.len()
+                                                ));
+                                                return Ok(());
+                                            }
+                                            Err(e) => {
+                                                logging::warn(format_args!(
+                                                    "failed to open mmap after delta patch: {e}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    logging::warn(format_args!(
+                                        "delta patch application failed: {e}, falling back to full fetch"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Full fetch
         let mut headers = Vec::new();
         if let Some(etag) = &self.etag {
             headers.push(("If-None-Match".to_string(), etag.clone()));
@@ -205,8 +416,46 @@ impl RemoteRuleSet {
             }
         }
         let _ = is_start;
-        let rules = parse_payload(&response.body, self.spec.format.as_deref())?;
-        self.set.replace_rules(rules);
+
+        if response.body.starts_with(b"TSRS") {
+            if let Some(parent) = tsrs_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp_path = tsrs_path.with_extension("tmp");
+            std::fs::write(&tmp_path, &response.body)?;
+            std::fs::rename(&tmp_path, &tsrs_path)?;
+            let mmap_set =
+                crate::route::mmap_set::MmapRuleSet::open_with_mode(&tsrs_path, self.spec.mode)
+                    .map_err(|e| io::Error::other(format!("open downloaded tsrs: {e}")))?;
+            self.set.replace_mmap(Arc::new(mmap_set));
+            logging::info(format_args!(
+                "updated rule-set {} via TSRS binary",
+                self.tag()
+            ));
+        } else {
+            let rules = parse_payload(&response.body, self.spec.format.as_deref())?;
+            if use_mmap {
+                match self.compile_and_cache_mmap(&rules, &tsrs_path) {
+                    Ok(mmap_set) => {
+                        self.set.replace_mmap(Arc::new(mmap_set));
+                        logging::info(format_args!(
+                            "compiled and mmapped rule-set {} ({} rules)",
+                            self.tag(),
+                            rules.len()
+                        ));
+                    }
+                    Err(e) => {
+                        logging::warn(format_args!(
+                            "failed to compile mmap: {e}, falling back to memory rules"
+                        ));
+                        self.set.replace_rules(rules);
+                    }
+                }
+            } else {
+                self.set.replace_rules(rules);
+            }
+        }
+
         if let Some(etag) = response.header("etag") {
             self.etag = Some(etag.to_string());
         }
@@ -303,10 +552,12 @@ impl RemoteRegistry {
             let cache = cache.clone();
             let interval = {
                 let guard = set.try_lock().expect("rule-set mutex");
-                if guard.spec.update_interval.is_zero() {
-                    DEFAULT_UPDATE_INTERVAL
-                } else {
+                if !guard.spec.cache_interval.is_zero() {
+                    guard.spec.cache_interval
+                } else if !guard.spec.update_interval.is_zero() {
                     guard.spec.update_interval
+                } else {
+                    DEFAULT_UPDATE_INTERVAL
                 }
             };
             tokio::spawn(async move {
@@ -361,11 +612,14 @@ pub fn parse_payload(data: &[u8], format: Option<&str>) -> io::Result<Vec<Value>
     match format {
         Some("source") => parse_source(data),
         Some("binary") => parse_binary(data),
+        Some("tsrs") => Ok(Vec::new()),
         Some(other) => Err(io::Error::other(format!(
             "unknown rule-set format: {other}"
         ))),
         None => {
-            if data.starts_with(b"SRS") {
+            if data.starts_with(b"TSRS") {
+                Ok(Vec::new())
+            } else if data.starts_with(b"SRS") {
                 parse_binary(data)
             } else {
                 parse_source(data)
@@ -422,6 +676,11 @@ mod tests {
                 update_interval: Duration::ZERO,
                 client: HttpClient::default(),
                 format: None,
+                mmap: false,
+                delta_update: true,
+                cache_interval: Duration::ZERO,
+                cache_file: None,
+                mode: crate::route::mmap_set::MmapMode::Auto,
             },
             set,
             etag: None,
@@ -604,5 +863,106 @@ mod tests {
             "the initial path compiled its suffix"
         );
         let _ = std::fs::remove_file(std::env::temp_dir().join("tachyon-remote-rule-set-test.srs"));
+    }
+
+    #[tokio::test]
+    async fn remote_mmap_compile_and_match() {
+        let router = router().await;
+        let payload = srs_with("mmap-fast.org");
+        let (url, server) = serve(body_response(&payload)).await;
+        let cache_file = std::env::temp_dir().join(format!("test-rs-{}.tsrs", std::process::id()));
+        let mut set = remote("mmap_rs", &url);
+        set.spec.mmap = true;
+        set.spec.cache_file = Some(cache_file.to_string_lossy().to_string());
+        set.start(&router, None).await.expect("start");
+        server.abort();
+
+        // Check file exists on disk/tmpfs
+        assert!(cache_file.exists(), "cache_file must be written");
+        let data = std::fs::read(&cache_file).expect("read cached tsrs");
+        assert!(data.starts_with(b"TSRS"));
+
+        // Match context
+        let ctx = crate::route::ConnContext::new(
+            "in",
+            "10.0.0.2:1234".parse().unwrap(),
+            crate::route::Target::Domain("sub.mmap-fast.org".to_string(), 443),
+            "tcp",
+        );
+        assert!(
+            set.set.matches(&ctx),
+            "mmap rule set must match sub.mmap-fast.org"
+        );
+
+        let _ = std::fs::remove_file(&cache_file);
+    }
+
+    #[tokio::test]
+    async fn remote_delta_update_flow() {
+        let router = router().await;
+        let base_rules = json!([{"domain_suffix": ["base-site.com"]}]);
+        let mut compiler = crate::route::mmap_set::RuleSetCompiler::new();
+        let base_tsrs = compiler.compile(base_rules.as_array().unwrap()).unwrap();
+        let base_sha = sha256_digest(&base_tsrs);
+
+        let cache_file =
+            std::env::temp_dir().join(format!("test-delta-{}.tsrs", std::process::id()));
+        std::fs::write(&cache_file, &base_tsrs).unwrap();
+
+        // Build target tsrs with additional domain
+        let mut target_compiler = crate::route::mmap_set::RuleSetCompiler::new();
+        let target_rules = json!([{"domain_suffix": ["base-site.com", "delta-added.com"]}]);
+        let target_tsrs = target_compiler
+            .compile(target_rules.as_array().unwrap())
+            .unwrap();
+        let target_sha = sha256_digest(&target_tsrs);
+
+        let delta_bytes = crate::route::mmap_set::DeltaBuilder::new(base_sha, target_sha)
+            .add_suffix("delta-added.com")
+            .build();
+
+        // Serve delta when requested
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let delta_clone = delta_bytes.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = [0u8; 1024];
+                let _ = stream.read(&mut head).await;
+                let response = body_response(&delta_clone);
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let mut set = remote("delta_rs", &format!("http://{addr}/ruleset.srs"));
+        set.spec.mmap = true;
+        set.spec.delta_update = true;
+        set.spec.cache_file = Some(cache_file.to_string_lossy().to_string());
+        set.start(&router, None).await.expect("start");
+
+        // Verify base matches before delta
+        let ctx = crate::route::ConnContext::new(
+            "in",
+            "10.0.0.2:1234".parse().unwrap(),
+            crate::route::Target::Domain("delta-added.com".to_string(), 443),
+            "tcp",
+        );
+        assert!(
+            !set.set.matches(&ctx),
+            "delta-added should not match before delta"
+        );
+
+        // Now trigger fetch, which requests .delta and applies it
+        set.fetch(&router, false, None).await.expect("fetch delta");
+        assert!(
+            set.set.matches(&ctx),
+            "delta-added must match after delta applied"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_file(&cache_file);
     }
 }

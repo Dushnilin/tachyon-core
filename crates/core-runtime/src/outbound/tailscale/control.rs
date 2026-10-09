@@ -142,6 +142,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn from_hex(s: &str, out: &mut [u8]) -> Result<(), ()> {
     if s.len() != out.len() * 2 {
         return Err(());
@@ -161,8 +162,10 @@ pub fn load_or_create_keys(
         let state_file = dir.join("tailscale.state");
         if let Ok(content) = fs::read_to_string(&state_file)
             && let Ok(state) = serde_json::from_str::<PersistedState>(&content)
-            && let (Some(m_bytes), Some(n_bytes)) =
-                (parse_key_hex(&state.machine_key), parse_key_hex(&state.node_key))
+            && let (Some(m_bytes), Some(n_bytes)) = (
+                parse_key_hex(&state.machine_key),
+                parse_key_hex(&state.node_key),
+            )
         {
             return (StaticSecret::from(m_bytes), StaticSecret::from(n_bytes));
         }

@@ -164,3 +164,100 @@ fn version_is_the_shape_tachyon_parses() {
         "`version` said {said:?}, which does not carry {expected}"
     );
 }
+
+#[test]
+fn openwrt_cli_invocations() {
+    let port = free_port();
+    let path = write_config("openwrt-check", &config(port));
+    let temp_dir = std::env::temp_dir();
+
+    // 1. Tachyon watchdog style: sing-box -c <path> check
+    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+        .arg("-c")
+        .arg(&path)
+        .arg("check")
+        .output()
+        .expect("run leading -c check");
+    assert!(output.status.success(), "leading -c check failed");
+
+    // 2. OpenWrt procd style: sing-box -D <dir> -c <path> check
+    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+        .arg("-D")
+        .arg(&temp_dir)
+        .arg("-c")
+        .arg(&path)
+        .arg("check")
+        .output()
+        .expect("run -D check");
+    assert!(output.status.success(), "-D check failed");
+
+    // 3. Trailing options with --disable-color
+    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+        .arg("check")
+        .arg("-c")
+        .arg(&path)
+        .arg("-D")
+        .arg(&temp_dir)
+        .arg("--disable-color")
+        .output()
+        .expect("check with trailing flags");
+    assert!(output.status.success(), "trailing flags check failed");
+
+    // 4. Short -v version
+    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+        .arg("-v")
+        .output()
+        .expect("run -v");
+    assert!(output.status.success(), "-v failed");
+    assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
+
+    // 5. Config directory (-C / --config-directory) and multi-config merging
+    let conf_dir = std::env::temp_dir().join(format!("tachyon-conf-d-{}", free_port()));
+    let _ = std::fs::create_dir_all(&conf_dir);
+    let part1 = conf_dir.join("00-log.json");
+    let part2 = conf_dir.join("10-inbound.json");
+    std::fs::write(&part1, r#"{"log": {"level": "error"}}"#).unwrap();
+    std::fs::write(
+        &part2,
+        serde_json::to_string(&json!({
+            "inbounds": [{
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": port
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+        .arg("check")
+        .arg("-C")
+        .arg(&conf_dir)
+        .output()
+        .expect("check -C dir");
+    assert!(
+        output.status.success(),
+        "check -C failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+        .arg("check")
+        .arg("-c")
+        .arg(&part1)
+        .arg("-c")
+        .arg(&part2)
+        .output()
+        .expect("check multiple -c");
+    assert!(
+        output.status.success(),
+        "check multi -c failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&conf_dir);
+    let _ = std::fs::remove_file(path);
+}

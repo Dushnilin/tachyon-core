@@ -76,6 +76,22 @@ fn version_line() -> String {
     }
 }
 
+fn collect_dir_configs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read directory {}: {e}", dir.display()))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read entry in {}: {e}", dir.display()))?;
+        let p = entry.path();
+        if p.is_file() && p.extension().is_some_and(|ext| ext == "json") {
+            files.push(p);
+        }
+    }
+    files.sort();
+    out.extend(files);
+    Ok(())
+}
+
 fn config_path_from(args: &[String]) -> Option<PathBuf> {
     let mut i = 0;
     while i < args.len() {
@@ -84,29 +100,103 @@ fn config_path_from(args: &[String]) -> Option<PathBuf> {
             s if s.starts_with("--config=") => {
                 return Some(PathBuf::from(&s["--config=".len()..]));
             }
+            s if s.starts_with("-c=") => {
+                return Some(PathBuf::from(&s["-c=".len()..]));
+            }
             _ => i += 1,
         }
     }
     None
 }
 
+fn load_config(args: &[String]) -> Result<String, String> {
+    let mut config_files = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" => {
+                if let Some(p) = args.get(i + 1) {
+                    config_files.push(PathBuf::from(p));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            s if s.starts_with("--config=") => {
+                config_files.push(PathBuf::from(&s["--config=".len()..]));
+                i += 1;
+            }
+            s if s.starts_with("-c=") => {
+                config_files.push(PathBuf::from(&s["-c=".len()..]));
+                i += 1;
+            }
+            "-C" | "--config-directory" => {
+                if let Some(p) = args.get(i + 1) {
+                    collect_dir_configs(Path::new(p), &mut config_files)?;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            s if s.starts_with("--config-directory=") => {
+                let p = &s["--config-directory=".len()..];
+                collect_dir_configs(Path::new(p), &mut config_files)?;
+                i += 1;
+            }
+            s if s.starts_with("-C=") => {
+                let p = &s["-C=".len()..];
+                collect_dir_configs(Path::new(p), &mut config_files)?;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    if config_files.is_empty() {
+        return Err("missing -c/--config or -C/--config-directory <path>".into());
+    }
+
+    let mut expanded = Vec::new();
+    for p in config_files {
+        if p.is_dir() {
+            collect_dir_configs(&p, &mut expanded)?;
+        } else {
+            expanded.push(p);
+        }
+    }
+
+    if expanded.is_empty() {
+        return Err("no .json configuration files found".into());
+    }
+
+    if expanded.len() == 1 {
+        let path = &expanded[0];
+        return std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()));
+    }
+
+    let mut merged = serde_json::Value::Object(serde_json::Map::new());
+    for p in &expanded {
+        let raw = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        let val: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", p.display()))?;
+        merge_json_values(&mut merged, val);
+    }
+    serde_json::to_string_pretty(&merged).map_err(|e| format!("encode: {e}"))
+}
+
 fn cmd_check(args: &[String]) -> Result<(), String> {
-    let path = config_path_from(args).ok_or("check: missing -c/--config <path>")?;
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("check: read {}: {e}", path.display()))?;
+    let raw = load_config(args).map_err(|e| format!("check: {e}"))?;
     // like the reference, `check` reports errors only — the ResolveLX
     // deprecation warnings surface at run time
-    core_config::check_str(&raw).map_err(|e| format!("check: {}: {e}", path.display()))?;
+    core_config::check_str(&raw).map_err(|e| format!("check: {e}"))?;
     Ok(())
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
-    let path = config_path_from(args).ok_or("run: missing -c/--config <path>")?;
+    let raw = load_config(args).map_err(|e| format!("run: {e}"))?;
     #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
     allocstat::start();
-    if let Ok(raw) = std::fs::read_to_string(&path)
-        && let Ok(warnings) = core_config::check_str_warnings(&raw)
-    {
+    if let Ok(warnings) = core_config::check_str_warnings(&raw) {
         // the reference logs ResolveLX deprecations when the box starts
         for warning in warnings {
             eprintln!("WARN[0000] {warning}");
@@ -144,7 +234,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
     .map_err(|e| format!("run: {e}"))?;
     runtime
-        .block_on(async { core_runtime::run(&path).await })
+        .block_on(async { core_runtime::run_str(&raw).await })
         .map_err(|e| format!("run: {e:#}"))
 }
 
@@ -406,8 +496,30 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+unsafe fn raise_rlimit_nofile() {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+        let max_target = 65535;
+        if rlim.rlim_cur < max_target {
+            let new_cur = max_target.min(rlim.rlim_max.max(max_target));
+            rlim.rlim_cur = new_cur;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    }
+}
+
 fn usage() -> String {
-    "usage: tachyon-core <command> [options]\n\
+    "usage: tachyon-core [options] <command> [command-options]\n\
+     \n\
+     global options:\n\
+       -c, --config <path>               configuration file path\n\
+       -C, --config-directory <path>     configuration directory path\n\
+       -D, --directory <dir>             working directory\n\
+       --disable-color                   disable color in log output\n\
      \n\
      commands:\n\
        check     -c <path>                 validate configuration\n\
@@ -439,39 +551,107 @@ fn main() -> ExitCode {
     unsafe {
         mi_option_set(15, 0);
         mi_option_set(43, 0);
+        raise_rlimit_nofile();
     }
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // The reference accepts its global options before the command, and tachyon
-    // validates configs as `sing-box -c <path> check` — without this every
-    // tachyon-side restart died on `unknown command '-c'`.
-    let mut leading_config: Option<String> = None;
-    while args.len() >= 2 && (args[0] == "-c" || args[0] == "--config") {
-        leading_config = Some(args[1].clone());
-        args.drain(0..2);
-    }
-    let command = if args.is_empty() {
-        "help".to_string()
-    } else {
-        args.remove(0)
-    };
-    if let Some(path) = leading_config
-        && !args.iter().any(|arg| arg == "-c" || arg == "--config")
-    {
-        args.splice(0..0, ["-c".to_string(), path]);
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // The reference accepts global options (-c, -C, -D, --disable-color) before or after the command.
+    // On OpenWrt, Tachyon/Podkop calls `sing-box -c <path> check`, or `sing-box -D <dir> -c <path> run`.
+    let mut working_dir: Option<PathBuf> = None;
+    let mut config_from_flags: Option<PathBuf> = None;
+    let mut command: Option<String> = None;
+    let mut cmd_args: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+        match arg.as_str() {
+            "-D" | "--directory" if i + 1 < raw_args.len() => {
+                working_dir = Some(PathBuf::from(&raw_args[i + 1]));
+                i += 2;
+            }
+            s if s.starts_with("--directory=") => {
+                working_dir = Some(PathBuf::from(&s["--directory=".len()..]));
+                i += 1;
+            }
+            "-c" | "--config" if i + 1 < raw_args.len() => {
+                let p = PathBuf::from(&raw_args[i + 1]);
+                if config_from_flags.is_none() {
+                    config_from_flags = Some(p);
+                }
+                cmd_args.push(raw_args[i].clone());
+                cmd_args.push(raw_args[i + 1].clone());
+                i += 2;
+            }
+            s if s.starts_with("--config=") => {
+                let p = PathBuf::from(&s["--config=".len()..]);
+                if config_from_flags.is_none() {
+                    config_from_flags = Some(p);
+                }
+                cmd_args.push(raw_args[i].clone());
+                i += 1;
+            }
+            s if s.starts_with("-c=") => {
+                let p = PathBuf::from(&s["-c=".len()..]);
+                if config_from_flags.is_none() {
+                    config_from_flags = Some(p);
+                }
+                cmd_args.push(raw_args[i].clone());
+                i += 1;
+            }
+            "-C" | "--config-directory" if i + 1 < raw_args.len() => {
+                cmd_args.push(raw_args[i].clone());
+                cmd_args.push(raw_args[i + 1].clone());
+                i += 2;
+            }
+            s if s.starts_with("--config-directory=") || s.starts_with("-C=") => {
+                cmd_args.push(raw_args[i].clone());
+                i += 1;
+            }
+            "--disable-color" => {
+                // Accepted for upstream CLI parity on OpenWrt loggers
+                i += 1;
+            }
+            "-v" | "--version" if command.is_none() => {
+                command = Some("version".to_string());
+                i += 1;
+            }
+            "-h" | "--help" if command.is_none() => {
+                command = Some("help".to_string());
+                i += 1;
+            }
+            _ => {
+                if command.is_none() && !arg.starts_with('-') {
+                    command = Some(arg.clone());
+                } else {
+                    cmd_args.push(arg.clone());
+                }
+                i += 1;
+            }
+        }
     }
 
-    let result = match command.as_str() {
+    if let Some(dir) = working_dir
+        && let Err(e) = std::env::set_current_dir(&dir)
+    {
+        eprintln!("failed to change directory to {}: {e}", dir.display());
+        return ExitCode::from(1);
+    }
+
+    let command_str = command.unwrap_or_else(|| "help".to_string());
+
+    let result = match command_str.as_str() {
         "version" | "-v" | "--version" => {
             print!("{}", version_line());
             Ok(())
         }
-        "check" => cmd_check(&args),
-        "run" => cmd_run(&args),
-        "api" => cmd_api(&args),
-        "generate" => cmd_generate(&args),
-        "format" => cmd_format(&args),
-        "merge" => cmd_merge(&args),
-        "rule-set" => rule_set::cmd_rule_set(&args),
+        "check" => cmd_check(&cmd_args),
+        "run" => cmd_run(&cmd_args),
+        "api" => cmd_api(&cmd_args),
+        "generate" => cmd_generate(&cmd_args),
+        "format" => cmd_format(&cmd_args),
+        "merge" => cmd_merge(&cmd_args),
+        "rule-set" => rule_set::cmd_rule_set(&cmd_args),
         // the process that holds an `unshare` network namespace open; it does
         // nothing until its stdin closes
         #[cfg(target_os = "linux")]

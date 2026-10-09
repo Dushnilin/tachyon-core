@@ -1299,6 +1299,7 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
         Outbound::Selector(_) => "Selector",
         Outbound::Chain(_) => "Chain",
         Outbound::ShadowTls(_) => "ShadowTLS",
+        Outbound::Tailscale(_) => "Tailscale",
     }
 }
 

@@ -23,4 +23,5 @@ pub mod urltest;
 pub mod vision;
 pub mod vless_enc;
 pub mod vmess;
+pub mod tailscale;
 pub mod wireguard;

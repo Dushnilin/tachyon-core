@@ -34,8 +34,9 @@ rand_core = { version = "0.6.4", default-features = false, features = ["getrando
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
-# The router build runs on musl/aarch64 where the system allocator is the
-# one thing every packet allocation goes through.
-[target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_env = "msvc"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
+libc.workspace = true
+
+[target.'cfg(all(target_os = "linux", not(target_env = "msvc"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
 libc.workspace = true

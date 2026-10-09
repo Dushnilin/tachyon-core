@@ -113,28 +113,68 @@ async def async_socks_connect(proxy, mode):
 
 
 # ------------------------------------------------------------------ proc info
-def proc_status(pid):
-    out = {"VmRSS": 0.0, "VmHWM": 0.0}
+def get_proc_tree_pids(pid):
+    pids = [pid]
     try:
-        with open(f"/proc/{pid}/status") as f:
-            for line in f:
-                if line.startswith(("VmRSS", "VmHWM")):
-                    k, v = line.split(":")
-                    out[k] = int(v.split()[0]) / 1024  # MiB
+        task_dir = f"/proc/{pid}/task"
+        if os.path.exists(task_dir):
+            for tid in os.listdir(task_dir):
+                cf = os.path.join(task_dir, tid, "children")
+                if os.path.exists(cf):
+                    with open(cf) as f:
+                        for c in f.read().split():
+                            pids.extend(get_proc_tree_pids(int(c)))
     except Exception:
         pass
+    return list(dict.fromkeys(pids))
+
+
+def proc_status(pid):
+    out = {"VmRSS": 0.0, "VmHWM": 0.0}
+    for p in get_proc_tree_pids(pid):
+        try:
+            with open(f"/proc/{p}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        out["VmRSS"] += int(line.split(":")[1].split()[0]) / 1024
+                    elif line.startswith("VmHWM:"):
+                        out["VmHWM"] += int(line.split(":")[1].split()[0]) / 1024
+        except Exception:
+            pass
     return out
 
 
 def cpu_split(pid):
-    """(user, system) seconds from /proc/<pid>/stat."""
+    """(user, system) seconds from /proc/<pid>/stat for pid and all child processes."""
+    user, system = 0.0, 0.0
+    tick = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    for p in get_proc_tree_pids(pid):
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            user += int(fields[11]) / tick
+            system += int(fields[12]) / tick
+        except Exception:
+            pass
+    return user, system
+
+
+def kill_proc_tree(proc):
     try:
-        with open(f"/proc/{pid}/stat") as f:
-            fields = f.read().rsplit(")", 1)[1].split()
-        tick = os.sysconf("SC_CLK_TCK")
-        return int(fields[11]) / tick, int(fields[12]) / tick
+        pids = get_proc_tree_pids(proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        for p in pids:
+            if p != proc.pid:
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except OSError:
+                    pass
     except Exception:
-        return 0.0, 0.0
+        pass
 
 
 # -------------------------------------------------------------------- measurement phases
@@ -228,9 +268,21 @@ def hold_connections(proxy, count, pid):
         return None
 
 
-def wait_listen(port, timeout=15):
+def wait_port_free(port, timeout=5):
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
+                time.sleep(0.05)
+        except OSError:
+            return
+
+
+def wait_listen(port, proc=None, timeout=15):
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout:
+        if proc and proc.poll() is not None:
+            raise RuntimeError(f"process exited prematurely with code {proc.returncode}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                 return (time.perf_counter() - t0) * 1000
@@ -240,8 +292,89 @@ def wait_listen(port, timeout=15):
 
 
 # ------------------------------------------------------------------ configurations
+def ensure_steer_env(bin_path):
+    """Sets up musl libc symlink, steerd in /usr/sbin, and libsteer in /usr/lib."""
+    try:
+        # Check if musl ld exists
+        if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
+            subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        os.makedirs("/usr/sbin", exist_ok=True)
+        os.makedirs("/usr/lib", exist_ok=True)
+
+        if os.path.exists("/lib/ld-musl-x86_64.so.1") and not os.path.exists("/usr/lib/libc.so"):
+            try:
+                os.symlink("/lib/ld-musl-x86_64.so.1", "/usr/lib/libc.so")
+            except OSError:
+                pass
+
+        bin_dir = os.path.dirname(os.path.abspath(bin_path))
+        steer_base = os.path.dirname(bin_dir)  # e.g. /bench/steer/usr
+
+        # Symlink steerd
+        candidates_steerd = [
+            os.path.join(bin_dir, "..", "sbin", "steerd"),
+            os.path.join(steer_base, "sbin", "steerd"),
+            os.path.join(os.path.dirname(steer_base), "usr", "sbin", "steerd"),
+            os.path.join(bin_dir, "steerd"),
+        ]
+        for c in candidates_steerd:
+            if os.path.exists(c):
+                try:
+                    os.chmod(c, 0o755)
+                except OSError:
+                    pass
+                if not os.path.exists("/usr/sbin/steerd"):
+                    try:
+                        os.symlink(os.path.abspath(c), "/usr/sbin/steerd")
+                    except OSError:
+                        pass
+                break
+
+        # Symlink steer
+        candidates_steer = [
+            os.path.join(bin_dir, "..", "sbin", "steer"),
+            os.path.join(steer_base, "sbin", "steer"),
+            os.path.join(os.path.dirname(steer_base), "usr", "sbin", "steer"),
+            os.path.join(bin_dir, "steer"),
+        ]
+        for c in candidates_steer:
+            if os.path.exists(c):
+                try:
+                    os.chmod(c, 0o755)
+                except OSError:
+                    pass
+                if not os.path.exists("/usr/sbin/steer"):
+                    try:
+                        os.symlink(os.path.abspath(c), "/usr/sbin/steer")
+                    except OSError:
+                        pass
+                break
+
+        # Copy or symlink libsteer
+        lib_candidates = [
+            os.path.join(bin_dir, "..", "lib"),
+            os.path.join(steer_base, "lib"),
+            os.path.join(os.path.dirname(steer_base), "usr", "lib"),
+            os.path.join(bin_dir, "lib"),
+        ]
+        for ldir in lib_candidates:
+            if os.path.exists(ldir):
+                for f in os.listdir(ldir):
+                    dst = os.path.join("/usr/lib", f)
+                    src = os.path.join(ldir, f)
+                    if not os.path.exists(dst):
+                        try:
+                            os.symlink(os.path.abspath(src), dst)
+                        except OSError:
+                            pass
+    except Exception as e:
+        print(f"Warning: ensure_steer_env error: {e}", file=sys.stderr)
+
+
 def setup_proxy(name, bin_path, proxy_cpus, workers=None):
-    """Generates config and launches proxy process, returns (proc, temp_dir)."""
+    """Generates config and launches proxy process, returns (proc, temp_dir, start_ms)."""
     d = tempfile.mkdtemp(prefix=f"bench_{name}_")
     env = os.environ.copy()
     if workers:
@@ -261,6 +394,21 @@ def setup_proxy(name, bin_path, proxy_cpus, workers=None):
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
         cmd = [bin_path, "run", "-c", cfg_path]
+
+    elif name in ("steer", "steer-box-connector"):
+        ensure_steer_env(bin_path)
+        cfg_path = os.path.join(d, "config.json")
+        cfg = {
+            "log": {"level": "error"},
+            "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
+            "outbounds": [{"type": "direct", "tag": "direct", "bind_interface": "lo"}],
+            "route": {"final": "direct"},
+        }
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        cmd = [bin_path, "run", "-c", cfg_path]
+        curr_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
 
     elif name in ("xray", "xray-core"):
         cfg_path = os.path.join(d, "config.json")
@@ -304,8 +452,31 @@ profile:
         env=env,
         preexec_fn=preexec,
     )
-    start_ms = wait_listen(PROXY_PORT)
+    start_ms = wait_listen(PROXY_PORT, proc)
     return proc, d, start_ms
+
+
+def get_binary_size(name, bin_path):
+    if name in ("steer", "steer-box-connector"):
+        total = 0
+        bin_dir = os.path.dirname(os.path.abspath(bin_path))
+        candidates = [
+            bin_path,
+            os.path.join(bin_dir, "..", "sbin", "steerd"),
+            os.path.join(bin_dir, "..", "sbin", "steer"),
+            os.path.join(bin_dir, "..", "lib", "libsteer.so.2.0.3"),
+            "/usr/sbin/steerd",
+            "/usr/sbin/steer",
+            "/usr/lib/libsteer.so.2.0.3",
+        ]
+        seen = set()
+        for candidate in candidates:
+            if os.path.exists(candidate) and os.path.realpath(candidate) not in seen:
+                seen.add(os.path.realpath(candidate))
+                total += os.path.getsize(candidate)
+        if total > 0:
+            return round(total / (1 << 20), 2)
+    return round(os.path.getsize(bin_path) / (1 << 20), 2)
 
 
 def get_version(name, bin_path):
@@ -315,6 +486,10 @@ def get_version(name, bin_path):
         else:
             out = subprocess.run([bin_path, "version"], capture_output=True, text=True, timeout=5).stdout
         lines = [line.strip() for line in out.splitlines() if line.strip()]
+        if name in ("steer", "steer-box-connector"):
+            for l in lines:
+                if "steer-box-connector" in l:
+                    return l.replace("Environment: ", "")
         return lines[0] if lines else "?"
     except Exception:
         return "?"
@@ -326,7 +501,7 @@ def bench_one(name, bin_path, proxy_cpus, args):
     res = {
         "name": name,
         "bin": bin_path,
-        "size_mib": round(os.path.getsize(bin_path) / (1 << 20), 2),
+        "size_mib": get_binary_size(name, bin_path),
         "version": get_version(name, bin_path),
     }
 
@@ -335,11 +510,8 @@ def bench_one(name, bin_path, proxy_cpus, args):
     for _ in range(3):
         p, d, s_ms = setup_proxy(name, bin_path, proxy_cpus, args.workers)
         starts.append(s_ms)
-        p.terminate()
-        try:
-            p.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            p.kill()
+        kill_proc_tree(p)
+        wait_port_free(PROXY_PORT)
         time.sleep(0.1)
     res["start_ms"] = round(statistics.median(starts), 1)
 
@@ -367,18 +539,15 @@ def bench_one(name, bin_path, proxy_cpus, args):
         res["peak_rss_mib"] = round(proc_status(proc.pid)["VmHWM"], 1)
 
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        kill_proc_tree(proc)
+        wait_port_free(PROXY_PORT)
 
     return res
 
 
 def print_table(results, direct):
     print("\n" + "=" * 115)
-    print("  FAST & OBJECTIVE PROXY CORE BENCHMARK (Tachyon vs Sing-box vs Xray vs Mihomo)")
+    print("  FAST & OBJECTIVE PROXY CORE BENCHMARK (Tachyon vs Sing-box vs Xray vs Mihomo vs Steer)")
     print("=" * 115)
     header = f"{'Proxy':<14} | {'Size':<7} | {'Start':<8} | {'Idle RSS':<9} | {'p50 us':<7} | {'p99 us':<7} | {'1s Gbps':<8} | {'8s Gbps':<8} | {'CPU s/GiB':<10} | {'C1K RSS':<8} | {'Peak RSS':<8}"
     print(header)
@@ -434,7 +603,7 @@ def generate_html(data, out_path):
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Proxy Core Benchmark: Tachyon vs Sing-box vs Xray vs Mihomo</title>
+<title>Proxy Core Benchmark: Tachyon vs Sing-box vs Xray vs Mihomo vs Steer</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0f1117; color: #e1e4e8; padding: 24px; }}
   h1 {{ font-size: 20px; margin-bottom: 4px; color: #58a6ff; }}
@@ -487,6 +656,7 @@ def main():
     ap.add_argument("--sing-box", default="/bench/sing-box-lx")
     ap.add_argument("--xray", default="/bench/xray-linux")
     ap.add_argument("--mihomo", default="/bench/mihomo-linux")
+    ap.add_argument("--steer", default=None, help="Path to steer-box-connector binary")
     ap.add_argument("--profile", choices=["router", "desktop"], default="router")
     ap.add_argument("--proxy-cpus", default=None, help="Explicit CPU set (e.g. '1')")
     ap.add_argument("--workers", type=int, default=None, help="Thread count (1 for router)")
@@ -535,6 +705,20 @@ def main():
         ("xray", args.xray),
         ("mihomo", args.mihomo),
     ]
+
+    steer_bin = args.steer
+    if not steer_bin:
+        for candidate in [
+            "/bench/steer/usr/bin/sing-box",
+            "/bench/steer/sing-box",
+            "/opt/steer/usr/bin/sing-box",
+        ]:
+            if os.path.exists(candidate):
+                steer_bin = candidate
+                break
+
+    if steer_bin:
+        proxies.append(("steer", steer_bin))
 
     if args.only:
         allowed = set(args.only.split(","))

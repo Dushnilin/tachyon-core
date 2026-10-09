@@ -105,7 +105,7 @@ impl SymmetricState {
 
     pub fn mix_hash(&mut self, data: &[u8]) {
         let mut hasher = Blake2s256::new();
-        hasher.update(&self.h);
+        hasher.update(self.h);
         hasher.update(data);
         self.h = hasher.finalize().into();
     }
@@ -236,7 +236,10 @@ impl NoiseIkInitiator {
     }
 
     /// Processes handshake message 2 (`<- e, ee, se, payload`) and produces transport ciphers.
-    pub fn read_msg2(&mut self, msg: &[u8]) -> anyhow::Result<(Vec<u8>, (CipherState, CipherState))> {
+    pub fn read_msg2(
+        &mut self,
+        msg: &[u8],
+    ) -> anyhow::Result<(Vec<u8>, (CipherState, CipherState))> {
         if msg.len() < 32 + 16 {
             anyhow::bail!("handshake message 2 is too short");
         }
@@ -244,7 +247,10 @@ impl NoiseIkInitiator {
         let re_pub = PublicKey::from(re_bytes);
         self.sym.mix_hash(re_pub.as_bytes());
 
-        let e = self.e.take().ok_or_else(|| anyhow::anyhow!("missing ephemeral key"))?;
+        let e = self
+            .e
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing ephemeral key"))?;
         let ee = e.diffie_hellman(&re_pub);
         self.sym.mix_key(ee.as_bytes());
 

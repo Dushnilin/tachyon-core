@@ -59,16 +59,10 @@ pub fn encode_note_preferred(preferred: bool) -> [u8; 6] {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DerpFrame {
     ServerInfo(Vec<u8>),
-    RecvPacket {
-        src_key: [u8; 32],
-        data: Vec<u8>,
-    },
+    RecvPacket { src_key: [u8; 32], data: Vec<u8> },
     KeepAlive,
     PeerGone([u8; 32]),
-    Other {
-        frame_type: u8,
-        data: Vec<u8>,
-    },
+    Other { frame_type: u8, data: Vec<u8> },
 }
 
 /// Reads a single DERP frame from an asynchronous stream.

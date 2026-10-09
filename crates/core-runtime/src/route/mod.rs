@@ -1,6 +1,7 @@
 //! Routing engine: rule walk with actions (route / route-options / reject /
 //! hijack-dns / sniff / resolve), connection context, and outbound dispatch.
 
+pub mod mmap_set;
 pub mod neighbor;
 pub mod process;
 pub mod rule;
@@ -307,18 +308,100 @@ pub(crate) fn build_rule_sets(
             .and_then(Value::as_str)
             .unwrap_or("inline");
         let tags = rule_set_tags(entry, &at)?;
-        // `remote` fills its set during start; the arm yields the empty list
-        let rules: Vec<Value> = match ty {
-            "inline" => entry
-                .get("rules")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
+        let use_mmap = entry.get("mmap").and_then(Value::as_bool).unwrap_or(false);
+        let mode_str = entry.get("mode").and_then(Value::as_str).unwrap_or("auto");
+        let mode = match mode_str {
+            "memory" => mmap_set::MmapMode::Memory,
+            "mmap" => mmap_set::MmapMode::Mmap,
+            _ => mmap_set::MmapMode::Auto,
+        };
+
+        match ty {
+            "inline" => {
+                let rules = entry
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if use_mmap {
+                    let mut compiler = mmap_set::RuleSetCompiler::new();
+                    let tsrs_bytes = compiler.compile(&rules)?;
+                    let cache_file = entry.get("cache_file").and_then(Value::as_str);
+                    let target_path = if let Some(cf) = cache_file {
+                        std::path::PathBuf::from(cf)
+                    } else {
+                        rule_set_remote::default_tsrs_cache_path(&tags[0])
+                    };
+                    if let Some(parent) = target_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&target_path, &tsrs_bytes)?;
+                    let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
+                        &target_path,
+                        mode,
+                    )?);
+                    logging::info(format_args!(
+                        "compiled and mmapped inline rule-set {}",
+                        tags.join(",")
+                    ));
+                    registry.insert(std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(
+                        tags, mmap_set,
+                    )));
+                } else {
+                    logging::info(format_args!("loaded rule-set {}", tags.join(",")));
+                    registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
+                }
+            }
             "local" => {
                 let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
-                let data = std::fs::read(resolve_rule_set_path(path, &tags))
+                let resolved_path = resolve_rule_set_path(path, &tags);
+                let data = std::fs::read(&resolved_path)
                     .map_err(|err| anyhow::anyhow!("{at}: read {path}: {err}"))?;
-                parse_rule_set_payload(&data, entry, &at)?
+                if data.starts_with(b"TSRS") {
+                    let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
+                        &resolved_path,
+                        mode,
+                    )?);
+                    logging::info(format_args!(
+                        "loaded rule-set {} via mmap from {}",
+                        tags.join(","),
+                        resolved_path
+                    ));
+                    registry.insert(std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(
+                        tags, mmap_set,
+                    )));
+                } else {
+                    let rules = parse_rule_set_payload(&data, entry, &at)?;
+                    if use_mmap {
+                        let mut compiler = mmap_set::RuleSetCompiler::new();
+                        let tsrs_bytes = compiler.compile(&rules)?;
+                        let cache_file = entry.get("cache_file").and_then(Value::as_str);
+                        let target_path = if let Some(cf) = cache_file {
+                            std::path::PathBuf::from(cf)
+                        } else {
+                            rule_set_remote::default_tsrs_cache_path(&tags[0])
+                        };
+                        if let Some(parent) = target_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        std::fs::write(&target_path, &tsrs_bytes)?;
+                        let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
+                            &target_path,
+                            mode,
+                        )?);
+                        logging::info(format_args!(
+                            "compiled and mmapped rule-set {} ({} rules)",
+                            tags.join(","),
+                            rules.len()
+                        ));
+                        registry.insert(std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(
+                            tags, mmap_set,
+                        )));
+                    } else {
+                        logging::info(format_args!("loaded rule-set {}", tags.join(",")));
+                        registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
+                    }
+                }
             }
             "remote" => {
                 let url = entry
@@ -340,7 +423,6 @@ pub(crate) fn build_rule_sets(
                             "{at}: http_client is conflict with deprecated download_detour field"
                         );
                     }
-                    // a string names one of the `http_clients` entries
                     let spec = clients.resolve(client_spec, &at)?;
                     crate::http_client::HttpClient::from_config(spec.as_ref(), &at)?
                 } else if let Some(detour) = detour {
@@ -351,7 +433,6 @@ pub(crate) fn build_rule_sets(
                     wrapper.insert("detour".into(), Value::String(detour.into()));
                     crate::http_client::HttpClient::from_config(Some(&Value::Object(wrapper)), &at)?
                 } else {
-                    // no client of its own: `route.default_http_client`
                     let spec = clients.default_client(route)?;
                     crate::http_client::HttpClient::from_config(spec.as_ref(), &at)?
                 };
@@ -360,6 +441,19 @@ pub(crate) fn build_rule_sets(
                     std::time::Duration::ZERO,
                     &at,
                 )?;
+                let cache_interval = crate::outbound::urltest::parse_duration(
+                    entry.get("cache_interval"),
+                    std::time::Duration::ZERO,
+                    &at,
+                )?;
+                let delta_update = entry
+                    .get("delta_update")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let cache_file = entry
+                    .get("cache_file")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let initial_path = entry
                     .get("initial_path")
                     .and_then(Value::as_str)
@@ -378,19 +472,20 @@ pub(crate) fn build_rule_sets(
                             .get("format")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        mmap: use_mmap,
+                        delta_update,
+                        cache_interval,
+                        cache_file,
+                        mode,
                     },
                     set: set.clone(),
                     etag: None,
                     last_updated: None,
                 });
-                Vec::new()
+                registry.insert(set);
             }
             other => anyhow::bail!("{at}: unknown rule-set type: {other}"),
-        };
-        if ty != "remote" {
-            logging::info(format_args!("loaded rule-set {}", tags.join(",")));
         }
-        registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
     }
     registry.attach_remotes(remotes);
     Ok(registry)
@@ -431,6 +526,9 @@ fn parse_rule_set_payload(
     at: &str,
 ) -> anyhow::Result<Vec<Value>> {
     let format = entry.get("format").and_then(Value::as_str).unwrap_or("");
+    if format == "tsrs" || data.starts_with(b"TSRS") {
+        return Ok(Vec::new());
+    }
     let binary = format == "binary"
         || (format.is_empty() && data.starts_with(b"SRS"))
         || (format.is_empty()

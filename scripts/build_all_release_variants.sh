@@ -19,7 +19,10 @@ pack_one() {
     rm -f "dist/${out_name}"
 }
 
-echo "=== Packaging Linux x86_64 Musl (already compiled and validated) ==="
+echo "=== Building Linux x86_64 Musl ==="
+cargo build -p core-cli --release --target x86_64-unknown-linux-musl
+mkdir -p target/full-x86_64-musl
+cp target/x86_64-unknown-linux-musl/release/tachyon-core target/full-x86_64-musl/tachyon-core
 pack_one "x86_64-musl" "target/full-x86_64-musl/tachyon-core"
 
 echo "=== Building AArch64 Musl ==="
@@ -51,10 +54,10 @@ pack_one "linux-amd64" "target/full-linux-amd64/tachyon-core"
 
 echo "=== Packaging MIPS & MIPSEL ==="
 if [ -f target/mipsel-unknown-linux-musl/release/tachyon-core ]; then
-    pack_one "full" "mipsel-musl" "target/mipsel-unknown-linux-musl/release/tachyon-core"
+    pack_one "mipsel-musl" "target/mipsel-unknown-linux-musl/release/tachyon-core"
 fi
 if [ -f target/mips-unknown-linux-musl/release/tachyon-core ]; then
-    pack_one "full" "mips-musl" "target/mips-unknown-linux-musl/release/tachyon-core"
+    pack_one "mips-musl" "target/mips-unknown-linux-musl/release/tachyon-core"
 fi
 
 echo "=== Building OpenWrt Package Archive ==="

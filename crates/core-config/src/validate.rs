@@ -664,7 +664,7 @@ const HEADLESS_RULE_FIELDS: &[&str] = &[
 
 /// reference `option._RuleSet` + the inline/local/remote option structs.
 const RULE_SET_INLINE_FIELDS: &[&str] = &["type", "tag", "format", "rules"];
-const RULE_SET_LOCAL_FIELDS: &[&str] = &["type", "tag", "format", "path"];
+const RULE_SET_LOCAL_FIELDS: &[&str] = &["type", "tag", "format", "path", "mmap", "mode"];
 const RULE_SET_REMOTE_FIELDS: &[&str] = &[
     "type",
     "tag",
@@ -674,6 +674,11 @@ const RULE_SET_REMOTE_FIELDS: &[&str] = &[
     "http_client",
     "update_interval",
     "download_detour",
+    "mmap",
+    "delta_update",
+    "cache_interval",
+    "cache_file",
+    "mode",
 ];
 
 /// reference `option.HTTPClientOptions` (shared by the remote rule sets and the
@@ -3305,7 +3310,7 @@ fn validate_rule_sets(route: &Map<String, Value>) -> Result<(), String> {
                 return Err(format!("{at}: missing format"));
             }
         }
-        if !format.is_empty() && !matches!(format.as_str(), "source" | "binary") {
+        if !format.is_empty() && !matches!(format.as_str(), "source" | "binary" | "tsrs") {
             return Err(format!("{at}: unknown rule-set format: {format}"));
         }
         if tags.len() > 1 {
@@ -3458,6 +3463,9 @@ fn rule_set_default_format(path: &str) -> String {
     if path.ends_with(".srs") {
         return "binary".to_string();
     }
+    if path.ends_with(".tsrs") {
+        return "tsrs".to_string();
+    }
     String::new()
 }
 
@@ -3473,6 +3481,9 @@ fn headless_rule_is_valid(rule: &Value) -> bool {
 /// The payload of a local rule set: source JSON or the binary SRS container.
 fn check_rule_set_payload(data: &[u8], entry: &Map<String, Value>, at: &str) -> Result<(), String> {
     let format = rule_set_payload_format(entry);
+    if format == "tsrs" || data.starts_with(b"TSRS") {
+        return Ok(());
+    }
     if format == "binary" {
         return match crate::srs::read(data) {
             Ok(_) => Ok(()),

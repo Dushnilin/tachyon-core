@@ -25,11 +25,11 @@ use crate::logging;
 use crate::outbound::quic::udp_loopback_pair;
 use crate::outbound::tailscale::config::TailscaleConfig;
 use crate::outbound::tailscale::control::{
-    discover_server_key, load_or_create_keys, machine_key_str, node_key_str, to_hex, Hostinfo,
-    RegisterRequest,
+    Hostinfo, RegisterRequest, discover_server_key, load_or_create_keys, machine_key_str,
+    node_key_str, to_hex,
 };
 use crate::outbound::tailscale::engine::{
-    resolve_target, spawn_tailscale_engine, Cmd, TailscaleShared,
+    Cmd, TailscaleShared, resolve_target, spawn_tailscale_engine,
 };
 
 const CALLER_BUF: usize = 65_536;
@@ -69,10 +69,8 @@ impl Tailscale {
         }
 
         // 1. Generate or load keys
-        let (machine_sec, node_sec) = load_or_create_keys(
-            self.cfg.state_directory.as_deref(),
-            self.cfg.ephemeral,
-        );
+        let (machine_sec, node_sec) =
+            load_or_create_keys(self.cfg.state_directory.as_deref(), self.cfg.ephemeral);
 
         let local_vip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1));
         let (_cmd_tx, cmd_rx) = mpsc::channel(128);
@@ -102,13 +100,22 @@ impl Tailscale {
             let register_req = RegisterRequest {
                 version: 1,
                 node_key: node_key_str(&x25519_dalek::PublicKey::from(&node_sec)),
-                auth: cfg_clone.auth_key.as_ref().map(|k| crate::outbound::tailscale::control::AuthObj {
-                    auth_key: k.clone(),
+                auth: cfg_clone.auth_key.as_ref().map(|k| {
+                    crate::outbound::tailscale::control::AuthObj {
+                        auth_key: k.clone(),
+                    }
                 }),
                 hostinfo: Hostinfo {
                     os: "linux".to_string(),
-                    hostname: cfg_clone.hostname.clone().unwrap_or_else(|| "tachyon-core".to_string()),
-                    routable_ips: cfg_clone.advertise_routes.iter().map(|c| c.to_string()).collect(),
+                    hostname: cfg_clone
+                        .hostname
+                        .clone()
+                        .unwrap_or_else(|| "tachyon-core".to_string()),
+                    routable_ips: cfg_clone
+                        .advertise_routes
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect(),
                 },
                 ephemeral: cfg_clone.ephemeral,
             };
@@ -213,7 +220,8 @@ impl Tailscale {
             .await
             .map_err(|_| io::Error::other("tailscale: engine task stopped"))?;
 
-        let (port, mut replies) = match tokio::time::timeout(Duration::from_secs(10), resp_rx).await {
+        let (port, mut replies) = match tokio::time::timeout(Duration::from_secs(10), resp_rx).await
+        {
             Ok(Ok(Ok(v))) => v,
             Ok(Ok(Err(e))) => return Err(io::Error::other(format!("tailscale: {e}"))),
             Ok(Err(_)) => return Err(io::Error::other("tailscale: engine task stopped")),
@@ -283,7 +291,7 @@ mod tests {
         let ts = Tailscale::build(map, "endpoints[0]").unwrap();
         assert_eq!(ts.cfg.tag, "ts-out");
         assert_eq!(ts.cfg.hostname.as_deref(), Some("test-box"));
-        assert_eq!(ts.cfg.ephemeral, true);
+        assert!(ts.cfg.ephemeral);
 
         // Test engine startup
         let shared = ts.shared().await.unwrap();

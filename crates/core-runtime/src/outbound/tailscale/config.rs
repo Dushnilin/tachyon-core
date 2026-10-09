@@ -90,9 +90,9 @@ impl TailscaleConfig {
         if let Some(Value::Array(items)) = obj.get("advertise_routes") {
             for (i, v) in items.iter().enumerate() {
                 if let Some(s) = v.as_str() {
-                    let cidr = s
-                        .parse::<IpCidr>()
-                        .map_err(|_| anyhow::anyhow!("{at}.advertise_routes[{i}]: invalid CIDR {s}"))?;
+                    let cidr = s.parse::<IpCidr>().map_err(|_| {
+                        anyhow::anyhow!("{at}.advertise_routes[{i}]: invalid CIDR {s}")
+                    })?;
                     advertise_routes.push(cidr);
                 }
             }
@@ -135,7 +135,9 @@ impl TailscaleConfig {
             for (i, v) in items.iter().enumerate() {
                 if let Some(s) = v.as_str() {
                     let addr = s.parse::<SocketAddr>().map_err(|_| {
-                        anyhow::anyhow!("{at}.relay_server_static_endpoints[{i}]: invalid socket address {s}")
+                        anyhow::anyhow!(
+                            "{at}.relay_server_static_endpoints[{i}]: invalid socket address {s}"
+                        )
                     })?;
                     relay_server_static_endpoints.push(addr);
                 }

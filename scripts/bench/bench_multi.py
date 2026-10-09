@@ -481,10 +481,15 @@ def get_binary_size(name, bin_path):
 
 def get_version(name, bin_path):
     try:
+        env = os.environ.copy()
+        if name in ("steer", "steer-box-connector"):
+            ensure_steer_env(bin_path)
+            curr_ld = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
         if name in ("mihomo", "clash"):
-            out = subprocess.run([bin_path, "-v"], capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run([bin_path, "-v"], capture_output=True, text=True, timeout=5, env=env).stdout
         else:
-            out = subprocess.run([bin_path, "version"], capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run([bin_path, "version"], capture_output=True, text=True, timeout=5, env=env).stdout
         lines = [line.strip() for line in out.splitlines() if line.strip()]
         if name in ("steer", "steer-box-connector"):
             for l in lines:
@@ -498,6 +503,8 @@ def get_version(name, bin_path):
 # ------------------------------------------------------------------ runner
 def bench_one(name, bin_path, proxy_cpus, args):
     print(f"\n>>> Benchmarking [{name}] ({bin_path}) ...", flush=True)
+    if name in ("steer", "steer-box-connector"):
+        ensure_steer_env(bin_path)
     res = {
         "name": name,
         "bin": bin_path,

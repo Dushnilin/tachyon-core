@@ -792,7 +792,15 @@ where
 {
     let mut atyp = [0u8; 1];
     stream.read_exact(&mut atyp).await?;
-    let addr = read_addr(stream, atyp[0]).await?;
+    // Trojan uses SOCKS address types (1/3/4); the shared reader uses
+    // VLESS/VMess types (1/2/3). Translate only at the Trojan boundary.
+    let addr_type = match atyp[0] {
+        0x01 => 0x01,
+        0x03 => 0x02,
+        0x04 => 0x03,
+        other => return Err(io::Error::other(format!("unknown address type: {other}"))),
+    };
+    let addr = read_addr(stream, addr_type).await?;
     Ok(addr.with_port(read_port(stream).await?))
 }
 
@@ -873,6 +881,117 @@ fn hex(uuid: &[u8; 16]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod trojan_address_tests {
+    use super::*;
+
+    async fn assert_request(address: &[u8], expected: Target) {
+        let key = [b'a'; KEY_LENGTH];
+        let keys = HashMap::from([(key, "test-user".to_string())]);
+        let mut request = key.to_vec();
+        request.extend_from_slice(b"\r\n\x01");
+        request.extend_from_slice(address);
+        request.extend_from_slice(b"\r\npayload");
+        let mut stream = request.as_slice();
+        let (name, command, target) = read_trojan_request(&mut stream, &keys).await.unwrap();
+        assert_eq!(name, "test-user");
+        assert_eq!(command, COMMAND_TCP);
+        assert_eq!(target, expected);
+        assert_eq!(
+            stream, b"payload",
+            "address parsing must preserve the payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn trojan_ipv4_request() {
+        assert_request(
+            &[1, 127, 0, 0, 1, 0x01, 0xbb],
+            Target::Ip("127.0.0.1:443".parse().unwrap()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn trojan_domain_request() {
+        // SOCKS/Trojan domain ATYP is 3, not VLESS/VMess's 2.
+        assert_request(
+            b"\x03\x0bexample.com\x01\xbb",
+            Target::Domain("example.com".into(), 443),
+        )
+        .await;
+        let mut address = vec![3, 255];
+        address.extend_from_slice(&[b'a'; 255]);
+        address.extend_from_slice(&8443u16.to_be_bytes());
+        assert_request(&address, Target::Domain("a".repeat(255), 8443)).await;
+    }
+
+    #[tokio::test]
+    async fn trojan_ipv6_request() {
+        let mut address = vec![4];
+        address.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        address.extend_from_slice(&8443u16.to_be_bytes());
+        assert_request(&address, Target::Ip("[::1]:8443".parse().unwrap())).await;
+    }
+
+    #[tokio::test]
+    async fn trojan_rejects_unknown_address_types() {
+        for atyp in [0, 2, 5, 255] {
+            let bytes = [atyp, 1, b'a', 0x01, 0xbb];
+            let mut stream = bytes.as_slice();
+            assert!(read_target(&mut stream).await.is_err(), "ATYP {atyp}");
+            assert_eq!(
+                stream,
+                &bytes[1..],
+                "unknown ATYP must not consume an address"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trojan_rejects_truncated_addresses_and_ports() {
+        let addresses: &[&[u8]] = &[
+            &[1, 127, 0, 0, 1, 0x01, 0xbb],
+            b"\x03\x0bexample.com\x01\xbb",
+            &[
+                4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x01, 0xbb,
+            ],
+        ];
+        for address in addresses {
+            for len in 0..address.len() {
+                let mut stream = &address[..len];
+                assert!(
+                    read_target(&mut stream).await.is_err(),
+                    "{address:?} at {len}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vless_keeps_its_port_first_address_types() {
+        let cases = [
+            (
+                b"\x01\xbb\x01\x7f\x00\x00\x01".as_slice(),
+                Target::Ip("127.0.0.1:443".parse().unwrap()),
+            ),
+            (
+                b"\x01\xbb\x02\x0bexample.com".as_slice(),
+                Target::Domain("example.com".into(), 443),
+            ),
+            (
+                b"\x01\xbb\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+                    .as_slice(),
+                Target::Ip("[::1]:443".parse().unwrap()),
+            ),
+        ];
+        for (mut stream, expected) in cases {
+            assert_eq!(read_vless_target(&mut stream).await.unwrap(), expected);
+            assert!(stream.is_empty());
+        }
+    }
 }
 
 #[cfg(test)]

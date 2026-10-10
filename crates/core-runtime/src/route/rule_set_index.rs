@@ -414,20 +414,27 @@ impl PlainRule {
         // Destination criteria (domain or IP)
         if self.has_domains || self.has_dest_ip {
             let mut dest_matched = false;
-            if let Some(host) = domain_host(ctx) {
-                if self.has_domains {
-                    dest_matched = self.domains.contains(host.as_ref())
-                        || self.suffixes.iter().any(|entry| domain_suffix_match(&host, entry))
-                        || self.keywords.iter().any(|entry| host.contains(entry.as_ref()));
-                }
+            if let Some(host) = domain_host(ctx)
+                && self.has_domains
+            {
+                dest_matched = self.domains.contains(host.as_ref())
+                    || self
+                        .suffixes
+                        .iter()
+                        .any(|entry| domain_suffix_match(&host, entry))
+                    || self
+                        .keywords
+                        .iter()
+                        .any(|entry| host.contains(entry.as_ref()));
             }
-            if !dest_matched && self.has_dest_ip {
-                if let Target::Ip(addr) = &ctx.destination {
-                    dest_matched = match addr.ip() {
-                        IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
-                        IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
-                    };
-                }
+            if !dest_matched
+                && self.has_dest_ip
+                && let Target::Ip(addr) = &ctx.destination
+            {
+                dest_matched = match addr.ip() {
+                    IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
+                    IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
+                };
             }
             if !dest_matched {
                 return self.inverted;
@@ -466,10 +473,8 @@ impl PlainRule {
         }
 
         // Network criteria
-        if self.has_network {
-            if !self.networks.iter().any(|known| **known == *ctx.network) {
-                return self.inverted;
-            }
+        if self.has_network && !self.networks.iter().any(|known| **known == *ctx.network) {
+            return self.inverted;
         }
 
         !self.inverted

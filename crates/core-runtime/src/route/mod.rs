@@ -247,7 +247,11 @@ impl Outbound {
         }
     }
 
-    pub fn apply_dial_defaults(&mut self, default_mark: Option<u32>, default_interface: Option<&str>) {
+    pub fn apply_dial_defaults(
+        &mut self,
+        default_mark: Option<u32>,
+        default_interface: Option<&str>,
+    ) {
         let apply = |dial: &mut crate::outbound::dial::DialOptions| {
             if dial.routing_mark.is_none() {
                 dial.routing_mark = default_mark;

@@ -247,6 +247,9 @@ pub struct VlessStream {
 }
 
 impl VlessStream {
+    pub(crate) fn enable_vision_direct_read(&mut self) -> bool {
+        crate::inbound::enable_vision_direct_read(&mut self.inner)
+    }
     /// The bare socket underneath, while the response head has not been touched:
     /// the relay can then eat the head itself and hand the rest to the kernel.
     #[cfg(target_os = "linux")]

@@ -21,8 +21,8 @@
 //! Ported from `sing-vmess/vless/vision.go`. The XTLS "direct" mode (writing
 //! through the TLS layer without re-encrypting, chosen once a TLS 1.3 handshake
 //! is seen) is deliberately not implemented: it needs a handle to the raw
-//! connection below the cipher. `CommandPaddingDirect` is still recognised on
-//! the way in, where it means the same thing as End for us.
+//! connection below the cipher. Receiving `CommandPaddingDirect` switches the
+//! peer's read direction to raw transport after its final padded frame.
 
 use std::io;
 
@@ -35,6 +35,7 @@ use crate::inbound::AnyStream;
 /// ever sent; Direct would need the raw connection underneath.
 const PADDING_CONTINUE: u8 = 0x00;
 const PADDING_END: u8 = 0x01;
+const PADDING_DIRECT: u8 = 0x02;
 
 /// Keep small writes padded to roughly a TLS record, as the reference does.
 const TLS_PADDING_FLOOR: usize = 900;
@@ -84,6 +85,7 @@ pub struct VisionStream {
     /// framed payload waiting for the caller
     payload: BytesMut,
     eof: bool,
+    direct_read: bool,
 }
 
 impl VisionStream {
@@ -104,6 +106,7 @@ impl VisionStream {
             raw: BytesMut::new(),
             payload: BytesMut::new(),
             eof: false,
+            direct_read: false,
         }
     }
 
@@ -254,6 +257,18 @@ impl AsyncRead for VisionStream {
         let this = &mut *self;
         loop {
             this.unpad();
+            if !this.direct_read
+                && this.current_command == PADDING_DIRECT
+                && this.remaining_content == 0
+                && this.remaining_padding == 0
+            {
+                if !crate::inbound::enable_vision_direct_read(&mut this.inner) {
+                    return std::task::Poll::Ready(Err(io::Error::other(
+                        "Vision Direct requires a raw-capable TLS stream",
+                    )));
+                }
+                this.direct_read = true;
+            }
             if !this.payload.is_empty() {
                 let take = this.payload.len().min(out.remaining());
                 out.put_slice(&this.payload[..take]);

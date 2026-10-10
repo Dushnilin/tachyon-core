@@ -20,6 +20,62 @@ use core_tls::rustls::{self, RootCertStore, ServerConfig};
 use core_tls::verify::{CertVerifier, WebpkiVerifier};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+#[derive(Debug)]
+struct TestCompressor(u16);
+
+impl rustls::compress::CertCompressor for TestCompressor {
+    fn compress(
+        &self,
+        input: Vec<u8>,
+        _: rustls::compress::CompressionLevel,
+    ) -> Result<Vec<u8>, rustls::compress::CompressionFailed> {
+        let mut out = Vec::new();
+        match self.0 {
+            1 => {
+                let mut writer =
+                    flate2::write::ZlibEncoder::new(out, flate2::Compression::default());
+                writer.write_all(&input).unwrap();
+                out = writer.finish().unwrap();
+            }
+            2 => {
+                brotli::BrotliCompress(
+                    &mut &input[..],
+                    &mut out,
+                    &brotli::enc::BrotliEncoderParams::default(),
+                )
+                .unwrap();
+            }
+            3 => {
+                out = ruzstd::encoding::compress_to_vec(
+                    &input[..],
+                    ruzstd::encoding::CompressionLevel::Fastest,
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(out.len() < input.len(), "fixture must actually compress");
+        Ok(out)
+    }
+
+    fn algorithm(&self) -> rustls::CertificateCompressionAlgorithm {
+        self.0.into()
+    }
+}
+
+#[tokio::test]
+async fn modern_profiles_accept_compressed_certificates_and_verify_finished() {
+    static COMPRESSORS: [TestCompressor; 3] =
+        [TestCompressor(1), TestCompressor(2), TestCompressor(3)];
+    let (certs, _) = fixture();
+    let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).unwrap();
+    for compressor in &COMPRESSORS {
+        let done = shake_compressed(&verifier, "firefox", "localhost", Some(compressor))
+            .await
+            .expect("compressed certificate handshake and Finished verification");
+        assert_eq!(done.leaf.as_ref(), Some(&certs[0]));
+    }
+}
+
 /// The certificate the repository already carries for its own golden tests: self
 /// signed for `localhost`, valid until 2036. A checked-in certificate is the
 /// only kind that can be a test fixture -- one generated per run would need a
@@ -105,12 +161,25 @@ async fn shake(
     fingerprint: &str,
     server_name: &str,
 ) -> Result<Outcome, String> {
+    shake_compressed(verifier, fingerprint, server_name, None).await
+}
+
+async fn shake_compressed(
+    verifier: &dyn CertVerifier,
+    fingerprint: &str,
+    server_name: &str,
+    compressor: Option<&'static dyn rustls::compress::CertCompressor>,
+) -> Result<Outcome, String> {
     core_tls::install_default_provider();
     let (client_side, server_side) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move {
         let mut sock = server_side;
+        let mut config = server();
+        if let Some(compressor) = compressor {
+            config.cert_compressors = vec![compressor];
+        }
         let mut conn =
-            rustls::ServerConnection::new(Arc::new(server())).expect("a server connection");
+            rustls::ServerConnection::new(Arc::new(config)).expect("a server connection");
         let mut scratch = [0u8; 4096];
         // reading drives the handshake: the flight goes out, the client's
         // Finished comes back

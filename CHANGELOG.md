@@ -3,6 +3,26 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.2
+
+Point release improving network compatibility, DNS resilience, protocol framing, and TLS fingerprint fidelity.
+
+### Fixes & Improvements
+
+- **DNS Resolver Resiliency**:
+  - Added automatic fallback to system resolver (`tokio::net::lookup_host`) when a configured `domain_resolver` (bootstrap DNS, e.g. UDP port 53) times out or is unreachable. Fixes DNS failure on ISPs (such as PPPoE WANs) that drop external UDP port 53.
+  - Implemented routing target resolution for DNS `Action::Evaluate`, resolving and routing DNS evaluation queries through the specified server rather than dropping or ignoring the rule.
+  - Corrected DNS rule iteration to skip `match_response` rules during initial query evaluation, preventing response-matching rules from misrouting outgoing queries.
+- **VLESS Vision Direct Raw Transport**:
+  - Implemented receive-side transition to raw transport upon receiving `CommandPaddingDirect`. Buffered content and padding are drained before switching the read path to the raw underlying stream, resolving inner TLS 1.3 HTTPS stalls behind REALITY/Vision (Closes #1).
+- **Browser TLS Fingerprints & RFC 8879 Certificate Compression**:
+  - Refreshed browser ClientHello fingerprint fixtures for modern Firefox (148), Safari (26.3), and Chrome with exact key-share tables and hybrid ML-KEM/X25519 alignment.
+  - Added native RFC 8879 certificate compression support (zlib, Brotli, Zstd) using pure-Rust decoders (Closes #2).
+- **Sing-Box Compatible XHTTP Forms**:
+  - Accepted `session_id_table` and `session_id_length` aliases, numeric values for range fields, named session alphabets (`hex`, `Base62`), and default fallback for zero uplink chunk sizes (Closes #3).
+- **AF_ALG & TUN Portability**:
+  - Replaced unchecked `msg_iovlen` casts with checked conversions across target architectures, and cleaned up TUN identity IP-address conversions (PR #4).
+
 ## 0.0.1
 
 The first tagged build. A routing core for OpenWrt: the client stack end to

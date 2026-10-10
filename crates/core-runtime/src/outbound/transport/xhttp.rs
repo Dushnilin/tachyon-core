@@ -147,12 +147,10 @@ struct Meta {
 
 impl Meta {
     fn resolve(t: &Map<String, Value>, mode: Mode) -> anyhow::Result<Self> {
-        let s = |k: &str| {
-            t.get(k)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string()
+        let s = |k: &str| match t.get(k) {
+            Some(Value::String(value)) => value.trim().to_string(),
+            Some(Value::Number(value)) => value.to_string(),
+            _ => String::new(),
         };
         let placement = |k: &str, what: &str| -> anyhow::Result<Placement> {
             match s(k).as_str() {
@@ -216,7 +214,7 @@ impl Meta {
         let sc_max_each_post =
             Range::parse(&s("sc_max_each_post_bytes"), Range(1_000_000, 1_000_000))?;
         let uplink_chunk = match s("uplink_chunk_size") {
-            v if !v.is_empty() => Range::parse(&v, Range(3000, 4000))?,
+            v if !v.is_empty() && v != "0" && v != "0-0" => Range::parse(&v, Range(3000, 4000))?,
             _ => match uplink_data {
                 UplinkPlacement::Cookie => Range(2048, 3072),
                 UplinkPlacement::Header => Range(3000, 4000),
@@ -240,8 +238,19 @@ impl Meta {
             session_key,
             seq_placement,
             seq_key,
-            session_table: s("session_table"),
-            session_len: Range::parse(&s("session_length"), Range(0, 0))?,
+            session_table: if t.contains_key("session_table") {
+                s("session_table")
+            } else {
+                s("session_id_table")
+            },
+            session_len: Range::parse(
+                &if t.contains_key("session_length") {
+                    s("session_length")
+                } else {
+                    s("session_id_length")
+                },
+                Range(0, 0),
+            )?,
             uplink_data,
             uplink_key,
             uplink_chunk,
@@ -1332,7 +1341,9 @@ fn new_session_id(meta: &Meta) -> String {
         }
         return h;
     }
-    let table: Vec<char> = meta.session_table.chars().collect();
+    let table: Vec<char> = core_config::xhttp_session_table(&meta.session_table)
+        .chars()
+        .collect();
     let len = meta.session_len.rand() as usize;
     let mut out = String::with_capacity(len);
     let mut buf = [0u8; 8];

@@ -14,9 +14,8 @@
 //! X25519 share (32). The shared secret is the ML-KEM secret then the X25519
 //! one, in that order.
 //!
-//! Chrome and Firefox also offer a second, plain X25519 share, and it is a
-//! *different* key from the hybrid's X25519 half -- utls generates a separate
-//! one "in line with Chrome" -- so we do the same.
+//! Chrome/Safari use independent plain X25519 keys. Firefox 148 reuses the
+//! hybrid's X25519 half; the relationship in the captured keys is preserved.
 
 use std::io;
 
@@ -116,6 +115,19 @@ impl Shares {
     /// fallback: offering a share we cannot complete would fail the handshake
     /// later, further from the cause.
     pub fn for_body(body: &[u8]) -> io::Result<Self> {
+        let captured = entries(body)?;
+        // Firefox 148 reuses the hybrid's X25519 half for its classical share.
+        // Preserve that relationship when replacing captured keys with fresh
+        // keys; Chrome/Safari retain their independent classical keys.
+        let reuse_x25519 = captured.iter().any(|(group, hybrid)| {
+            *group == X25519MLKEM768
+                && hybrid.len() == MLKEM768_EK_LEN + X_LEN
+                && captured.iter().any(|(group, plain)| {
+                    *group == X25519
+                        && plain.iter().any(|byte| *byte != 0)
+                        && *plain == &hybrid[MLKEM768_EK_LEN..]
+                })
+        });
         let mut shares = Shares {
             entries: Vec::new(),
             hybrid: None,
@@ -137,7 +149,16 @@ impl Shares {
                     share
                 }
                 X25519 => {
-                    let x = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+                    let x = if reuse_x25519 {
+                        shares
+                            .hybrid
+                            .as_ref()
+                            .ok_or_else(|| err("reused X25519 share must follow the hybrid share"))?
+                            .x
+                            .clone()
+                    } else {
+                        x25519_dalek::StaticSecret::random_from_rng(OsRng)
+                    };
                     let share = *x25519_dalek::PublicKey::from(&x).as_bytes();
                     shares.x25519 = Some(x);
                     share.to_vec()

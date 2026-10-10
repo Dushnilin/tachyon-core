@@ -1,0 +1,11 @@
+{
+  "reference": "Sing-Box X 1.0.3 / core 1.14.2",
+  "package": "sing-box-x_1.0.3-1_x86_64.ipk",
+  "package_sha256": "44375519eca91e706d913f240d380b4d1ba3ff9341d5de4d944c376bbadd3d1c",
+  "binary_sha256": "aeaa320896dc6ff65afee39f57bc75134b36cdf95920332e05cec297b1054ffa",
+  "captures": {
+    "chrome.bin": "8dca410decc6d5e05f1f1e9bc8b62f2f2f61f8e74ed3bf39ff80f817290ff3d8",
+    "firefox.bin": "182a9abaf9bcf3a285525c78dd8c669836bb47a79cae9c4902307436496857d8",
+    "safari.bin": "818bb928b91e5b7de82b37df2e89b4aee0c65ae1e0f9f3d3ef750bbb825d6917"
+  }
+}

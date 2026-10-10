@@ -87,6 +87,7 @@ jobs:
           # all seven on a tag; this job is the per-push smoke test, and paying for
           # seven builds plus seven artifacts on every commit is not a smoke test.
           - target: x86_64-unknown-linux-musl
+            budget: 14680064
           - target: aarch64-unknown-linux-musl
           - target: armv7-unknown-linux-musleabihf
           # tier-3, no prebuilt std: the standard library is built from source
@@ -136,13 +137,15 @@ jobs:
         if: matrix.target == 'mipsel-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mipsel-linux-gnu
+          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu
           curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           tar -xzf /tmp/musl.tar.gz -C /tmp
           (cd /tmp/musl-1.2.5 && \
-            ./configure --target=mipsel-linux-musl --prefix=/opt/mipsel-musl \
-              CC=mipsel-linux-gnu-gcc && \
+            ./configure --prefix=/opt/mipsel-musl \
+              CC=mipsel-linux-gnu-gcc \
+              AR=mipsel-linux-gnu-ar \
+              RANLIB=mipsel-linux-gnu-ranlib && \
             make -j"$(nproc)" && sudo make install)
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"

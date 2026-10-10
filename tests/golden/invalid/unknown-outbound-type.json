@@ -4,7 +4,7 @@
   },
   "outbounds": [
     {
-      "type": "mieru",
+      "type": "nosuchproto",
       "tag": "m"
     }
   ]

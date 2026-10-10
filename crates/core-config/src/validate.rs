@@ -249,6 +249,7 @@ const KNOWN_INBOUND_TYPES: &[&str] = &[
     "snell",
     "cloudflared",
     "fptn",
+    "mieru",
 ];
 
 const KNOWN_OUTBOUND_TYPES: &[&str] = &[
@@ -275,6 +276,7 @@ const KNOWN_OUTBOUND_TYPES: &[&str] = &[
     "snell",
     "wireguard",
     "fptn",
+    "mieru",
     "dns",
     "bridge",
 ];
@@ -733,6 +735,7 @@ const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
     ("tuic", "TUICInboundOptions"),
     ("snell", "SnellInboundOptions"),
     ("fptn", "FPTNInboundOptions"),
+    ("mieru", "MieruInboundOptions"),
 ];
 
 /// Fields each simple inbound type declares beyond `ListenOptions` and the
@@ -864,6 +867,7 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
             "endpoint_independent_nat",
         ],
     ),
+    ("mieru", &["users", "transport"]),
     (
         "fptn",
         &[
@@ -3246,6 +3250,10 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
             // these four are served, by `core_runtime::inbound::transport`: a
             // websocket handshake, an httpupgrade 101, one HTTP/2 POST stream,
             // or the XHTTP download/upload requests, then the protocol bytes
+            continue;
+        }
+        if field == "transport" && value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("tcp")) {
+            // mieru's own `transport` is a plain "TCP" string, not a v2ray object
             continue;
         }
         return Err(format!(
@@ -7235,6 +7243,51 @@ fn check_fptn_obfuscation(obj: &Map<String, Value>, at: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn validate_mieru_out(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let mut allowed: Vec<&str> = vec![
+        "type",
+        "tag",
+        "server",
+        "server_port",
+        "server_ports",
+        "transport",
+        "username",
+        "password",
+        "multiplexing",
+        "traffic_pattern",
+    ];
+    allowed.extend_from_slice(DIALER_OUT_FIELDS);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    match obj.get("server") {
+        Some(Value::String(s)) if !s.is_empty() => {}
+        Some(Value::String(_)) | None | Some(Value::Null) => {
+            return Err(format!("{at}: missing server"));
+        }
+        Some(_) => return Err(format!("{at}.server: must be a string")),
+    }
+    if matches!(obj.get("server_port"), None | Some(Value::Null))
+        && matches!(obj.get("server_ports"), None | Some(Value::Null))
+    {
+        return Err(format!("{at}: missing server_port"));
+    }
+    for field in ["username", "password"] {
+        match obj.get(field) {
+            Some(Value::String(s)) if !s.is_empty() => {}
+            Some(Value::String(_)) | None | Some(Value::Null) => {
+                return Err(format!("{at}: missing {field}"));
+            }
+            Some(_) => return Err(format!("{at}.{field}: must be a string")),
+        }
+    }
+    match obj.get("transport") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s == "TCP" || s == "UDP" => {}
+        Some(_) => return Err(format!("{at}.transport: must be TCP or UDP")),
+    }
+    Ok(())
+}
+
 fn validate_fptn_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     check_fptn_obfuscation(obj, &at)?;
@@ -7486,6 +7539,7 @@ fn validate_outbound(
         "anytls" => validate_anytls_out_decode(i, tag, obj)?,
         "snell" => validate_snell_out_decode(i, tag, obj)?,
         "fptn" => validate_fptn_out_decode(i, obj)?,
+        "mieru" => validate_mieru_out(i, obj)?,
         "socks" | "http" | "shadowsocks" | "shadowtls" | "vmess" | "vless" | "trojan"
         | "hysteria" | "naive" | "ssh" => {
             validate_plain_out_decode(i, ty, tag, obj)?;
@@ -7542,7 +7596,7 @@ fn validate_outbound(
         _ => {}
     }
 
-    if let Some(transport) = obj.get("transport") {
+    if let Some(transport) = obj.get("transport").filter(|_| ty != "mieru") {
         let go_struct = SERVER_OUT_BASES
             .iter()
             .find(|(known, _)| *known == ty)
@@ -7824,7 +7878,7 @@ fn validate_outbound(
                 }
             }
         }
-        "fptn" => {
+        "fptn" | "mieru" => {
             let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
             if !server.is_empty()
                 && crate::netip_parse::parse_addr(server).is_err()

@@ -43,6 +43,7 @@ use crate::outbound::proxy::{HttpOut, Selector, Socks};
 use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::shadowsocks::stream::Shadowsocks;
 use crate::outbound::shadowtls::ShadowTls;
+use crate::outbound::mieru::Mieru;
 use crate::outbound::snell::Snell;
 use crate::outbound::tailscale::Tailscale;
 use crate::outbound::tuic::Tuic;
@@ -164,6 +165,7 @@ pub enum Outbound {
     Fptn(Fptn),
     Masque(Masque),
     Snell(Snell),
+    Mieru(Mieru),
     Tuic(Tuic),
     WireGuard(WireGuard),
     OpenVpn(OpenVpn),
@@ -200,6 +202,7 @@ impl Outbound {
             Outbound::Fptn(fptn) => fptn.connect(target).await.map(Conn::Plain),
             Outbound::Masque(masque) => masque.connect(target).await.map(Conn::Plain),
             Outbound::Snell(snell) => snell.connect(target).await.map(Conn::Plain),
+            Outbound::Mieru(mieru) => mieru.connect(target).await.map(Conn::Plain),
             Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
             Outbound::OpenVpn(ovpn) => ovpn.connect(target).await.map(Conn::Plain),
@@ -229,6 +232,7 @@ impl Outbound {
             Outbound::Vmess(vmess) => vmess.connect_udp(target).await,
             Outbound::Trojan(trojan) => trojan.connect_udp(target).await,
             Outbound::Snell(snell) => snell.connect_udp(target).await,
+            Outbound::Mieru(mieru) => mieru.connect_udp(target).await,
             Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
             Outbound::OpenVpn(ovpn) => ovpn.connect_udp(target).await,
@@ -272,6 +276,7 @@ impl Outbound {
             Outbound::ShadowTls(s) => apply(&mut s.dial),
             Outbound::Naive(n) => apply(&mut n.dial),
             Outbound::Snell(s) => apply(&mut s.dial),
+            Outbound::Mieru(m) => apply(&mut m.dial),
             _ => {}
         }
     }
@@ -297,6 +302,7 @@ impl Outbound {
             "fptn" => Ok(Outbound::Fptn(Fptn::build(obj, at)?)),
             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
             "snell" => Ok(Outbound::Snell(Snell::build(obj, at)?)),
+            "mieru" => Ok(Outbound::Mieru(Mieru::build(obj, at)?)),
             "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
             "naive" => Ok(Outbound::Naive(Naive::build(obj, at)?)),
             "anytls" => Ok(Outbound::AnyTls(AnyTls::build(obj, at)?)),

@@ -1324,8 +1324,39 @@ mod tests {
         );
     }
 
-    /// The options have to reach the socket, not just the struct: read each
-    /// one back with getsockopt.
+    /// Only SO_MARK needs privileges; do not skip the other socket options.
+    #[cfg(target_os = "linux")]
+    fn test_routing_mark(mark: u32) -> Option<u32> {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let fd = new_socket(&addr, false).expect("socket");
+        let result = DialOptions {
+            routing_mark: Some(mark),
+            ..Default::default()
+        }
+        .apply(fd, &addr, false);
+        unsafe { libc::close(fd) };
+        match result {
+            Ok(()) => Some(mark),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                assert!(
+                    std::env::var_os("TACHYON_TEST_REQUIRE_SO_MARK").is_none(),
+                    "privileged SO_MARK check failed: {error}"
+                );
+                eprintln!(
+                    "SO_MARK requires CAP_NET_ADMIN or CAP_NET_RAW; other options are still checked"
+                );
+                None
+            }
+            Err(error) => panic!("SO_MARK probe failed: {error}"),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn test_routing_mark(_mark: u32) -> Option<u32> {
+        None
+    }
+
+    /// Read each applied option back with getsockopt.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_options_reach_the_socket() {
@@ -1345,7 +1376,7 @@ mod tests {
             value
         };
         let options = DialOptions {
-            routing_mark: Some(0x1234),
+            routing_mark: test_routing_mark(0x1234),
             reuse_addr: true,
             tcp_keep_alive: Some(Duration::from_secs(42)),
             tcp_keep_alive_interval: Some(Duration::from_secs(11)),
@@ -1354,7 +1385,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
         options.apply(fd, &addr, false).expect("apply");
-        assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_MARK), 0x1234);
+        if let Some(mark) = options.routing_mark {
+            assert_eq!(
+                get_int(fd, libc::SOL_SOCKET, libc::SO_MARK),
+                mark as libc::c_int
+            );
+        }
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR), 1);
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 42);
@@ -1390,11 +1426,12 @@ mod tests {
     /// local address it bound is the one the config asked for.
     #[tokio::test]
     async fn a_connect_with_options_still_reaches_the_peer() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let server = listener.local_addr().expect("addr");
-        let accept = tokio::task::spawn_blocking(move || listener.accept().map(|(s, _)| s));
         let options = DialOptions {
-            routing_mark: Some(0x2000),
+            routing_mark: test_routing_mark(0x2000),
             reuse_addr: true,
             tcp_fast_open: true,
             inet4_bind_address: Some("127.0.0.1".parse().unwrap()),
@@ -1418,6 +1455,9 @@ mod tests {
             .await
             .expect("the write must not block: the socket was never connected")
             .expect("write");
-        accept.await.expect("join").expect("accept");
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept must not block")
+            .expect("accept");
     }
 }

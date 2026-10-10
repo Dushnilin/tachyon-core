@@ -27,14 +27,8 @@ cargo +nightly build -p core-cli --release --target mipsel-unknown-linux-musl -Z
 echo "=== 7. Building mips-unknown-linux-musl ==="
 cargo +nightly build -p core-cli --release --target mips-unknown-linux-musl -Z build-std=std,panic_abort || echo "MIPS build warning, keeping existing"
 
+VER="${1:-v0.0.2}"
+
 echo "=== 8. Packaging all router architectures ==="
-bash scripts/pack_all_architectures.sh
-
-echo "=== 9. Building OpenWrt Package Archive ==="
-tar -czf "dist/tachyon-core-openwrt-package-v0.0.1.tar.gz" openwrt/
-
-echo "=== 10. Generating Checksums ==="
-cd dist
-sha256sum *.tar.gz > SHA256SUMS
-cat SHA256SUMS
-echo "=== All architectures successfully built and packaged! ==="
+bash scripts/pack_all_architectures.sh "${VER}"
+echo "=== All architectures successfully built and packaged for ${VER}! ==="

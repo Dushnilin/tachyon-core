@@ -117,10 +117,16 @@ impl BoxInstance {
     }
 
     /// Abort all listeners and connection tasks.
-    pub fn shutdown(self) {
-        for task in self.tasks {
+    pub fn shutdown(&self) {
+        for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+impl Drop for BoxInstance {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -365,14 +371,87 @@ pub async fn run_str(raw: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run the box with reload support: on SIGHUP, invoke `load()` and restart the box in-place.
+pub async fn run_reloadable<F>(mut load: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Result<String, String> + Send + 'static,
+{
+    let raw = load().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let root: Value = serde_json::from_str(&raw).with_context(|| "decode config".to_string())?;
+    #[allow(unused_mut)]
+    let mut instance = start(&root).await?;
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    logging::info(format_args!("received SIGINT, shutting down"));
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    logging::info(format_args!("received SIGTERM, shutting down"));
+                    break;
+                }
+                _ = sighup.recv() => {
+                    logging::info(format_args!("received SIGHUP, reloading configuration"));
+                    match load() {
+                        Ok(new_raw) => {
+                            match serde_json::from_str::<Value>(&new_raw) {
+                                Ok(new_root) => {
+                                    instance.shutdown();
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    match start(&new_root).await {
+                                        Ok(new_inst) => {
+                                            instance = new_inst;
+                                            logging::info(format_args!("configuration reloaded successfully"));
+                                        }
+                                        Err(err) => {
+                                            logging::error(format_args!("failed to start box after SIGHUP reload: {err:#}"));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    logging::error(format_args!("failed to parse configuration after SIGHUP: {err:#}"));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            logging::error(format_args!("failed to load configuration on SIGHUP: {err}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    logging::info(format_args!("shutting down"));
+    instance.shutdown();
+    Ok(())
+}
+
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+        let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = term.recv() => break,
+                _ = hup.recv() => {
+                    logging::info(format_args!("received SIGHUP (ignored in non-reloadable mode)"));
+                }
+            }
         }
     }
     #[cfg(not(unix))]

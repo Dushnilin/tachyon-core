@@ -198,7 +198,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
-    let raw = load_config(args).map_err(|e| format!("run: {e}"))?;
+    let args_owned = args.to_vec();
+    let raw = load_config(&args_owned).map_err(|e| format!("run: {e}"))?;
     #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
     allocstat::start();
     if let Ok(warnings) = core_config::check_str_warnings(&raw) {
@@ -239,7 +240,9 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
     .map_err(|e| format!("run: {e}"))?;
     runtime
-        .block_on(async { core_runtime::run_str(&raw).await })
+        .block_on(async move {
+            core_runtime::run_reloadable(move || load_config(&args_owned)).await
+        })
         .map_err(|e| format!("run: {e:#}"))
 }
 

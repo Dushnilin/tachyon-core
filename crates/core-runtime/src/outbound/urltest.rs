@@ -140,6 +140,30 @@ impl Urltest {
             .unwrap_or_default()
     }
 
+    /// Switch to member by tag across reloads or runtime commands.
+    pub fn select(&self, member: &str) -> bool {
+        if let Some(pos) = self.shared.members.iter().position(|m| m == member) {
+            self.shared.current.store(pos, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Copy measured latencies from an earlier urltest group if member tags match.
+    pub fn copy_latencies_from(&self, old: &Urltest) {
+        let old_latencies = old.shared.latencies.lock().expect("old latencies lock");
+        let mut new_latencies = self.shared.latencies.lock().expect("new latencies lock");
+        for (new_pos, member) in self.shared.members.iter().enumerate() {
+            if let Some(old_pos) = old.shared.members.iter().position(|m| m == member)
+                && let Some(Some(latency)) = old_latencies.get(old_pos)
+                && new_pos < new_latencies.len()
+            {
+                new_latencies[new_pos] = Some(*latency);
+            }
+        }
+    }
+
     /// Spawn the background probe loop (called once the router is shared).
     pub(crate) fn spawn(&self, router: Arc<Router>) -> tokio::task::JoinHandle<()> {
         let shared = Arc::clone(&self.shared);

@@ -34,6 +34,7 @@ use crate::route::Router;
 
 /// A started box instance: running inbound listeners plus their tasks.
 pub struct BoxInstance {
+    router: Arc<Router>,
     tasks: Vec<JoinHandle<()>>,
     quic_endpoints: Vec<(quinn::Endpoint, Weak<dyn quinn::AsyncUdpSocket>)>,
     udp_sockets: Vec<Weak<tokio::net::UdpSocket>>,
@@ -175,6 +176,60 @@ impl BoxInstance {
         self.clash_api
     }
 
+    /// Running router instance.
+    pub fn router(&self) -> Arc<Router> {
+        Arc::clone(&self.router)
+    }
+
+    /// Perform in-place hot reload without stopping inbounds or dropping connections.
+    /// Perform in-place hot reload without stopping inbounds or dropping connections.
+    pub async fn reload_in_place(&mut self, new_root: &Value) -> anyhow::Result<()> {
+        warn_unhonored_options(new_root);
+
+        // 1. Build and validate new router inner BEFORE mutating anything running
+        let new_inner = Router::build_inner(new_root)?;
+
+        // 2. Build and validate new DNS service BEFORE mutating anything running
+        let new_dns = dns::DnsService::build_with_registry(new_root, new_inner.rule_sets())
+            .context("dns section")?;
+
+        // 3. Migrate active DNS cache, server addrs, reverse mappings, and fakeip pools
+        if let (Some(new_svc), Some(old_svc)) = (&new_dns, &self.dns) {
+            new_svc.migrate_from(old_svc);
+        }
+
+        // 4. Atomically apply the new router inner (delay history, selectors, and urltest preserved)
+        self.router.apply_inner(new_inner).await?;
+
+        // 5. Connect DNS service to the shared router and publish globally
+        if let Some(service) = &new_dns {
+            service.set_router(Arc::clone(&self.router));
+        }
+        dns::set_service(new_dns.clone());
+        self.dns = new_dns;
+
+        // 6. Start remote rule sets and endpoints for the new router
+        self.router
+            .rule_sets()
+            .start_remote(&self.router, self.cache_file.clone())
+            .await?;
+        self.router.start_endpoints().await?;
+
+        // 7. Hot-apply log settings
+        let log = new_root.get("log");
+        let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
+        let disabled = log
+            .and_then(|l| l.get("disabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(lvl) = level {
+            logging::set_level(lvl);
+        }
+        logging::set_enabled(!disabled);
+
+        Ok(())
+    }
+
     /// Abort all listeners and connection tasks.
     pub fn shutdown(&self) {
         self.abort_listeners();
@@ -304,7 +359,7 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
         .await?;
     router.start_endpoints().await?;
     let dns_service =
-        dns::DnsService::build_with_registry(root, router.rule_sets()).context("dns section")?;
+        dns::DnsService::build_with_registry(root, &router.rule_sets()).context("dns section")?;
     if let Some(service) = &dns_service {
         // `dns.server.detour` dials through the outbounds
         service.set_router(Arc::clone(&router));
@@ -485,6 +540,7 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
     }
 
     Ok(BoxInstance {
+        router,
         quic_endpoints,
         udp_sockets,
         tasks: Vec::new(),
@@ -569,8 +625,31 @@ where
     }
 }
 
-/// One SIGHUP: load, `check`, stop the running box, start the new one — and
-/// put the old one back if the new one will not come up.
+pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
+    if old_root.get("inbounds") != new_root.get("inbounds") {
+        return false;
+    }
+    let old_clash = old_root
+        .get("experimental")
+        .and_then(|e| e.get("clash_api"));
+    let new_clash = new_root
+        .get("experimental")
+        .and_then(|e| e.get("clash_api"));
+    if old_clash != new_clash {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if old_root.get("network_namespaces") != new_root.get("network_namespaces") {
+        return false;
+    }
+    if old_root.get("ntp") != new_root.get("ntp") {
+        return false;
+    }
+    true
+}
+
+/// One SIGHUP: load, `check`, hot reload in-place if inbounds are unchanged,
+/// or stop running box and start new one if listeners changed.
 ///
 /// `Err` means the box is down and nothing is listening.
 #[cfg(unix)]
@@ -606,6 +685,25 @@ where
             return None;
         }
     };
+
+    if can_reload_in_place(root, &new_root) {
+        logging::info(format_args!(
+            "inbounds unchanged: applying hot reload in-place"
+        ));
+        if let Err(err) = instance.reload_in_place(&new_root).await {
+            logging::error(format_args!(
+                "in-place hot reload failed: {err:#}, keeping running configuration"
+            ));
+            return None;
+        }
+        *root = new_root;
+        logging::info(format_args!(
+            "configuration hot-reloaded successfully without downtime"
+        ));
+        return None;
+    }
+
+    logging::info(format_args!("inbounds changed, restarting box listeners"));
     // No fixed sleep here: this waits for every task to finish, so by the
     // time it returns the ports are actually free to bind again.
     instance.shutdown_wait().await;

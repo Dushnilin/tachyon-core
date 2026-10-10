@@ -63,6 +63,7 @@ async fn routed_tag(router: &Router, source: &str) -> String {
         panic!("an outbound decision");
     };
     router
+        .inner()
         .outbound_table()
         .find(|(candidate, _, _)| *candidate == index)
         .map(|(_, tag, _)| tag.to_string())

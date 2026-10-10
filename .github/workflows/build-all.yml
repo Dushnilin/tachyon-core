@@ -65,14 +65,16 @@ jobs:
             desc: "MediaTek MT7621, ramips routers"
             build-std: true
             use_musl_lld: true
-            budget: 12582912
+            # ~350 KiB of .pdr descriptors survive strip, and the gcc-linked
+            # build has no --icf: 12 MiB is unreachable on MIPS.
+            budget: 16777216
           - name: mips-musl
             target: mips-unknown-linux-musl
             arch: "MIPS Big-Endian"
             desc: "Qualcomm Atheros ath79 routers"
             build-std: true
             use_musl_lld: true
-            budget: 12582912
+            budget: 16777216
           # Desktop & Server targets
           - name: linux-amd64
             target: x86_64-unknown-linux-gnu
@@ -106,6 +108,40 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+      # rust-lld's self-contained CRT only carries start files for the targets
+      # rustup distributes a std for; the MIPS targets are tier-3 and have
+      # none, so `link-self-contained=yes` hands lld bare `Scrt1.o` / `-lc`
+      # names it cannot resolve. Link those two through a real musl gcc driver
+      # instead, which carries its own crt and libc.
+      - name: MIPS musl toolchain (mipsel)
+        if: matrix.target == 'mipsel-unknown-linux-musl'
+        run: |
+          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
+            https://musl.cc/mipsel-linux-musl-cross.tgz
+          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
+          echo "/opt/mipsel-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          {
+            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-musl-gcc"
+            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-musl-gcc"
+            # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
+            # array is repeated here minus everything that names lld:
+            # `--icf=safe` is an lld flag and GNU ld rejects it.
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+          } >> "$GITHUB_ENV"
+
+      - name: MIPS musl toolchain (mips)
+        if: matrix.target == 'mips-unknown-linux-musl'
+        run: |
+          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
+            https://musl.cc/mips-linux-musl-cross.tgz
+          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
+          echo "/opt/mips-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          {
+            echo "CC_mips_unknown_linux_musl=mips-linux-musl-gcc"
+            echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-musl-gcc"
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+          } >> "$GITHUB_ENV"
 
       - name: Toolchain (prebuilt std)
         if: ${{ !matrix.build-std }}

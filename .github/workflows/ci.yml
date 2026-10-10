@@ -142,10 +142,7 @@ jobs:
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           tar -xzf /tmp/musl.tar.gz -C /tmp
           (cd /tmp/musl-1.2.5 && \
-            ./configure --prefix=/opt/mipsel-musl \
-              CC=mipsel-linux-gnu-gcc \
-              AR=mipsel-linux-gnu-ar \
-              RANLIB=mipsel-linux-gnu-ranlib && \
+            CROSS_COMPILE=mipsel-linux-gnu- ./configure --prefix=/opt/mipsel-musl && \
             make -j"$(nproc)" && sudo make install)
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"

@@ -23,7 +23,7 @@ pub mod ws;
 mod zip;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Context;
 use serde_json::Value;
@@ -34,6 +34,8 @@ use crate::route::Router;
 /// A started box instance: running inbound listeners plus their tasks.
 pub struct BoxInstance {
     tasks: Vec<JoinHandle<()>>,
+    quic_endpoints: Vec<(quinn::Endpoint, Weak<dyn quinn::AsyncUdpSocket>)>,
+    udp_sockets: Vec<Weak<tokio::net::UdpSocket>>,
     inbounds: Vec<(String, SocketAddr)>,
     dns: Option<Arc<dns::DnsService>>,
     clash_api: Option<SocketAddr>,
@@ -174,6 +176,13 @@ impl BoxInstance {
 
     /// Abort all listeners and connection tasks.
     pub fn shutdown(&self) {
+        self.abort_listeners();
+    }
+
+    fn abort_listeners(&self) {
+        for (endpoint, _) in &self.quic_endpoints {
+            endpoint.close(quinn::VarInt::from_u32(0), b"configuration reload");
+        }
         for task in &self.tasks {
             task.abort();
         }
@@ -190,6 +199,35 @@ impl BoxInstance {
         self.shutdown();
         for task in self.tasks.drain(..) {
             let _ = task.await;
+        }
+        // Aborting a reverse reader releases its reply socket when Tokio next
+        // polls it. Observe the actual direct UDP socket before rebinding.
+        for socket in self.udp_sockets.drain(..) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while socket.strong_count() != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .ok();
+        }
+        for (endpoint, socket) in self.quic_endpoints.drain(..) {
+            // QUIC connections retain the listening socket after the accept
+            // task is aborted. Drain them before trying to bind that port again.
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.wait_idle()).await;
+            drop(endpoint);
+            // wait_idle tracks protocol state, not the driver's socket lifetime.
+            // A weak reference observes the actual socket without retaining it.
+            let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while socket.strong_count() != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if released.is_err() {
+                logging::warn(format_args!("QUIC socket did not release during shutdown"));
+            }
         }
     }
 }
@@ -272,6 +310,8 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
     }
     dns::set_service(dns_service.clone());
 
+    let mut quic_endpoints = Vec::new();
+    let mut udp_sockets = Vec::new();
     guard.extend(router.take_probe_tasks());
     #[allow(unused_mut)]
     let mut clash_api = None;
@@ -320,6 +360,9 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
                     .await
                     .with_context(|| format!("inbounds[{i}]: direct"))?;
                 let addr = inbound.local_addr()?;
+                if let Some(socket) = inbound.shutdown_socket() {
+                    udp_sockets.push(socket);
+                }
                 inbounds.push((tag.clone(), addr));
                 guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
@@ -416,6 +459,7 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
                     .await
                     .with_context(|| format!("inbounds[{i}]: hysteria2"))?;
                 let addr = inbound.local_addr()?;
+                quic_endpoints.push(inbound.shutdown_endpoint());
                 inbounds.push((tag.clone(), addr));
                 guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
@@ -432,6 +476,8 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
     }
 
     Ok(BoxInstance {
+        quic_endpoints,
+        udp_sockets,
         tasks: Vec::new(),
         inbounds,
         dns: dns_service,

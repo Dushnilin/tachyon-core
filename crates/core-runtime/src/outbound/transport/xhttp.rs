@@ -1757,7 +1757,10 @@ mod tests {
 
             // POST 1: MUST arrive on the SAME post_io, not a new dial!
             let head1 = read_request_head(&mut post_io).await;
-            eprintln!("SERVER: POST 1 read: {}", head1.lines().next().unwrap_or(""));
+            eprintln!(
+                "SERVER: POST 1 read: {}",
+                head1.lines().next().unwrap_or("")
+            );
             assert!(head1.contains("/1 HTTP/1.1"), "got {head1:?}");
             let mut body1 = [0u8; 4];
             post_io.read_exact(&mut body1).await.unwrap();

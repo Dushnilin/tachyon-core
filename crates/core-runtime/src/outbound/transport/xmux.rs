@@ -436,9 +436,10 @@ mod tests {
                 "h_max_reusable_secs": "120-300",
             })),
             "xmux",
-        ).unwrap();
+        )
+        .unwrap();
         let pool = Pool::new(config);
-        
+
         // 1. Initially empty
         assert!(pool.acquire().await.is_none());
 

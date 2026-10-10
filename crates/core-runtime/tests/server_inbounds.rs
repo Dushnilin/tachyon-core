@@ -14,7 +14,11 @@ async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 async fn spawn_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+    spawn_echo_at("127.0.0.1:0").await
+}
+
+async fn spawn_echo_at(listen: &str) -> SocketAddr {
+    let listener = TcpListener::bind(listen).await.expect("bind echo");
     let addr = listener.local_addr().expect("echo addr");
     tokio::spawn(async move {
         loop {
@@ -796,6 +800,23 @@ async fn through_our_own_client(
     payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
     let echo = spawn_echo().await;
+    through_our_own_client_to(
+        server_inbound,
+        client_outbound,
+        core_runtime::inbound::Target::Ip(echo),
+        payload,
+    )
+    .await
+}
+
+async fn through_our_own_client_to(
+    server_inbound: Value,
+    client_outbound: Value,
+    target: core_runtime::inbound::Target,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use core_runtime::inbound::Target;
+
     let tag = server_inbound["tag"]
         .as_str()
         .expect("the server inbound needs a tag")
@@ -833,9 +854,24 @@ async fn through_our_own_client(
     let mut greeting = [0u8; 2];
     stream.read_exact(&mut greeting).await?;
     assert_eq!(greeting, [0x05, 0x00], "socks greeting");
-    let mut request = vec![0x05, 0x01, 0x00, 0x01];
-    request.extend_from_slice(&[127, 0, 0, 1]);
-    request.extend_from_slice(&echo.port().to_be_bytes());
+    let mut request = vec![0x05, 0x01, 0x00];
+    match &target {
+        Target::Ip(addr) => match addr.ip() {
+            IpAddr::V4(ip) => {
+                request.push(1);
+                request.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                request.push(4);
+                request.extend_from_slice(&ip.octets());
+            }
+        },
+        Target::Domain(host, _) => {
+            request.extend_from_slice(&[3, u8::try_from(host.len()).expect("SOCKS domain length")]);
+            request.extend_from_slice(host.as_bytes());
+        }
+    }
+    request.extend_from_slice(&target.port().to_be_bytes());
     stream.write_all(&request).await?;
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await.map_err(io_shutdown)?;
@@ -1331,6 +1367,34 @@ async fn a_xhttp_server_refuses_another_path() {
         got.is_empty(),
         "a refused xhttp session must not carry the payload: {got:?}"
     );
+}
+
+#[tokio::test]
+async fn trojan_server_over_tls_carries_domain_and_ipv6_targets() {
+    use core_runtime::inbound::Target;
+
+    let _guard = test_guard().await;
+    let ipv4 = spawn_echo().await;
+    let ipv6 = spawn_echo_at("[::1]:0").await;
+    // Encode a numeric hostname as a domain to avoid external DNS dependencies.
+    for target in [
+        Target::Domain("127.0.0.1".into(), ipv4.port()),
+        Target::Ip(ipv6),
+    ] {
+        let mut server = json!({
+            "type": "trojan", "tag": "trojan-in", "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "users": [{"name": "bob", "password": "hunter2"}]
+        });
+        server["tls"] = server_tls();
+        let mut client = json!({"type": "trojan", "tag": "out", "password": "hunter2"});
+        client["tls"] = client_tls();
+        let got =
+            through_our_own_client_to(server, client, target.clone(), b"trojan-address-over-tls")
+                .await
+                .unwrap_or_else(|e| panic!("{target:?}: {e}"));
+        assert_eq!(got, b"trojan-address-over-tls", "{target:?}");
+    }
 }
 
 #[tokio::test]

@@ -150,7 +150,7 @@ jobs:
             # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
             # array is repeated here minus everything that names lld: the
             # driver is GNU ld now and it rejects `--icf=safe`.
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
       # Every other musl target links exactly as `.cargo/config.toml` says:
       # linker = "rust-lld" plus the self-contained CRT, and the per-target

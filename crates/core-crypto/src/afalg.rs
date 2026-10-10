@@ -210,7 +210,12 @@ impl Conn {
         push_iov_const(&mut iov, &mut n, buf);
         push_iov_const(&mut iov, &mut n, tag);
         msg.msg_iov = iov.as_mut_ptr();
-        msg.msg_iovlen = n as _;
+        // libc uses usize or a narrower integer depending on the target.
+        #[allow(clippy::useless_conversion)]
+        let iovlen = n.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many AF_ALG I/O vectors")
+        })?;
+        msg.msg_iovlen = iovlen;
 
         loop {
             let sent = unsafe { libc::sendmsg(self.child, &msg, 0) };
@@ -434,7 +439,12 @@ fn recv_payload(
         }
         let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
         msg.msg_iov = iov.as_mut_ptr();
-        msg.msg_iovlen = n as _;
+        // libc uses usize or a narrower integer depending on the target.
+        #[allow(clippy::useless_conversion)]
+        let iovlen = n.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many AF_ALG I/O vectors")
+        })?;
+        msg.msg_iovlen = iovlen;
         recv_exact(fd, &mut msg, total)?;
         return Ok(());
     }

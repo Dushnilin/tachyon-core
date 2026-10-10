@@ -396,13 +396,13 @@ impl Tun {
             let mut ip_addrs: Vec<smoltcp::wire::IpCidr> = Vec::new();
             for &(ip4, prefix) in &self.ipv4_addrs {
                 ip_addrs.push(smoltcp::wire::IpCidr::new(
-                    smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(ip4)),
+                    smoltcp::wire::IpAddress::Ipv4(ip4),
                     prefix,
                 ));
             }
             for &(ip6, prefix) in &self.ipv6_addrs {
                 ip_addrs.push(smoltcp::wire::IpCidr::new(
-                    smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(ip6)),
+                    smoltcp::wire::IpAddress::Ipv6(ip6),
                     prefix,
                 ));
             }
@@ -849,6 +849,9 @@ async fn drive_tun_stack(
 
 /// Handle a single IPv4 packet arriving on TUN.
 #[cfg(target_os = "linux")]
+// Keep the explicit shared event-loop state here; grouping it would only change
+// the handler interface without simplifying packet processing.
+#[allow(clippy::too_many_arguments)]
 fn handle_ipv4_packet(
     packet: &[u8],
     tag: &str,
@@ -986,6 +989,8 @@ fn handle_ipv4_packet(
 
 /// Handle a single IPv6 packet arriving on TUN.
 #[cfg(target_os = "linux")]
+// Mirrors the IPv4 handler and uses the same event-loop state.
+#[allow(clippy::too_many_arguments)]
 fn handle_ipv6_packet(
     packet: &[u8],
     tag: &str,

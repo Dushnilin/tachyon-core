@@ -286,7 +286,7 @@ pub struct Naive {
     quic: bool,
     quic_tunnel: crate::outbound::quic::QuicTunnelOptions,
     congestion: crate::outbound::quic::CongestionKind,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Naive {

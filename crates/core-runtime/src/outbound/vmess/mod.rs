@@ -56,7 +56,7 @@ pub struct Vmess {
     packet_encoding: PacketEncoding,
     /// Mux.Cool session pool; `None` when multiplexing is off
     mux: Option<Arc<mux::Client>>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Vmess {

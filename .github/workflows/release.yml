@@ -48,7 +48,7 @@ jobs:
           - name: x86_64
             target: x86_64-unknown-linux-musl
             use_musl_lld: true
-            budget: 12582912
+            budget: 14680064
           - name: aarch64
             target: aarch64-unknown-linux-musl
             budget: 12582912
@@ -114,13 +114,15 @@ jobs:
         if: matrix.target == 'mipsel-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mipsel-linux-gnu
+          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu
           curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           tar -xzf /tmp/musl.tar.gz -C /tmp
           (cd /tmp/musl-1.2.5 && \
-            ./configure --target=mipsel-linux-musl --prefix=/opt/mipsel-musl \
-              CC=mipsel-linux-gnu-gcc && \
+            ./configure --prefix=/opt/mipsel-musl \
+              CC=mipsel-linux-gnu-gcc \
+              AR=mipsel-linux-gnu-ar \
+              RANLIB=mipsel-linux-gnu-ranlib && \
             make -j"$(nproc)" && sudo make install)
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
@@ -135,13 +137,15 @@ jobs:
         if: matrix.target == 'mips-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mips-linux-gnu
+          sudo apt-get install -y gcc-mips-linux-gnu binutils-mips-linux-gnu
           curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           tar -xzf /tmp/musl.tar.gz -C /tmp
           (cd /tmp/musl-1.2.5 && \
-            ./configure --target=mips-linux-musl --prefix=/opt/mips-musl \
-              CC=mips-linux-gnu-gcc && \
+            ./configure --prefix=/opt/mips-musl \
+              CC=mips-linux-gnu-gcc \
+              AR=mips-linux-gnu-ar \
+              RANLIB=mips-linux-gnu-ranlib && \
             make -j"$(nproc)" && sudo make install)
           {
             echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"

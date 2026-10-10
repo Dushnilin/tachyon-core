@@ -383,7 +383,7 @@ where
 
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
 
@@ -441,7 +441,7 @@ where
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
         loop {

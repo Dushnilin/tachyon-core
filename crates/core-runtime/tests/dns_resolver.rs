@@ -858,9 +858,17 @@ async fn predefined_noerror_and_ruleset_matching() {
         .expect("build dns service")
         .expect("dns service configured");
 
-    let query_bytes = core_runtime::dns::codec::build_query(1, "example.com", hickory_proto::rr::RecordType::HTTPS).unwrap();
+    let query_bytes = core_runtime::dns::codec::build_query(
+        1,
+        "example.com",
+        hickory_proto::rr::RecordType::HTTPS,
+    )
+    .unwrap();
     let meta = core_runtime::dns::QueryMeta::default();
-    let resp = service.exchange(&meta, &query_bytes, false).await.expect("exchange");
+    let resp = service
+        .exchange(&meta, &query_bytes, false)
+        .await
+        .expect("exchange");
     let resp_meta = core_runtime::dns::codec::response_meta(&resp).expect("meta");
     assert_eq!(resp_meta.rcode, hickory_proto::op::ResponseCode::NoError);
 }

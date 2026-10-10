@@ -382,8 +382,9 @@ async fn tun_inbound_linux_open_interface() {
     );
     let instance = match core_runtime::start(&cfg).await {
         Ok(i) => i,
-        Err(err) if format!("{err:#}").contains("Operation not permitted")
-            || format!("{err:#}").contains("Permission denied") =>
+        Err(err)
+            if format!("{err:#}").contains("Operation not permitted")
+                || format!("{err:#}").contains("Permission denied") =>
         {
             eprintln!("tun test skipped: {err}");
             return;

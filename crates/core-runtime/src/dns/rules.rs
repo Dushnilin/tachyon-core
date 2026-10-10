@@ -511,8 +511,7 @@ fn build_predefined(
 ) -> anyhow::Result<PredefinedResponse> {
     let rcode = match map.get("rcode") {
         None | Some(Value::Null) => None,
-        Some(val) => parse_rcode(val)
-            .map_err(|err| anyhow::anyhow!("{at}: bad option: {err}"))?,
+        Some(val) => parse_rcode(val).map_err(|err| anyhow::anyhow!("{at}: bad option: {err}"))?,
     };
     let records = |key: &str| -> anyhow::Result<Vec<hickory_proto::rr::Record>> {
         let list = match map.get(key) {

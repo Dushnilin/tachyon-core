@@ -35,7 +35,7 @@ use smoltcp::wire::{HardwareAddress, Ipv4Address, Ipv6Address};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 #[allow(unused_imports)]
 use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, TunReply, UdpHub};
@@ -233,29 +233,28 @@ impl Tun {
         let mut ipv4_addrs = Vec::new();
         let mut ipv6_addrs = Vec::new();
 
-        let collect_addrs = |val: Option<&Value>,
-                             v4: &mut Vec<(Ipv4Addr, u8)>,
-                             v6: &mut Vec<(Ipv6Addr, u8)>| {
-            if let Some(v) = val {
-                if let Some(s) = v.as_str() {
-                    if let Ok(cidr) = parse_ipv4_cidr(s) {
-                        v4.push(cidr);
-                    } else if let Ok(cidr) = parse_ipv6_cidr(s) {
-                        v6.push(cidr);
-                    }
-                } else if let Some(arr) = v.as_array() {
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            if let Ok(cidr) = parse_ipv4_cidr(s) {
-                                v4.push(cidr);
-                            } else if let Ok(cidr) = parse_ipv6_cidr(s) {
-                                v6.push(cidr);
+        let collect_addrs =
+            |val: Option<&Value>, v4: &mut Vec<(Ipv4Addr, u8)>, v6: &mut Vec<(Ipv6Addr, u8)>| {
+                if let Some(v) = val {
+                    if let Some(s) = v.as_str() {
+                        if let Ok(cidr) = parse_ipv4_cidr(s) {
+                            v4.push(cidr);
+                        } else if let Ok(cidr) = parse_ipv6_cidr(s) {
+                            v6.push(cidr);
+                        }
+                    } else if let Some(arr) = v.as_array() {
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                if let Ok(cidr) = parse_ipv4_cidr(s) {
+                                    v4.push(cidr);
+                                } else if let Ok(cidr) = parse_ipv6_cidr(s) {
+                                    v6.push(cidr);
+                                }
                             }
                         }
                     }
                 }
-            }
-        };
+            };
 
         collect_addrs(obj.get("address"), &mut ipv4_addrs, &mut ipv6_addrs);
         collect_addrs(obj.get("inet4_address"), &mut ipv4_addrs, &mut ipv6_addrs);
@@ -446,7 +445,8 @@ impl Tun {
                 let now = SmolInstant::now();
                 let delay = match iface.poll_at(now, &sockets) {
                     Some(at) if at <= now => Duration::from_millis(1),
-                    Some(at) => Duration::from_micros((at - now).total_micros()).min(Duration::from_millis(50)),
+                    Some(at) => Duration::from_micros((at - now).total_micros())
+                        .min(Duration::from_millis(50)),
                     None => Duration::from_millis(50),
                 };
 
@@ -1447,7 +1447,9 @@ mod linux {
 
         // 1. Route default to tun0 in custom table
         let status = std::process::Command::new("ip")
-            .args(["route", "replace", "default", "dev", iface, "table", &table_str])
+            .args([
+                "route", "replace", "default", "dev", iface, "table", &table_str,
+            ])
             .status()?;
         if !status.success() {
             return Err(io::Error::other(format!(
@@ -1457,29 +1459,80 @@ mod linux {
 
         // 2. Suppress prefixlength 0 in main table so LAN/router local traffic works
         let _ = std::process::Command::new("ip")
-            .args(["rule", "add", "table", "main", "suppress_prefixlength", "0", "pref", &suppress_pref_str])
+            .args([
+                "rule",
+                "add",
+                "table",
+                "main",
+                "suppress_prefixlength",
+                "0",
+                "pref",
+                &suppress_pref_str,
+            ])
             .status();
 
         // 3. Direct traffic not marked with proxy fwmark into table 2022
         let _ = std::process::Command::new("ip")
-            .args(["rule", "add", "not", "fwmark", &fwmark_str, "lookup", &table_str, "pref", &pref_str])
+            .args([
+                "rule",
+                "add",
+                "not",
+                "fwmark",
+                &fwmark_str,
+                "lookup",
+                &table_str,
+                "pref",
+                &pref_str,
+            ])
             .status();
 
         if strict {
             let _ = std::process::Command::new("ip")
-                .args(["route", "add", "blackhole", "default", "table", &table_str, "metric", "1024"])
+                .args([
+                    "route",
+                    "add",
+                    "blackhole",
+                    "default",
+                    "table",
+                    &table_str,
+                    "metric",
+                    "1024",
+                ])
                 .status();
         }
 
         if has_v6 {
             let _ = std::process::Command::new("ip")
-                .args(["-6", "route", "replace", "default", "dev", iface, "table", &table_str])
+                .args([
+                    "-6", "route", "replace", "default", "dev", iface, "table", &table_str,
+                ])
                 .status();
             let _ = std::process::Command::new("ip")
-                .args(["-6", "rule", "add", "table", "main", "suppress_prefixlength", "0", "pref", &suppress_pref_str])
+                .args([
+                    "-6",
+                    "rule",
+                    "add",
+                    "table",
+                    "main",
+                    "suppress_prefixlength",
+                    "0",
+                    "pref",
+                    &suppress_pref_str,
+                ])
                 .status();
             let _ = std::process::Command::new("ip")
-                .args(["-6", "rule", "add", "not", "fwmark", &fwmark_str, "lookup", &table_str, "pref", &pref_str])
+                .args([
+                    "-6",
+                    "rule",
+                    "add",
+                    "not",
+                    "fwmark",
+                    &fwmark_str,
+                    "lookup",
+                    &table_str,
+                    "pref",
+                    &pref_str,
+                ])
                 .status();
         }
 
@@ -1487,22 +1540,36 @@ mod linux {
     }
 
     /// Clean up added ip rules and routes
-    pub fn cleanup_auto_route(
-        _iface: &str,
-        table: u32,
-        pref: u32,
-        has_v6: bool,
-    ) -> io::Result<()> {
+    pub fn cleanup_auto_route(_iface: &str, table: u32, pref: u32, has_v6: bool) -> io::Result<()> {
         let table_str = table.to_string();
         let pref_str = pref.to_string();
         let suppress_pref_str = (pref.saturating_sub(1)).to_string();
         let fwmark_str = format!("0x{ROUTING_FWMARK:x}");
 
         let _ = std::process::Command::new("ip")
-            .args(["rule", "del", "not", "fwmark", &fwmark_str, "lookup", &table_str, "pref", &pref_str])
+            .args([
+                "rule",
+                "del",
+                "not",
+                "fwmark",
+                &fwmark_str,
+                "lookup",
+                &table_str,
+                "pref",
+                &pref_str,
+            ])
             .status();
         let _ = std::process::Command::new("ip")
-            .args(["rule", "del", "table", "main", "suppress_prefixlength", "0", "pref", &suppress_pref_str])
+            .args([
+                "rule",
+                "del",
+                "table",
+                "main",
+                "suppress_prefixlength",
+                "0",
+                "pref",
+                &suppress_pref_str,
+            ])
             .status();
         let _ = std::process::Command::new("ip")
             .args(["route", "flush", "table", &table_str])
@@ -1510,10 +1577,31 @@ mod linux {
 
         if has_v6 {
             let _ = std::process::Command::new("ip")
-                .args(["-6", "rule", "del", "not", "fwmark", &fwmark_str, "lookup", &table_str, "pref", &pref_str])
+                .args([
+                    "-6",
+                    "rule",
+                    "del",
+                    "not",
+                    "fwmark",
+                    &fwmark_str,
+                    "lookup",
+                    &table_str,
+                    "pref",
+                    &pref_str,
+                ])
                 .status();
             let _ = std::process::Command::new("ip")
-                .args(["-6", "rule", "del", "table", "main", "suppress_prefixlength", "0", "pref", &suppress_pref_str])
+                .args([
+                    "-6",
+                    "rule",
+                    "del",
+                    "table",
+                    "main",
+                    "suppress_prefixlength",
+                    "0",
+                    "pref",
+                    &suppress_pref_str,
+                ])
                 .status();
             let _ = std::process::Command::new("ip")
                 .args(["-6", "route", "flush", "table", &table_str])
@@ -1566,13 +1654,7 @@ mod linux {
                             iov_len: pkt.len(),
                         },
                     ];
-                    let n = unsafe {
-                        libc::writev(
-                            inner.as_raw_fd(),
-                            iov.as_ptr(),
-                            2,
-                        )
-                    };
+                    let n = unsafe { libc::writev(inner.as_raw_fd(), iov.as_ptr(), 2) };
                     if n < 0 {
                         Err(io::Error::last_os_error())
                     } else {
@@ -1632,18 +1714,21 @@ mod tests {
     #[test]
     fn parse_ipv6_cidr_valid() {
         let (ip, prefix) = parse_ipv6_cidr("fdfe:dcba:9876::1/64").unwrap();
-        assert_eq!(
-            ip,
-            "fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap()
-        );
+        assert_eq!(ip, "fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap());
         assert_eq!(prefix, 64);
     }
 
     #[test]
     fn prefix_to_netmask_calculation() {
-        assert_eq!(prefix_to_ipv4_netmask(30), Ipv4Addr::new(255, 255, 255, 252));
+        assert_eq!(
+            prefix_to_ipv4_netmask(30),
+            Ipv4Addr::new(255, 255, 255, 252)
+        );
         assert_eq!(prefix_to_ipv4_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
-        assert_eq!(prefix_to_ipv4_netmask(32), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(
+            prefix_to_ipv4_netmask(32),
+            Ipv4Addr::new(255, 255, 255, 255)
+        );
         assert_eq!(prefix_to_ipv4_netmask(0), Ipv4Addr::new(0, 0, 0, 0));
     }
 
@@ -1726,7 +1811,10 @@ mod tests {
 
     #[test]
     fn smoltcp_syn_ack_generation() {
-        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Packet, Ipv4Repr, IpProtocol, TcpPacket, TcpRepr, TcpControl};
+        use smoltcp::wire::{
+            IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl,
+            TcpPacket, TcpRepr,
+        };
 
         let mut device = TunDevice::new(1500);
         let mut iconfig = IfaceConfig::new(HardwareAddress::Ip);
@@ -1737,7 +1825,8 @@ mod tests {
             list.push(IpCidr::new(
                 IpAddress::Ipv4(Ipv4Address::new(172, 19, 200, 1)),
                 30,
-            )).unwrap();
+            ))
+            .unwrap();
         });
 
         let mut sockets = SocketSet::new(Vec::new());
@@ -1785,7 +1874,13 @@ mod tests {
         device.rx_queue.push_back(pkt_bytes);
         let now = SmolInstant::now();
         let polled = iface.poll(now, &mut device, &mut sockets);
-        println!("iface.poll returned: {polled:?}, tx_queue len: {}", device.tx_queue.len());
-        assert!(!device.tx_queue.is_empty(), "expected SYN-ACK packet in tx_queue");
+        println!(
+            "iface.poll returned: {polled:?}, tx_queue len: {}",
+            device.tx_queue.len()
+        );
+        assert!(
+            !device.tx_queue.is_empty(),
+            "expected SYN-ACK packet in tx_queue"
+        );
     }
 }

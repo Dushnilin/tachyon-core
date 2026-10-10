@@ -454,9 +454,12 @@ impl DnsService {
                                     };
                                     if let Some(target_cfg) = self.servers.get(resp_tag) {
                                         if target_cfg.is_fakeip() && allow_fakeip {
-                                            let store = target_cfg.store.clone().ok_or_else(|| {
-                                                std::io::Error::other("dns: fakeip server without store")
-                                            })?;
+                                            let store =
+                                                target_cfg.store.clone().ok_or_else(|| {
+                                                    std::io::Error::other(
+                                                        "dns: fakeip server without store",
+                                                    )
+                                                })?;
                                             return self.fakeip_answer(
                                                 &query_msg,
                                                 &info,

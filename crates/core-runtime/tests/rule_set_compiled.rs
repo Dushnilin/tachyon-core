@@ -532,9 +532,8 @@ fn the_index_reports_what_it_holds() {
     assert!(!index.has_keyword("cdn.net"));
     assert!(index.has_prefix("10.1.2.3".parse().expect("ip"), 8));
     assert!(!index.has_prefix("11.1.2.3".parse().expect("ip"), 8));
-    // Port criteria live in fallbacks, not the shared destination pools.
-    assert_eq!(index.len(), 2 + 2 + 1 + 1);
-    assert_eq!(set.fallback_count(), 1);
+    assert_eq!(index.len(), 2 + 2 + 1 + 1 + 2);
+    assert_eq!(set.fallback_count(), 0);
     assert_eq!(set.rule_count(), 5);
     let outside = ConnContext::new(
         "in",

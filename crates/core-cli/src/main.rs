@@ -52,8 +52,6 @@ mod rule_set;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-
-
 fn version_line() -> String {
     format!("tachyon-core {}\n", env!("CARGO_PKG_VERSION"))
 }
@@ -216,11 +214,15 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             .build()
     }
     .map_err(|e| format!("run: {e}"))?;
-    runtime
+    let result = runtime
         .block_on(
             async move { core_runtime::run_reloadable(move || load_config(&args_owned)).await },
         )
-        .map_err(|e| format!("run: {e:#}"))
+        .map_err(|e| format!("run: {e:#}"));
+    // Blocking workers must not postpone process exit after
+    // a failed reload; procd needs to restart the data plane promptly.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+    result
 }
 
 /// `api <method> <path> [body]` against our own Clash REST controller

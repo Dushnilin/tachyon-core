@@ -180,7 +180,10 @@ impl PacketWriter {
                     meta.extend_from_slice(&[2, 1]); // Keep, opt
                 } else {
                     meta.extend_from_slice(&[1, 1, 2]); // New, opt, udp
+                    let address_start = meta.len();
                     put_addr_port(&mut meta, target)?;
+                    // Xray common/xudp uses PortThenAddress, unlike packetaddr.
+                    meta[address_start..].rotate_right(2);
                     self.named = true;
                 }
                 out.extend_from_slice(&(meta.len() as u16).to_be_bytes());
@@ -241,7 +244,9 @@ impl PacketReader {
                     stream.read_exact(&mut meta).await?;
                     let keep = meta[2] == 2;
                     let mut payload = Vec::new();
-                    read_xudp_data(stream, &mut payload).await?;
+                    if meta[3] & 1 != 0 {
+                        read_xudp_data(stream, &mut payload).await?;
+                    }
                     // a fin (4) or an option-only frame carries no datagram
                     if keep && !payload.is_empty() {
                         return Ok(payload);
@@ -346,16 +351,16 @@ mod tests {
         let mut out = PacketWriter::new(PacketEncoding::Xudp);
         let first = out.frame(&target, b"a").expect("frame");
         let second = out.frame(&target, b"b").expect("frame");
-        // [meta len][session][New][opt][udp][addr][port][data len][data]
+        // [meta len][session][New][opt][udp][port][addr][data len][data]
         assert_eq!(
             u16::from_be_bytes([first[0], first[1]]) as usize,
             2 + 3 + 15
         );
         assert_eq!(&first[2..4], &[0, 0], "mux session id");
         assert_eq!(&first[4..7], &[1, 1, 2], "new, opt, udp");
-        assert_eq!(&first[7..9], &[0x02, 11], "domain with its length");
-        assert_eq!(&first[9..20], b"example.com");
-        assert_eq!(&first[20..22], &53u16.to_be_bytes());
+        assert_eq!(&first[7..9], &53u16.to_be_bytes());
+        assert_eq!(&first[9..11], &[0x02, 11], "domain with its length");
+        assert_eq!(&first[11..22], b"example.com");
         assert_eq!(&first[22..24], &1u16.to_be_bytes());
         assert_eq!(&first[24..], b"a");
 
@@ -363,6 +368,18 @@ mod tests {
         assert_eq!(&second[2..6], &[0, 0, 2, 1], "keep, opt");
         assert_eq!(&second[6..8], &1u16.to_be_bytes());
         assert_eq!(&second[8..], b"b");
+    }
+
+    #[test]
+    fn xudp_ipv4_matches_xray_wire_format() {
+        let target = Target::Ip("162.159.207.0:3478".parse().expect("addr"));
+        let mut out = PacketWriter::new(PacketEncoding::Xudp);
+        assert_eq!(
+            out.frame(&target, b"ping").expect("frame"),
+            [
+                0, 12, 0, 0, 1, 1, 2, 0x0d, 0x96, 1, 162, 159, 207, 0, 0, 4, b'p', b'i', b'n', b'g'
+            ]
+        );
     }
 
     /// A server only ever sends `Keep` frames; the first `New` frame is ours.
@@ -401,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_may_rename_the_destination_mid_session() {
         // Keep meta with the udp flag set: the address is read and dropped
-        let meta = [0u8, 0, 2, 1, 2, 0x01, 9, 9, 9, 9, 0, 53];
+        let meta = [0u8, 0, 2, 1, 2, 0, 53, 0x01, 9, 9, 9, 9];
         let mut framed = (meta.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(&meta);
         framed.extend_from_slice(&3u16.to_be_bytes());
@@ -412,8 +429,7 @@ mod tests {
     #[tokio::test]
     async fn an_option_only_xudp_frame_is_skipped() {
         let mut empty = 4u16.to_be_bytes().to_vec();
-        empty.extend_from_slice(&[0, 0, 2, 1]);
-        empty.extend_from_slice(&0u16.to_be_bytes());
+        empty.extend_from_slice(&[0, 0, 2, 0]);
         let framed = [empty, inbound_frame(b"xyz")].concat();
         assert_eq!(feed(framed, PacketEncoding::Xudp).await, [b"xyz".to_vec()]);
     }

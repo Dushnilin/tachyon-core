@@ -252,6 +252,8 @@ impl Fallbacks {
 /// applied to the node's own outcome.
 #[derive(Debug, Clone)]
 enum FallbackRule {
+    /// Malformed logical children are always false, unlike an empty object.
+    Never,
     /// `type: logical`. `mode: or` is `any`, everything else -- including the
     /// default -- is `all` over a *non-empty* list: the interpreter's
     /// `!rules.is_empty() && rules.iter().all(..)` guard, kept because an
@@ -278,10 +280,8 @@ impl FallbackRule {
                     subs.iter()
                         .map(|sub| match sub.as_object() {
                             Some(object) => FallbackRule::compile(object),
-                            // the interpreter refuses a non-object before it
-                            // looks at invert, and an empty plain rule answers
-                            // exactly that false
-                            None => FallbackRule::Plain(Box::default()),
+                            // Preserve match_rule's rejection of non-objects.
+                            None => FallbackRule::Never,
                         })
                         .collect()
                 })
@@ -297,6 +297,7 @@ impl FallbackRule {
 
     fn matches(&self, ctx: &ConnContext) -> bool {
         match self {
+            FallbackRule::Never => false,
             FallbackRule::Plain(rule) => rule.matches(ctx),
             FallbackRule::Logical {
                 all,
@@ -414,20 +415,27 @@ impl PlainRule {
         // Destination criteria (domain or IP)
         if self.has_domains || self.has_dest_ip {
             let mut dest_matched = false;
-            if let Some(host) = domain_host(ctx) {
-                if self.has_domains {
-                    dest_matched = self.domains.contains(host.as_ref())
-                        || self.suffixes.iter().any(|entry| domain_suffix_match(&host, entry))
-                        || self.keywords.iter().any(|entry| host.contains(entry.as_ref()));
-                }
+            if let Some(host) = domain_host(ctx)
+                && self.has_domains
+            {
+                dest_matched = self.domains.contains(host.as_ref())
+                    || self
+                        .suffixes
+                        .iter()
+                        .any(|entry| domain_suffix_match(&host, entry))
+                    || self
+                        .keywords
+                        .iter()
+                        .any(|entry| host.contains(entry.as_ref()));
             }
-            if !dest_matched && self.has_dest_ip {
-                if let Target::Ip(addr) = &ctx.destination {
-                    dest_matched = match addr.ip() {
-                        IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
-                        IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
-                    };
-                }
+            if !dest_matched
+                && self.has_dest_ip
+                && let Target::Ip(addr) = &ctx.destination
+            {
+                dest_matched = match addr.ip() {
+                    IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
+                    IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
+                };
             }
             if !dest_matched {
                 return self.inverted;
@@ -466,10 +474,8 @@ impl PlainRule {
         }
 
         // Network criteria
-        if self.has_network {
-            if !self.networks.iter().any(|known| **known == *ctx.network) {
-                return self.inverted;
-            }
+        if self.has_network && !self.networks.iter().any(|known| **known == *ctx.network) {
+            return self.inverted;
         }
 
         !self.inverted
@@ -501,7 +507,13 @@ impl RuleSetIndex {
                 || object.contains_key("source_port")
                 || object.contains_key("source_port_range")
                 || object.contains_key("source_ip_cidr");
-            if inverted || logical || has_non_dest {
+            let has_dest = object.contains_key("domain")
+                || object.contains_key("domain_suffix")
+                || object.contains_key("domain_keyword")
+                || object.contains_key("ip_cidr");
+            // A matcher-free object is a catch-all in the interpreter, not
+            // an empty destination pool. Preserve it as a compiled plain rule.
+            if inverted || logical || has_non_dest || !has_dest {
                 fallbacks.rules.push(FallbackRule::compile(object));
                 continue;
             }

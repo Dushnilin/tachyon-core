@@ -278,21 +278,32 @@ pub fn match_rule(rule: &Value, ctx: &ConnContext) -> bool {
 
 fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bool {
     // 1. Destination criteria: domain, domain_suffix, domain_keyword, ip_cidr
-    let has_domain = rule.contains_key("domain") || rule.contains_key("domain_suffix") || rule.contains_key("domain_keyword");
+    let has_domain = rule.contains_key("domain")
+        || rule.contains_key("domain_suffix")
+        || rule.contains_key("domain_keyword");
     let has_ip = rule.contains_key("ip_cidr");
     if has_domain || has_ip {
         let mut dest_matched = false;
-        if let Some(domain) = super::rule::domain_host(ctx) {
-            if has_domain {
-                dest_matched = list(rule.get("domain")).iter().any(|entry| entry == domain.as_ref())
-                    || list(rule.get("domain_suffix")).iter().any(|entry| super::rule::domain_suffix_match(&domain, entry))
-                    || list(rule.get("domain_keyword")).iter().any(|entry| domain.contains(entry.as_str()));
-            }
+        if let Some(domain) = super::rule::domain_host(ctx)
+            && has_domain
+        {
+            dest_matched = list(rule.get("domain"))
+                .iter()
+                .any(|entry| entry == domain.as_ref())
+                || list(rule.get("domain_suffix"))
+                    .iter()
+                    .any(|entry| super::rule::domain_suffix_match(&domain, entry))
+                || list(rule.get("domain_keyword"))
+                    .iter()
+                    .any(|entry| domain.contains(entry.as_str()));
         }
-        if !dest_matched && has_ip {
-            if let Target::Ip(addr) = &ctx.destination {
-                dest_matched = list(rule.get("ip_cidr")).iter().any(|entry| prefix_contains(entry, addr.ip()));
-            }
+        if !dest_matched
+            && has_ip
+            && let Target::Ip(addr) = &ctx.destination
+        {
+            dest_matched = list(rule.get("ip_cidr"))
+                .iter()
+                .any(|entry| prefix_contains(entry, addr.ip()));
         }
         if !dest_matched {
             return false;
@@ -300,10 +311,12 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
     }
 
     // 2. Source IP criteria
-    if rule.contains_key("source_ip_cidr") {
-        if !list(rule.get("source_ip_cidr")).iter().any(|entry| prefix_contains(entry, ctx.source.ip())) {
-            return false;
-        }
+    if rule.contains_key("source_ip_cidr")
+        && !list(rule.get("source_ip_cidr"))
+            .iter()
+            .any(|entry| prefix_contains(entry, ctx.source.ip()))
+    {
+        return false;
     }
 
     // 3. Destination Port criteria
@@ -312,7 +325,10 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
     if has_port || has_port_range {
         let destination_port = ctx.destination.port();
         let port_matched = (has_port && ports(rule.get("port")).contains(&destination_port))
-            || (has_port_range && list(rule.get("port_range")).iter().any(|entry| port_range_contains(entry, destination_port)));
+            || (has_port_range
+                && list(rule.get("port_range"))
+                    .iter()
+                    .any(|entry| port_range_contains(entry, destination_port)));
         if !port_matched {
             return false;
         }
@@ -323,18 +339,24 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
     let has_source_port_range = rule.contains_key("source_port_range");
     if has_source_port || has_source_port_range {
         let source_port = ctx.source.port();
-        let port_matched = (has_source_port && ports(rule.get("source_port")).contains(&source_port))
-            || (has_source_port_range && list(rule.get("source_port_range")).iter().any(|entry| port_range_contains(entry, source_port)));
+        let port_matched = (has_source_port
+            && ports(rule.get("source_port")).contains(&source_port))
+            || (has_source_port_range
+                && list(rule.get("source_port_range"))
+                    .iter()
+                    .any(|entry| port_range_contains(entry, source_port)));
         if !port_matched {
             return false;
         }
     }
 
     // 5. Network criteria
-    if rule.contains_key("network") {
-        if !list(rule.get("network")).iter().any(|entry| *entry == ctx.network) {
-            return false;
-        }
+    if rule.contains_key("network")
+        && !list(rule.get("network"))
+            .iter()
+            .any(|entry| *entry == ctx.network)
+    {
+        return false;
     }
 
     true

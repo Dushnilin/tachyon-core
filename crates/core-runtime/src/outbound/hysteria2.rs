@@ -740,10 +740,21 @@ fn send_hy2_datagram(
     payload: &[u8],
     sess: &UdpSession,
 ) -> io::Result<()> {
+    send_hy2_packet(conn, sid, dest, payload, &sess.packet_id)
+}
+
+/// The same MTU-aware framing is required for UDP replies from a server.
+pub(crate) fn send_hy2_packet(
+    conn: &quinn::Connection,
+    sid: u32,
+    dest: &str,
+    payload: &[u8],
+    packet_counter: &AtomicU32,
+) -> io::Result<()> {
     if payload.len() > HY2_MAX_UDP {
         return Err(io::Error::other("hysteria2: udp payload exceeds 4096"));
     }
-    let pid = next_packet_id(&sess.packet_id);
+    let pid = next_packet_id(packet_counter);
     let header_len = 8 + varint_len(dest.len() as u64) + dest.len();
     let mut budget = conn.max_datagram_size().unwrap_or(1197);
     if payload.len() + header_len <= budget {

@@ -20,6 +20,20 @@ const F1_FIXTURE: &str = include_str!("../../../tests/golden/tachyon/f1-exit-gat
 /// Rewrite the fixture for the test host: loopback-only listens on ephemeral
 /// ports, drop tproxy off Linux (reference binds fail there too), quiet log.
 fn adapt_for_test(root: &mut Value) {
+    // The generated rules evaluate dns-server before routing google.com to
+    // FakeIP. Keep that ordering, but make evaluation independent of public DNS.
+    let servers = root["dns"]["servers"]
+        .as_array_mut()
+        .expect("fixture DNS servers");
+    let server = servers
+        .iter_mut()
+        .find(|server| server["tag"] == "dns-server")
+        .expect("fixture evaluation server");
+    *server = serde_json::json!({
+        "type": "hosts",
+        "tag": "dns-server",
+        "predefined": { "www.google.com": ["203.0.113.7"] }
+    });
     if let Some(log) = root.get_mut("log").and_then(Value::as_object_mut) {
         log.insert("level".into(), Value::String("error".into()));
     }
@@ -110,7 +124,7 @@ async fn f1_exit_gate_starts_and_answers_fakeip_dns() {
     );
 
     // UDP DNS through the direct inbound → hijack-dns → FakeIP pool
-    // (domain_suffix google.com routes to fakeip-server; no upstream needed).
+    // (local evaluation precedes the google.com route to fakeip-server).
     let dns_addr = inbound_addr(&instance, "dns-in");
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
     let query = codec::build_query(0xF1F1, "www.google.com", hickory_proto::rr::RecordType::A)

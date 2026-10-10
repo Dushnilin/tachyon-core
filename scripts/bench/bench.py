@@ -22,6 +22,7 @@ import socket
 import statistics
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,6 +32,60 @@ PROXY_PORT = 45002
 CHUNK = 1 << 20
 
 MODE_HOLD, MODE_ECHO, MODE_SOURCE, MODE_SINK = b"H", b"E", b"S", b"K"
+
+
+# ---------------------------------------------------------------- steer env
+def ensure_steer_env(bin_path):
+    """Sets up musl libc symlink, steerd/steer in /usr/sbin, libsteer in /usr/lib."""
+    try:
+        if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
+            subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        os.makedirs("/usr/sbin", exist_ok=True)
+        os.makedirs("/usr/lib", exist_ok=True)
+
+        if os.path.exists("/lib/ld-musl-x86_64.so.1") and not os.path.exists("/usr/lib/libc.so"):
+            try:
+                os.symlink("/lib/ld-musl-x86_64.so.1", "/usr/lib/libc.so")
+            except OSError:
+                pass
+
+        bin_dir = os.path.dirname(os.path.abspath(bin_path))
+        steer_base = os.path.dirname(bin_dir)
+
+        for name in ("steerd", "steer"):
+            for c in (os.path.join(bin_dir, "..", "sbin", name),
+                      os.path.join(steer_base, "sbin", name),
+                      os.path.join(os.path.dirname(steer_base), "usr", "sbin", name),
+                      os.path.join(bin_dir, name)):
+                if os.path.exists(c):
+                    try:
+                        os.chmod(c, 0o755)
+                    except OSError:
+                        pass
+                    dst = f"/usr/sbin/{name}"
+                    if not os.path.exists(dst):
+                        try:
+                            os.symlink(os.path.abspath(c), dst)
+                        except OSError:
+                            pass
+                    break
+
+        for ldir in (os.path.join(bin_dir, "..", "lib"),
+                     os.path.join(steer_base, "lib"),
+                     os.path.join(os.path.dirname(steer_base), "usr", "lib"),
+                     os.path.join(bin_dir, "lib")):
+            if os.path.exists(ldir):
+                for f in os.listdir(ldir):
+                    dst = os.path.join("/usr/lib", f)
+                    if not os.path.exists(dst):
+                        try:
+                            os.symlink(os.path.abspath(os.path.join(ldir, f)), dst)
+                        except OSError:
+                            pass
+    except Exception as e:
+        print(f"Warning: ensure_steer_env error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- sink server

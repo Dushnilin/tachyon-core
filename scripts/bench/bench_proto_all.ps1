@@ -44,6 +44,12 @@ $extraArgs = @("--profile", $Profile, "--seconds", $Seconds, "--latency-rounds",
 if ($Only) {
     $extraArgs += @("--only", $Only)
 }
+# Steer is extracted from its OpenWrt ipk by bench_multi.ps1 -Steer; reuse if present
+if (Test-Path "$work\steer\usr\bin\sing-box") {
+    $extraArgs += @("--steer", "/bench/steer/usr/bin/sing-box")
+} else {
+    Write-Host "steer binaries not found (run .\scripts\bench\bench_multi_steer.ps1 once) - steer column will be skipped"
+}
 
 $outJson = "/bench/proto-all-$Profile.json"
 $outHtml = "/bench/proto-all-$Profile.html"
@@ -54,7 +60,7 @@ $argStr = $extraArgs -join " "
 Write-Host "Launching All-Protocol Multi-Proxy Benchmark ($Profile profile) ..."
 docker run --rm --ulimit nofile=1048576:1048576 `
     -v "${work}:/bench" python:3 `
-    sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux && python3 /bench/bench_proto_all.py $argStr"
+    sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux /bench/steer/usr/bin/* /bench/steer/usr/sbin/* 2>/dev/null; python3 /bench/bench_proto_all.py $argStr"
 
 Write-Host "`nReport saved to: $work\proto-all-$Profile.html"
 Write-Host "JSON saved to:   $work\proto-all-$Profile.json"

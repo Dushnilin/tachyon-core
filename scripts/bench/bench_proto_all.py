@@ -102,6 +102,79 @@ def recvn(s, n):
     return out
 
 
+# ---------------------------------------------------------------- steer env
+def ensure_steer_env(bin_path):
+    """Sets up musl libc symlink, steerd in /usr/sbin, and libsteer in /usr/lib."""
+    try:
+        if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
+            subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        os.makedirs("/usr/sbin", exist_ok=True)
+        os.makedirs("/usr/lib", exist_ok=True)
+
+        if os.path.exists("/lib/ld-musl-x86_64.so.1") and not os.path.exists("/usr/lib/libc.so"):
+            try:
+                os.symlink("/lib/ld-musl-x86_64.so.1", "/usr/lib/libc.so")
+            except OSError:
+                pass
+
+        bin_dir = os.path.dirname(os.path.abspath(bin_path))
+        steer_base = os.path.dirname(bin_dir)
+
+        for name in ("steerd", "steer"):
+            candidates = [
+                os.path.join(bin_dir, "..", "sbin", name),
+                os.path.join(steer_base, "sbin", name),
+                os.path.join(os.path.dirname(steer_base), "usr", "sbin", name),
+                os.path.join(bin_dir, name),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    try:
+                        os.chmod(c, 0o755)
+                    except OSError:
+                        pass
+                    dst = f"/usr/sbin/{name}"
+                    if not os.path.exists(dst):
+                        try:
+                            os.symlink(os.path.abspath(c), dst)
+                        except OSError:
+                            pass
+                    break
+
+        for ldir in (
+            os.path.join(bin_dir, "..", "lib"),
+            os.path.join(steer_base, "lib"),
+            os.path.join(os.path.dirname(steer_base), "usr", "lib"),
+            os.path.join(bin_dir, "lib"),
+        ):
+            if os.path.exists(ldir):
+                for f in os.listdir(ldir):
+                    dst = os.path.join("/usr/lib", f)
+                    if not os.path.exists(dst):
+                        try:
+                            os.symlink(os.path.abspath(os.path.join(ldir, f)), dst)
+                        except OSError:
+                            pass
+    except Exception as e:
+        print(f"Warning: ensure_steer_env error: {e}", file=sys.stderr)
+
+
+def steer_component(case):
+    """Which steer module handles this protocol (for the report column)."""
+    cid = case.get("id", "")
+    if cid.startswith(("ss-", "ss2022-", "trojan")):
+        return "steer-proxy"
+    if cid.startswith("vless"):
+        return "steer-vless"
+    if cid.startswith("vmess"):
+        return "steer-extended"
+    if cid.startswith("hysteria2"):
+        return "steer-hysteria2"
+    return "steer"
+
+
 # ---------------------------------------------------------------- proc info
 def proc_status(pid):
     out = {"VmRSS": 0.0, "VmHWM": 0.0}
@@ -809,10 +882,14 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
         env["GOMAXPROCS"] = str(workers)
     pre = (lambda: os.sched_setaffinity(0, client_cpus)) if hasattr(os, "sched_setaffinity") else None
 
-    if core_name in ("tachyon", "sing-box"):
+    if core_name in ("tachyon", "sing-box", "steer"):
         spec = case.get("client_sb")
         if not spec:
             return None, d
+        if core_name == "steer":
+            ensure_steer_env(bin_path)
+            curr_ld = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
         outbound = dict(spec, tag="proxy")
         cfg_path = os.path.join(d, "config.json")
         cfg = {
@@ -881,12 +958,12 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
 
 # ---------------------------------------------------------------- table output
 def print_comparison_table(results):
-    print("\n" + "=" * 135)
-    print("  ALL-PROTOCOL MULTI-PROXY BENCHMARK (Tachyon vs Sing-box vs Xray vs Mihomo)")
-    print("=" * 135)
-    header = f"{'Protocol':<28} | {'Tachyon 1s/8s':<19} | {'Sing-box 1s/8s':<19} | {'Xray 1s/8s':<19} | {'Mihomo 1s/8s':<19} | {'Winner':<18}"
+    print("\n" + "=" * 158)
+    print("  ALL-PROTOCOL MULTI-PROXY BENCHMARK (Tachyon vs Sing-box vs Xray vs Mihomo vs steer)")
+    print("=" * 158)
+    header = f"{'Protocol':<28} | {'Tachyon 1s/8s':<19} | {'Sing-box 1s/8s':<19} | {'Xray 1s/8s':<19} | {'Mihomo 1s/8s':<19} | {'steer 1s/8s':<19} | {'Winner':<18}"
     print(header)
-    print("-" * 135)
+    print("-" * 158)
 
     for r in results:
         pname = r["name"]
@@ -905,6 +982,7 @@ def print_comparison_table(results):
         s_cell = fmt_cell(r.get("sing-box"))
         x_cell = fmt_cell(r.get("xray"))
         m_cell = fmt_cell(r.get("mihomo"))
+        st_cell = fmt_cell(r.get("steer"))
 
         winner = "-"
         t_data = r.get("tachyon")
@@ -912,7 +990,7 @@ def print_comparison_table(results):
             t_speed = max(t_data.get("tput_1", 0), t_data.get("tput_8", 0))
             best_ref = 0
             best_name = "ref"
-            for ref_name in ("sing-box", "xray", "mihomo"):
+            for ref_name in ("sing-box", "xray", "mihomo", "steer"):
                 ref_d = r.get(ref_name)
                 if ref_d and ref_d.get("status") == "OK":
                     spd = max(ref_d.get("tput_1", 0), ref_d.get("tput_8", 0))
@@ -930,9 +1008,9 @@ def print_comparison_table(results):
             else:
                 winner = "TACHYON (ONLY)"
 
-        print(f"{pname:<28} | {t_cell:<19} | {s_cell:<19} | {x_cell:<19} | {m_cell:<19} | {winner:<18}")
+        print(f"{pname:<28} | {t_cell:<19} | {s_cell:<19} | {x_cell:<19} | {m_cell:<19} | {st_cell:<19} | {winner:<18}")
 
-    print("=" * 135)
+    print("=" * 158)
 
 
 def generate_html_report(results, profile, out_path):
@@ -1397,6 +1475,7 @@ def main():
     ap.add_argument("--sing-box", default="/bench/sing-box-lx")
     ap.add_argument("--xray", default="/bench/xray-linux")
     ap.add_argument("--mihomo", default="/bench/mihomo-linux")
+    ap.add_argument("--steer", default="/bench/steer/usr/bin/sing-box")
     ap.add_argument("--profile", choices=["router", "router2", "desktop"], default="router2")
     ap.add_argument("--workers", type=int, default=None, help="Worker threads per core")
     ap.add_argument("--seconds", type=int, default=1)
@@ -1470,6 +1549,7 @@ def main():
         ("sing-box", args.sing_box),
         ("xray", args.xray),
         ("mihomo", args.mihomo),
+        ("steer", args.steer),
     ]
 
     results = []
@@ -1510,6 +1590,8 @@ def main():
                     "cpu_s_per_gib": cpu8 or cpu1,
                     "peak_rss_mib": peak_rss,
                 }
+                if c_name == "steer":
+                    case_res[c_name]["component"] = steer_component(case)
                 print(f"  [{c_name:<8}] 1s: {t1:>4.1f} G, 8s: {t8:>4.1f} G, p50: {lat:>4.0f} µs, RSS: {peak_rss}M", flush=True)
 
             except Exception as e:

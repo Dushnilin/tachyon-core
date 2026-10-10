@@ -352,15 +352,23 @@ impl DnsService {
         skip_cache_read: bool,
     ) -> std::io::Result<Vec<u8>> {
         let (query_msg, info) = codec::parse_query(query)?;
+        crate::logging::debug(format_args!(
+            "[DNS-TRACE] query: {} ({:?}) from {:?} allow_fakeip={}",
+            info.name, info.qtype, meta.source, allow_fakeip
+        ));
         let mut opts = WalkOptions::default();
         let mut target: Option<Arc<ServerConfig>> = None;
-        for rule in &self.rules {
+        for (rule_idx, rule) in self.rules.iter().enumerate() {
             if rule.match_response {
                 continue;
             }
             if !rule.matches(meta, &info) {
                 continue;
             }
+            crate::logging::debug(format_args!(
+                "[DNS-TRACE] rule [{}] MATCHED for {} action={:?}",
+                rule_idx, info.name, rule.action
+            ));
             match &rule.action {
                 Action::RouteOptions {
                     rewrite_ttl,

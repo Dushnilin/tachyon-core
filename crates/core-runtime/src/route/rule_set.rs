@@ -277,41 +277,67 @@ pub fn match_rule(rule: &Value, ctx: &ConnContext) -> bool {
 }
 
 fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bool {
-    let mut matched = false;
-    if let Some(domain) = super::rule::domain_host(ctx) {
-        matched |= list(rule.get("domain"))
-            .iter()
-            .any(|entry| entry == domain.as_ref());
-        matched |= list(rule.get("domain_suffix"))
-            .iter()
-            .any(|entry| super::rule::domain_suffix_match(&domain, entry));
-        matched |= list(rule.get("domain_keyword"))
-            .iter()
-            .any(|entry| domain.contains(entry.as_str()));
+    // 1. Destination criteria: domain, domain_suffix, domain_keyword, ip_cidr
+    let has_domain = rule.contains_key("domain") || rule.contains_key("domain_suffix") || rule.contains_key("domain_keyword");
+    let has_ip = rule.contains_key("ip_cidr");
+    if has_domain || has_ip {
+        let mut dest_matched = false;
+        if let Some(domain) = super::rule::domain_host(ctx) {
+            if has_domain {
+                dest_matched = list(rule.get("domain")).iter().any(|entry| entry == domain.as_ref())
+                    || list(rule.get("domain_suffix")).iter().any(|entry| super::rule::domain_suffix_match(&domain, entry))
+                    || list(rule.get("domain_keyword")).iter().any(|entry| domain.contains(entry.as_str()));
+            }
+        }
+        if !dest_matched && has_ip {
+            if let Target::Ip(addr) = &ctx.destination {
+                dest_matched = list(rule.get("ip_cidr")).iter().any(|entry| prefix_contains(entry, addr.ip()));
+            }
+        }
+        if !dest_matched {
+            return false;
+        }
     }
-    if let Target::Ip(addr) = &ctx.destination {
-        matched |= list(rule.get("ip_cidr"))
-            .iter()
-            .any(|entry| prefix_contains(entry, addr.ip()));
+
+    // 2. Source IP criteria
+    if rule.contains_key("source_ip_cidr") {
+        if !list(rule.get("source_ip_cidr")).iter().any(|entry| prefix_contains(entry, ctx.source.ip())) {
+            return false;
+        }
     }
-    matched |= list(rule.get("source_ip_cidr"))
-        .iter()
-        .any(|entry| prefix_contains(entry, ctx.source.ip()));
-    let destination_port = ctx.destination.port();
-    matched |= ports(rule.get("port")).contains(&destination_port);
-    matched |= list(rule.get("port_range"))
-        .iter()
-        .any(|entry| port_range_contains(entry, destination_port));
-    matched |= ports(rule.get("source_port"))
-        .iter()
-        .any(|entry| *entry == ctx.source.port());
-    matched |= list(rule.get("source_port_range"))
-        .iter()
-        .any(|entry| port_range_contains(entry, ctx.source.port()));
-    matched |= list(rule.get("network"))
-        .iter()
-        .any(|entry| *entry == ctx.network);
-    matched
+
+    // 3. Destination Port criteria
+    let has_port = rule.contains_key("port");
+    let has_port_range = rule.contains_key("port_range");
+    if has_port || has_port_range {
+        let destination_port = ctx.destination.port();
+        let port_matched = (has_port && ports(rule.get("port")).contains(&destination_port))
+            || (has_port_range && list(rule.get("port_range")).iter().any(|entry| port_range_contains(entry, destination_port)));
+        if !port_matched {
+            return false;
+        }
+    }
+
+    // 4. Source Port criteria
+    let has_source_port = rule.contains_key("source_port");
+    let has_source_port_range = rule.contains_key("source_port_range");
+    if has_source_port || has_source_port_range {
+        let source_port = ctx.source.port();
+        let port_matched = (has_source_port && ports(rule.get("source_port")).contains(&source_port))
+            || (has_source_port_range && list(rule.get("source_port_range")).iter().any(|entry| port_range_contains(entry, source_port)));
+        if !port_matched {
+            return false;
+        }
+    }
+
+    // 5. Network criteria
+    if rule.contains_key("network") {
+        if !list(rule.get("network")).iter().any(|entry| *entry == ctx.network) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// `badoption.Listable[uint16]`: the SRS container stores numbers.
@@ -498,5 +524,42 @@ mod tests {
         assert!(sets[0].matches(&context("a.com")));
         let error = registry.resolve(&["three".to_string()]).unwrap_err();
         assert_eq!(error.to_string(), "rule-set not found: three");
+    }
+
+    #[test]
+    fn compound_rule_matching() {
+        let rule = json!({
+            "network": "udp",
+            "port_range": ["50000-65535"],
+            "ip_cidr": ["10.0.0.0/8"]
+        });
+        let mut udp_match = ConnContext::new(
+            "in",
+            "192.168.1.100:1234".parse().unwrap(),
+            Target::Ip("10.1.2.3:50001".parse().unwrap()),
+            "udp",
+        );
+        assert!(match_rule(&rule, &udp_match));
+
+        let set = RuleSet::new(vec!["test".into()], vec![rule]);
+        assert!(set.matches(&udp_match));
+
+        // Wrong network (tcp) must fail
+        udp_match.network = "tcp";
+        assert!(!set.matches(&udp_match));
+
+        // Wrong port (53) must fail
+        udp_match.network = "udp";
+        udp_match.destination = Target::Ip("10.1.2.3:53".parse().unwrap());
+        assert!(!set.matches(&udp_match));
+
+        // DNS query context to domain without IP must fail
+        let dns_ctx = ConnContext::new(
+            "",
+            "127.0.0.1:0".parse().unwrap(),
+            Target::Domain("yandex.ru".into(), 0),
+            "udp",
+        );
+        assert!(!set.matches(&dns_ctx));
     }
 }

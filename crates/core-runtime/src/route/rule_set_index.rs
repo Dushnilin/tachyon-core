@@ -320,6 +320,12 @@ impl FallbackRule {
 #[derive(Debug, Clone, Default)]
 struct PlainRule {
     inverted: bool,
+    has_domains: bool,
+    has_dest_ip: bool,
+    has_source_ip: bool,
+    has_dest_ports: bool,
+    has_source_ports: bool,
+    has_network: bool,
     domains: HashSet<Box<str>>,
     /// Kept as a list and tested with the interpreter's own
     /// `domain_suffix_match`: the label boundary, the leading-dot form and
@@ -357,28 +363,39 @@ impl PlainRule {
                 .into_iter()
                 .map(String::into_boxed_str),
         );
+        rule.has_domains = object.contains_key("domain")
+            || object.contains_key("domain_suffix")
+            || object.contains_key("domain_keyword");
 
         for entry in list(object.get("ip_cidr")) {
             insert_prefix(&mut rule.dest_v4, &mut rule.dest_v6, &entry);
         }
+        rule.has_dest_ip = object.contains_key("ip_cidr");
+
         for entry in list(object.get("source_ip_cidr")) {
             insert_prefix(&mut rule.source_v4, &mut rule.source_v6, &entry);
         }
+        rule.has_source_ip = object.contains_key("source_ip_cidr");
 
         rule.dest_ports.extend(ports(object.get("port")));
         rule.dest_port_ranges
             .0
             .extend(parse_ranges(list(object.get("port_range"))));
+        rule.has_dest_ports = object.contains_key("port") || object.contains_key("port_range");
+
         rule.source_ports.extend(ports(object.get("source_port")));
         rule.source_port_ranges
             .0
             .extend(parse_ranges(list(object.get("source_port_range"))));
+        rule.has_source_ports =
+            object.contains_key("source_port") || object.contains_key("source_port_range");
 
         for entry in list(object.get("network")) {
             if !rule.networks.iter().any(|known| **known == *entry) {
                 rule.networks.push(entry.into_boxed_str());
             }
         }
+        rule.has_network = object.contains_key("network");
 
         rule.dest_ports.sort_unstable();
         rule.dest_ports.dedup();
@@ -394,37 +411,68 @@ impl PlainRule {
     }
 
     fn matches(&self, ctx: &ConnContext) -> bool {
-        let mut matched = false;
-        if let Some(host) = domain_host(ctx) {
-            matched |= self.domains.contains(host.as_ref());
-            matched |= self
-                .suffixes
-                .iter()
-                .any(|entry| domain_suffix_match(&host, entry));
-            matched |= self
-                .keywords
-                .iter()
-                .any(|entry| host.contains(entry.as_ref()));
+        // Destination criteria (domain or IP)
+        if self.has_domains || self.has_dest_ip {
+            let mut dest_matched = false;
+            if let Some(host) = domain_host(ctx) {
+                if self.has_domains {
+                    dest_matched = self.domains.contains(host.as_ref())
+                        || self.suffixes.iter().any(|entry| domain_suffix_match(&host, entry))
+                        || self.keywords.iter().any(|entry| host.contains(entry.as_ref()));
+                }
+            }
+            if !dest_matched && self.has_dest_ip {
+                if let Target::Ip(addr) = &ctx.destination {
+                    dest_matched = match addr.ip() {
+                        IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
+                        IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
+                    };
+                }
+            }
+            if !dest_matched {
+                return self.inverted;
+            }
         }
-        if let Target::Ip(addr) = &ctx.destination {
-            matched |= match addr.ip() {
-                IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
-                IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
+
+        // Source IP criteria
+        if self.has_source_ip {
+            let matched_source = match ctx.source.ip() {
+                IpAddr::V4(v4) => self.source_v4.contains(v4.into()),
+                IpAddr::V6(v6) => self.source_v6.contains(v6.into()),
             };
+            if !matched_source {
+                return self.inverted;
+            }
         }
-        let source = ctx.source.ip();
-        matched |= match source {
-            IpAddr::V4(v4) => self.source_v4.contains(v4.into()),
-            IpAddr::V6(v6) => self.source_v6.contains(v6.into()),
-        };
-        let port = ctx.destination.port();
-        matched |=
-            self.dest_ports.binary_search(&port).is_ok() || self.dest_port_ranges.contains(port);
-        let source_port = ctx.source.port();
-        matched |= self.source_ports.binary_search(&source_port).is_ok()
-            || self.source_port_ranges.contains(source_port);
-        matched |= self.networks.iter().any(|known| **known == *ctx.network);
-        matched != self.inverted
+
+        // Destination port criteria
+        if self.has_dest_ports {
+            let port = ctx.destination.port();
+            let port_matched = self.dest_ports.binary_search(&port).is_ok()
+                || self.dest_port_ranges.contains(port);
+            if !port_matched {
+                return self.inverted;
+            }
+        }
+
+        // Source port criteria
+        if self.has_source_ports {
+            let source_port = ctx.source.port();
+            let port_matched = self.source_ports.binary_search(&source_port).is_ok()
+                || self.source_port_ranges.contains(source_port);
+            if !port_matched {
+                return self.inverted;
+            }
+        }
+
+        // Network criteria
+        if self.has_network {
+            if !self.networks.iter().any(|known| **known == *ctx.network) {
+                return self.inverted;
+            }
+        }
+
+        !self.inverted
     }
 }
 
@@ -447,7 +495,13 @@ impl RuleSetIndex {
             };
             let inverted = object.get("invert") == Some(&Value::Bool(true));
             let logical = object.get("type").and_then(Value::as_str) == Some("logical");
-            if inverted || logical {
+            let has_non_dest = object.contains_key("network")
+                || object.contains_key("port")
+                || object.contains_key("port_range")
+                || object.contains_key("source_port")
+                || object.contains_key("source_port_range")
+                || object.contains_key("source_ip_cidr");
+            if inverted || logical || has_non_dest {
                 fallbacks.rules.push(FallbackRule::compile(object));
                 continue;
             }
@@ -551,24 +605,7 @@ impl RuleSetIndex {
                 return true;
             }
         }
-        let source = ctx.source.ip();
-        if match source {
-            IpAddr::V4(v4) => self.source_v4.contains(v4.into()),
-            IpAddr::V6(v6) => self.source_v6.contains(v6.into()),
-        } {
-            return true;
-        }
-        let port = ctx.destination.port();
-        if self.dest_ports.binary_search(&port).is_ok() || self.dest_port_ranges.contains(port) {
-            return true;
-        }
-        let source_port = ctx.source.port();
-        if self.source_ports.binary_search(&source_port).is_ok()
-            || self.source_port_ranges.contains(source_port)
-        {
-            return true;
-        }
-        self.networks.iter().any(|known| **known == *ctx.network)
+        false
     }
 
     /// `domain_suffix`: the host equals the suffix, or ends with `.` plus it.

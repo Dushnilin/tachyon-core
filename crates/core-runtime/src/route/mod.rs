@@ -247,6 +247,31 @@ impl Outbound {
         }
     }
 
+    pub fn apply_dial_defaults(&mut self, default_mark: Option<u32>, default_interface: Option<&str>) {
+        let apply = |dial: &mut crate::outbound::dial::DialOptions| {
+            if dial.routing_mark.is_none() {
+                dial.routing_mark = default_mark;
+            }
+            if dial.bind_interface.is_none() {
+                dial.bind_interface = default_interface.map(str::to_string);
+            }
+        };
+
+        match self {
+            Outbound::Direct(d) => apply(&mut d.dial),
+            Outbound::Vless(v) => apply(&mut v.dial),
+            Outbound::Trojan(t) => apply(&mut t.dial),
+            Outbound::Shadowsocks(s) => apply(&mut s.dial),
+            Outbound::Vmess(m) => apply(&mut m.dial),
+            Outbound::Socks(s) => apply(&mut s.dial),
+            Outbound::Http(h) => apply(&mut h.dial),
+            Outbound::ShadowTls(s) => apply(&mut s.dial),
+            Outbound::Naive(n) => apply(&mut n.dial),
+            Outbound::Snell(s) => apply(&mut s.dial),
+            _ => {}
+        }
+    }
+
     fn build(obj: &Value, at: &str) -> anyhow::Result<Outbound> {
         let ty = obj
             .get("type")
@@ -784,14 +809,7 @@ impl Router {
                 tags.insert(tag, i);
             }
             let mut outbound = Outbound::build(obj, &format!("outbounds[{i}]"))?;
-            if let Outbound::Direct(direct) = &mut outbound {
-                if direct.dial.routing_mark.is_none() {
-                    direct.dial.routing_mark = defaults.default_mark;
-                }
-                if direct.dial.bind_interface.is_none() {
-                    direct.dial.bind_interface = bind_iface.clone();
-                }
-            }
+            outbound.apply_dial_defaults(defaults.default_mark, bind_iface.as_deref());
             outbounds.push(outbound);
         }
         let endpoints_list = root

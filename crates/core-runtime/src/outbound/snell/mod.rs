@@ -135,7 +135,7 @@ pub struct Snell {
     mode: Mode,
     profile: Option<Arc<Profile>>,
     pool: Option<Arc<SnellPool>>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Snell {

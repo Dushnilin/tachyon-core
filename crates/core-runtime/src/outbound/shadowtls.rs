@@ -26,7 +26,7 @@ pub struct ShadowTls {
     version: u8,
     password: String,
     tls: Option<TlsOptions>,
-    dial: DialOptions,
+    pub dial: DialOptions,
 }
 
 impl ShadowTls {

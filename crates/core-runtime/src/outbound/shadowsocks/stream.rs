@@ -42,7 +42,7 @@ pub struct Shadowsocks {
     port: u16,
     method: Method,
     master_key: Arc<Vec<u8>>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
     tls: Option<crate::tls_client::TlsOptions>,
 }
 

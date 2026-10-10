@@ -73,7 +73,7 @@ pub struct Socks {
     port: u16,
     version: u8,
     credentials: Option<(String, String)>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Socks {
@@ -337,7 +337,7 @@ pub struct HttpOut {
     port: u16,
     credentials: Option<(String, String)>,
     tls: Option<Arc<crate::tls_client::TlsOptions>>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl HttpOut {

@@ -73,7 +73,7 @@ pub struct Vless {
     packet_encoding: PacketEncoding,
     /// Mux.Cool session pool; `None` when multiplexing is off
     mux: Option<Arc<mux::Client>>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Vless {
@@ -335,7 +335,7 @@ pub struct Trojan {
     password_hash: String,
     transport: Transport,
     tls: Option<TlsOptions>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Trojan {

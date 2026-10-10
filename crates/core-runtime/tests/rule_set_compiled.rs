@@ -49,8 +49,8 @@ fn corpus() -> Vec<Value> {
         json!({"network": ["tcp"]}),
         json!({"network": ["udp"]}),
         json!({"network": ["tcp", "udp"]}),
-        // Several fields at once: a plain rule ORs them, which is what makes the
-        // pools mergeable in the first place.
+        // Destination fields OR together; source/port/network restrictions
+        // require a separate compiled fallback to preserve conjunction.
         json!({"domain": ["multi.com"], "port": [443], "network": ["tcp"]}),
         json!({"domain": ["split.com"], "ip_cidr": ["10.1.0.0/16"]}),
         // Not flattenable.
@@ -84,6 +84,8 @@ fn corpus() -> Vec<Value> {
             "not-an-object",
             {"domain": ["sub-with-junk.com"]}
         ]}),
+        json!({"type":"logical","mode":"and","rules":[null,{"domain":"a.com"}]}),
+        json!({"type":"logical","mode":"or","invert":true,"rules":[null,{"domain":"a.com"}]}),
         json!({}),
         json!({"unknown_field": ["ignored.com"]}),
         Value::String("not-an-object".into()),
@@ -508,5 +510,18 @@ fn the_index_reports_what_it_holds() {
     assert!(!index.has_keyword("cdn.net"));
     assert!(index.has_prefix("10.1.2.3".parse().expect("ip"), 8));
     assert!(!index.has_prefix("11.1.2.3".parse().expect("ip"), 8));
-    assert_eq!(index.len(), 2 + 2 + 1 + 1 + 2);
+    // Port criteria live in fallbacks, not the shared destination pools.
+    assert_eq!(index.len(), 2 + 2 + 1 + 1);
+    assert_eq!(set.fallback_count(), 1);
+    assert_eq!(set.rule_count(), 5);
+    let outside = ConnContext::new(
+        "in",
+        "192.0.2.1:1234".parse().unwrap(),
+        Target::Domain("outside-the-pools.test".into(), 443),
+        "tcp",
+    );
+    assert!(
+        set.matches(&outside),
+        "the fallback's port 443 still matches"
+    );
 }

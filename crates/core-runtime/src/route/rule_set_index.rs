@@ -252,6 +252,8 @@ impl Fallbacks {
 /// applied to the node's own outcome.
 #[derive(Debug, Clone)]
 enum FallbackRule {
+    /// Malformed logical children are always false, unlike an empty object.
+    Never,
     /// `type: logical`. `mode: or` is `any`, everything else -- including the
     /// default -- is `all` over a *non-empty* list: the interpreter's
     /// `!rules.is_empty() && rules.iter().all(..)` guard, kept because an
@@ -278,10 +280,8 @@ impl FallbackRule {
                     subs.iter()
                         .map(|sub| match sub.as_object() {
                             Some(object) => FallbackRule::compile(object),
-                            // the interpreter refuses a non-object before it
-                            // looks at invert, and an empty plain rule answers
-                            // exactly that false
-                            None => FallbackRule::Plain(Box::default()),
+                            // Preserve match_rule's rejection of non-objects.
+                            None => FallbackRule::Never,
                         })
                         .collect()
                 })
@@ -297,6 +297,7 @@ impl FallbackRule {
 
     fn matches(&self, ctx: &ConnContext) -> bool {
         match self {
+            FallbackRule::Never => false,
             FallbackRule::Plain(rule) => rule.matches(ctx),
             FallbackRule::Logical {
                 all,

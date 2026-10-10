@@ -85,14 +85,15 @@ impl Shadowsocks {
             );
         }
         let listen = parse_listen(object, &at)?;
-        let listener = TcpListener::bind(listen)
-            .await
+        let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
         let want_udp = network_includes_udp(object);
         let udp_socket = if want_udp {
-            Some(Arc::new(UdpSocket::bind(listen).await.map_err(|e| {
-                anyhow::anyhow!("{at}: udp bind {}:{}: {e}", listen.0, listen.1)
-            })?))
+            Some(Arc::new(
+                super::bind_udp(std::net::SocketAddr::from(listen)).map_err(|e| {
+                    anyhow::anyhow!("{at}: udp bind {}:{}: {e}", listen.0, listen.1)
+                })?,
+            ))
         } else {
             None
         };
@@ -118,53 +119,66 @@ impl Shadowsocks {
     }
 
     pub async fn serve(self) {
-        if let Some(udp) = self.udp_socket {
-            let method = self.method;
-            let master_key = Arc::clone(&self.master_key);
-            let tag = self.tag.clone();
-            let hub = UdpHub::new(
-                Arc::clone(&self.router),
-                self.udp_timeout,
-                DatagramFrame::Shadowsocks,
-            );
-            tokio::spawn(async move {
-                serve_udp(udp, method, master_key, hub, tag).await;
-            });
-        }
-
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, peer)) => {
-                    let _ = stream.set_nodelay(true);
-                    let method = self.method;
-                    let master_key = Arc::clone(&self.master_key);
-                    let tag = self.tag.clone();
-                    let router = Arc::clone(&self.router);
-                    let tls = self.tls.clone();
-                    tokio::spawn(async move {
-                        let local = stream.local_addr().unwrap_or(peer);
-                        let result = match tls {
-                            Some(tls) => match tls.accept(stream).await {
-                                Ok(stream) => {
+        let Self {
+            listener,
+            udp_socket,
+            tag,
+            router,
+            method,
+            master_key,
+            tls,
+            udp_timeout,
+        } = self;
+        // The UDP half is joined into this future, not spawned beside it: a
+        // task that outlives `serve` holds the port bound, and the next start
+        // gets `EADDRINUSE` (issue #5).
+        let (udp_router, udp_key, udp_tag) = (router.clone(), master_key.clone(), tag.clone());
+        let udp = async move {
+            let Some(udp) = udp_socket else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            let hub = UdpHub::new(udp_router, udp_timeout, DatagramFrame::Shadowsocks);
+            serve_udp(udp, method, udp_key, hub, udp_tag).await;
+        };
+        let tcp = async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
+                        let master_key = Arc::clone(&master_key);
+                        let tag = tag.clone();
+                        let router = Arc::clone(&router);
+                        let tls = tls.clone();
+                        tokio::spawn(async move {
+                            let local = stream.local_addr().unwrap_or(peer);
+                            let result = match tls {
+                                Some(tls) => match tls.accept(stream).await {
+                                    Ok(stream) => {
+                                        handle(stream, peer, local, method, master_key, tag, router)
+                                            .await
+                                    }
+                                    Err(err) => Err(err),
+                                },
+                                None => {
                                     handle(stream, peer, local, method, master_key, tag, router)
                                         .await
                                 }
-                                Err(err) => Err(err),
-                            },
-                            None => {
-                                handle(stream, peer, local, method, master_key, tag, router).await
+                            };
+                            if let Err(err) = result {
+                                logging::debug(format_args!("shadowsocks {peer}: {err}"));
                             }
-                        };
-                        if let Err(err) = result {
-                            logging::debug(format_args!("shadowsocks {peer}: {err}"));
-                        }
-                    });
-                }
-                Err(err) => {
-                    logging::debug(format_args!("shadowsocks accept: {err}"));
-                    return;
+                        });
+                    }
+                    Err(err) => {
+                        super::serve_stalled("shadowsocks accept", &err).await;
+                    }
                 }
             }
+        };
+        tokio::select! {
+            _ = udp => {}
+            _ = tcp => {}
         }
     }
 }
@@ -178,7 +192,7 @@ async fn serve_udp(
 ) {
     let mut buf = vec![0u8; 65535];
     let reply = Reply::Shadowsocks {
-        socket: Arc::clone(&sock),
+        socket: Arc::downgrade(&sock),
         method,
         master_key: Arc::clone(&master_key),
     };

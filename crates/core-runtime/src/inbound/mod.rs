@@ -36,6 +36,50 @@ pub mod vmess;
 #[cfg(target_os = "linux")]
 mod relay;
 
+/// A TCP listener on `addr`, with `SO_REUSEADDR`.
+///
+/// The reference's Go runtime sets it on every listener, and without it a
+/// rebind right after a reload loses to a TIME_WAIT socket the previous
+/// instance left behind — one half of issue #5's `Address in use`. Off
+/// Windows, where `SO_REUSEADDR` means "let two sockets own the port".
+pub(crate) fn bind_tcp(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    let listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(listener)
+}
+
+/// A UDP socket on `addr`, with the same `SO_REUSEADDR` treatment.
+pub(crate) fn bind_udp(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
+}
+
+/// An error from a serving loop: log it loudly and pause, never end the loop.
+///
+/// Every inbound used to `return` on the first `accept` failure, which drops
+/// the socket — the process stays `running` while the port goes dark, which
+/// is how issue #5 reported it. `tproxy` and `direct` were worse: their TCP
+/// and UDP halves are `select!`ed, so one transient error took both down.
+/// We own this socket, so nothing that fails on it is permanent; `EMFILE` and
+/// friends clear up, and a socket that really is gone is worth shouting about
+/// once a second rather than dying silently.
+pub(crate) async fn serve_stalled(scope: &str, err: &io::Error) {
+    logging::error(format_args!("{scope}: {err}; keeping the listener up"));
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
 /// Object-safe stream for dial results (TCP, TLS, future transports).
 ///
 /// `Any` is here so the relay can recognise a bare `TcpStream` behind the box

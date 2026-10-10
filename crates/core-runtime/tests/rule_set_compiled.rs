@@ -386,11 +386,13 @@ fn inverted_and_logical_rules_stay_on_the_interpreter() {
 }
 
 /// An empty set, or one whose every entry was unparsable, must never match.
+/// A bare `{}` is deliberately not on this list: it is a rule with no
+/// criteria at all, the interpreter answers true for it, and `corpus` pins
+/// that same answer.
 #[test]
 fn nothing_to_match_means_no_match() {
     for rules in [
         vec![],
-        vec![json!({})],
         vec![json!({"domain": []})],
         vec![json!({"ip_cidr": ["nonsense"]})],
         vec![json!({"port_range": ["nonsense"]})],

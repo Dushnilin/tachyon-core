@@ -142,8 +142,7 @@ impl Vmess {
             });
         }
         let listen = parse_listen(object, &at)?;
-        let listener = TcpListener::bind(listen)
-            .await
+        let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
         Ok(Self {
             listener,
@@ -195,8 +194,7 @@ impl Vmess {
                     });
                 }
                 Err(err) => {
-                    logging::debug(format_args!("vmess accept: {err}"));
-                    return;
+                    super::serve_stalled("vmess accept", &err).await;
                 }
             }
         }

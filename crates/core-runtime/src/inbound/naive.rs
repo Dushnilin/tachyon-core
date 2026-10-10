@@ -51,8 +51,7 @@ impl Naive {
         }
 
         let listen = parse_listen(object, &at)?;
-        let listener = TcpListener::bind(listen)
-            .await
+        let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
 
         let tls = ServerTls::from_inbound(obj, &at)?;
@@ -108,8 +107,7 @@ impl Naive {
                     });
                 }
                 Err(err) => {
-                    logging::debug(format_args!("naive accept: {err}"));
-                    return;
+                    super::serve_stalled("naive accept", &err).await;
                 }
             }
         }

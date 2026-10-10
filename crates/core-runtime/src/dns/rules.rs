@@ -31,11 +31,14 @@ pub enum Action {
         disable_cache: bool,
     },
     Reject,
-    /// `evaluate` — evaluate query with the specified server.
+    /// `evaluate` — resolve through `server` but keep walking: the answer is
+    /// remembered for the response rules that follow, not returned.
     Evaluate {
         server: String,
+        rewrite_ttl: Option<u32>,
+        disable_cache: bool,
     },
-    /// `respond` — known gap (requires evaluated responses).
+    /// `respond` — hand back the answer the last `evaluate` produced.
     Respond,
     /// `predefined`: a synthesized answer (rcode + answer/ns/extra records).
     Predefined(PredefinedResponse),
@@ -64,6 +67,8 @@ pub struct Rule {
     pub domain_suffix: Vec<String>,
     pub domain_keyword: Vec<String>,
     pub domain_regex: Vec<Regex>,
+    /// `ip_cidr`: an address the *response* must carry.
+    pub ip_cidr: Vec<super::transport::IpPrefix>,
     pub source_ip_cidr: Vec<super::transport::IpPrefix>,
     /// `route.find_neighbor`: the asking client's hardware address and DHCP
     /// hostname.
@@ -138,13 +143,17 @@ impl Rule {
         let network = string_list(map, "network", at)?;
         let rule_set_tags = string_list(map, "rule_set", at)?;
         let rule_sets = registry.resolve(&rule_set_tags)?;
-        let source_ip_cidr = string_list(map, "source_ip_cidr", at)?
-            .into_iter()
-            .map(|raw| {
-                super::transport::IpPrefix::parse(&raw)
-                    .map_err(|e| anyhow::anyhow!("{at}: bad source_ip_cidr {raw:?}: {e}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let prefixes = |key: &str| -> anyhow::Result<Vec<super::transport::IpPrefix>> {
+            string_list(map, key, at)?
+                .into_iter()
+                .map(|raw| {
+                    parse_prefix(&raw)
+                        .map_err(|err| anyhow::anyhow!("{at}: bad {key} {raw:?}: {err}"))
+                })
+                .collect()
+        };
+        let ip_cidr = prefixes("ip_cidr")?;
+        let source_ip_cidr = prefixes("source_ip_cidr")?;
 
         let invert = map.get("invert").and_then(Value::as_bool).unwrap_or(false);
         let match_response = match map.get("match_response") {
@@ -201,7 +210,11 @@ impl Rule {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                Action::Evaluate { server }
+                Action::Evaluate {
+                    server,
+                    rewrite_ttl,
+                    disable_cache,
+                }
             }
             "respond" => Action::Respond,
             "predefined" => Action::Predefined(build_predefined(map, at)?),
@@ -215,6 +228,7 @@ impl Rule {
             domain_suffix,
             domain_keyword,
             domain_regex,
+            ip_cidr,
             source_ip_cidr,
             source_mac: string_list(map, "source_mac_address", at)?
                 .iter()
@@ -233,92 +247,48 @@ impl Rule {
         })
     }
 
+    /// The forward stage of the walk: there is no answer to look at yet.
     pub fn matches(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
-        let hit = self.matches_inner(meta, query);
-        hit != self.invert
+        self.matches_stage(meta, query, None)
     }
 
-    pub fn matches_response(&self, meta: &QueryMeta, query: &QueryInfo, ips: &[IpAddr]) -> bool {
-        if !self.match_response {
-            return false;
-        }
-        if !self.matches_query_meta(meta, query) {
-            return false;
-        }
-        if self.rule_sets.is_empty() {
-            return true;
-        }
-        let source = meta
-            .source
-            .map(|address| std::net::SocketAddr::new(address, 0))
-            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        for &ip in ips {
-            let context = crate::route::ConnContext::new(
-                meta.inbound.as_deref().unwrap_or(""),
-                source,
-                crate::inbound::Target::Ip(std::net::SocketAddr::new(ip, 0)),
-                "udp",
-            );
-            if self.rule_sets.iter().any(|set| set.matches(&context)) {
-                return true;
-            }
-        }
-        false
+    /// Evaluate a rule once the walk holds a response. `ips` is `None` while
+    /// it does not: a rule that tests the answer is *undecided* then rather
+    /// than a miss, so `invert` cannot promote it into a hit before `evaluate`
+    /// has run.
+    pub fn matches_stage(
+        &self,
+        meta: &QueryMeta,
+        query: &QueryInfo,
+        ips: Option<&[IpAddr]>,
+    ) -> bool {
+        self.stage(meta, query, ips).unwrap_or(false)
     }
 
-    fn matches_query_meta(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
-        if !self.inbound.is_empty() {
-            let Some(inbound) = meta.inbound.as_deref() else {
-                return false;
-            };
-            if !self.inbound.iter().any(|i| i == inbound) {
-                return false;
+    /// Three-valued on purpose: `None` propagates through `logical` trees and
+    /// only turns into a miss at the top of the walk.
+    fn stage(&self, meta: &QueryMeta, query: &QueryInfo, ips: Option<&[IpAddr]>) -> Option<bool> {
+        if ips.is_none() && (self.match_response || !self.ip_cidr.is_empty()) {
+            return None;
+        }
+        let hit = if self.logical {
+            let mut undecided = false;
+            for sub in &self.sub_rules {
+                match sub.stage(meta, query, ips) {
+                    // one operand already settles `and` / `or`
+                    Some(hit) if hit == self.mode_or => return Some(hit != self.invert),
+                    None => undecided = true,
+                    Some(_) => {}
+                }
             }
-        }
-        if !self.query_type.is_empty() && !self.query_type.contains(&query.qtype) {
-            return false;
-        }
-        if !self.network.is_empty() {
-            let Some(network) = meta.network.as_deref() else {
-                return false;
-            };
-            if !self.network.iter().any(|n| n == network) {
-                return false;
+            if undecided {
+                return None;
             }
-        }
-        if !self.source_ip_cidr.is_empty() {
-            let Some(source) = meta.source else {
-                return false;
-            };
-            if !self.source_ip_cidr.iter().any(|p| p.contains(source)) {
-                return false;
-            }
-        }
-        if !self.domain.is_empty() && !self.domain.iter().any(|d| d == &query.name) {
-            return false;
-        }
-        if !self.domain_suffix.is_empty()
-            && !self
-                .domain_suffix
-                .iter()
-                .any(|suffix| domain_suffix_match(&query.name, suffix))
-        {
-            return false;
-        }
-        if !self.domain_keyword.is_empty()
-            && !self
-                .domain_keyword
-                .iter()
-                .any(|k| query.name.contains(k.as_str()))
-        {
-            return false;
-        }
-        if !self.domain_regex.is_empty()
-            && !self.domain_regex.iter().any(|re| re.is_match(&query.name))
-        {
-            return false;
-        }
-        true
+            !self.mode_or && !self.sub_rules.is_empty()
+        } else {
+            self.matches_inner(meta, query, ips)
+        };
+        Some(hit != self.invert)
     }
 
     /// `option.LogicalDNSRule`: the action lives on the parent, the sub rules
@@ -353,11 +323,13 @@ impl Rule {
             }
             sub_rules.push(Rule::build_nested(sub, &sub_at, registry, true)?);
         }
-        let mut rule = Rule::build_with_rule_sets(
-            &serde_json::json!({ "action": map.get("action").cloned().unwrap_or(Value::Null) }),
-            at,
-            registry,
-        )?;
+        // the action lives on the parent, and so does everything else the
+        // generator left there — server, rewrite_ttl, match_response — while
+        // the children stay pure matchers
+        let mut parent = map.clone();
+        parent.remove("type");
+        parent.remove("rules");
+        let mut rule = Rule::build_with_rule_sets(&Value::Object(parent), at, registry)?;
         rule.invert = map.get("invert").and_then(Value::as_bool).unwrap_or(false);
         rule.sub_rules = sub_rules;
         rule.logical = true;
@@ -365,8 +337,14 @@ impl Rule {
         Ok(rule)
     }
 
-    /// The rule-set view of a DNS query: domain, source and destination ports.
-    fn matches_rule_sets(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
+    /// The rule-set view of a DNS exchange: query name, source, and — once an
+    /// answer exists — the answer addresses as the destination.
+    fn matches_rule_sets(
+        &self,
+        meta: &QueryMeta,
+        query: &QueryInfo,
+        ips: Option<&[IpAddr]>,
+    ) -> bool {
         if self.rule_sets.is_empty() {
             return false;
         }
@@ -374,24 +352,51 @@ impl Rule {
             .source
             .map(|address| std::net::SocketAddr::new(address, 0))
             .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        let context = crate::route::ConnContext::new(
-            meta.inbound.as_deref().unwrap_or(""),
-            source,
-            crate::inbound::Target::Domain(query.name.clone(), 0),
-            "udp",
-        );
-        self.rule_sets.iter().any(|set| set.matches(&context))
+        let network = if meta.network.as_deref() == Some("tcp") {
+            "tcp"
+        } else {
+            "udp"
+        };
+        let response = self.match_response;
+        let probe = |destination: crate::inbound::Target, domain: Option<String>| {
+            let mut context = crate::route::ConnContext::new(
+                meta.inbound.as_deref().unwrap_or(""),
+                source,
+                destination,
+                network,
+            );
+            context.domain = domain;
+            self.rule_sets.iter().any(|set| set.matches(&context))
+        };
+        if response {
+            // domain lists in the set still see the query name, while the
+            // address lists see what the server answered with
+            return ips.unwrap_or_default().iter().any(|ip| {
+                probe(
+                    crate::inbound::Target::Ip(std::net::SocketAddr::new(*ip, 0)),
+                    Some(query.name.clone()),
+                )
+            });
+        }
+        probe(crate::inbound::Target::Domain(query.name.clone(), 0), None)
     }
 
-    fn matches_inner(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
-        if self.logical {
-            return if self.mode_or {
-                self.sub_rules.iter().any(|sub| sub.matches(meta, query))
-            } else {
-                !self.sub_rules.is_empty()
-                    && self.sub_rules.iter().all(|sub| sub.matches(meta, query))
-            };
+    fn matches_inner(&self, meta: &QueryMeta, query: &QueryInfo, ips: Option<&[IpAddr]>) -> bool {
+        if !self.matches_query_meta(meta, query) {
+            return false;
         }
+        if !self.ip_cidr.is_empty()
+            && !ips
+                .unwrap_or_default()
+                .iter()
+                .any(|ip| self.ip_cidr.iter().any(|prefix| prefix.contains(*ip)))
+        {
+            return false;
+        }
+        self.rule_sets.is_empty() || self.matches_rule_sets(meta, query, ips)
+    }
+
+    fn matches_query_meta(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
         if !self.inbound.is_empty() {
             let Some(inbound) = meta.inbound.as_deref() else {
                 return false;
@@ -444,9 +449,6 @@ impl Rule {
             {
                 return false;
             }
-        }
-        if !self.rule_sets.is_empty() && !self.matches_rule_sets(meta, query) {
-            return false;
         }
         if !self.domain_suffix.is_empty()
             && !self
@@ -553,6 +555,17 @@ pub fn base64_decode(raw: &str) -> anyhow::Result<Vec<u8>> {
 fn domain_suffix_match(name: &str, suffix: &str) -> bool {
     let suffix = super::codec::normalize_name(suffix);
     name == suffix || name.ends_with(&format!(".{suffix}"))
+}
+
+/// `netip.ParsePrefix` with the reference's retry: a bare address is a
+/// host route, which is what `check` already accepts.
+fn parse_prefix(raw: &str) -> anyhow::Result<super::transport::IpPrefix> {
+    if raw.contains('/') {
+        return super::transport::IpPrefix::parse(raw);
+    }
+    let addr: IpAddr = raw.parse()?;
+    let bits = if addr.is_ipv4() { 32 } else { 128 };
+    super::transport::IpPrefix::parse(&format!("{addr}/{bits}"))
 }
 
 fn string_list(

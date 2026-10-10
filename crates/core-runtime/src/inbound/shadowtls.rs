@@ -116,8 +116,7 @@ impl ShadowTls {
             .map(ToString::to_string);
 
         let listen = parse_listen(object, &at)?;
-        let listener = TcpListener::bind(listen)
-            .await
+        let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
 
         logging::info(format_args!(
@@ -186,8 +185,7 @@ impl ShadowTls {
                     });
                 }
                 Err(err) => {
-                    logging::warn(format_args!("shadowtls[{tag}] accept: {err}"));
-                    return;
+                    super::serve_stalled(&format!("shadowtls[{tag}] accept"), &err).await;
                 }
             }
         }

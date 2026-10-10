@@ -80,7 +80,7 @@ impl Direct {
                         }
                     };
                     let chosen = udp_sock.local_addr()?.port();
-                    match TcpListener::bind(SocketAddr::new(ip, chosen)).await {
+                    match super::bind_tcp(SocketAddr::new(ip, chosen)) {
                         Ok(tcp) => {
                             bound = Some((Some(tcp), Some(Arc::new(udp_sock))));
                             break;
@@ -101,7 +101,7 @@ impl Direct {
             }
             _ => {
                 let listener = if want_tcp {
-                    Some(TcpListener::bind(SocketAddr::new(ip, port)).await?)
+                    Some(super::bind_tcp(SocketAddr::new(ip, port))?)
                 } else {
                     None
                 };
@@ -110,9 +110,7 @@ impl Direct {
                     None => port,
                 };
                 let udp = if want_udp {
-                    Some(Arc::new(
-                        UdpSocket::bind(SocketAddr::new(ip, bound_port)).await?,
-                    ))
+                    Some(Arc::new(super::bind_udp(SocketAddr::new(ip, bound_port))?))
                 } else {
                     None
                 };
@@ -200,8 +198,7 @@ impl Direct {
                         });
                     }
                     Err(err) => {
-                        logging::warn(format_args!("direct[{tcp_tag}] accept: {err}"));
-                        return;
+                        super::serve_stalled(&format!("direct[{tcp_tag}] accept"), &err).await;
                     }
                 }
             }
@@ -231,7 +228,7 @@ impl Direct {
                             continue;
                         }
                         let hub = Arc::clone(&hub);
-                        let reply = Reply::Socket(Arc::clone(&sock));
+                        let reply = Reply::Socket(Arc::downgrade(&sock));
                         let tag = tag.clone();
                         let payload = buf[..n].to_vec();
                         tokio::spawn(async move {
@@ -242,8 +239,7 @@ impl Direct {
                         });
                     }
                     Err(err) => {
-                        logging::warn(format_args!("direct[{tag}] udp recv: {err}"));
-                        return;
+                        super::serve_stalled(&format!("direct[{tag}] udp recv"), &err).await;
                     }
                 }
             }

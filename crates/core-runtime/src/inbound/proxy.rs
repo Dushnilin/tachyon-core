@@ -117,8 +117,7 @@ impl Vless {
         let tls = ServerTls::from_inbound(obj, &at)?;
         let transport = Transport::from_inbound(obj, &at)?.map(Arc::new);
         let listen = parse_listen(object, &at)?;
-        let listener = TcpListener::bind(listen)
-            .await
+        let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
         Ok(Self {
             listener,
@@ -168,8 +167,7 @@ impl Vless {
                     });
                 }
                 Err(err) => {
-                    logging::debug(format_args!("vless accept: {err}"));
-                    return;
+                    super::serve_stalled("vless accept", &err).await;
                 }
             }
         }
@@ -365,8 +363,7 @@ impl Trojan {
             }
         }
         let listen = parse_listen(object, &at)?;
-        let listener = TcpListener::bind(listen)
-            .await
+        let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
             .map_err(|e| anyhow::anyhow!("{at}: bind {}:{}: {e}", listen.0, listen.1))?;
         Ok(Self {
             listener,
@@ -413,8 +410,7 @@ impl Trojan {
                     });
                 }
                 Err(err) => {
-                    logging::debug(format_args!("trojan accept: {err}"));
-                    return;
+                    super::serve_stalled("trojan accept", &err).await;
                 }
             }
         }

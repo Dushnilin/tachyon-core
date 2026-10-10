@@ -129,8 +129,7 @@ impl Tproxy {
                         });
                     }
                     Err(err) => {
-                        logging::warn(format_args!("tproxy[{tcp_tag}] accept: {err}"));
-                        return;
+                        super::serve_stalled(&format!("tproxy[{tcp_tag}] accept"), &err).await;
                     }
                 }
             }
@@ -169,8 +168,7 @@ impl Tproxy {
                         continue;
                     }
                     Err(err) => {
-                        logging::warn(format_args!("tproxy[{tag}] udp recv: {err}"));
-                        return;
+                        super::serve_stalled(&format!("tproxy[{tag}] udp recv"), &err).await;
                     }
                     Ok((n, source, orig)) => {
                         let dest = orig.unwrap_or_else(|| {
@@ -183,7 +181,7 @@ impl Tproxy {
                             continue;
                         }
                         let hub = Arc::clone(&hub);
-                        let reply = Reply::Socket(Arc::clone(&sock));
+                        let reply = Reply::Socket(Arc::downgrade(&sock));
                         let tag = tag.clone();
                         let payload = buf[..n].to_vec();
                         tokio::spawn(async move {

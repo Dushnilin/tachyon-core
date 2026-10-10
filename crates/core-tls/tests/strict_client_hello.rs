@@ -261,10 +261,10 @@ fn every_table_satisfies_a_servers_parser() {
     ];
     let mut bad = Vec::new();
     for name in fingerprints::NAMES {
-        // `random` and `randomized` are policy names, not tables
-        if fingerprints::by_name(name).is_none() {
-            continue;
-        }
+        assert!(
+            fingerprints::by_name(name).is_some(),
+            "missing profile {name}"
+        );
         for (shape, alpn, sni) in shapes {
             let record = build_with(name, alpn, sni);
             if let Err(why) = unmarshal(&record[5..]) {

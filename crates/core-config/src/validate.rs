@@ -3252,7 +3252,11 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
             // or the XHTTP download/upload requests, then the protocol bytes
             continue;
         }
-        if field == "transport" && value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("tcp")) {
+        if field == "transport"
+            && value
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("tcp"))
+        {
             // mieru's own `transport` is a plain "TCP" string, not a v2ray object
             continue;
         }

@@ -31,7 +31,7 @@ impl Redirect {
             ));
         }
         let (ip, port) = parse_listen(obj, &at)?;
-        let listener = TcpListener::bind(SocketAddr::new(ip, port)).await?;
+        let listener = super::bind_tcp(SocketAddr::new(ip, port))?;
         logging::info(format_args!(
             "inbound redirect[{tag}] listening at {ip}:{port}"
         ));
@@ -74,8 +74,7 @@ impl Redirect {
                     });
                 }
                 Err(err) => {
-                    logging::warn(format_args!("redirect[{}] accept: {err}", self.tag));
-                    return;
+                    super::serve_stalled(&format!("redirect[{}] accept", self.tag), &err).await;
                 }
             }
         }

@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use portable_atomic::AtomicU64;
@@ -188,17 +188,28 @@ pub(crate) struct TunReply {
 /// the TUN interface.
 #[derive(Clone)]
 pub(crate) enum Reply {
-    Socket(Arc<UdpSocket>),
+    /// Weak on purpose: a session task that outlives its inbound must not be
+    /// what holds the listening socket open, or the next `bind` after a
+    /// reload gets `EADDRINUSE` (issue #5). The inbound owns the only strong
+    /// handle, so aborting `serve` closes the port.
+    Socket(Weak<UdpSocket>),
     Stream(Arc<tokio::sync::Mutex<AnyWrite>>),
     #[allow(dead_code)]
     Tun {
         sender: tokio::sync::mpsc::Sender<TunReply>,
     },
     Shadowsocks {
-        socket: Arc<UdpSocket>,
+        socket: Weak<UdpSocket>,
         method: crate::outbound::shadowsocks::crypto::Method,
         master_key: Arc<Vec<u8>>,
     },
+}
+
+/// A weak reply handle that is still backed by a socket.
+fn live(socket: &Weak<UdpSocket>) -> io::Result<Arc<UdpSocket>> {
+    socket
+        .upgrade()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "udp socket is gone"))
 }
 
 impl Reply {
@@ -209,7 +220,7 @@ impl Reply {
         remote: SocketAddr,
     ) -> std::io::Result<()> {
         match self {
-            Reply::Socket(socket) => socket.send_to(framed, source).await.map(|_| ()),
+            Reply::Socket(socket) => live(socket)?.send_to(framed, source).await.map(|_| ()),
             Reply::Stream(writer) => {
                 let mut writer = writer.lock().await;
                 writer.write_all(framed).await
@@ -227,6 +238,7 @@ impl Reply {
                 method,
                 master_key,
             } => {
+                let socket = live(socket)?;
                 use crate::outbound::shadowsocks::crypto::{Cipher, derive_subkey, random_bytes};
                 let mut salt = vec![0u8; method.salt_len()];
                 random_bytes(&mut salt)?;

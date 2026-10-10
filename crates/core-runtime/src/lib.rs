@@ -40,6 +40,62 @@ pub struct BoxInstance {
     cache_file: Option<Arc<std::sync::Mutex<cache_file::CacheFile>>>,
 }
 
+/// Everything `start()` has spawned so far, aborted together if it does not
+/// come up.
+///
+/// A `?` anywhere in `start()` used to strand whatever had already been
+/// spawned: listeners still bound, sockets still held, and no `BoxInstance`
+/// anywhere to shut them down. Holding them here makes a failed start leave
+/// nothing behind but the error, which is what lets a reload fall back to
+/// the configuration that was running.
+#[derive(Default)]
+struct TaskGuard(Vec<JoinHandle<()>>);
+
+impl TaskGuard {
+    fn push(&mut self, task: JoinHandle<()>) {
+        self.0.push(task);
+    }
+
+    fn extend(&mut self, tasks: impl IntoIterator<Item = JoinHandle<()>>) {
+        self.0.extend(tasks);
+    }
+
+    /// The box is up: its tasks belong to it now, and this guard must not
+    /// touch them when it drops.
+    fn keep(mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Spawn a listener and say so if it ever comes back on its own.
+///
+/// `serve` runs until the box shuts down. If it returns sooner, a port has
+/// gone quiet while the process still reports `running` — issue #5's exact
+/// symptom — and nothing else in the box would ever print a line about it.
+fn serve_forever(
+    kind: &str,
+    tag: &str,
+    serve: impl std::future::Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    let label = if tag.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}[{tag}]")
+    };
+    tokio::spawn(async move {
+        serve.await;
+        logging::error(format_args!("inbound {label}: listener stopped"));
+    })
+}
+
 /// Dialer options `check` accepts and the runtime does not read. The reference
 /// applies each of them to the outbound's own sockets; saying so once per
 /// entry beats leaving a mistyped `netns` looking like it worked.
@@ -122,6 +178,20 @@ impl BoxInstance {
             task.abort();
         }
     }
+
+    /// Abort them all, then wait for each to actually stop.
+    ///
+    /// The waiting is the point: an aborted task that has not run its `drop`
+    /// yet still holds its sockets, and the next `bind` gets `EADDRINUSE` —
+    /// the reload failure reported in issue #5. The fixed 50 ms sleep this
+    /// replaces was a guess at the same thing, and it was too short for a
+    /// tproxy UDP socket with a session still holding it.
+    pub async fn shutdown_wait(&mut self) {
+        self.shutdown();
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for BoxInstance {
@@ -131,7 +201,23 @@ impl Drop for BoxInstance {
 }
 
 /// Build and start the data plane from a parsed configuration document.
+///
+/// All or nothing: anything `start_inner` leaves spawned while a later step
+/// fails is aborted here, so a failed start holds no sockets and the caller
+/// is free to try another configuration.
 pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
+    let mut guard = TaskGuard::default();
+    let instance = start_inner(root, &mut guard).await;
+    match instance {
+        Ok(mut instance) => {
+            instance.tasks = guard.keep();
+            Ok(instance)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxInstance> {
     core_tls::install_default_provider();
     warn_unhonored_options(root);
     let log = root.get("log");
@@ -178,26 +264,26 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
         .start_remote(&router, cache_file.clone())
         .await?;
     router.start_endpoints().await?;
-    let dns_service = dns::DnsService::build(root).context("dns section")?;
+    let dns_service =
+        dns::DnsService::build_with_registry(root, router.rule_sets()).context("dns section")?;
     if let Some(service) = &dns_service {
         // `dns.server.detour` dials through the outbounds
         service.set_router(Arc::clone(&router));
     }
     dns::set_service(dns_service.clone());
 
-    let mut tasks = Vec::new();
-    tasks.extend(router.take_probe_tasks());
+    guard.extend(router.take_probe_tasks());
     #[allow(unused_mut)]
     let mut clash_api = None;
     #[cfg(feature = "clash-api")]
     if let Some(clash) = clash_api::ClashApi::build(root).context("experimental.clash_api")? {
         let (addr, handle) = clash.bind_and_spawn(Arc::clone(&router)).await?;
         logging::info(format_args!("clash-api: restful api listening at {addr}"));
-        tasks.push(handle);
+        guard.push(handle);
         clash_api = Some(addr);
     }
     if let Some(ntp) = ntp::NtpService::build(root)? {
-        tasks.push(ntp.spawn());
+        guard.push(ntp.spawn());
     }
     let mut inbounds = Vec::new();
     let empty = Vec::new();
@@ -227,7 +313,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: {ty}"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "direct" => {
                 let inbound = inbound::direct::Direct::bind(obj, Arc::clone(&router))
@@ -235,7 +321,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: direct"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "redirect" => {
                 let inbound = inbound::redirect::Redirect::bind(obj, Arc::clone(&router))
@@ -243,7 +329,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: redirect"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "tproxy" => {
                 let inbound = inbound::tproxy::Tproxy::bind(obj, Arc::clone(&router))
@@ -251,7 +337,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: tproxy"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "vless" => {
                 let inbound = inbound::proxy::Vless::bind(obj, Arc::clone(&router))
@@ -259,7 +345,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: vless"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "trojan" => {
                 let inbound = inbound::proxy::Trojan::bind(obj, Arc::clone(&router))
@@ -267,7 +353,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: trojan"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "vmess" => {
                 let inbound = inbound::vmess::Vmess::bind(obj, Arc::clone(&router))
@@ -275,7 +361,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: vmess"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "shadowsocks" => {
                 let inbound = inbound::shadowsocks::Shadowsocks::bind(obj, Arc::clone(&router))
@@ -283,7 +369,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: shadowsocks"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "tun" => {
                 let inbound = inbound::tun::Tun::bind(obj, Arc::clone(&router))
@@ -291,7 +377,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: tun"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "anytls" => {
                 let inbound = inbound::anytls::AnyTls::bind(obj, Arc::clone(&router))
@@ -299,7 +385,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: anytls"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "naive" => {
                 let inbound = inbound::naive::Naive::bind(obj, Arc::clone(&router))
@@ -307,7 +393,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: naive"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "shadowtls" => {
                 let inbound = inbound::shadowtls::ShadowTls::bind(obj, Arc::clone(&router))
@@ -315,7 +401,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: shadowtls"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "fptn" => {
                 let inbound = inbound::fptn::Fptn::bind(obj, Arc::clone(&router))
@@ -323,7 +409,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: fptn"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "hysteria2" => {
                 let inbound = inbound::hysteria2::Hysteria2::bind(obj, Arc::clone(&router))
@@ -331,7 +417,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: hysteria2"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             "tuic" => {
                 let inbound = inbound::tuic::Tuic::bind(obj, Arc::clone(&router))
@@ -339,14 +425,14 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
                     .with_context(|| format!("inbounds[{i}]: tuic"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
             other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
         }
     }
 
     Ok(BoxInstance {
-        tasks,
+        tasks: Vec::new(),
         inbounds,
         dns: dns_service,
         clash_api,
@@ -364,22 +450,30 @@ pub async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
 /// Run the box from raw JSON configuration string, and block until SIGINT/SIGTERM.
 pub async fn run_str(raw: &str) -> anyhow::Result<()> {
     let root: Value = serde_json::from_str(raw).with_context(|| "decode config".to_string())?;
-    let instance = start(&root).await?;
+    let mut instance = start(&root).await?;
     wait_for_signal().await;
     logging::info(format_args!("shutting down"));
-    instance.shutdown();
+    instance.shutdown_wait().await;
     Ok(())
 }
 
 /// Run the box with reload support: on SIGHUP, invoke `load()` and restart the box in-place.
+///
+/// The running box is only stopped once the new configuration has passed
+/// `check`, and it comes back if the new one will not start. Exiting with an
+/// error when both fail is deliberate: a box with no listeners must not sit
+/// there looking `running`.
 pub async fn run_reloadable<F>(mut load: F) -> anyhow::Result<()>
 where
     F: FnMut() -> Result<String, String> + Send + 'static,
 {
     let raw = load().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let root: Value = serde_json::from_str(&raw).with_context(|| "decode config".to_string())?;
-    #[allow(unused_mut)]
+    #[allow(unused_mut)] // only the SIGHUP path writes it back
+    let mut root: Value =
+        serde_json::from_str(&raw).with_context(|| "decode config".to_string())?;
     let mut instance = start(&root).await?;
+    #[allow(unused_mut)] // only the SIGHUP path can set it
+    let mut fatal: Option<anyhow::Error> = None;
 
     #[cfg(unix)]
     {
@@ -399,30 +493,9 @@ where
                 }
                 _ = sighup.recv() => {
                     logging::info(format_args!("received SIGHUP, reloading configuration"));
-                    match load() {
-                        Ok(new_raw) => {
-                            match serde_json::from_str::<Value>(&new_raw) {
-                                Ok(new_root) => {
-                                    instance.shutdown();
-                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                    match start(&new_root).await {
-                                        Ok(new_inst) => {
-                                            instance = new_inst;
-                                            logging::info(format_args!("configuration reloaded successfully"));
-                                        }
-                                        Err(err) => {
-                                            logging::error(format_args!("failed to start box after SIGHUP reload: {err:#}"));
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    logging::error(format_args!("failed to parse configuration after SIGHUP: {err:#}"));
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            logging::error(format_args!("failed to load configuration on SIGHUP: {err}"));
-                        }
+                    if let Some(err) = reload(&mut load, &mut root, &mut instance).await {
+                        fatal = Some(err);
+                        break;
                     }
                 }
             }
@@ -434,8 +507,79 @@ where
     }
 
     logging::info(format_args!("shutting down"));
-    instance.shutdown();
-    Ok(())
+    instance.shutdown_wait().await;
+    match fatal {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// One SIGHUP: load, `check`, stop the running box, start the new one — and
+/// put the old one back if the new one will not come up.
+///
+/// `Err` means the box is down and nothing is listening.
+#[cfg(unix)]
+async fn reload<F>(
+    load: &mut F,
+    root: &mut Value,
+    instance: &mut BoxInstance,
+) -> Option<anyhow::Error>
+where
+    F: FnMut() -> Result<String, String> + Send + 'static,
+{
+    let new_raw = match load() {
+        Ok(raw) => raw,
+        Err(err) => {
+            logging::error(format_args!(
+                "failed to load configuration on SIGHUP: {err}"
+            ));
+            return None;
+        }
+    };
+    // `check` before anything is stopped: a configuration the CLI itself
+    // rejects must not cost the box that is already serving.
+    if let Err(err) = core_config::check_str(&new_raw) {
+        logging::error(format_args!("reload rejected by check: {err}"));
+        return None;
+    }
+    let new_root: Value = match serde_json::from_str(&new_raw) {
+        Ok(value) => value,
+        Err(err) => {
+            logging::error(format_args!(
+                "failed to parse configuration after SIGHUP: {err}"
+            ));
+            return None;
+        }
+    };
+    // No fixed sleep here: this waits for every task to finish, so by the
+    // time it returns the ports are actually free to bind again.
+    instance.shutdown_wait().await;
+    match start(&new_root).await {
+        Ok(new_instance) => {
+            *instance = new_instance;
+            *root = new_root;
+            logging::info(format_args!("configuration reloaded successfully"));
+            None
+        }
+        Err(err) => {
+            logging::error(format_args!(
+                "failed to start box after SIGHUP reload: {err:#}"
+            ));
+            match start(root).await {
+                Ok(previous) => {
+                    *instance = previous;
+                    logging::error(format_args!(
+                        "rolled back to the configuration that was running; the new one was not applied"
+                    ));
+                    None
+                }
+                Err(err) => {
+                    logging::error(format_args!("rollback failed: {err:#}"));
+                    Some(err.context("reload left the box without listeners"))
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_signal() {

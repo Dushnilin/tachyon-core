@@ -67,14 +67,22 @@ impl Cache {
     /// The read that keeps a hot name alive: it bumps the entry to the front
     /// of the eviction order, so unknown names churning through the cache
     /// cannot push out a name that is being asked for.
-    pub fn get(&mut self, key: &CacheKey, now: Instant) -> Option<CacheHit> {
+    /// The read that keeps a hot name alive: it bumps the entry to the front
+    /// of the eviction order, so unknown names churning through the cache
+    /// cannot push out a name that is being asked for.
+    ///
+    /// The timestamp comes back with the hit: a caller that has to attribute
+    /// the answer to a point in time (reverse mapping) needs the insert, not
+    /// the hit, or repeated hits would keep pushing it forward.
+    pub fn get(&mut self, key: &CacheKey, now: Instant) -> Option<(CacheHit, Instant)> {
         let entry = self.entries.get(key)?;
+        let received = entry.inserted;
         let age = now.duration_since(entry.inserted);
         if age < entry.ttl {
-            return Some(CacheHit::Fresh(Arc::clone(&entry.raw)));
+            return Some((CacheHit::Fresh(Arc::clone(&entry.raw)), received));
         }
         if entry.optimistic_until.is_some_and(|until| now < until) {
-            return Some(CacheHit::Stale(Arc::clone(&entry.raw)));
+            return Some((CacheHit::Stale(Arc::clone(&entry.raw)), received));
         }
         None
     }
@@ -85,7 +93,7 @@ impl Cache {
         raw: impl Into<Arc<[u8]>>,
         meta: &ResponseMeta,
         optimistic_timeout: Option<Duration>,
-    ) {
+    ) -> Instant {
         let ttl_secs = meta.min_answer_ttl.unwrap_or(60).max(1);
         let inserted = Instant::now();
         let optimistic_until = optimistic_timeout.map(|window| inserted + window);
@@ -98,6 +106,7 @@ impl Cache {
                 optimistic_until,
             },
         );
+        inserted
     }
 }
 
@@ -132,7 +141,10 @@ mod tests {
         // timestamp a hair later, and the 61-second probe then lands just under
         // the 61 seconds it meant to be, which is a test that fails at random.
         let now = Instant::now();
-        assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(_))));
+        assert!(matches!(
+            cache.get(&key(), now),
+            Some((CacheHit::Fresh(_), _))
+        ));
         assert!(cache.get(&key(), now + Duration::from_secs(61)).is_none());
     }
 
@@ -146,10 +158,13 @@ mod tests {
             Some(Duration::from_secs(300)),
         );
         let now = Instant::now();
-        assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(_))));
+        assert!(matches!(
+            cache.get(&key(), now),
+            Some((CacheHit::Fresh(_), _))
+        ));
         assert!(matches!(
             cache.get(&key(), now + Duration::from_secs(2)),
-            Some(CacheHit::Stale(_))
+            Some((CacheHit::Stale(_), _))
         ));
         assert!(cache.get(&key(), now + Duration::from_secs(400)).is_none());
     }
@@ -191,7 +206,7 @@ mod tests {
         // touch the oldest insert
         assert!(matches!(
             cache.get(&probe("h0.test"), Instant::now()),
-            Some(CacheHit::Fresh(_))
+            Some((CacheHit::Fresh(_), _))
         ));
         let mut newest = key();
         newest.name = "h16.test".into();

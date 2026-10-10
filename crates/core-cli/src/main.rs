@@ -52,8 +52,6 @@ mod rule_set;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-
-
 fn version_line() -> String {
     format!("tachyon-core {}\n", env!("CARGO_PKG_VERSION"))
 }
@@ -179,11 +177,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let raw = load_config(&args_owned).map_err(|e| format!("run: {e}"))?;
     #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
     allocstat::start();
-    if let Ok(warnings) = core_config::check_str_warnings(&raw) {
-        // the reference logs ResolveLX deprecations when the box starts
-        for warning in warnings {
-            eprintln!("WARN[0000] {warning}");
-        }
+    // The reference validates the same document `check` does before it opens
+    // anything, so a config `check` rejects must not reach `start()` either;
+    // ResolveLX deprecations are warnings and are logged when the box starts.
+    let warnings = core_config::check_str_warnings(&raw).map_err(|e| format!("run: {e}"))?;
+    for warning in warnings {
+        eprintln!("WARN[0000] {warning}");
     }
     // Sized to the cores we are actually allowed to run on. Left to itself tokio
     // reads `sched_getaffinity` at startup, which happens to be right on a router

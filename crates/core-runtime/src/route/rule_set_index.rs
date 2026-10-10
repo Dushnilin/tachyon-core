@@ -266,6 +266,10 @@ enum FallbackRule {
     /// over the same acceptance rules. Boxed because the pools make it far
     /// larger than the `Logical` arm, and a fallback rule is built once.
     Plain(Box<PlainRule>),
+    /// A `rules` entry that is not an object. `match_rule` refuses one before
+    /// it looks at invert, so this arm answers false for the same reason --
+    /// unlike an empty `PlainRule`, which is an empty object and answers true.
+    Never,
 }
 
 impl FallbackRule {
@@ -278,10 +282,7 @@ impl FallbackRule {
                     subs.iter()
                         .map(|sub| match sub.as_object() {
                             Some(object) => FallbackRule::compile(object),
-                            // the interpreter refuses a non-object before it
-                            // looks at invert, and an empty plain rule answers
-                            // exactly that false
-                            None => FallbackRule::Plain(Box::default()),
+                            None => FallbackRule::Never,
                         })
                         .collect()
                 })
@@ -310,6 +311,7 @@ impl FallbackRule {
                 };
                 matched != *inverted
             }
+            FallbackRule::Never => false,
         }
     }
 }
@@ -414,20 +416,27 @@ impl PlainRule {
         // Destination criteria (domain or IP)
         if self.has_domains || self.has_dest_ip {
             let mut dest_matched = false;
-            if let Some(host) = domain_host(ctx) {
-                if self.has_domains {
-                    dest_matched = self.domains.contains(host.as_ref())
-                        || self.suffixes.iter().any(|entry| domain_suffix_match(&host, entry))
-                        || self.keywords.iter().any(|entry| host.contains(entry.as_ref()));
-                }
+            if let Some(host) = domain_host(ctx)
+                && self.has_domains
+            {
+                dest_matched = self.domains.contains(host.as_ref())
+                    || self
+                        .suffixes
+                        .iter()
+                        .any(|entry| domain_suffix_match(&host, entry))
+                    || self
+                        .keywords
+                        .iter()
+                        .any(|entry| host.contains(entry.as_ref()));
             }
-            if !dest_matched && self.has_dest_ip {
-                if let Target::Ip(addr) = &ctx.destination {
-                    dest_matched = match addr.ip() {
-                        IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
-                        IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
-                    };
-                }
+            if !dest_matched
+                && self.has_dest_ip
+                && let Target::Ip(addr) = &ctx.destination
+            {
+                dest_matched = match addr.ip() {
+                    IpAddr::V4(v4) => self.dest_v4.contains(v4.into()),
+                    IpAddr::V6(v6) => self.dest_v6.contains(v6.into()),
+                };
             }
             if !dest_matched {
                 return self.inverted;
@@ -466,14 +475,33 @@ impl PlainRule {
         }
 
         // Network criteria
-        if self.has_network {
-            if !self.networks.iter().any(|known| **known == *ctx.network) {
-                return self.inverted;
-            }
+        if self.has_network && !self.networks.iter().any(|known| **known == *ctx.network) {
+            return self.inverted;
         }
 
         !self.inverted
     }
+}
+
+/// The pools answer a set with one `any` over everything they hold, so a rule
+/// may only join them when it *is* that single term: exactly one constraint
+/// group, and no `invert` wrapped around it. `{domain, network}` means both
+/// and only both, and that conjunction survives nowhere but the fallback
+/// tree. A rule with no constraint at all is not a rule the pools can
+/// express -- it matches everything, and only the plain fallback says so.
+fn poolable(object: &serde_json::Map<String, Value>) -> bool {
+    const GROUPS: [&[&str]; 5] = [
+        &["domain", "domain_suffix", "domain_keyword", "ip_cidr"],
+        &["source_ip_cidr"],
+        &["port", "port_range"],
+        &["source_port", "source_port_range"],
+        &["network"],
+    ];
+    GROUPS
+        .iter()
+        .filter(|group| group.iter().any(|key| object.contains_key(*key)))
+        .count()
+        == 1
 }
 
 impl RuleSetIndex {
@@ -495,13 +523,7 @@ impl RuleSetIndex {
             };
             let inverted = object.get("invert") == Some(&Value::Bool(true));
             let logical = object.get("type").and_then(Value::as_str) == Some("logical");
-            let has_non_dest = object.contains_key("network")
-                || object.contains_key("port")
-                || object.contains_key("port_range")
-                || object.contains_key("source_port")
-                || object.contains_key("source_port_range")
-                || object.contains_key("source_ip_cidr");
-            if inverted || logical || has_non_dest {
+            if inverted || logical || !poolable(object) {
                 fallbacks.rules.push(FallbackRule::compile(object));
                 continue;
             }
@@ -605,7 +627,27 @@ impl RuleSetIndex {
                 return true;
             }
         }
-        false
+        // The other pools only ever take rules with no destination criteria of
+        // their own -- `poolable` decides that -- so each of them stands alone
+        // here, which is exactly the `any` the rule set already was.
+        let port = ctx.destination.port();
+        if self.dest_ports.binary_search(&port).is_ok() || self.dest_port_ranges.contains(port) {
+            return true;
+        }
+        let source = ctx.source.ip();
+        if match source {
+            IpAddr::V4(v4) => self.source_v4.contains(v4.into()),
+            IpAddr::V6(v6) => self.source_v6.contains(v6.into()),
+        } {
+            return true;
+        }
+        let source_port = ctx.source.port();
+        if self.source_ports.binary_search(&source_port).is_ok()
+            || self.source_port_ranges.contains(source_port)
+        {
+            return true;
+        }
+        self.networks.iter().any(|known| **known == *ctx.network)
     }
 
     /// `domain_suffix`: the host equals the suffix, or ends with `.` plus it.

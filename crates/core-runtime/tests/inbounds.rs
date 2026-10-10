@@ -668,3 +668,39 @@ async fn direct_inbound_udp_hijack_dns() {
     );
     instance.shutdown();
 }
+
+/// Issue #5: every listener lives in the instance's task guard, so shutdown
+/// really reaps them and the same port binds again. Before that the accept
+/// tasks were spawned untracked, `shutdown` freed nothing, and the next
+/// `start` came back with `Address in use`.
+#[tokio::test]
+async fn shutdown_frees_the_listeners_for_the_next_start() {
+    let _g = test_guard().await;
+
+    let probe = TcpListener::bind("127.0.0.1:0").await.expect("probe");
+    let port = probe.local_addr().expect("probe addr").port();
+    drop(probe);
+
+    let cfg = base_cfg(
+        json!([{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": port
+        }]),
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    );
+
+    let mut first = start_box(cfg.clone()).await;
+    assert_eq!(inbound_addr(&first, "mixed-in").port(), port);
+    first.shutdown_wait().await;
+
+    let mut second = start_box(cfg).await;
+    assert_eq!(
+        inbound_addr(&second, "mixed-in").port(),
+        port,
+        "the port must be free for the second start"
+    );
+    second.shutdown_wait().await;
+}

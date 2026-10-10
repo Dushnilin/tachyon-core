@@ -69,7 +69,7 @@ impl Mixed {
         let ip: IpAddr = host
             .parse()
             .map_err(|_| anyhow::anyhow!("{at}: invalid listen address {host:?}"))?;
-        let listener = TcpListener::bind(SocketAddr::new(ip, port)).await?;
+        let listener = super::bind_tcp(SocketAddr::new(ip, port))?;
         let users = obj
             .get("users")
             .and_then(Value::as_array)
@@ -129,8 +129,7 @@ impl Mixed {
                     });
                 }
                 Err(err) => {
-                    logging::warn(format_args!("mixed[{}] accept: {err}", self.tag));
-                    return;
+                    super::serve_stalled(&format!("mixed[{}] accept", self.tag), &err).await;
                 }
             }
         }
@@ -480,7 +479,7 @@ async fn socks_udp_associate(
                             }
                             if let Err(err) = hub
                                 .handle(
-                                    Reply::Socket(Arc::clone(&relay)),
+                                    Reply::Socket(Arc::downgrade(&relay)),
                                     source,
                                     dest,
                                     &buf[offset..n],

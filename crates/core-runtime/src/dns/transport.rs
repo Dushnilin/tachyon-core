@@ -892,7 +892,7 @@ async fn exchange_doh_h2(
         .await
         .map_err(|e| io::Error::other(format!("dns: DoH h2 ready: {e}")))?;
 
-    let request = doh_request(cfg, &authority)?;
+    let request = doh_request(cfg, &authority, query.len())?;
     let (response, send) = send_request
         .send_request(request, false)
         .map_err(|e| io::Error::other(format!("dns: DoH send: {e}")))?;
@@ -1078,7 +1078,7 @@ async fn exchange_h3(
     });
 
     let authority = doh_authority(cfg);
-    let request = doh_request(cfg, &authority)?;
+    let request = doh_request(cfg, &authority, query.len())?;
     let mut stream = send_request
         .send_request(request)
         .await
@@ -1151,7 +1151,13 @@ async fn quic_endpoint(
 
 /// The DoH request head: `dns.headers` are cloned onto the request the way
 /// the reference does it, with Content-Type and Accept overwritten after.
-fn doh_request(cfg: &ServerConfig, authority: &str) -> io::Result<http::Request<()>> {
+/// `content-length` is optional in h2/h3, but cloudflare-dns.com answers 400
+/// to a POST without it while google and quad9 do not care.
+fn doh_request(
+    cfg: &ServerConfig,
+    authority: &str,
+    body_len: usize,
+) -> io::Result<http::Request<()>> {
     let mut request = http::Request::builder()
         .method("POST")
         .uri(format!("https://{authority}{}", cfg.path));
@@ -1164,6 +1170,7 @@ fn doh_request(cfg: &ServerConfig, authority: &str) -> io::Result<http::Request<
     request
         .header("content-type", "application/dns-message")
         .header("accept", "application/dns-message")
+        .header("content-length", body_len.to_string())
         .body(())
         .map_err(|e| io::Error::other(format!("dns: DoH request: {e}")))
 }
@@ -1246,5 +1253,92 @@ mod tests {
         // next allocation wraps back to base+2 but domain map keeps stability
         let b = store.create("two", false).unwrap();
         assert_eq!(b.to_string(), "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn doh_h2_sends_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.expect("server handshake");
+            let mut seen = None;
+            let mut readers = Vec::new();
+            while let Some(res) = std::future::poll_fn(|cx| conn.poll_accept(cx)).await {
+                let Ok((req, mut respond)) = res else { break };
+                seen = Some((req.uri().path().to_string(), req.headers().clone()));
+                readers.push(tokio::spawn(async move {
+                    let mut body = Vec::new();
+                    let mut stream = req.into_body();
+                    while let Some(Ok(chunk)) = stream.data().await {
+                        let _ = stream.flow_control().release_capacity(chunk.len());
+                        body.extend_from_slice(&chunk);
+                    }
+                    let resp = http::Response::builder().status(200).body(()).unwrap();
+                    if let Ok(mut send) = respond.send_response(resp, false) {
+                        let _ = send.send_data(vec![0x01u8; 8].into(), true);
+                    }
+                    body
+                }));
+            }
+            let mut bodies = Vec::new();
+            for reader in readers {
+                if let Ok(body) = reader.await {
+                    bodies.push(body);
+                }
+            }
+            (seen, bodies)
+        });
+
+        let cfg = ServerConfig::build(
+            &serde_json::json!({
+                "type": "https",
+                "tag": "d",
+                "server": "127.0.0.1",
+                "server_port": 443,
+                "path": "/dns-query",
+                "tls": {"enabled": true, "server_name": "example.test"}
+            }),
+            "dns.servers[0]",
+        )
+        .expect("server cfg");
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let stream: AnyStream = Box::new(tcp);
+        let query = crate::dns::codec::build_query(
+            0x1111,
+            "www.google.com",
+            hickory_proto::rr::RecordType::A,
+        )
+        .expect("query");
+        let wire = wire_query(&query);
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            exchange_doh_h2(&cfg, stream, &wire),
+        )
+        .await
+        .expect("doh exchange timed out")
+        .expect("doh exchange");
+        assert!(!answer.is_empty());
+
+        let (seen, bodies) = server.await.expect("server task");
+        let (path, headers) = seen.expect("one request");
+        assert_eq!(path, "/dns-query");
+        assert_eq!(
+            headers.get("content-type").map(|v| v.to_str().unwrap()),
+            Some("application/dns-message")
+        );
+        assert_eq!(
+            headers.get("accept").map(|v| v.to_str().unwrap()),
+            Some("application/dns-message")
+        );
+        assert_eq!(bodies.len(), 1);
+        let declared: usize = headers
+            .get("content-length")
+            .expect("content-length")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(declared, bodies[0].len());
     }
 }

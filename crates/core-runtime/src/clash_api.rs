@@ -155,9 +155,14 @@ impl ClashApi {
     ) -> anyhow::Result<(SocketAddr, JoinHandle<()>)> {
         // reference order: the dashboard is in place before the listener opens
         self.ensure_external_ui(&router).await;
-        let listener = TcpListener::bind(normalize_bind(&self.bind))
+        let bind = normalize_bind(&self.bind);
+        let addr = tokio::net::lookup_host(&bind)
             .await
-            .with_context(|| "external controller listen error")?;
+            .with_context(|| "external controller listen error")?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("external controller: {bind} resolves to nothing"))?;
+        let listener =
+            crate::inbound::bind_tcp(addr).with_context(|| "external controller listen error")?;
         let addr = listener.local_addr()?;
         let handle = tokio::spawn(serve(listener, Arc::new(self), router));
         Ok((addr, handle))

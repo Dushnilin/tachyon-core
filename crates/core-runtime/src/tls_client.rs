@@ -829,6 +829,20 @@ mod tests {
         assert!(tls.reality().is_none());
     }
 
+    #[test]
+    fn random_fingerprints_survive_runtime_construction() {
+        for name in ["random", "randomized"] {
+            let tls = options(json!({
+                "server": "example.com",
+                "tls": {"enabled": true, "utls": {"enabled": true, "fingerprint": name}}
+            }))
+            .expect("a validator-accepted fingerprint must also start")
+            .expect("TLS present");
+            assert_eq!(tls.fingerprint().unwrap().name, name);
+            assert!(tls.own_stack());
+        }
+    }
+
     /// An empty fingerprint is chrome, the way the reference reads it, and a
     /// name it does not know is refused rather than quietly downgraded: the
     /// whole point of asking for a browser is getting that browser.

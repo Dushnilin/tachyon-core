@@ -186,7 +186,8 @@ pub const MODERN_CAPTURED_FROM: &str = "1.14.2-x-1.0.3";
 
 /// Every fingerprint name the reference accepts, and the table behind it. The
 /// six `chrome_*` names all resolve to the same `HelloChrome_Auto` in the
-/// reference (common/tls/utls_client.go). Random profiles are outside this update.
+/// reference (common/tls/utls_client.go). Random policies are resolved once per
+/// process by `random_fingerprints`, separately from the captured tables.
 pub fn by_name(name: &str) -> Option<Template> {
     Some(match name {
         "" | "chrome" | "chrome_psk" | "chrome_psk_shuffle"
@@ -198,6 +199,8 @@ pub fn by_name(name: &str) -> Option<Template> {
         "qq" => qq(),
         "ios" => ios(),
         "android" => android(),
+        "random" => super::random_fingerprints::random(),
+        "randomized" => super::random_fingerprints::randomized(),
         _ => return None,
     })
 }

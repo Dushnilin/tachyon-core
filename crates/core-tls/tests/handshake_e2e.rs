@@ -255,6 +255,24 @@ async fn the_handshake_completes_against_a_rustls_server() {
     );
 }
 
+#[tokio::test]
+async fn random_policies_complete_tls_and_negotiate_h2() {
+    let (certs, _) = fixture();
+    let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).unwrap();
+    for name in ["random", "randomized"] {
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shake(&verifier, name, "localhost"),
+        )
+        .await
+        .expect("bounded handshake")
+        .expect("random profile handshake");
+        assert_eq!(done.leaf.as_ref(), Some(&certs[0]));
+        assert_eq!(done.client_alpn, Some(b"h2".to_vec()));
+        assert_eq!(done.server_alpn, Some(b"h2".to_vec()));
+    }
+}
+
 /// A verifier that trusts nobody must stop the handshake. The Finished check on
 /// its own would pass here: it only proves the peer holds the same keys, not
 /// that anybody vouched for them.
@@ -454,12 +472,18 @@ async fn application_data_flows_after_the_handshake() {
 /// arithmetic by one byte, the seal would not open.
 #[tokio::test]
 async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
+    reality_session_id_opens("chrome").await;
+    reality_session_id_opens("randomized").await;
+    reality_session_id_opens("random").await;
+}
+
+async fn reality_session_id_opens(fingerprint: &str) {
     use core_tls::keyshare::X25519MLKEM768;
     use core_tls::reality;
 
     let (certs, _) = fixture();
     let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
-    let template = fingerprints::by_name("chrome").expect("a chrome table");
+    let template = fingerprints::by_name(fingerprint).expect("a profile");
     let server_secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
     let server_public: [u8; 32] = *x25519_dalek::PublicKey::from(&server_secret).as_bytes();
     let short_id = b"\x12\x34\xab\xcd";
@@ -522,12 +546,8 @@ async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
             core_tls::hello::Ext::KeyShare(body) => Some(body.clone()),
             _ => None,
         })
-        .expect("the chrome key share");
+        .expect("the profile key share");
     let shares = core_tls::keyshare::entries(&key_share).expect("the share list");
-    let (_, hybrid) = shares
-        .iter()
-        .find(|(group, _)| *group == X25519MLKEM768)
-        .expect("the hybrid share");
     // the server scans the shares and takes the first plain X25519, not the
     // hybrid's half, so that is the key the exchange has to be run with
     let offered: [u8; 32] = shares
@@ -537,7 +557,13 @@ async fn a_reality_session_id_opens_under_the_servers_own_arithmetic() {
         .1
         .try_into()
         .expect("32 bytes");
-    assert_ne!(&hybrid[1184..], &offered[..], "a browser offers two keys");
+    if fingerprint != "random" {
+        let (_, hybrid) = shares
+            .iter()
+            .find(|(group, _)| *group == X25519MLKEM768)
+            .expect("the hybrid share");
+        assert_ne!(&hybrid[1184..], &offered[..], "two independent keys");
+    }
 
     // the server's half of the exchange, computed here
     let shared = server_secret.diffie_hellman(&offered.into());

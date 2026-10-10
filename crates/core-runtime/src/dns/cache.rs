@@ -108,6 +108,25 @@ impl Cache {
         );
         inserted
     }
+
+    /// Copy non-expired (or optimistically servable) entries into `target`.
+    pub fn copy_valid_into(&self, target: &mut Cache, now: Instant) {
+        for (k, v) in self.entries.iter() {
+            let is_fresh = now.duration_since(v.inserted) < v.ttl;
+            let is_optimistic = v.optimistic_until.is_some_and(|until| now < until);
+            if is_fresh || is_optimistic {
+                target.entries.put(
+                    k.clone(),
+                    CacheEntry {
+                        raw: Arc::clone(&v.raw),
+                        inserted: v.inserted,
+                        ttl: v.ttl,
+                        optimistic_until: v.optimistic_until,
+                    },
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

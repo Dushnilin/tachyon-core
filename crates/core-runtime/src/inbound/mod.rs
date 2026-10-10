@@ -437,7 +437,8 @@ pub fn clash_meta(
     // reference chain display for group proxies)
     for _ in 0..8 {
         let Some(current) = index else { break };
-        let Some((_, tag, outbound)) = router.outbound_table().find(|(i, _, _)| *i == current)
+        let inner = router.inner();
+        let Some((_, tag, outbound)) = inner.outbound_table().find(|(i, _, _)| *i == current)
         else {
             break;
         };

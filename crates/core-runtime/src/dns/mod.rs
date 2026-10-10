@@ -288,6 +288,39 @@ impl DnsService {
         })))
     }
 
+    /// Migrate active cache, server addresses, reverse mappings, and fakeip pools from an earlier DNS service.
+    pub fn migrate_from(&self, old: &DnsService) {
+        let now = Instant::now();
+        if let (Ok(old_cache), Ok(mut new_cache)) = (old.cache.read(), self.cache.write()) {
+            old_cache.copy_valid_into(&mut new_cache, now);
+        }
+        if let (Ok(old_addrs), Ok(mut new_addrs)) =
+            (old.server_addrs.lock(), self.server_addrs.lock())
+        {
+            for (k, (addr, valid_until)) in old_addrs.iter() {
+                if now < *valid_until {
+                    new_addrs.insert(k.clone(), (*addr, *valid_until));
+                }
+            }
+        }
+        if let (Some(old_rev_lock), Some(new_rev_lock)) = (&old.reverse, &self.reverse)
+            && let (Ok(old_rev), Ok(mut new_rev)) = (old_rev_lock.read(), new_rev_lock.write())
+        {
+            for (ip, entry) in old_rev.iter() {
+                if entry.expires > now {
+                    new_rev.insert(*ip, entry.clone());
+                }
+            }
+        }
+        for (tag, new_server) in &self.servers {
+            if let Some(old_server) = old.servers.get(tag)
+                && let (Some(new_store), Some(old_store)) = (&new_server.store, &old_server.store)
+            {
+                new_store.migrate_from(old_store);
+            }
+        }
+    }
+
     pub fn strategy(&self) -> Strategy {
         self.strategy
     }
@@ -950,16 +983,16 @@ impl DnsService {
                         return Ok(addr);
                     }
                     Ok(_) => {
-                        crate::logging::warn(format_args!(
-                            "dns: domain_resolver {:?} returned no address for {:?}, falling back to system resolution",
+                        return Err(std::io::Error::other(format!(
+                            "dns: domain_resolver {:?} returned no address for {:?}",
                             resolver_tag, cfg.server
-                        ));
+                        )));
                     }
                     Err(e) => {
-                        crate::logging::warn(format_args!(
-                            "dns: domain_resolver {:?} failed for {:?}: {e}, falling back to system resolution",
+                        return Err(std::io::Error::other(format!(
+                            "dns: domain_resolver {:?} failed for {:?}: {e}",
                             resolver_tag, cfg.server
-                        ));
+                        )));
                     }
                 }
             }

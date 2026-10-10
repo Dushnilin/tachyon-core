@@ -34,6 +34,8 @@ const RESOLVE_TIMEOUT_GUARD: Duration = Duration::from_secs(10);
 /// The reference's `mdnsTimeout`: an mDNS answer is either already on the LAN
 /// or it is not coming.
 const MDNS_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a `domain_resolver` answer for a transport's own address is reused.
+const SERVER_ADDR_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -79,6 +81,12 @@ pub struct DnsService {
     /// are purged on the next insert (the key itself owns an `Arc<str>`).
     inflight: std::sync::Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>,
     refreshing: std::sync::Mutex<HashSet<CacheKey>>,
+    /// Resolved transport addresses (domain_resolver result) for a short while,
+    /// and a lock so a burst of dials resolves a server once, not once each:
+    /// dozens of identical bootstrap queries at the same instant get dropped
+    /// upstream and every one of them sat out the full timeout.
+    server_addrs: std::sync::Mutex<HashMap<(String, String), (SocketAddr, Instant)>>,
+    server_addr_lock: tokio::sync::Mutex<()>,
     /// Installed after the router exists, so `detour` can dial through it.
     router: RwLock<Option<Arc<crate::route::Router>>>,
     /// `dns.reverse_mapping`: ip → domain learned from A/AAAA answers, present
@@ -272,6 +280,8 @@ impl DnsService {
             cache: RwLock::new(Cache::new(cache_capacity)),
             inflight: std::sync::Mutex::new(HashMap::new()),
             refreshing: std::sync::Mutex::new(HashSet::new()),
+            server_addrs: std::sync::Mutex::new(HashMap::new()),
+            server_addr_lock: tokio::sync::Mutex::new(()),
             router: RwLock::new(None),
             reverse: reverse_mapping.then(|| RwLock::new(HashMap::new())),
             client_subnet,
@@ -908,15 +918,46 @@ impl DnsService {
                         "dns: domain_resolver must not be a fakeip server",
                     ));
                 }
+                let cache_key = (resolver_tag.clone(), cfg.server.clone());
+                let cached = |this: &Self| {
+                    this.server_addrs
+                        .lock()
+                        .ok()
+                        .and_then(|map| map.get(&cache_key).copied())
+                        .filter(|(_, at)| at.elapsed() < SERVER_ADDR_TTL)
+                        .map(|(addr, _)| SocketAddr::new(addr.ip(), cfg.port))
+                };
+                if let Some(addr) = cached(self) {
+                    return Ok(addr);
+                }
+                // only the outermost lookup takes the lock: a chained resolver
+                // resolving its own address would otherwise wait on itself
+                let _once = match depth {
+                    0 => Some(self.server_addr_lock.lock().await),
+                    _ => None,
+                };
+                if let Some(addr) = cached(self) {
+                    return Ok(addr);
+                }
                 match self.lookup_via(resolver, &cfg.server, depth + 1).await {
                     Ok(addrs) if !addrs.is_empty() => {
                         let ip = pick_address(addrs, self.strategy)
                             .ok_or_else(|| std::io::Error::other("dns: no addresses resolved"))?;
-                        return Ok(SocketAddr::new(ip, cfg.port));
+                        let addr = SocketAddr::new(ip, cfg.port);
+                        if let Ok(mut map) = self.server_addrs.lock() {
+                            map.insert(cache_key.clone(), (addr, Instant::now()));
+                        }
+                        return Ok(addr);
                     }
-                    Ok(_) | Err(_) => {
+                    Ok(_) => {
                         crate::logging::warn(format_args!(
-                            "dns: domain_resolver {:?} failed for {:?}, falling back to system resolution",
+                            "dns: domain_resolver {:?} returned no address for {:?}, falling back to system resolution",
+                            resolver_tag, cfg.server
+                        ));
+                    }
+                    Err(e) => {
+                        crate::logging::warn(format_args!(
+                            "dns: domain_resolver {:?} failed for {:?}: {e}, falling back to system resolution",
                             resolver_tag, cfg.server
                         ));
                     }
@@ -1006,13 +1047,26 @@ impl DnsService {
         depth: u8,
     ) -> std::io::Result<Vec<IpAddr>> {
         let mut out = Vec::new();
+        let mut last_err = None;
         for qtype in self.strategy.query_types() {
-            let query = codec::build_query(rand_id(), host, *qtype)?;
-            let addr = self.resolve_server_addr(resolver, depth).await?;
-            let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
-            out.extend(codec::answer_ips(&raw)?);
+            // One failing record type (a v6 query on a v4-only uplink, say) must
+            // not sink the other: the server is reachable if any family resolves.
+            let one = async {
+                let query = codec::build_query(rand_id(), host, *qtype)?;
+                let addr = self.resolve_server_addr(resolver, depth).await?;
+                let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
+                codec::answer_ips(&raw)
+            }
+            .await;
+            match one {
+                Ok(ips) => out.extend(ips),
+                Err(e) => last_err = Some(e),
+            }
         }
-        Ok(out)
+        match (out.is_empty(), last_err) {
+            (true, Some(e)) => Err(e),
+            _ => Ok(out),
+        }
     }
 
     /// `resolve` rule action with an explicit server tag: lookup bypasses the

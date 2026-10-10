@@ -9,6 +9,7 @@ pub(crate) use core_tls::fastgcm;
 pub mod http_client;
 pub mod inbound;
 pub mod logging;
+pub mod mieru;
 #[cfg(target_os = "linux")]
 pub mod netns;
 pub mod ntp;
@@ -418,6 +419,14 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
                 let inbound = inbound::tun::Tun::bind(obj, Arc::clone(&router))
                     .await
                     .with_context(|| format!("inbounds[{i}]: tun"))?;
+                let addr = inbound.local_addr()?;
+                inbounds.push((tag.clone(), addr));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
+            }
+            "mieru" => {
+                let inbound = inbound::mieru::Mieru::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: mieru"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
                 guard.push(serve_forever(ty, &tag, inbound.serve()));

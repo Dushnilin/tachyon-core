@@ -2,13 +2,6 @@ name: Build All Platforms
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.*"
-      - ".cargo/**"
-      - ".github/workflows/build-all.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

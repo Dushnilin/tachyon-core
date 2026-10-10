@@ -5,25 +5,24 @@ All notable changes to tachyon-core. The version is the workspace version in
 
 ## 0.0.6
 
-### SIGHUP: перезагрузка на лету без разрыва сессий и N/A
-- Конфигурация теперь перезагружается in-place, если инбаунды не менялись (то есть почти всегда): слушатели и сокеты не трогаются, живые TCP-сессии продолжают идти без разрывов.
-- История пингов (`delay_history`), выбранные узлы в селекторах и задержки в группах `urltest` переезжают по тегам. Сервера больше не сбрасываются в `N/A` в веб-интерфейсе и Clash API при автообновлении списков.
-- Кэш DNS, отрезолвленные адреса апстримов и пулы `FakeIP` мигрируют в новый инстанс без сброса.
-- Если в новом конфиге ошибка (битый DNS или несуществующий аутбаунд), ядро не падает и не ломает текущую работу, а остаётся на прежней конфигурации.
+Point release delivering zero-downtime atomic in-place configuration reload via SIGHUP, DNS query loop prevention with UDP retransmission, process-stable randomized TLS fingerprints, and Trojan server address type framing fixes.
 
-### DNS: петля с системным резолвером
-- Убран фолбэк на `lookup_host` при сбое `domain_resolver`: раньше при недоступности апстрима запрос уходил в систему (в dnsmasq), а тот слал его обратно в sing-box. Запросы зацикливались на 53 порту и вешали DNS на роутере.
-- Добавлен повтор UDP-запросов (1.5 с) при потере пакетов на нестабильных PPPoE-линках.
+### Fixes & Improvements
 
-### uTLS: стабильные случайные фингерпринты (спасибо @Screamshow, PR #11)
-- Профили `random` и `randomized` теперь работают в рантайме (в том числе под REALITY). Раньше валидатор их пропускал, но ядро падало при запуске из-за неизвестного браузера.
-- Профиль выбирается один раз на процесс и остаётся стабильным между соединениями, а при `randomized` наборы шифров перетасовываются без поломки согласования `h2`.
-
-### Trojan: домены и IPv6 на сервере (спасибо @MaksSt, PR #10)
-- Преобразование SOCKS ATYP вынесено на границу Trojan, формат VLESS/VMess не ломается.
-- Данные к доменным и IPv6-целям теперь нормально ходят через TLS в trojan-сервере, закрыто тестами.
-
-Новых зависимостей нет, размер бинарников в пределах бюджета.
+- **Zero-Downtime Atomic In-Place SIGHUP Reload**:
+  - Implemented true in-place configuration swapping when inbound listeners remain unchanged, keeping existing listener sockets open and active TCP connections uninterrupted.
+  - Preserved outbound latency measurements (`delay_history`), selector selections, and `urltest` group latencies across reloads by tag mapping, permanently eliminating `N/A` latency resets in Clash API and dashboard clients.
+  - Migrated active DNS cache entries, resolved server bootstrap IP addresses, reverse DNS records, and FakeIP LRU address-to-domain mapping pools across reloads without state flushing.
+  - Added atomic rollback: invalid configurations, syntax errors, or unresolvable server references fail gracefully with running listeners and routes completely untouched.
+- **DNS Resolver Hardening & Retransmission**:
+  - Eliminated fallback to system resolver (`lookup_host`) when a configured `domain_resolver` fails or returns no records, preventing recursive forwarding amplification loops between `dnsmasq` and `sing-box` on port 53.
+  - Added UDP query retransmission loop (1.5s interval bounded by query timeout) to gracefully recover from dropped DNS packets on lossy PPPoE links.
+- **Process-Stable Random & Randomized uTLS Fingerprints**:
+  - Enabled runtime construction and execution for `tls.utls.fingerprint: "random"` and `"randomized"`, including under REALITY outbounds (PR #11 by @Screamshow).
+  - Selected profile remains stable per-process across outbounds, reloads, and handshakes, with cipher suite and extension shuffling preserving HTTP/2 ALPN and hybrid group pairs.
+- **Trojan Inbound Server Address Types & IPv6 Support**:
+  - Isolated SOCKS ATYP translation strictly to the Trojan protocol boundary, preserving standard binary framing for VLESS and VMess transports (PR #10 by @MaksSt).
+  - Fixed TLS streaming to domain and IPv6 target destinations on the Trojan server inbound, backed by wire regression test suites.
 
 ## 0.0.5
 

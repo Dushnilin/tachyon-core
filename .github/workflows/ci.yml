@@ -92,8 +92,20 @@ jobs:
           # tier-3, no prebuilt std: the standard library is built from source
           - target: mipsel-unknown-linux-musl
             build-std: true
+            # ~350 KiB of .pdr procedure descriptors survive every strip mode,
+            # and the gcc-linked build has no `--icf`: 12 MiB is unreachable
+            # on MIPS, so it gets the same ceiling as the glibc desktop build.
+            budget: 16777216
     steps:
       - uses: actions/checkout@v4
+      # mimalloc is an x86_64-only dependency and it is a C library: without a
+      # musl C compiler the x86_64-musl job dies inside cc-rs looking for
+      # `x86_64-linux-musl-gcc`, which no runner image ships.
+      - name: Install musl-tools (x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       # `rustup target add` refuses a tier-3 target outright -- there are no
       # prebuilt artifacts to add, and it says so and exits non-zero -- so the
       # MIPS entry must not be asked to install its target. It gets nightly plus
@@ -110,6 +122,27 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
+      # rust-lld's self-contained CRT only carries start files for the targets
+      # rustup distributes a std for. mipsel is tier-3, its self-contained dir
+      # does not exist, and `link-self-contained=yes` hands lld bare `Scrt1.o`
+      # / `-lc` names it cannot resolve -- which is exactly how these jobs used
+      # to die at link time. A real musl gcc driver carries its own crt and
+      # libc, so the MIPS jobs link through it instead of through rust-lld.
+      - name: MIPS musl toolchain (mipsel)
+        if: matrix.target == 'mipsel-unknown-linux-musl'
+        run: |
+          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
+            https://musl.cc/mipsel-linux-musl-cross.tgz
+          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
+          echo "/opt/mipsel-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          {
+            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-musl-gcc"
+            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-musl-gcc"
+            # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
+            # array is repeated here. Everything that names lld is dropped:
+            # `--icf=safe` is an lld flag and GNU ld rejects it.
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+          } >> "$GITHUB_ENV"
       # The toolchains are static musl: link with the bundled rust-lld and the
       # self-contained CRT objects instead of a host gcc that is not there.
       # Not set for aarch64 at all: cargo takes rustflags from exactly one
@@ -120,7 +153,7 @@ jobs:
       # GiB/s against 0.22 measured on a Cortex-A55), while the config alone
       # already carries linker=rust-lld and link-self-contained=yes.
       - name: Link musl with rust-lld
-        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
+        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' && !matrix.build-std }}
         run: |
           echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
       - name: Build
@@ -131,11 +164,12 @@ jobs:
           else
             cargo build --workspace --release --target ${{ matrix.target }}
           fi
-      - name: Size budget (<= 12 MiB)
+      - name: Size budget
         run: |
+          budget="${{ matrix.budget || 12582912 }}"
           size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")
-          echo "size=$size bytes"
-          test "$size" -le 12582912
+          echo "size=$size bytes, budget=$budget"
+          test "$size" -le "$budget"
       - uses: actions/upload-artifact@v4
         with:
           name: tachyon-core-${{ matrix.target }}

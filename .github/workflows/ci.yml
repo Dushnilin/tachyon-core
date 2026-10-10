@@ -53,7 +53,8 @@ jobs:
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --test inbounds -- --nocapture
           # Unprivileged tests cover all socket options except SO_MARK when
           # unavailable; this rerun verifies the mark with the required capability.
-          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests -- --nocapture
+          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests::the_options_reach_the_socket -- --nocapture
+          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests::a_connect_with_options_still_reaches_the_peer -- --nocapture
 
   differential:
     name: check vs sing-box-lx

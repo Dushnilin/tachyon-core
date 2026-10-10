@@ -26,6 +26,11 @@ fn the_flow_travels_in_the_request_addons() {
     assert_eq!(&vision[18..36], b"\x0a\x10xtls-rprx-vision");
     assert_eq!(vision[36], 0x01, "the command follows the addons");
     assert_eq!(vision.len(), 36 + 1 + 7);
+
+    let mux = super::request_head(&uuid, 3, &target, true).expect("vision mux head");
+    assert_eq!(mux.len(), 37, "Xray Mux header ends at the command");
+    assert_eq!(&mux[..36], &vision[..36]);
+    assert_eq!(mux[36], 3);
 }
 
 /// trojan's destination block is `M.SocksaddrSerializer`, whose family bytes
@@ -200,7 +205,7 @@ fn an_unknown_flow_is_rejected() {
 }
 
 /// A vless udp relay: the request head carries the `Mux` command and the
-/// destination, and each datagram then rides the stream framed by xudp.
+/// no destination, and each datagram then rides the stream framed by xudp.
 #[tokio::test]
 async fn udp_relay_frames_datagrams_over_one_stream() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -211,7 +216,7 @@ async fn udp_relay_frames_datagrams_over_one_stream() {
     let port = listener.local_addr().expect("addr").port();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept");
-        let mut head = vec![0u8; 34];
+        let mut head = vec![0u8; 19];
         socket.read_exact(&mut head).await.expect("request head");
         // the first xudp frame names the destination
         let mut meta_len = [0u8; 2];
@@ -254,12 +259,13 @@ async fn udp_relay_frames_datagrams_over_one_stream() {
     );
 
     let (head, meta, data) = server.await.expect("join");
-    let mut expected = request_head_with(3);
-    expected[19..21].copy_from_slice(&53u16.to_be_bytes());
-    assert_eq!(head, expected, "the request head names the udp target");
+    let mut expected = vec![0];
+    expected.extend_from_slice(&UUID);
+    expected.extend_from_slice(&[0, 3]);
+    assert_eq!(head, expected, "Mux has no destination in the VLESS head");
     assert_eq!(&meta[..5], &[0, 0, 1, 1, 2], "new, opt, udp");
-    assert_eq!(&meta[5..7], &[0x02, 11], "domain with its length");
-    assert_eq!(&meta[7..18], b"example.com");
-    assert_eq!(&meta[18..20], &53u16.to_be_bytes());
+    assert_eq!(&meta[5..7], &53u16.to_be_bytes());
+    assert_eq!(&meta[7..9], &[0x02, 11], "domain with its length");
+    assert_eq!(&meta[9..20], b"example.com");
     assert_eq!(&data, b"ping");
 }

@@ -33,6 +33,8 @@ pub(crate) const COMMAND_MUX: u8 = 0x7f;
 /// that picked one number would refuse half of them, so both are read as the
 /// same command and the mux value stays 0x7f, which neither of them uses.
 pub(crate) const COMMAND_UDP_ALT: u8 = 0x03;
+/// VLESS command 3 carries Xray Mux.Cool/XUDP, not sing-mux H2MUX.
+const VLESS_COMMAND_MUX: u8 = 0x03;
 
 /// The answer head the server puts in front of the first payload: version and
 /// addons length, both zero (`serverConn.Write`).
@@ -249,6 +251,18 @@ where
             "xtls-rprx-vision flow does not support UDP",
         ));
     }
+    if command == VLESS_COMMAND_MUX {
+        stream.write_all(&RESPONSE_HEAD).await?;
+        let framed: AnyStream = if flow == "xtls-rprx-vision" {
+            Box::new(crate::outbound::vision::VisionStream::new(
+                Box::new(stream),
+                user.uuid,
+            ))
+        } else {
+            Box::new(stream)
+        };
+        return serve_xudp(framed, peer, &tag, &router).await;
+    }
     if command == COMMAND_UDP {
         let dest = udp_destination(&destination)?;
         // The answer head goes out in front of the first datagram, not in
@@ -305,6 +319,136 @@ where
         &router,
     )
     .await
+}
+
+struct XudpSession {
+    hub: Arc<super::udp::UdpHub>,
+    target: Target,
+    address: SocketAddr,
+}
+
+impl Drop for XudpSession {
+    fn drop(&mut self) {
+        // End, replacement, EOF and cancelled transport all stop reverse readers.
+        self.hub.stop();
+    }
+}
+
+/// The UDP subset of Xray Mux.Cool. Keep H2MUX on the separate sing-mux path.
+/// Global IDs are accepted but cross-connection XUDP migration is not provided.
+async fn serve_xudp(
+    stream: AnyStream,
+    peer: SocketAddr,
+    tag: &str,
+    router: &Arc<Router>,
+) -> io::Result<()> {
+    use super::udp::{DatagramFrame, Reply, UdpHub};
+    let (mut reader, writer) = tokio::io::split(stream);
+    let writer = Arc::new(tokio::sync::Mutex::new(Box::new(writer) as AnyWrite));
+    let reply = Reply::Stream(Arc::clone(&writer));
+    let mut sessions = HashMap::<u16, XudpSession>::new();
+    loop {
+        let meta_len = match reader.read_u16().await {
+            Ok(len) => usize::from(len),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if !(4..=512).contains(&meta_len) {
+            return Err(io::Error::other("xudp: invalid metadata length"));
+        }
+        let mut metadata = vec![0; meta_len];
+        reader.read_exact(&mut metadata).await?;
+        let id = u16::from_be_bytes([metadata[0], metadata[1]]);
+        let status = metadata[2];
+        let option = metadata[3];
+        let mut target = None;
+        let mut unsupported_tcp = false;
+        if status == 1 || (status == 2 && meta_len > 4) {
+            let network = *metadata
+                .get(4)
+                .ok_or_else(|| io::Error::other("xudp: missing network"))?;
+            if !matches!(network, 1 | 2) {
+                return Err(io::Error::other("xudp: invalid network"));
+            }
+            unsupported_tcp = network == 1;
+            target = Some(read_vless_target(&mut &metadata[5..]).await?);
+        }
+        // Control frames without Data have no payload-length field.
+        let payload = if option & 1 != 0 {
+            let len = reader.read_u16().await?;
+            let mut payload = vec![0; usize::from(len)];
+            reader.read_exact(&mut payload).await?;
+            Some(payload)
+        } else {
+            None
+        };
+        match status {
+            3 => {
+                sessions.remove(&id);
+                continue;
+            }
+            4 => continue,
+            1 | 2 => {}
+            _ => return Err(io::Error::other("xudp: invalid session status")),
+        }
+        if unsupported_tcp || (status == 2 && !sessions.contains_key(&id)) {
+            // Reject only this session, keeping other UDP sessions usable.
+            let mut writer = writer.lock().await;
+            writer
+                .write_all(&[0, 4, metadata[0], metadata[1], 3, 2])
+                .await?;
+            continue;
+        }
+        if status == 1 {
+            sessions.remove(&id);
+            if sessions.len() >= 1024 {
+                return Err(io::Error::other("xudp: too many sessions"));
+            }
+        }
+        if let Some(target) = target {
+            if sessions
+                .get(&id)
+                .is_some_and(|session| session.target != target)
+            {
+                sessions.remove(&id);
+            }
+            let address = match &target {
+                Target::Ip(address) => *address,
+                Target::Domain(host, port) => crate::outbound::dial::resolve(host, *port)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| io::Error::other("xudp: destination has no addresses"))?,
+            };
+            let session = sessions.entry(id).or_insert_with(|| XudpSession {
+                hub: UdpHub::new(
+                    Arc::clone(router),
+                    std::time::Duration::ZERO,
+                    DatagramFrame::Xudp(id),
+                ),
+                target: target.clone(),
+                address,
+            });
+            session.target = target;
+            session.address = address;
+        }
+        if let Some(payload) = payload {
+            let session = sessions
+                .get(&id)
+                .ok_or_else(|| io::Error::other("xudp: missing session"))?;
+            session
+                .hub
+                .handle_routed(
+                    reply.clone(),
+                    peer,
+                    session.address,
+                    &payload,
+                    tag,
+                    &session.target,
+                )
+                .await?;
+        }
+    }
 }
 
 /// trojan server inbound: the request is
@@ -592,7 +736,12 @@ where
         .get(&uuid)
         .ok_or_else(|| io::Error::other(format!("unknown UUID: {}", hex(&uuid))))?
         .clone();
-    let destination = read_vless_target(stream).await?;
+    // Command 3 ends the VLESS header; its destinations are inside mux frames.
+    let destination = if command[0] == VLESS_COMMAND_MUX {
+        Target::Domain("v1.mux.cool".to_string(), 0)
+    } else {
+        read_vless_target(stream).await?
+    };
     Ok((user, command[0], destination, flow))
 }
 
@@ -728,4 +877,160 @@ fn hex(uuid: &[u8; 16]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod xudp_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::net::UdpSocket;
+
+    async fn write_frame(
+        stream: &mut tokio::io::DuplexStream,
+        meta: &[u8],
+        payload: Option<&[u8]>,
+    ) {
+        stream.write_u16(meta.len() as u16).await.unwrap();
+        stream.write_all(meta).await.unwrap();
+        if let Some(payload) = payload {
+            stream.write_u16(payload.len() as u16).await.unwrap();
+            stream.write_all(payload).await.unwrap();
+        }
+    }
+
+    async fn read_frame(stream: &mut tokio::io::DuplexStream) -> (Vec<u8>, Option<Vec<u8>>) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let len = stream.read_u16().await.unwrap();
+            let mut meta = vec![0; usize::from(len)];
+            stream.read_exact(&mut meta).await.unwrap();
+            let payload = if meta[3] & 1 != 0 {
+                let len = stream.read_u16().await.unwrap();
+                let mut payload = vec![0; usize::from(len)];
+                stream.read_exact(&mut payload).await.unwrap();
+                Some(payload)
+            } else {
+                None
+            };
+            (meta, payload)
+        })
+        .await
+        .expect("XUDP reply deadline")
+    }
+
+    #[tokio::test]
+    async fn xudp_wire_control_frames_session_ids_and_end_cleanup() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = echo.local_addr().unwrap();
+        let (observed, mut remotes) = tokio::sync::mpsc::unbounded_channel();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0; 2048];
+            loop {
+                let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+                observed.send(from).unwrap();
+                echo.send_to(&buf[..n], from).await.unwrap();
+            }
+        });
+        // A named target must retain its domain when the route is selected.
+        let router = Router::new(&json!({
+            "outbounds": [{"type":"direct","tag":"out"},{"type":"block","tag":"deny"}],
+            "route":{"final":"deny","rules":[{"domain":"127.0.0.1","outbound":"out"}]}
+        }))
+        .unwrap();
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            serve_xudp(
+                Box::new(server),
+                "127.0.0.1:12345".parse().unwrap(),
+                "test",
+                &router,
+            )
+            .await
+        });
+        let mut new = vec![1, 2, 1, 1, 2]; // session 0x0102, New/Data/UDP
+        new.extend_from_slice(&address.port().to_be_bytes());
+        new.extend_from_slice(&[2, 9]); // domain address, length
+        new.extend_from_slice(b"127.0.0.1");
+        new.extend_from_slice(&[0x42; 8]); // optional Xray GlobalID
+        let mut expected = vec![1, 2, 2, 1, 2];
+        expected.extend_from_slice(&address.port().to_be_bytes());
+        expected.extend_from_slice(&[1, 127, 0, 0, 1]);
+        write_frame(&mut client, &new, Some(b"first")).await;
+        assert_eq!(
+            read_frame(&mut client).await,
+            (expected.clone(), Some(b"first".to_vec()))
+        );
+        let first_remote = remotes.recv().await.unwrap();
+
+        // KeepAlive has no payload length; the following frame must stay aligned.
+        write_frame(&mut client, &[0, 0, 4, 0], None).await;
+        write_frame(&mut client, &[1, 2, 2, 1], Some(b"second")).await;
+        assert_eq!(
+            read_frame(&mut client).await,
+            (expected.clone(), Some(b"second".to_vec()))
+        );
+        assert_eq!(remotes.recv().await.unwrap(), first_remote);
+
+        new[0] = 3;
+        new[1] = 4;
+        write_frame(&mut client, &new, Some(b"independent")).await;
+        let mut second_expected = expected.clone();
+        second_expected[0] = 3;
+        second_expected[1] = 4;
+        assert_eq!(
+            read_frame(&mut client).await,
+            (second_expected.clone(), Some(b"independent".to_vec()))
+        );
+        let second_remote = remotes.recv().await.unwrap();
+        assert_ne!(first_remote, second_remote);
+
+        write_frame(&mut client, &[1, 2, 3, 0], None).await;
+        write_frame(&mut client, &[1, 2, 2, 1], Some(b"closed")).await;
+        assert_eq!(read_frame(&mut client).await, (vec![1, 2, 3, 2], None));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(socket) = UdpSocket::bind(first_remote).await {
+                    drop(socket);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("End releases the UDP socket");
+        write_frame(&mut client, &[3, 4, 2, 1], Some(b"still open")).await;
+        assert_eq!(
+            read_frame(&mut client).await,
+            (second_expected, Some(b"still open".to_vec()))
+        );
+        remotes.recv().await.unwrap();
+
+        // TCP mux is explicitly rejected, without disturbing the UDP session.
+        new[0] = 5;
+        new[1] = 6;
+        new[4] = 1;
+        write_frame(&mut client, &new, Some(b"unsupported TCP")).await;
+        assert_eq!(read_frame(&mut client).await, (vec![5, 6, 3, 2], None));
+        drop(client);
+        task.await.unwrap().unwrap();
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn xudp_rejects_unbounded_or_short_metadata() {
+        for len in [3, 513] {
+            let router = Router::new(&json!({"outbounds":[{"type":"direct"}]})).unwrap();
+            let (mut client, server) = tokio::io::duplex(64);
+            client.write_u16(len).await.unwrap();
+            assert!(
+                serve_xudp(
+                    Box::new(server),
+                    "127.0.0.1:1".parse().unwrap(),
+                    "test",
+                    &router
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
 }

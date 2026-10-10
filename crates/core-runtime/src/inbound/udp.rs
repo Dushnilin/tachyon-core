@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use portable_atomic::AtomicU64;
@@ -38,6 +38,7 @@ const UDP_BACKLOG_MAX: usize = 64;
 struct Flow {
     kind: FlowKind,
     last_ms: AtomicU64,
+    timeout: Duration,
     /// datagrams `try_send` refused; drained in order by the writer task
     backlog: Mutex<VecDeque<Vec<u8>>>,
     /// exactly one writer task is (or will be) draining `backlog`
@@ -128,6 +129,8 @@ pub(crate) enum DatagramFrame {
     Shadowsocks,
     /// `[len:u16][address][port][payload]` (PacketAddr mode in sing-box / v2fly)
     PacketAddr,
+    /// Xray Mux.Cool Keep/Data reply, addressed by its session ID.
+    Xudp(u16),
 }
 
 impl DatagramFrame {
@@ -154,6 +157,25 @@ impl DatagramFrame {
                 body.extend_from_slice(payload);
                 out.extend_from_slice(&(body.len() as u16).to_be_bytes());
                 out.extend_from_slice(&body);
+            }
+            DatagramFrame::Xudp(id) => {
+                let meta_len = if dest.is_ipv4() { 12u16 } else { 24u16 };
+                out.extend_from_slice(&meta_len.to_be_bytes());
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&[2, 1, 2]); // Keep, Data, UDP
+                out.extend_from_slice(&dest.port().to_be_bytes());
+                match dest.ip() {
+                    IpAddr::V4(ip) => {
+                        out.push(1);
+                        out.extend_from_slice(&ip.octets());
+                    }
+                    IpAddr::V6(ip) => {
+                        out.push(3);
+                        out.extend_from_slice(&ip.octets());
+                    }
+                }
+                out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                out.extend_from_slice(payload);
             }
         }
     }
@@ -247,6 +269,10 @@ impl Reply {
 pub(crate) struct UdpHub {
     router: Arc<Router>,
     flows: RwLock<HashMap<FlowKey, Arc<Flow>>>,
+    /// First packets for one tuple share an initialization gate, so a burst
+    /// cannot create multiple proxy sessions whose idle tasks race each other.
+    opening: Mutex<HashMap<FlowKey, Weak<tokio::sync::Mutex<()>>>>,
+    reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     timeout: Duration,
     /// how replies are framed before they go back
     frame: DatagramFrame,
@@ -257,6 +283,8 @@ impl UdpHub {
         let hub = Arc::new(Self {
             router,
             flows: RwLock::new(HashMap::new()),
+            opening: Mutex::new(HashMap::new()),
+            reverse_tasks: Mutex::new(Vec::new()),
             timeout: if timeout.is_zero() {
                 DEFAULT_UDP_TIMEOUT
             } else {
@@ -277,10 +305,17 @@ impl UdpHub {
         hub
     }
 
+    /// Release per-flow reply sockets when a transparent listener is stopped.
+    pub fn stop(&self) {
+        for task in self.reverse_tasks.lock().expect("reverse tasks").drain(..) {
+            task.abort();
+        }
+        self.flows.write().expect("flows").clear();
+    }
+
     async fn sweep(&self) {
         let mut flows = self.flows.write().expect("flows");
-        let timeout = self.timeout;
-        flows.retain(|_, flow| flow.idle() < timeout);
+        flows.retain(|_, flow| flow.idle() < flow.timeout);
     }
 
     /// Fast path for the receive loops: an already-open outbound flow is fed
@@ -336,6 +371,22 @@ impl UdpHub {
         payload: &[u8],
         tag: &str,
     ) -> std::io::Result<()> {
+        self.handle_routed(reply, source, dest, payload, tag, &Target::Ip(dest))
+            .await
+    }
+
+    /// Preserve a named proxy destination in routing even though the flow key
+    /// and the datagram reply use its resolved socket address.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_routed(
+        self: &Arc<Self>,
+        reply: Reply,
+        source: SocketAddr,
+        dest: SocketAddr,
+        payload: &[u8],
+        tag: &str,
+        target: &Target,
+    ) -> std::io::Result<()> {
         let key = (source, dest);
         let found = {
             let map = self.flows.read().expect("flows");
@@ -347,14 +398,32 @@ impl UdpHub {
                 flow
             }
             None => {
-                let flow = self.open_flow(reply.clone(), source, dest, tag).await?;
-                flow.touch();
-                let mut map = self.flows.write().expect("flows");
-                // Another packet may have won the race — keep the first.
-                if let Some(existing) = map.get(&key) {
-                    Arc::clone(existing)
+                let gate = {
+                    let mut opening = self.opening.lock().expect("opening");
+                    opening.retain(|_, gate| gate.strong_count() != 0);
+                    match opening.get(&key).and_then(Weak::upgrade) {
+                        Some(gate) => gate,
+                        None => {
+                            let gate = Arc::new(tokio::sync::Mutex::new(()));
+                            opening.insert(key, Arc::downgrade(&gate));
+                            gate
+                        }
+                    }
+                };
+                let _gate = gate.lock_owned().await;
+                let found = self.flows.read().expect("flows").get(&key).cloned();
+                if let Some(existing) = found {
+                    existing.touch();
+                    existing
                 } else {
-                    map.insert(key, Arc::clone(&flow));
+                    let flow = self
+                        .open_flow(reply.clone(), source, dest, tag, target)
+                        .await?;
+                    flow.touch();
+                    self.flows
+                        .write()
+                        .expect("flows")
+                        .insert(key, Arc::clone(&flow));
                     flow
                 }
             }
@@ -374,8 +443,9 @@ impl UdpHub {
         source: SocketAddr,
         dest: SocketAddr,
         tag: &str,
+        target: &Target,
     ) -> std::io::Result<Arc<Flow>> {
-        let mut ctx = ConnContext::new(tag, source, Target::Ip(dest), "udp");
+        let mut ctx = ConnContext::new(tag, source, target.clone(), "udp");
         let decision = self.router.route_raw(&mut ctx).await?;
         logging::debug(format_args!(
             "udp {tag} {source} -> {} => {:?}",
@@ -385,6 +455,7 @@ impl UdpHub {
             Decision::HijackDns => Flow {
                 kind: FlowKind::Dns,
                 last_ms: AtomicU64::new(now_ms()),
+                timeout: self.timeout,
                 backlog: Mutex::new(VecDeque::new()),
                 writing: AtomicBool::new(false),
             },
@@ -399,7 +470,7 @@ impl UdpHub {
                 let timeout = ctx.udp_timeout.unwrap_or(self.timeout);
                 let sock = self.router.connect_udp_index(idx, target).await?;
                 let sock = Arc::new(sock);
-                spawn_reverse(
+                let task = spawn_reverse(
                     Arc::clone(&sock),
                     reply,
                     self.frame,
@@ -409,9 +480,13 @@ impl UdpHub {
                     Arc::clone(self),
                     (source, dest),
                 );
+                let mut tasks = self.reverse_tasks.lock().expect("reverse tasks");
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
                 Flow {
                     kind: FlowKind::Outbound { sock },
                     last_ms: AtomicU64::new(now_ms()),
+                    timeout,
                     backlog: Mutex::new(VecDeque::new()),
                     writing: AtomicBool::new(false),
                 }
@@ -450,8 +525,46 @@ impl UdpHub {
         Ok(())
     }
 
-    async fn remove_flow(&self, key: FlowKey) {
-        self.flows.write().expect("flows").remove(&key);
+    fn touch_flow(&self, key: FlowKey, socket: &Arc<UdpSocket>) -> bool {
+        let flows = self.flows.read().expect("flows");
+        let Some(flow) = flows.get(&key) else {
+            return false;
+        };
+        if let FlowKind::Outbound { sock } = &flow.kind
+            && Arc::ptr_eq(sock, socket)
+        {
+            flow.touch();
+            return true;
+        }
+        false
+    }
+
+    fn flow_is_active(&self, key: FlowKey, socket: &Arc<UdpSocket>) -> bool {
+        self.flows
+            .read()
+            .expect("flows")
+            .get(&key)
+            .is_some_and(|flow| {
+                matches!(&flow.kind, FlowKind::Outbound {sock} if Arc::ptr_eq(sock, socket))
+                    && flow.idle() < flow.timeout
+            })
+    }
+
+    pub fn has_active_flow(&self, source: SocketAddr, dest: SocketAddr) -> bool {
+        self.flows
+            .read()
+            .expect("flows")
+            .get(&(source, dest))
+            .is_some_and(|flow| flow.idle() < flow.timeout)
+    }
+
+    async fn remove_flow(&self, key: FlowKey, socket: &Arc<UdpSocket>) {
+        let mut flows = self.flows.write().expect("flows");
+        if flows.get(&key).is_some_and(
+            |flow| matches!(&flow.kind, FlowKind::Outbound {sock} if Arc::ptr_eq(sock, socket)),
+        ) {
+            flows.remove(&key);
+        }
     }
 }
 
@@ -543,7 +656,7 @@ fn spawn_reverse(
     idle: Duration,
     hub: Arc<UdpHub>,
     key: FlowKey,
-) {
+) -> tokio::task::AbortHandle {
     let tag = tag.to_string();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -554,6 +667,11 @@ fn spawn_reverse(
         loop {
             match tokio::time::timeout(idle, outbound.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
+                    // Both directions count as activity. A receive-only media
+                    // flow must keep its established proxy/NAT session.
+                    if !hub.touch_flow(key, &outbound) {
+                        return;
+                    }
                     let framed: &[u8] = if frame == DatagramFrame::Raw {
                         &buf[..n]
                     } else {
@@ -562,28 +680,228 @@ fn spawn_reverse(
                     };
                     if let Err(err) = reply.send(framed, source, key.1).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
-                        hub.remove_flow(key).await;
+                        hub.remove_flow(key, &outbound).await;
                         return;
                     }
                 }
                 Ok(Err(err)) => {
                     logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
-                    hub.remove_flow(key).await;
+                    hub.remove_flow(key, &outbound).await;
                     return;
                 }
                 Err(_) => {
+                    // Sending without replies is also a live UDP session.
+                    if hub.flow_is_active(key, &outbound) {
+                        continue;
+                    }
                     // Idle timeout — drop the flow (reference udpnat purge).
-                    hub.remove_flow(key).await;
+                    hub.remove_flow(key, &outbound).await;
                     return;
                 }
             }
         }
-    });
+    })
+    .abort_handle()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_test_router() -> Arc<Router> {
+        Router::new(&serde_json::json!({
+            "outbounds": [{"type": "direct", "tag": "out"}],
+            "route": {"final": "out"}
+        }))
+        .expect("direct router")
+    }
+
+    #[tokio::test]
+    async fn reverse_traffic_keeps_a_receive_only_udp_flow_alive() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("server");
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("reply"));
+        let source = client.local_addr().expect("source");
+        let dest = server.local_addr().expect("dest");
+        let hub = UdpHub::new(
+            direct_test_router(),
+            Duration::from_millis(100),
+            DatagramFrame::Raw,
+        );
+        hub.handle(Reply::Socket(reply), source, dest, b"start", "test")
+            .await
+            .expect("open flow");
+        let mut buf = [0; 64];
+        let (_, upstream) = server.recv_from(&mut buf).await.expect("first packet");
+        // The client does not transmit again, while the server remains active.
+        for sequence in 0..12u8 {
+            server
+                .send_to(&[sequence], upstream)
+                .await
+                .expect("server reply");
+            let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut buf))
+                .await
+                .expect("reply deadline")
+                .expect("reply");
+            assert_eq!(&buf[..n], &[sequence]);
+            hub.sweep().await;
+            assert!(
+                hub.flows
+                    .read()
+                    .expect("flows")
+                    .contains_key(&(source, dest)),
+                "active receive-only flow was swept at packet {sequence}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub.stop();
+    }
+
+    #[tokio::test]
+    async fn an_old_reverse_task_cannot_remove_a_replacement_udp_flow() {
+        let old = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("old"));
+        let replacement = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("replacement"));
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("reply"));
+        let hub = UdpHub::new(
+            direct_test_router(),
+            Duration::from_secs(1),
+            DatagramFrame::Raw,
+        );
+        let key = (
+            "127.0.0.1:30000".parse().expect("source"),
+            "127.0.0.1:30001".parse().expect("dest"),
+        );
+        hub.flows.write().expect("flows").insert(
+            key,
+            Arc::new(Flow {
+                kind: FlowKind::Outbound { sock: replacement },
+                last_ms: AtomicU64::new(now_ms()),
+                timeout: Duration::from_secs(1),
+                backlog: Mutex::new(VecDeque::new()),
+                writing: AtomicBool::new(false),
+            }),
+        );
+        let task = spawn_reverse(
+            old,
+            Reply::Socket(reply),
+            DatagramFrame::Raw,
+            key.0,
+            "test",
+            Duration::from_millis(20),
+            Arc::clone(&hub),
+            key,
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(task.is_finished(), "old reverse task must finish");
+        assert!(
+            hub.flows.read().expect("flows").contains_key(&key),
+            "old timeout removed a newer flow with the same tuple"
+        );
+        hub.stop();
+    }
+
+    #[tokio::test]
+    async fn sending_without_replies_keeps_the_same_udp_session() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("server");
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("reply"));
+        let source = reply.local_addr().expect("source");
+        let dest = server.local_addr().expect("dest");
+        let hub = UdpHub::new(
+            direct_test_router(),
+            Duration::from_millis(100),
+            DatagramFrame::Raw,
+        );
+        let mut first_peer = None;
+        let mut buf = [0; 64];
+        for sequence in 0..12u8 {
+            hub.handle(
+                Reply::Socket(Arc::clone(&reply)),
+                source,
+                dest,
+                &[sequence],
+                "test",
+            )
+            .await
+            .expect("send");
+            let (_, peer) =
+                tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+                    .await
+                    .expect("receive deadline")
+                    .expect("receive");
+            assert_eq!(
+                peer,
+                *first_peer.get_or_insert(peer),
+                "active sender's NAT session changed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub.stop();
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_datagrams_open_one_proxy_udp_session() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy");
+        let proxy = listener.local_addr().expect("proxy addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                count.fetch_add(1, Ordering::Relaxed);
+                let mut header = [0; 19];
+                stream
+                    .read_exact(&mut header)
+                    .await
+                    .expect("VLESS Mux header");
+                assert_eq!(header[18], crate::outbound::packet::CMD_MUX);
+                stream.write_all(&[0, 0]).await.expect("VLESS response");
+                streams.push(stream);
+            }
+        });
+        let router = Router::new(&serde_json::json!({
+            "outbounds": [{"type":"vless", "tag":"out", "server":"127.0.0.1",
+                "server_port":proxy.port(), "uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],
+            "route":{"final":"out"}
+        }))
+        .expect("router");
+        let hub = UdpHub::new(router, Duration::from_secs(1), DatagramFrame::Raw);
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("reply"));
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut requests = tokio::task::JoinSet::new();
+        for sequence in 0..16u8 {
+            let hub = Arc::clone(&hub);
+            let reply = Arc::clone(&reply);
+            let barrier = Arc::clone(&barrier);
+            requests.spawn(async move {
+                barrier.wait().await;
+                hub.handle(
+                    Reply::Socket(reply),
+                    "127.0.0.1:30000".parse().expect("source"),
+                    "192.0.2.1:50000".parse().expect("dest"),
+                    &[sequence],
+                    "test",
+                )
+                .await
+            });
+        }
+        barrier.wait().await;
+        while let Some(request) = requests.join_next().await {
+            request.expect("task").expect("send");
+        }
+        // connect_udp returns before the proxy's accept loop has drained its
+        // listen backlog. Observe the sockets after that loop gets scheduled.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "first-packet burst opened duplicate proxy UDP sessions"
+        );
+        hub.stop();
+        server.abort();
+    }
 
     /// The datagrams of a UDP command carry no address, so the head has to name
     /// one. A name cannot be sent to, and a session that accepted one would

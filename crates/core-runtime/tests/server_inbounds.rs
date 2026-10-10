@@ -58,6 +58,176 @@ async fn spawn_udp_echo() -> SocketAddr {
     addr
 }
 
+/// Reload must release a direct UDP listener even while its reverse session is alive.
+#[tokio::test]
+async fn direct_udp_reload_releases_port_with_a_live_session() {
+    let _guard = test_guard().await;
+    let echo = spawn_udp_echo().await;
+    let mut config = json!({
+        "log": {"disabled": true},
+        "inbounds": [{"type":"direct", "tag":"test", "listen":"127.0.0.1",
+            "listen_port":0, "network":"udp", "override_address":"127.0.0.1",
+            "override_port":echo.port()}],
+        "outbounds": [{"type":"direct", "tag":"direct"}],
+        "route": {"final":"direct"}
+    });
+    let mut instance = core_runtime::start(&config)
+        .await
+        .expect("start direct UDP");
+    let addr = inbound_addr(&instance, "test");
+    config["inbounds"][0]["listen_port"] = json!(addr.port());
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+    let mut buf = [0u8; 64];
+    for _ in 0..3 {
+        client.send_to(b"active UDP", addr).await.expect("send");
+        let (n, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("reply deadline")
+        .expect("reply");
+        assert_eq!(&buf[..n], b"active UDP");
+        assert_eq!(peer, addr);
+        instance.shutdown_and_wait().await.expect("stop direct UDP");
+        instance = core_runtime::start(&config)
+            .await
+            .expect("reload releases live UDP listener");
+    }
+    instance.shutdown_and_wait().await.expect("final shutdown");
+}
+
+#[cfg(target_os = "linux")]
+fn can_run_tproxy_test() -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").expect("process capabilities");
+    let capabilities = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("CapEff:\t")
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        })
+        .expect("effective capabilities");
+    // IP_TRANSPARENT accepts CAP_NET_ADMIN or CAP_NET_RAW on Linux.
+    if capabilities & ((1 << 12) | (1 << 13)) != 0 {
+        return true;
+    }
+    assert!(
+        std::env::var_os("TACHYON_REQUIRE_NET_ADMIN").is_none(),
+        "privileged TProxy regression gate requires CAP_NET_ADMIN or CAP_NET_RAW"
+    );
+    eprintln!("SKIP transparent UDP: requires CAP_NET_ADMIN or CAP_NET_RAW");
+    false
+}
+
+/// A connected transparent reply socket receives subsequent client datagrams.
+/// Repeated packets and shutdown must exercise the entire listener, not only
+/// the first send from the shared socket. Requires Linux CAP_NET_ADMIN.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tproxy_udp_forwards_repeated_datagrams_and_releases_session_sockets() {
+    if !can_run_tproxy_test() {
+        return;
+    }
+    let _guard = test_guard().await;
+    let echo = spawn_udp_echo().await;
+    let config = json!({
+        "log": {"disabled": true},
+        "inbounds": [{"type": "tproxy", "tag": "test", "listen": "127.0.0.1",
+            "listen_port": 0, "network": "udp"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"rules": [{"inbound": "test", "action": "route",
+            "outbound": "direct", "override_port": echo.port()}]}
+    });
+    let mut instance = core_runtime::start(&config).await.expect("start tproxy");
+    let addr = inbound_addr(&instance, "test");
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+    let mut buf = [0u8; 2048];
+    for size in [20, 74, 1200, 74, 20] {
+        let payload = vec![size as u8; size];
+        client.send_to(&payload, addr).await.expect("send");
+        let (n, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("reply in time")
+        .expect("recv");
+        assert_eq!(peer, addr);
+        assert_eq!(&buf[..n], payload);
+    }
+    instance.shutdown_and_wait().await.expect("stop tproxy");
+    let rebound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Ok(socket) = UdpSocket::bind(addr).await {
+                break socket;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("transparent session socket released");
+    drop(rebound);
+}
+
+/// Incoming media must keep the same UDP session and its client receive pump alive.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tproxy_receive_only_media_keeps_the_client_receive_pump_alive() {
+    if !can_run_tproxy_test() {
+        return;
+    }
+    let _guard = test_guard().await;
+    let server = UdpSocket::bind("127.0.0.1:0").await.expect("media server");
+    let config = json!({
+        "log": {"disabled": true},
+        "inbounds": [{"type":"tproxy", "tag":"test", "listen":"127.0.0.1",
+            "listen_port":0, "network":"udp", "udp_timeout":"100ms"}],
+        "outbounds": [{"type":"direct", "tag":"direct"}],
+        "route":{"rules":[{"inbound":"test", "action":"route", "outbound":"direct",
+            "override_port":server.local_addr().expect("server addr").port()}]}
+    });
+    let mut instance = core_runtime::start(&config).await.expect("start tproxy");
+    let addr = inbound_addr(&instance, "test");
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+    client.send_to(b"start", addr).await.expect("first send");
+    let mut buf = [0; 64];
+    let (_, upstream) = server.recv_from(&mut buf).await.expect("first packet");
+    // The server streams beyond several idle timeouts, then the client speaks.
+    for sequence in 0..20u8 {
+        server
+            .send_to(&[sequence], upstream)
+            .await
+            .expect("media packet");
+        let (n, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("media deadline")
+        .expect("media receive");
+        assert_eq!(peer, addr);
+        assert_eq!(&buf[..n], &[sequence]);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    client
+        .send_to(b"resume", addr)
+        .await
+        .expect("client resumes");
+    let (n, resumed_peer) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        server.recv_from(&mut buf),
+    )
+    .await
+    .expect("receive pump survived active incoming media")
+    .expect("resumed receive");
+    assert_eq!(&buf[..n], b"resume");
+    assert_eq!(
+        resumed_peer, upstream,
+        "active media flow changed its NAT session"
+    );
+    instance.shutdown_and_wait().await.expect("shutdown");
+}
+
 /// SOCKS5 UDP ASSOCIATE against the client's mixed inbound, and the socket to
 /// send from plus the address to send to -- which is the relay the reply named
 /// and not the destination inside the datagram. The control connection has to
@@ -157,6 +327,16 @@ async fn udp_round_trip(
     client_outbound: Value,
     payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
+    let replies = udp_round_trips(server_inbound, client_outbound, &[payload], Some("")).await?;
+    Ok(replies.into_iter().next().expect("one reply"))
+}
+
+async fn udp_round_trips(
+    server_inbound: Value,
+    client_outbound: Value,
+    payloads: &[&[u8]],
+    packet_encoding: Option<&str>,
+) -> std::io::Result<Vec<Vec<u8>>> {
     let echo = spawn_udp_echo().await;
     let tag = server_inbound["tag"]
         .as_str()
@@ -175,7 +355,9 @@ async fn udp_round_trip(
         .clone();
     outbound.insert("server".into(), json!("127.0.0.1"));
     outbound.insert("server_port".into(), json!(server_addr.port()));
-    outbound.insert("packet_encoding".into(), json!(""));
+    if let Some(encoding) = packet_encoding {
+        outbound.insert("packet_encoding".into(), json!(encoding));
+    }
     let client = core_runtime::start(&json!({
         "log": {"level": "debug"},
         "inbounds": [{
@@ -191,29 +373,44 @@ async fn udp_round_trip(
     .expect("start client");
 
     let (socket, relay) = socks_udp_associate(inbound_addr(&client, "mixed-in")).await;
-    // The relay, not the echo: sent to the echo the datagram comes straight
-    // back from it and reads exactly like a round trip through the server.
-    socket
-        .send_to(&socks_udp_request(echo, payload), relay)
-        .await?;
+    let mut replies = Vec::new();
     let mut buf = vec![0u8; 65535];
-    let mut got = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while got.len() < payload.len() && std::time::Instant::now() < deadline {
-        let Ok(read) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), socket.recv(&mut buf))
-                .await
-        else {
-            continue;
-        };
-        match read {
-            Ok(0) | Err(_) => break,
-            Ok(n) => got.extend_from_slice(&socks_udp_payload(&buf[..n])),
-        }
+    for payload in payloads {
+        // Send to the relay, so an answer cannot bypass the proxy under test.
+        socket
+            .send_to(&socks_udp_request(echo, payload), relay)
+            .await?;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), socket.recv(&mut buf))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP reply deadline")
+            })??;
+        replies.push(socks_udp_payload(&buf[..n]));
     }
     drop(client);
     drop(server);
-    Ok(got)
+    Ok(replies)
+}
+
+/// The default client uses VLESS command 3 (XUDP), including for Vision.
+/// Exercise New and consecutive Keep frames through real client/server sockets.
+#[tokio::test]
+async fn a_vless_server_carries_default_xudp_repeated_datagrams() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let large = vec![0x5a; 1400];
+    let payloads: &[&[u8]] = &[b"first", b"second", &large, b"after media"];
+    for flow in ["", "xtls-rprx-vision"] {
+        let got = udp_round_trips(
+            vless_server(uuid, flow),
+            vless_client(uuid, flow),
+            payloads,
+            None,
+        )
+        .await
+        .expect("default XUDP round trips");
+        assert_eq!(got, payloads);
+    }
 }
 
 /// The UDP command on the three server inbounds that speak it: one datagram out
@@ -904,6 +1101,87 @@ fn server_tls() -> Value {
 /// it, so a payload that comes back is a handshake that happened on the wire.
 fn client_tls() -> Value {
     json!({"enabled": true, "server_name": "localhost", "insecure": true})
+}
+
+#[tokio::test]
+async fn hysteria2_shutdown_releases_port_with_live_connections() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let udp_echo = spawn_udp_echo().await;
+    let mut config = cfg(
+        json!({
+            "type": "hysteria2", "tag": "hy2", "listen": "127.0.0.1",
+            "listen_port": 0, "password": "reload-test", "tls": {
+                "enabled": true,
+                "certificate": [include_str!("../../../tests/golden/certs/localhost.crt")],
+                "key": [include_str!("../../../tests/golden/certs/localhost.key")]
+            }
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    );
+    let mut instance = core_runtime::start(&config).await.expect("start hy2");
+    let addr = inbound_addr(&instance, "hy2");
+    config["inbounds"][0]["listen_port"] = json!(addr.port());
+    let client_config = json!({
+        "type": "hysteria2", "server": "127.0.0.1", "server_port": addr.port(),
+        "password": "reload-test", "tls": client_tls()
+    });
+
+    for _ in 0..3 {
+        let client = core_runtime::outbound::hysteria2::Hysteria2::build(
+            client_config.as_object().expect("client config"),
+            "reload client",
+        )
+        .expect("build hy2 client");
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.connect(&core_runtime::inbound::Target::Ip(echo)),
+        )
+        .await
+        .expect("connect timeout")
+        .expect("connect hy2");
+        stream.write_all(b"live").await.expect("write echo");
+        let mut payload = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_exact(&mut payload),
+        )
+        .await
+        .expect("echo timeout")
+        .expect("read echo");
+        assert_eq!(&payload, b"live");
+
+        let udp = client
+            .connect_udp(&core_runtime::inbound::Target::Ip(udp_echo))
+            .await
+            .expect("connect hy2 udp");
+        udp.send(b"udp").await.expect("send udp");
+        let mut datagram = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv(&mut datagram))
+            .await
+            .expect("udp timeout")
+            .expect("receive udp");
+        assert_eq!(&datagram[..n], b"udp");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            instance.shutdown_and_wait(),
+        )
+        .await
+        .expect("shutdown timeout")
+        .expect("shutdown error");
+        // Keep both the old client and its stream alive while rebinding: active
+        // QUIC connections used to retain the server socket after task abort.
+        instance = core_runtime::start(&config)
+            .await
+            .expect("rebind live hy2 port");
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut payload))
+                .await
+                .expect("old stream did not close");
+        assert!(matches!(closed, Ok(0) | Err(_)), "old stream still live");
+    }
+    instance.shutdown_and_wait().await.expect("final shutdown");
 }
 
 #[tokio::test]

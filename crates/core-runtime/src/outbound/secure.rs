@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::mux;
-use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
+use crate::outbound::packet::{CMD_MUX, CMD_TCP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
@@ -233,7 +233,10 @@ fn request_head(
     header.push(addons.len() as u8);
     header.extend_from_slice(&addons);
     header.push(command);
-    header.extend_from_slice(&encode_vless_target(target)?);
+    // Xray's Mux request ends at the command; XUDP names the destination.
+    if command != CMD_MUX {
+        header.extend_from_slice(&encode_vless_target(target)?);
+    }
     Ok(header)
 }
 

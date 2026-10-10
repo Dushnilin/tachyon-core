@@ -34,8 +34,10 @@ pub enum Action {
     /// `evaluate` — evaluate query with the specified server.
     Evaluate {
         server: String,
+        rewrite_ttl: Option<u32>,
+        disable_cache: bool,
     },
-    /// `respond` — known gap (requires evaluated responses).
+    /// `respond` — return the most recently evaluated response.
     Respond,
     /// `predefined`: a synthesized answer (rcode + answer/ns/extra records).
     Predefined(PredefinedResponse),
@@ -64,6 +66,7 @@ pub struct Rule {
     pub domain_suffix: Vec<String>,
     pub domain_keyword: Vec<String>,
     pub domain_regex: Vec<Regex>,
+    pub ip_cidr: Vec<super::transport::IpPrefix>,
     pub source_ip_cidr: Vec<super::transport::IpPrefix>,
     /// `route.find_neighbor`: the asking client's hardware address and DHCP
     /// hostname.
@@ -138,6 +141,13 @@ impl Rule {
         let network = string_list(map, "network", at)?;
         let rule_set_tags = string_list(map, "rule_set", at)?;
         let rule_sets = registry.resolve(&rule_set_tags)?;
+        let ip_cidr = string_list(map, "ip_cidr", at)?
+            .into_iter()
+            .map(|raw| {
+                super::transport::IpPrefix::parse(&raw)
+                    .map_err(|e| anyhow::anyhow!("{at}: bad ip_cidr {raw:?}: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let source_ip_cidr = string_list(map, "source_ip_cidr", at)?
             .into_iter()
             .map(|raw| {
@@ -201,7 +211,11 @@ impl Rule {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                Action::Evaluate { server }
+                Action::Evaluate {
+                    server,
+                    rewrite_ttl,
+                    disable_cache,
+                }
             }
             "respond" => Action::Respond,
             "predefined" => Action::Predefined(build_predefined(map, at)?),
@@ -215,6 +229,7 @@ impl Rule {
             domain_suffix,
             domain_keyword,
             domain_regex,
+            ip_cidr,
             source_ip_cidr,
             source_mac: string_list(map, "source_mac_address", at)?
                 .iter()
@@ -234,36 +249,51 @@ impl Rule {
     }
 
     pub fn matches(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
-        let hit = self.matches_inner(meta, query);
-        hit != self.invert
+        self.matches_stage(meta, query, None)
     }
 
     pub fn matches_response(&self, meta: &QueryMeta, query: &QueryInfo, ips: &[IpAddr]) -> bool {
-        if !self.match_response {
-            return false;
+        self.matches_stage(meta, query, Some(ips))
+    }
+
+    /// None is an unavailable response, not a failed predicate: invert must
+    /// not make a response-only rule match before evaluate has run.
+    pub fn matches_stage(
+        &self,
+        meta: &QueryMeta,
+        query: &QueryInfo,
+        ips: Option<&[IpAddr]>,
+    ) -> bool {
+        self.match_result(meta, query, ips).unwrap_or(false)
+    }
+
+    fn match_result(
+        &self,
+        meta: &QueryMeta,
+        query: &QueryInfo,
+        ips: Option<&[IpAddr]>,
+    ) -> Option<bool> {
+        if ips.is_none() && (self.match_response || !self.ip_cidr.is_empty()) {
+            return None;
         }
-        if !self.matches_query_meta(meta, query) {
-            return false;
-        }
-        if self.rule_sets.is_empty() {
-            return true;
-        }
-        let source = meta
-            .source
-            .map(|address| std::net::SocketAddr::new(address, 0))
-            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        for &ip in ips {
-            let context = crate::route::ConnContext::new(
-                meta.inbound.as_deref().unwrap_or(""),
-                source,
-                crate::inbound::Target::Ip(std::net::SocketAddr::new(ip, 0)),
-                "udp",
-            );
-            if self.rule_sets.iter().any(|set| set.matches(&context)) {
-                return true;
+        let hit = if self.logical {
+            let mut unavailable = false;
+            for child in &self.sub_rules {
+                match child.match_result(meta, query, ips) {
+                    // A definite true decides OR; a definite false decides AND.
+                    Some(hit) if hit == self.mode_or => return Some(hit != self.invert),
+                    None => unavailable = true,
+                    _ => {}
+                }
             }
-        }
-        false
+            if unavailable {
+                return None;
+            }
+            !self.mode_or && !self.sub_rules.is_empty()
+        } else {
+            self.matches_inner(meta, query, ips)
+        };
+        Some(hit != self.invert)
     }
 
     fn matches_query_meta(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
@@ -318,6 +348,29 @@ impl Rule {
         {
             return false;
         }
+        if !self.source_mac.is_empty() || !self.source_hostname.is_empty() {
+            // the neighbour tables, when they are running at all
+            let found = meta.source.and_then(|source| {
+                crate::route::neighbor::current().map(|resolver| {
+                    (
+                        resolver.lookup_mac(source),
+                        resolver.lookup_hostname(source),
+                    )
+                })
+            });
+            let (mac, hostname) = found.unwrap_or((None, None));
+            if !self.source_mac.is_empty() && !mac.is_some_and(|mac| self.source_mac.contains(&mac))
+            {
+                return false;
+            }
+            if !self.source_hostname.is_empty()
+                && !hostname
+                    .as_deref()
+                    .is_some_and(|name| self.source_hostname.iter().any(|item| item == name))
+            {
+                return false;
+            }
+        }
         true
     }
 
@@ -353,11 +406,10 @@ impl Rule {
             }
             sub_rules.push(Rule::build_nested(sub, &sub_at, registry, true)?);
         }
-        let mut rule = Rule::build_with_rule_sets(
-            &serde_json::json!({ "action": map.get("action").cloned().unwrap_or(Value::Null) }),
-            at,
-            registry,
-        )?;
+        let mut parent = map.clone();
+        parent.remove("type");
+        parent.remove("rules");
+        let mut rule = Rule::build_with_rule_sets(&Value::Object(parent), at, registry)?;
         rule.invert = map.get("invert").and_then(Value::as_bool).unwrap_or(false);
         rule.sub_rules = sub_rules;
         rule.logical = true;
@@ -383,93 +435,48 @@ impl Rule {
         self.rule_sets.iter().any(|set| set.matches(&context))
     }
 
-    fn matches_inner(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
-        if self.logical {
-            return if self.mode_or {
-                self.sub_rules.iter().any(|sub| sub.matches(meta, query))
+    fn matches_inner(&self, meta: &QueryMeta, query: &QueryInfo, ips: Option<&[IpAddr]>) -> bool {
+        if !self.matches_query_meta(meta, query) {
+            return false;
+        }
+        if !self.ip_cidr.is_empty()
+            && !ips
+                .unwrap_or_default()
+                .iter()
+                .any(|ip| self.ip_cidr.iter().any(|prefix| prefix.contains(*ip)))
+        {
+            return false;
+        }
+        self.rule_sets.is_empty()
+            || if self.match_response {
+                self.matches_response_rule_sets(meta, query, ips.unwrap_or_default())
             } else {
-                !self.sub_rules.is_empty()
-                    && self.sub_rules.iter().all(|sub| sub.matches(meta, query))
-            };
-        }
-        if !self.inbound.is_empty() {
-            let Some(inbound) = meta.inbound.as_deref() else {
-                return false;
-            };
-            if !self.inbound.iter().any(|i| i == inbound) {
-                return false;
+                self.matches_rule_sets(meta, query)
             }
-        }
-        if !self.query_type.is_empty() && !self.query_type.contains(&query.qtype) {
-            return false;
-        }
-        if !self.network.is_empty() {
-            let Some(network) = meta.network.as_deref() else {
-                return false;
-            };
-            if !self.network.iter().any(|n| n == network) {
-                return false;
-            }
-        }
-        if !self.source_ip_cidr.is_empty() {
-            let Some(source) = meta.source else {
-                return false;
-            };
-            if !self.source_ip_cidr.iter().any(|p| p.contains(source)) {
-                return false;
-            }
-        }
-        if !self.domain.is_empty() && !self.domain.iter().any(|d| d == &query.name) {
-            return false;
-        }
-        if !self.source_mac.is_empty() || !self.source_hostname.is_empty() {
-            // the neighbour tables, when they are running at all
-            let found = meta.source.and_then(|source| {
-                crate::route::neighbor::current().map(|resolver| {
-                    (
-                        resolver.lookup_mac(source),
-                        resolver.lookup_hostname(source),
-                    )
-                })
-            });
-            let (mac, hostname) = found.unwrap_or((None, None));
-            if !self.source_mac.is_empty() && !mac.is_some_and(|mac| self.source_mac.contains(&mac))
-            {
-                return false;
-            }
-            if !self.source_hostname.is_empty()
-                && !hostname
-                    .as_deref()
-                    .is_some_and(|name| self.source_hostname.iter().any(|item| item == name))
-            {
-                return false;
-            }
-        }
-        if !self.rule_sets.is_empty() && !self.matches_rule_sets(meta, query) {
-            return false;
-        }
-        if !self.domain_suffix.is_empty()
-            && !self
-                .domain_suffix
-                .iter()
-                .any(|suffix| domain_suffix_match(&query.name, suffix))
-        {
-            return false;
-        }
-        if !self.domain_keyword.is_empty()
-            && !self
-                .domain_keyword
-                .iter()
-                .any(|k| query.name.contains(k.as_str()))
-        {
-            return false;
-        }
-        if !self.domain_regex.is_empty()
-            && !self.domain_regex.iter().any(|re| re.is_match(&query.name))
-        {
-            return false;
-        }
-        true
+    }
+
+    fn matches_response_rule_sets(
+        &self,
+        meta: &QueryMeta,
+        query: &QueryInfo,
+        ips: &[IpAddr],
+    ) -> bool {
+        let source =
+            std::net::SocketAddr::new(meta.source.unwrap_or(IpAddr::from([0, 0, 0, 0])), 0);
+        ips.iter().any(|ip| {
+            let mut context = crate::route::ConnContext::new(
+                meta.inbound.as_deref().unwrap_or(""),
+                source,
+                crate::inbound::Target::Ip(std::net::SocketAddr::new(*ip, 0)),
+                if meta.network.as_deref() == Some("tcp") {
+                    "tcp"
+                } else {
+                    "udp"
+                },
+            );
+            context.domain = Some(query.name.clone());
+            self.rule_sets.iter().any(|set| set.matches(&context))
+        })
     }
 }
 

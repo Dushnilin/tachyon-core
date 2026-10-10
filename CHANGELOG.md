@@ -3,6 +3,28 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.4
+
+### XHTTP: большой пинг
+- Сокет теперь возвращается в пул после `POST` (пустое тело с `Content-Length: 0` больше не оставляет соединение висеть).
+- Починена инвертированная проверка в xmux, из-за которой каждый запрос открывал новое соединение.
+- Пинг по xhttp-узлам упал до нормальных значений, double-hop узлы больше не висят в `N/A`.
+
+### DNS
+- Remote rule-set теперь работает внутри DNS-правил (#8).
+- `evaluate` / `respond`: порядок правил и обратное сопоставление FakeIP сохраняются.
+- DoH у Cloudflare: исправлен `Content-Length`.
+
+### Перезапуск и UDP (спасибо @MaksSt, PR #9)
+- Порты инбаундов освобождаются при SIGHUP и при остановке: UDP, QUIC, Hysteria2, tproxy (#5).
+- Если новая конфигурация не стартует, откатываемся на прежнюю.
+- XUDP / VLESS UDP, ответы TProxy с адреса назначения, session id у Hysteria2.
+- Таймаут блокирующих воркеров в CLI.
+
+Спасибо @Screamshow за PR #7 и разбор DNS: нужные части поведения закрыты тестами, часть правок уже была в нашей реализации.
+
+Новых зависимостей нет, размер бинарников в пределах бюджета.
+
 ## 0.0.3
 
 Point release addressing compound headless rules matching in RuleSet, outbound proxy routing mark tagging, zero-downtime SIGHUP reload, and MIPS toolchain musl linker stability.

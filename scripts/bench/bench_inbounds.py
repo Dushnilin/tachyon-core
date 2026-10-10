@@ -70,13 +70,76 @@ def tls_client(alpn=None):
     return t
 
 
+def xray_tls(certs):
+    return {
+        "security": "tls",
+        "tlsSettings": {
+            "certificates": [{"certificateFile": certs["crt"], "keyFile": certs["key"]}],
+        },
+    }
+
+
+def mihomo_tls(certs):
+    with open(certs["crt"]) as f:
+        crt_pem = f.read()
+    with open(certs["key"]) as f:
+        key_pem = f.read()
+    return {"enabled": True, "certificate": crt_pem, "certificate-key": key_pem}
+
+
+def yaml_dump(obj, indent=0):
+    """Tiny YAML emitter: dicts, lists, scalars; block scalars for multi-line strings."""
+    pad = "  " * indent
+    lines = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, dict) and v:
+                lines.append(f"{pad}{k}:")
+                lines.append(yaml_dump(v, indent + 1))
+            elif isinstance(v, list) and v:
+                lines.append(f"{pad}{k}:")
+                for item in v:
+                    if isinstance(item, dict):
+                        body = yaml_dump(item, indent + 2).lstrip()
+                        lines.append(f"{pad}  - {body}")
+                    else:
+                        lines.append(f"{pad}  - {yaml_scalar(item)}")
+            elif isinstance(v, str) and "\n" in v:
+                lines.append(f"{pad}{k}: |-\n" + "\n".join(pad + "  " + ln for ln in v.splitlines()))
+            elif isinstance(v, bool):
+                lines.append(f"{pad}{k}: {'true' if v else 'false'}")
+            elif v is None:
+                lines.append(f"{pad}{k}: null")
+            else:
+                lines.append(f"{pad}{k}: {yaml_scalar(v)}")
+    return "\n".join(lines)
+
+
+def yaml_scalar(v):
+    if isinstance(v, str):
+        if v == "" or any(c in v for c in ":#{}[],&*?|-<>=!%@`\"'\n"):
+            return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+        return v
+    return str(v)
+
+
 def build_inbound_cases(certs):
     tls_s, tls_c = tls_server(certs), tls_client()
     ref_tls = {"enabled": True, "certificate_path": certs["crt"], "key_path": certs["key"]}
 
     cases = []
 
-    def add(name, cat, desc, crypto, server, client, ref_supported=True):
+    def add(name, cat, desc, crypto, server, client, ref_supported=True,
+            steer_supported=False, xray_server=None, mihomo_server=None):
+        engines = ["tachyon"]
+        if ref_supported:
+            engines.append("singbox")
+        if steer_supported:
+            engines.append("steer")
+        if xray_server:
+            engines.append("xray")
+        if mihomo_server:
+            engines.append("mihomo")
         cases.append({
             "name": name,
             "category": cat,
@@ -85,82 +148,136 @@ def build_inbound_cases(certs):
             "server": server,
             "client": client,
             "ref_supported": ref_supported,
+            "engines": engines,
+            "xray_server": xray_server,
+            "mihomo_server": mihomo_server,
         })
 
     # 1. Classic Proxies
     add("mixed-socks5", "classic", "SOCKS5 прокси с аутентификацией и UDP ASSOCIATE",
         "Plain / SOCKS5",
         {"type": "mixed"},
-        {"type": "socks"})
+        {"type": "socks"},
+        steer_supported=True,
+        xray_server={"protocol": "socks", "settings": {"auth": "noauth", "udp": False}},
+        mihomo_server={"name": "in", "type": "mixed"})
 
     add("mixed-http", "classic", "HTTP CONNECT туннелирование с TLS sniffing",
         "Plain / HTTP CONNECT",
         {"type": "mixed"},
-        {"type": "http"})
+        {"type": "http"},
+        steer_supported=True,
+        xray_server={"protocol": "http", "settings": {}},
+        mihomo_server={"name": "in", "type": "http"})
 
     # 2. Shadowsocks AEAD & 2022
+    def ss_specs(method, password):
+        return (
+            {"protocol": "shadowsocks",
+             "settings": {"method": method, "password": password, "network": "tcp"}},
+            {"name": "in", "type": "shadowsocks", "network": "tcp",
+             "method": method, "password": password},
+        )
+
+    xm, mm = ss_specs("aes-128-gcm", "bench-password")
     add("ss-aes-128-gcm", "shadowsocks", "Shadowsocks AEAD (AES-128-GCM)",
         "AES-128-GCM",
         {"type": "shadowsocks", "method": "aes-128-gcm", "password": "bench-password"},
-        {"type": "shadowsocks", "method": "aes-128-gcm", "password": "bench-password"})
+        {"type": "shadowsocks", "method": "aes-128-gcm", "password": "bench-password"},
+        steer_supported=True, xray_server=xm, mihomo_server=mm)
 
+    xm, mm = ss_specs("aes-256-gcm", "bench-password")
     add("ss-aes-256-gcm", "shadowsocks", "Shadowsocks AEAD (AES-256-GCM)",
         "AES-256-GCM",
         {"type": "shadowsocks", "method": "aes-256-gcm", "password": "bench-password"},
-        {"type": "shadowsocks", "method": "aes-256-gcm", "password": "bench-password"})
+        {"type": "shadowsocks", "method": "aes-256-gcm", "password": "bench-password"},
+        steer_supported=True, xray_server=xm, mihomo_server=mm)
 
+    xm, mm = ss_specs("chacha20-ietf-poly1305", "bench-password")
     add("ss-chacha20-poly1305", "shadowsocks", "Shadowsocks AEAD (ChaCha20-Poly1305)",
         "ChaCha20-Poly1305",
         {"type": "shadowsocks", "method": "chacha20-ietf-poly1305", "password": "bench-password"},
-        {"type": "shadowsocks", "method": "chacha20-ietf-poly1305", "password": "bench-password"})
+        {"type": "shadowsocks", "method": "chacha20-ietf-poly1305", "password": "bench-password"},
+        steer_supported=True, xray_server=xm, mihomo_server=mm)
 
+    xm, mm = ss_specs("2022-blake3-aes-128-gcm", b64(16))
     add("ss2022-aes-128", "shadowsocks", "Shadowsocks 2022 (BLAKE3 + AES-128-GCM)",
         "2022-blake3-aes-128-gcm",
         {"type": "shadowsocks", "method": "2022-blake3-aes-128-gcm", "password": b64(16)},
-        {"type": "shadowsocks", "method": "2022-blake3-aes-128-gcm", "password": b64(16)})
+        {"type": "shadowsocks", "method": "2022-blake3-aes-128-gcm", "password": b64(16)},
+        steer_supported=True, xray_server=xm, mihomo_server=mm)
 
+    xm, mm = ss_specs("2022-blake3-chacha20-poly1305", b64(32))
     add("ss2022-chacha20", "shadowsocks", "Shadowsocks 2022 (BLAKE3 + ChaCha20-Poly1305)",
         "2022-blake3-chacha20-poly1305",
         {"type": "shadowsocks", "method": "2022-blake3-chacha20-poly1305", "password": b64(32)},
-        {"type": "shadowsocks", "method": "2022-blake3-chacha20-poly1305", "password": b64(32)})
+        {"type": "shadowsocks", "method": "2022-blake3-chacha20-poly1305", "password": b64(32)},
+        steer_supported=True, xray_server=xm, mihomo_server=mm)
 
     # 3. TLS 1.3 Inbounds (VLESS, Trojan, VMess)
+    mtls = mihomo_tls(certs)
+    mtls_h3 = dict(mihomo_tls(certs), alpn=["h3"])
     vless_s = {"type": "vless", "users": [{"name": "u", "uuid": UUID}]}
     vless_c = {"type": "vless", "uuid": UUID}
     add("vless-plain", "tls", "VLESS без TLS (чистый легковесный TCP/UDP транспорт)",
         "UUID auth (plain)",
-        dict(vless_s), dict(vless_c))
+        dict(vless_s), dict(vless_c),
+        steer_supported=True,
+        xray_server={"protocol": "vless", "settings": {"clients": [{"id": UUID}], "decryption": "none"}},
+        mihomo_server={"name": "in", "type": "vless", "users": [{"uuid": UUID}]})
 
     add("vless-tls", "tls", "VLESS поверх чистого Rust TLS 1.3 сервера",
         "TLS 1.3 + UUID",
-        dict(vless_s, tls=tls_s), dict(vless_c, tls=tls_c))
+        dict(vless_s, tls=tls_s), dict(vless_c, tls=tls_c),
+        steer_supported=True,
+        xray_server={"protocol": "vless", "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+                     "streamSettings": xray_tls(certs)},
+        mihomo_server={"name": "in", "type": "vless", "users": [{"uuid": UUID}], "tls": mtls})
 
     vision_s = {"type": "vless", "users": [{"name": "u", "uuid": UUID, "flow": "xtls-rprx-vision"}]}
     vision_c = {"type": "vless", "uuid": UUID, "flow": "xtls-rprx-vision"}
     add("vless-vision", "tls", "VLESS с XTLS-Vision flow и padding-защитой",
         "TLS 1.3 + Vision flow",
-        dict(vision_s, tls=tls_s), dict(vision_c, tls=tls_c))
+        dict(vision_s, tls=tls_s), dict(vision_c, tls=tls_c),
+        steer_supported=True,
+        xray_server={"protocol": "vless",
+                     "settings": {"clients": [{"id": UUID, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+                     "streamSettings": xray_tls(certs)},
+        mihomo_server={"name": "in", "type": "vless",
+                       "users": [{"uuid": UUID, "flow": "xtls-rprx-vision"}], "tls": mtls})
 
     vmess_s = {"type": "vmess", "users": [{"name": "u", "uuid": UUID, "alterId": 0}]}
     vmess_c = {"type": "vmess", "uuid": UUID, "security": "auto"}
     add("vmess-plain", "tls", "VMess AEAD заголовок и двустороннее шифрование",
         "AEAD ChaCha20 / AES",
-        dict(vmess_s), dict(vmess_c))
+        dict(vmess_s), dict(vmess_c),
+        steer_supported=True,
+        xray_server={"protocol": "vmess", "settings": {"clients": [{"id": UUID, "alterId": 0}]}},
+        mihomo_server={"name": "in", "type": "vmess", "users": [{"uuid": UUID, "alterId": 0}]})
 
     add("vmess-tls", "tls", "VMess AEAD в туннеле TLS 1.3",
         "TLS 1.3 + VMess AEAD",
-        dict(vmess_s, tls=tls_s), dict(vmess_c, tls=tls_c))
+        dict(vmess_s, tls=tls_s), dict(vmess_c, tls=tls_c),
+        steer_supported=True,
+        xray_server={"protocol": "vmess", "settings": {"clients": [{"id": UUID, "alterId": 0}]},
+                     "streamSettings": xray_tls(certs)},
+        mihomo_server={"name": "in", "type": "vmess", "users": [{"uuid": UUID, "alterId": 0}], "tls": mtls})
 
     trojan_s = {"type": "trojan", "users": [{"name": "u", "password": "bench-password"}]}
     trojan_c = {"type": "trojan", "password": "bench-password"}
     add("trojan-tls", "tls", "Trojan с SHA224 паролем в TLS 1.3",
         "TLS 1.3 + SHA224",
-        dict(trojan_s, tls=tls_s), dict(trojan_c, tls=tls_c))
+        dict(trojan_s, tls=tls_s), dict(trojan_c, tls=tls_c),
+        steer_supported=True,
+        xray_server={"protocol": "trojan", "settings": {"clients": [{"password": "bench-password"}]},
+                     "streamSettings": xray_tls(certs)},
+        mihomo_server={"name": "in", "type": "trojan", "users": [{"password": "bench-password"}], "tls": mtls})
 
     add("anytls-tls", "tls", "AnyTLS: прямое TLS 1.3 со случайным padding",
         "TLS 1.3 + custom pad",
         {"type": "anytls", "users": [{"password": "bench-password"}], "tls": tls_s},
-        {"type": "anytls", "password": "bench-password", "tls": tls_c})
+        {"type": "anytls", "password": "bench-password", "tls": tls_c},
+        mihomo_server={"name": "in", "type": "anytls", "users": [{"password": "bench-password"}], "tls": mtls})
 
     # 4. HTTP/2 & HTTP/3 Naive
     add("naive-h2", "quic", "NaiveProxy поверх HTTP/2 CONNECT",
@@ -180,14 +297,19 @@ def build_inbound_cases(certs):
         "QUIC + BBR + H3 Auth",
         {"type": "hysteria2", "users": [{"password": "bench-password"}],
          "tls": tls_server(certs, ["h3"])},
-        {"type": "hysteria2", "password": "bench-password", "tls": tls_client(["h3"])})
+        {"type": "hysteria2", "password": "bench-password", "tls": tls_client(["h3"])},
+        steer_supported=True,
+        mihomo_server={"name": "in", "type": "hysteria2", "users": [{"password": "bench-password"}],
+                       "tls": mtls_h3})
 
     add("tuic-v5", "quic", "TUIC v5: QUIC + EKM экспорт ключей + 0-RTT",
         "QUIC + BBR + EKM Auth",
         {"type": "tuic", "users": [{"uuid": UUID, "password": "bench-password"}],
          "congestion_control": "bbr", "tls": tls_server(certs, ["h3"])},
         {"type": "tuic", "uuid": UUID, "password": "bench-password",
-         "congestion_control": "bbr", "udp_relay_mode": "native", "tls": tls_client(["h3"])})
+         "congestion_control": "bbr", "udp_relay_mode": "native", "tls": tls_client(["h3"])},
+        mihomo_server={"name": "in", "type": "tuic", "congestion_control": "bbr",
+                       "users": [{"uuid": UUID, "password": "bench-password"}], "tls": mtls_h3})
 
     # 6. Stealth & VPN: ShadowTLS & FPTN
     add("shadowtls-v3", "stealth", "ShadowTLS v3: HMAC-SHA1 stealth SNI + Trojan",
@@ -211,27 +333,51 @@ def build_inbound_cases(certs):
 
 
 class Proc:
-    def __init__(self, path, cfg, cpus, workdir, tag):
-        self.cfg_path = os.path.join(workdir, f"{tag}.json")
-        with open(self.cfg_path, "w") as f:
-            json.dump(cfg, f, indent=2)
+    def __init__(self, path, cfg_text, cfg_name, kind, cpus, workdir, tag, env_extra=None):
+        self.cfg_path = os.path.join(workdir, cfg_name)
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            f.write(cfg_text)
         self.err_path = os.path.join(workdir, f"{tag}.err")
         self.err = open(self.err_path, "w")
-        self.path, self.cpus = path, cpus
+        self.path, self.cpus, self.kind = path, cpus, kind
+        self.workdir = workdir
+        self.env_extra = env_extra or {}
         self.p = None
 
+    def _env(self):
+        env = os.environ.copy()
+        env.update(self.env_extra)
+        return env
+
+    def _cmd(self, mode):
+        if self.kind == "xray":
+            args = [self.path, "run"]
+            if mode == "check":
+                args.append("-test")
+            return args + ["-c", self.cfg_path]
+        if self.kind == "mihomo":
+            args = [self.path]
+            if mode == "check":
+                args.append("-t")
+            return args + ["-d", self.workdir, "-f", self.cfg_path]
+        return [self.path, mode, "-c", self.cfg_path]
+
     def check(self):
-        r = subprocess.run([self.path, "check", "-c", self.cfg_path],
-                           capture_output=True, text=True, timeout=15)
+        try:
+            r = subprocess.run(self._cmd("check"), capture_output=True, text=True,
+                               timeout=15, env=self._env())
+        except subprocess.TimeoutExpired:
+            return False, "check timed out"
         return r.returncode == 0, (r.stdout + r.stderr).strip()
 
     def start(self):
         preexec = (lambda: os.sched_setaffinity(0, self.cpus)) if hasattr(os, "sched_setaffinity") and self.cpus else None
         self.p = subprocess.Popen(
-            [self.path, "run", "-c", self.cfg_path],
+            self._cmd("run"),
             stdout=self.err, stderr=self.err,
             start_new_session=True,
             preexec_fn=preexec,
+            env=self._env(),
         )
 
     def alive(self):
@@ -305,18 +451,61 @@ def probe(port, deadline_s=12):
     return last_err or "timeout waiting for probe"
 
 
-def measure_cell(server_bin, client_bin, case, ports, cpus, runs=1, seconds=1, rounds=300):
+def make_server_proc(engine, server_bin, case, server_port, cpus, work):
+    """Server-side process for the given engine; None when it has no config for the case."""
+    if engine in ("tachyon", "singbox", "steer"):
+        env_extra = {}
+        if engine == "steer":
+            bench.ensure_steer_env(server_bin)
+            env_extra["LD_LIBRARY_PATH"] = "/usr/lib"
+        server_inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=server_port)
+        server_cfg = {
+            "log": {"level": "warn"},
+            "inbounds": [server_inbound],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"},
+        }
+        if engine == "steer":
+            server_cfg["outbounds"][0]["bind_interface"] = "lo"
+        return Proc(server_bin, json.dumps(server_cfg, indent=2), "server.json",
+                    "sb", cpus, work, "server", env_extra)
+
+    if engine == "xray":
+        spec = case.get("xray_server")
+        if not spec:
+            return None
+        inbound = dict(spec, listen="127.0.0.1", port=server_port)
+        cfg = {
+            "log": {"loglevel": "error"},
+            "inbounds": [inbound],
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+        }
+        return Proc(server_bin, json.dumps(cfg, indent=2), "server.json", "xray", cpus, work, "server")
+
+    if engine == "mihomo":
+        spec = case.get("mihomo_server")
+        if not spec:
+            return None
+        inbound = dict(spec, listen="127.0.0.1", port=server_port)
+        cfg = {
+            "log-level": "silent",
+            "mode": "rule",
+            "inbounds": [inbound],
+            "rules": ["MATCH,DIRECT"],
+        }
+        return Proc(server_bin, yaml_dump(cfg) + "\n", "server.yaml", "mihomo", cpus, work, "server")
+
+    return None
+
+
+def measure_cell(engine, server_bin, client_bin, case, ports, cpus, runs=1, seconds=1, rounds=300):
     proxy_port, server_port = ports
     work = tempfile.mkdtemp(prefix="tachyon_inb_")
     bench.PROXY_PORT = proxy_port
 
-    server_inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=server_port)
-    server_cfg = {
-        "log": {"level": "warn"},
-        "inbounds": [server_inbound],
-        "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final": "direct"},
-    }
+    srv = make_server_proc(engine, server_bin, case, server_port, cpus["server"], work)
+    if srv is None:
+        return {"status": "SKIP", "why": f"{engine}: no config for this case"}
 
     client_outbound = dict(case["client"], tag="proxy", server="127.0.0.1", server_port=server_port)
     client_cfg = {
@@ -326,8 +515,8 @@ def measure_cell(server_bin, client_bin, case, ports, cpus, runs=1, seconds=1, r
         "route": {"final": "proxy"},
     }
 
-    srv = Proc(server_bin, server_cfg, cpus["server"], work, "server")
-    cli = Proc(client_bin, client_cfg, cpus["client"], work, "client")
+    cli = Proc(client_bin, json.dumps(client_cfg, indent=2), "client.json",
+               "sb", cpus["client"], work, "client")
 
     res = {}
     try:
@@ -822,16 +1011,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tachyon", default="target/bench/tachyon-core")
     ap.add_argument("--ref", default="target/bench/sing-box-lx")
+    ap.add_argument("--steer", default="target/bench/steer/usr/bin/sing-box")
+    ap.add_argument("--xray", default="target/bench/xray-linux")
+    ap.add_argument("--mihomo", default="target/bench/mihomo-linux")
     ap.add_argument("--client-cpus", default="0-1")
     ap.add_argument("--server-cpus", default="2-3")
     ap.add_argument("--seconds", type=int, default=1)
     ap.add_argument("--rounds", type=int, default=200)
+    ap.add_argument("--only", help="Filter inbound names (comma-separated)")
     ap.add_argument("--out-json", default="target/bench/inbound_bench_result.json")
     ap.add_argument("--out-html", default="INBOUND_BENCHMARK.html")
     args = ap.parse_args()
 
     tachyon_bin = os.path.abspath(args.tachyon)
-    ref_bin = os.path.abspath(args.ref)
+    engine_bins = {
+        "singbox": os.path.abspath(args.ref),
+        "steer": os.path.abspath(args.steer),
+        "xray": os.path.abspath(args.xray),
+        "mihomo": os.path.abspath(args.mihomo),
+    }
 
     work = tempfile.mkdtemp(prefix="tachyon_cert_")
     # Generate certs via openssl or fallback
@@ -839,12 +1037,12 @@ def main():
     key_path = os.path.join(work, "localhost.key")
 
     # Use existing test certs if available
-    for candidate in ("target/bench/localhost.crt", "tests/golden/certs/localhost.crt"):
+    for candidate in ("target/bench/localhost.crt", "localhost.crt", "tests/golden/certs/localhost.crt"):
         if os.path.exists(candidate):
             with open(candidate, "rb") as f:
                 open(cert_path, "wb").write(f.read())
             break
-    for candidate in ("target/bench/localhost.key", "tests/golden/certs/localhost.key"):
+    for candidate in ("target/bench/localhost.key", "localhost.key", "tests/golden/certs/localhost.key"):
         if os.path.exists(candidate):
             with open(candidate, "rb") as f:
                 open(key_path, "wb").write(f.read())
@@ -859,6 +1057,9 @@ def main():
 
     certs = {"crt": cert_path, "key": key_path}
     cases = build_inbound_cases(certs)
+    if args.only:
+        allowed = set(args.only.split(","))
+        cases = [c for c in cases if c["name"] in allowed]
 
     def parse_cpus(s):
         if not hasattr(os, "sched_setaffinity") or not s:
@@ -872,6 +1073,10 @@ def main():
     cpus = {"client": parse_cpus(args.client_cpus), "server": parse_cpus(args.server_cpus)}
     load = set(range(os.cpu_count() or 4)) - cpus["client"] - cpus["server"] or cpus["client"]
 
+    # steer needs musl + steerd + libsteer wired up once for the whole run
+    if os.path.exists(engine_bins["steer"]):
+        bench.ensure_steer_env(engine_bins["steer"])
+
     # Start sink process and tls decoy process
     ctx = multiprocessing.get_context("fork")
     sink = ctx.Process(target=bench.run_sink, args=(load,), daemon=True)
@@ -884,7 +1089,7 @@ def main():
 
     results = []
     port_idx = 0
-    print(f"=== Starting Inbound Benchmark ({len(cases)} inbounds) ===")
+    print(f"=== Starting Inbound Benchmark ({len(cases)} inbounds x 5 engines) ===")
 
     for case in cases:
         port_idx += 1
@@ -892,18 +1097,30 @@ def main():
         name = case["name"]
         print(f"Benchmarking inbound: {name:<24s} ...", end=" ", flush=True)
 
-        # 1. Tachyon server inbound
-        t_res = measure_cell(tachyon_bin, tachyon_bin, case, ports, cpus,
-                             runs=1, seconds=args.seconds, rounds=args.rounds)
+        entry = {
+            "name": name,
+            "category": case["category"],
+            "description": case["description"],
+            "crypto": case["crypto"],
+            "tachyon": None, "singbox": None, "steer": None, "xray": None, "mihomo": None,
+            "engines": case["engines"],
+        }
 
-        # 2. Sing-box server inbound (if supported by reference)
-        s_res = None
-        if case["ref_supported"] and os.path.exists(ref_bin):
+        entry["tachyon"] = measure_cell("tachyon", tachyon_bin, tachyon_bin, case, ports, cpus,
+                                        runs=1, seconds=args.seconds, rounds=args.rounds)
+
+        for eng in ("singbox", "steer", "xray", "mihomo"):
+            if eng not in case["engines"]:
+                continue
+            b = engine_bins[eng]
+            if not os.path.exists(b):
+                continue
             port_idx += 1
-            ref_ports = (PROXY_PORT_BASE + port_idx, SERVER_PORT_BASE + port_idx)
-            s_res = measure_cell(ref_bin, tachyon_bin, case, ref_ports, cpus,
-                                 runs=1, seconds=args.seconds, rounds=args.rounds)
+            eng_ports = (PROXY_PORT_BASE + port_idx, SERVER_PORT_BASE + port_idx)
+            entry[eng] = measure_cell(eng, b, tachyon_bin, case, eng_ports, cpus,
+                                      runs=1, seconds=args.seconds, rounds=args.rounds)
 
+        t_res, s_res = entry["tachyon"], entry["singbox"]
         verdict = "ПОБЕДА"
         delta_pct = None
         if t_res.get("status") == "OK" and s_res and s_res.get("status") == "OK":
@@ -917,22 +1134,18 @@ def main():
                     verdict = "ПАРИТЕТ"
         elif t_res.get("status") == "OK":
             verdict = "ПОБЕДА"
-
-        entry = {
-            "name": name,
-            "category": case["category"],
-            "description": case["description"],
-            "crypto": case["crypto"],
-            "tachyon": t_res,
-            "singbox": s_res,
-            "verdict": verdict,
-            "delta_tput_8_pct": delta_pct,
-        }
+        entry["verdict"] = verdict
+        entry["delta_tput_8_pct"] = delta_pct
         results.append(entry)
 
-        t8_str = f"{t_res.get('tput_8', 0):.1f} Gbit/s" if t_res.get("status") == "OK" else "FAIL"
-        s8_str = f"(ref: {s_res.get('tput_8', 0):.1f})" if s_res and s_res.get("status") == "OK" else ""
-        print(f"{t8_str} {s8_str} -> {verdict}")
+        def cell_str(res):
+            if not res:
+                return "—"
+            if res.get("status") == "OK":
+                return f"{res.get('tput_8', 0):.1f}G"
+            return res.get("status", "FAIL")
+
+        print(" | ".join(f"{eng}:{cell_str(entry[eng])}" for eng in ("tachyon", "singbox", "steer", "xray", "mihomo")))
 
     sink.terminate()
 
@@ -946,7 +1159,10 @@ def main():
     with open(args.out_json, "w", encoding="utf-8") as f:
         json.dump({"results": results, "meta": run_meta}, f, indent=2)
 
-    generate_html_report(results, run_meta, args.out_html)
+    try:
+        generate_html_report(results, run_meta, args.out_html)
+    except Exception as e:
+        print(f"legacy html skipped: {e}")
     print("Benchmark complete!")
 
 

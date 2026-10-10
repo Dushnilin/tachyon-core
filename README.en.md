@@ -90,7 +90,7 @@ All numbers come from real static musl builds measured against reference Go core
 | **Hysteria 2 (QUIC)** | **3.2 / 4.2** | 1.8 / 1.8 | — | 2.3 / 1.9 | 1.8 / 1.8 | **~2.3×** |
 | **NaiveProxy (H2)** | **2.4 / 4.2** | 1.4 / 2.1 | — | — | — | **~2×** |
 | **TUIC v5 (QUIC)** | **3.9 / 4.6** | 2.5 / 1.9 | — | 2.4 / 2.0 | — | **~2×** |
-| Mieru (TCP) | — | 2.1 / 2.5 | — | 2.1 / 2.4 | — | not in the tree |
+| Mieru (TCP) | — | 2.1 / 2.5 | — | 2.1 / 2.4 | — | in the tree, client and server; interop-checked against the real mieru and mita, speed not measured |
 | **WireGuard** | **7.2 / 8.5** | 4.1 / 4.8 | 3.8 / 4.2 | 3.9 / 4.4 | — | **~1.8×** |
 | **AmneziaWG** | **7.0 / 8.1** | 4.0 / 4.6 | 3.6 / 4.1 | 3.8 / 4.2 | — | **~1.8×** |
 | **MASQUE (WARP)** | **4.8 / 6.4** | 3.1 / 3.9 | — | — | — | **~1.6×** |

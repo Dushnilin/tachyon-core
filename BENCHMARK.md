@@ -72,7 +72,7 @@
 | NaiveProxy (HTTP/3 QUIC) | 0.89/0.90 G | 0.60/0.75 G | - | - | — | 14.5 µs / 655.6 µs | 15.5M / 59.0M | **TACHYON (1.2x)** |
 | AnyTLS (H2MUX TLS) | 7.05/6.71 G | 5.61/5.64 G | - | - | — | 341.3 µs / 358.1 µs | 37.4M / 46.3M | **TACHYON (1.2x)** |
 | Snell (v4/v5) | 3.64/3.41 G | 2.68/2.69 G | - | 2.28/2.30 G | — | 321.8 µs / 341.3 µs | 6.8M / 45.2M | **TACHYON (1.4x)** |
-| Mieru (TCP) | 3.25/4.80 G | 2.10/2.45 G | - | 2.05/2.38 G | — | 330.4 µs / 365.2 µs | 7.8M / 44.0M | **TACHYON (2.0x)** |
+| Mieru (TCP) | не измерено | - | - | - | — | - | - | интероп с настоящими mieru/mita проверен, скорость не мерили |
 | ShadowTLS v3 (TLS SNI Obfs) | 5.60/7.10 G | 3.80/4.60 G | - | 3.40/4.10 G | — | 318.4 µs / 348.0 µs | 8.0M / 45.0M | **TACHYON (1.5x)** |
 | WireGuard (UDP Native) | 7.20/8.50 G | 4.10/4.80 G | 3.80/4.20 G | 3.90/4.35 G | — | 290.5 µs / 330.2 µs | 7.5M / 43.5M | **TACHYON (1.8x)** |
 | AmneziaWG (Obfuscated WG) | 6.95/8.10 G | 3.95/4.55 G | 3.60/4.05 G | 3.75/4.15 G | — | 295.0 µs / 335.4 µs | 7.6M / 43.8M | **TACHYON (1.8x)** |
@@ -84,8 +84,8 @@
 ## 3. Ключевые выводы
 
 - **Tachyon Core побеждает в 36 из 39 протокольных тестов** (3 паритета, 0 поражений).
-- **REALITY & Mieru поддержка:**
-  - Полная поддержка VLESS-Reality (Vision/direct), Trojan-Reality и Mieru.
+- **REALITY поддержка:**
+  - Полная поддержка VLESS-Reality (Vision/direct) и Trojan-Reality. Mieru (TCP, клиент и сервер) есть, но скорость на нём пока не мерили.
   - На VLESS Reality Vision: **3.53/6.45 Gbps** у Tachyon при задержке **306.4 µs** и расходе CPU всего **3.4 s/GiB** (против 2.86/5.53 Gbps, 364.5 µs и 3.9 s/GiB у sing-box, а также 2.18/2.79 Gbps у Xray).
 - **Потребление оперативной памяти (RSS):** 
   - На базовом SOCKS5/Direct routing: **4.2 MiB** у Tachyon против **5.1 MiB** у Steer (C), **25.0 MiB** у Xray и **39.9 MiB** у sing-box.

@@ -58,6 +58,12 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// Keep the answer's age anchor for reverse mapping, including stale hits.
+    pub fn get_with_time(&mut self, key: &CacheKey, now: Instant) -> Option<(CacheHit, Instant)> {
+        let hit = self.get(key, now)?;
+        Some((hit, self.entries.peek(key)?.inserted))
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: LruCache::new(NonZeroUsize::new(capacity.max(16)).expect("max(16)")),
@@ -85,7 +91,7 @@ impl Cache {
         raw: impl Into<Arc<[u8]>>,
         meta: &ResponseMeta,
         optimistic_timeout: Option<Duration>,
-    ) {
+    ) -> Instant {
         let ttl_secs = meta.min_answer_ttl.unwrap_or(60).max(1);
         let inserted = Instant::now();
         let optimistic_until = optimistic_timeout.map(|window| inserted + window);
@@ -98,6 +104,7 @@ impl Cache {
                 optimistic_until,
             },
         );
+        inserted
     }
 }
 

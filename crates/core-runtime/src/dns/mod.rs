@@ -284,6 +284,10 @@ impl DnsService {
     /// for its TTL, so a connection that dials that IP can still match
     /// domain rules. FakeIP answers are skipped — they have their own map.
     fn record_reverse(&self, raw: &[u8], from_fakeip: bool) {
+        self.record_reverse_at(raw, from_fakeip, Instant::now());
+    }
+
+    fn record_reverse_at(&self, raw: &[u8], from_fakeip: bool, received: Instant) {
         let Some(reverse) = &self.reverse else {
             return;
         };
@@ -317,7 +321,7 @@ impl DnsService {
                 ip,
                 ReverseEntry {
                     domain: codec::normalize_name(&answer.name.to_string()),
-                    expires: now + Duration::from_secs(answer.ttl as u64),
+                    expires: received + Duration::from_secs(answer.ttl as u64),
                 },
             );
         }
@@ -358,11 +362,14 @@ impl DnsService {
         ));
         let mut opts = WalkOptions::default();
         let mut target: Option<Arc<ServerConfig>> = None;
+        let mut evaluated: Option<(Vec<u8>, bool, Instant)> = None;
+        let mut answer_ips = Vec::new();
         for (rule_idx, rule) in self.rules.iter().enumerate() {
-            if rule.match_response {
-                continue;
-            }
-            if !rule.matches(meta, &info) {
+            if !rule.matches_stage(
+                meta,
+                &info,
+                evaluated.as_ref().map(|_| answer_ips.as_slice()),
+            ) {
                 continue;
             }
             crate::logging::debug(format_args!(
@@ -427,11 +434,15 @@ impl DnsService {
                     self.record_reverse(&raw, false);
                     return Ok(raw);
                 }
-                Action::Evaluate { server } => {
+                Action::Evaluate {
+                    server,
+                    rewrite_ttl,
+                    disable_cache,
+                } => {
                     let tag = if server.is_empty() {
-                        self.final_tag.as_str()
+                        &self.final_tag
                     } else {
-                        server.as_str()
+                        server
                     };
                     let Some(cfg) = self.servers.get(tag) else {
                         crate::logging::warn(format_args!(
@@ -439,76 +450,37 @@ impl DnsService {
                         ));
                         continue;
                     };
-                    let response = self.exchange_remote(cfg, query).await?;
-                    let answer_ips = codec::answer_ips(&response).unwrap_or_default();
-
-                    let mut matched_response = false;
-                    for resp_rule in &self.rules {
-                        if !resp_rule.match_response {
-                            continue;
-                        }
-                        if resp_rule.matches_response(meta, &info, &answer_ips) {
-                            matched_response = true;
-                            match &resp_rule.action {
-                                Action::Route {
-                                    server: r_server,
-                                    rewrite_ttl: r_ttl,
-                                    disable_cache: _,
-                                } => {
-                                    let resp_tag = if r_server.is_empty() {
-                                        self.final_tag.as_str()
-                                    } else {
-                                        r_server.as_str()
-                                    };
-                                    if let Some(target_cfg) = self.servers.get(resp_tag) {
-                                        if target_cfg.is_fakeip() && allow_fakeip {
-                                            let store =
-                                                target_cfg.store.clone().ok_or_else(|| {
-                                                    std::io::Error::other(
-                                                        "dns: fakeip server without store",
-                                                    )
-                                                })?;
-                                            return self.fakeip_answer(
-                                                &query_msg,
-                                                &info,
-                                                &store,
-                                                r_ttl.or(opts.rewrite_ttl),
-                                            );
-                                        }
-                                        target = Some(Arc::clone(target_cfg));
-                                        break;
-                                    }
-                                }
-                                Action::Reject => {
-                                    return match resp_rule.reject_method {
-                                        RejectMethod::Refused => {
-                                            codec::refused_response(&query_msg)
-                                                .map_err(std::io::Error::other)
-                                        }
-                                        RejectMethod::Drop => Err(std::io::Error::new(
-                                            std::io::ErrorKind::ConnectionReset,
-                                            "dns: query dropped by match_response rule",
-                                        )),
-                                    };
-                                }
-                                _ => {}
-                            }
-                        }
+                    if cfg.is_fakeip() && !allow_fakeip {
+                        continue;
                     }
-                    if !matched_response || target.is_none() {
-                        let rewritten: Arc<[u8]> = match opts.rewrite_ttl {
-                            Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
-                            None => response.into(),
-                        };
-                        self.record_reverse(&rewritten, false);
-                        return codec::set_id(&rewritten, info.id);
+                    let mut options = opts.clone();
+                    if let Some(ttl) = rewrite_ttl {
+                        options.rewrite_ttl = Some(*ttl);
                     }
-                    break;
+                    options.disable_cache |= *disable_cache;
+                    let (raw, received) = self
+                        .exchange_target(
+                            meta,
+                            query,
+                            allow_fakeip,
+                            skip_cache_read,
+                            Arc::clone(cfg),
+                            options,
+                        )
+                        .await?;
+                    answer_ips = codec::answer_ips(&raw)?;
+                    evaluated = Some((raw, cfg.is_fakeip(), received));
                 }
                 Action::Respond => {
-                    crate::logging::warn(format_args!(
-                        "dns: respond action is a known gap; rule ignored"
-                    ));
+                    let (raw, fakeip, received) = evaluated.as_ref().ok_or_else(|| {
+                        std::io::Error::other("dns: respond without evaluated response")
+                    })?;
+                    let raw = match opts.rewrite_ttl {
+                        Some(ttl) => codec::rewrite_ttl(raw, ttl)?,
+                        None => raw.clone(),
+                    };
+                    self.record_reverse_at(&raw, *fakeip, *received);
+                    return codec::set_id(&raw, info.id);
                 }
             }
         }
@@ -521,6 +493,46 @@ impl DnsService {
             ),
         };
 
+        let fakeip = target.is_fakeip();
+        let (raw, received) = self
+            .exchange_target(meta, query, allow_fakeip, skip_cache_read, target, opts)
+            .await?;
+        self.record_reverse_at(&raw, fakeip, received);
+        Ok(raw)
+    }
+
+    /// Evaluate and route share transport selection, cache, TTL and ID handling.
+    async fn exchange_target(
+        self: &Arc<Self>,
+        meta: &QueryMeta,
+        query: &[u8],
+        allow_fakeip: bool,
+        skip_cache_read: bool,
+        target: Arc<ServerConfig>,
+        opts: WalkOptions,
+    ) -> std::io::Result<(Vec<u8>, Instant)> {
+        let (raw, received) = self
+            .exchange_target_inner(meta, query, allow_fakeip, skip_cache_read, target, &opts)
+            .await?;
+        // Also applies to hosts/local/group transports, which bypass the wire cache.
+        let raw = match opts.rewrite_ttl {
+            Some(ttl) => codec::rewrite_ttl(&raw, ttl)?,
+            None => raw,
+        };
+        Ok((raw, received))
+    }
+
+    async fn exchange_target_inner(
+        self: &Arc<Self>,
+        meta: &QueryMeta,
+        query: &[u8],
+        allow_fakeip: bool,
+        skip_cache_read: bool,
+        target: Arc<ServerConfig>,
+        opts: &WalkOptions,
+    ) -> std::io::Result<(Vec<u8>, Instant)> {
+        let (query_msg, info) = codec::parse_query(query)?;
+
         // the hosts and local transports answer without touching the wire
         match target.kind {
             Kind::Hosts => {
@@ -530,32 +542,33 @@ impl DnsService {
                     .ok_or_else(|| std::io::Error::other("dns: hosts server without sources"))?;
                 let addrs = sources.lookup(&info.name);
                 if addrs.is_empty() {
-                    return codec::name_error(&query_msg).map_err(std::io::Error::other);
+                    return codec::name_error(&query_msg)
+                        .map(|raw| (raw, Instant::now()))
+                        .map_err(std::io::Error::other);
                 }
                 let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
                     .map_err(std::io::Error::other)?;
-                self.record_reverse(&raw, target.is_fakeip());
-                return codec::set_id(&raw, info.id);
+                return codec::set_id(&raw, info.id).map(|raw| (raw, Instant::now()));
             }
             Kind::Local | Kind::Dhcp | Kind::Resolved => {
                 if mdns::is_local_domain(&info.name)
                     && let Some(mdns_result) = self.local_zone_mdns(query).await
                 {
                     let raw = mdns_result?;
-                    self.record_reverse(&raw, target.is_fakeip());
-                    return codec::set_id(&raw, info.id);
+                    return codec::set_id(&raw, info.id).map(|raw| (raw, Instant::now()));
                 }
                 let addrs = match self.neighbor_lookup(&target, &info.name) {
                     Some(addresses) => addresses,
                     None => system_lookup(&info.name).await,
                 };
                 if addrs.is_empty() {
-                    return codec::name_error(&query_msg).map_err(std::io::Error::other);
+                    return codec::name_error(&query_msg)
+                        .map(|raw| (raw, Instant::now()))
+                        .map_err(std::io::Error::other);
                 }
                 let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
                     .map_err(std::io::Error::other)?;
-                self.record_reverse(&raw, target.is_fakeip());
-                return codec::set_id(&raw, info.id);
+                return codec::set_id(&raw, info.id).map(|raw| (raw, Instant::now()));
             }
             _ => {}
         }
@@ -565,8 +578,7 @@ impl DnsService {
             let service: Arc<DnsService> = Arc::clone(self);
             let members: Arc<dyn group::Members> = service;
             let raw = group.exchange(members, query).await?;
-            self.record_reverse(&raw, target.is_fakeip());
-            return codec::set_id(&raw, info.id);
+            return codec::set_id(&raw, info.id).map(|raw| (raw, Instant::now()));
         }
 
         if target.is_fakeip() {
@@ -574,7 +586,9 @@ impl DnsService {
                 .store
                 .clone()
                 .ok_or_else(|| std::io::Error::other("dns: fakeip server without store"))?;
-            return self.fakeip_answer(&query_msg, &info, &store, opts.rewrite_ttl);
+            return self
+                .fakeip_answer(&query_msg, &info, &store, opts.rewrite_ttl)
+                .map(|raw| (raw, Instant::now()));
         }
 
         let use_cache = !self.disable_cache && !opts.disable_cache;
@@ -593,15 +607,19 @@ impl DnsService {
             let now = std::time::Instant::now();
             // write, not read: a hit bumps the entry's place in the eviction
             // order (see dns::cache)
-            let hit = self.cache.write().expect("dns cache").get(&key, now);
-            // reverse mapping was already recorded when this answer went into
-            // the cache; re-recording identical bytes per hit cost a full
-            // message parse. Just stamp the client id.
+            let hit = self
+                .cache
+                .write()
+                .expect("dns cache")
+                .get_with_time(&key, now);
+            // The caller records reverse mapping only if this answer is returned.
             match hit {
-                Some(CacheHit::Fresh(raw)) => return codec::set_id(&raw, info.id),
-                Some(CacheHit::Stale(raw)) => {
+                Some((CacheHit::Fresh(raw), received)) => {
+                    return codec::set_id(&raw, info.id).map(|raw| (raw, received));
+                }
+                Some((CacheHit::Stale(raw), received)) => {
                     self.spawn_refresh(meta.clone(), query.to_vec(), allow_fakeip, key.clone());
-                    return codec::set_id(&raw, info.id);
+                    return codec::set_id(&raw, info.id).map(|raw| (raw, received));
                 }
                 None => {}
             }
@@ -622,10 +640,13 @@ impl DnsService {
         let _guard = lock.lock().await;
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            if let Some(CacheHit::Fresh(raw)) =
-                self.cache.write().expect("dns cache").get(&key, now)
+            if let Some((CacheHit::Fresh(raw), received)) = self
+                .cache
+                .write()
+                .expect("dns cache")
+                .get_with_time(&key, now)
             {
-                return codec::set_id(&raw, info.id);
+                return codec::set_id(&raw, info.id).map(|raw| (raw, received));
             }
         }
 
@@ -634,10 +655,9 @@ impl DnsService {
             Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
             None => response.into(),
         };
-        // one reverse-map write per wire answer, here; the fakeip target has
-        // its own store and was answered above.
-        self.record_reverse(&rewritten, target.is_fakeip());
+        // The rule walk records only its returned answer in reverse mapping.
 
+        let mut received = Instant::now();
         if use_cache && let Ok(meta_resp) = codec::response_meta(&rewritten) {
             let cacheable = matches!(
                 meta_resp.rcode,
@@ -655,7 +675,7 @@ impl DnsService {
                 } else {
                     meta_resp
                 };
-                cache.insert(
+                received = cache.insert(
                     key.clone(),
                     Arc::clone(&rewritten),
                     &meta_for_insert,
@@ -663,7 +683,7 @@ impl DnsService {
                 );
             }
         }
-        codec::set_id(&rewritten, info.id)
+        codec::set_id(&rewritten, info.id).map(|raw| (raw, received))
     }
 
     fn spawn_refresh(
@@ -1287,3 +1307,6 @@ mod tests {
         assert!(err.contains("optimistic"), "{err}");
     }
 }
+
+#[cfg(test)]
+mod response_tests;

@@ -157,7 +157,10 @@ impl Rule {
         let action_raw = map.get("action").and_then(Value::as_str).unwrap_or("");
         let rewrite_ttl = map
             .get("rewrite_ttl")
-            .and_then(Value::as_u64)
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
             .map(|t| t as u32);
         let disable_cache = map
             .get("disable_cache")
@@ -233,6 +236,89 @@ impl Rule {
     pub fn matches(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
         let hit = self.matches_inner(meta, query);
         hit != self.invert
+    }
+
+    pub fn matches_response(&self, meta: &QueryMeta, query: &QueryInfo, ips: &[IpAddr]) -> bool {
+        if !self.match_response {
+            return false;
+        }
+        if !self.matches_query_meta(meta, query) {
+            return false;
+        }
+        if self.rule_sets.is_empty() {
+            return true;
+        }
+        let source = meta
+            .source
+            .map(|address| std::net::SocketAddr::new(address, 0))
+            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        for &ip in ips {
+            let context = crate::route::ConnContext::new(
+                meta.inbound.as_deref().unwrap_or(""),
+                source,
+                crate::inbound::Target::Ip(std::net::SocketAddr::new(ip, 0)),
+                "udp",
+            );
+            if self.rule_sets.iter().any(|set| set.matches(&context)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matches_query_meta(&self, meta: &QueryMeta, query: &QueryInfo) -> bool {
+        if !self.inbound.is_empty() {
+            let Some(inbound) = meta.inbound.as_deref() else {
+                return false;
+            };
+            if !self.inbound.iter().any(|i| i == inbound) {
+                return false;
+            }
+        }
+        if !self.query_type.is_empty() && !self.query_type.contains(&query.qtype) {
+            return false;
+        }
+        if !self.network.is_empty() {
+            let Some(network) = meta.network.as_deref() else {
+                return false;
+            };
+            if !self.network.iter().any(|n| n == network) {
+                return false;
+            }
+        }
+        if !self.source_ip_cidr.is_empty() {
+            let Some(source) = meta.source else {
+                return false;
+            };
+            if !self.source_ip_cidr.iter().any(|p| p.contains(source)) {
+                return false;
+            }
+        }
+        if !self.domain.is_empty() && !self.domain.iter().any(|d| d == &query.name) {
+            return false;
+        }
+        if !self.domain_suffix.is_empty()
+            && !self
+                .domain_suffix
+                .iter()
+                .any(|suffix| domain_suffix_match(&query.name, suffix))
+        {
+            return false;
+        }
+        if !self.domain_keyword.is_empty()
+            && !self
+                .domain_keyword
+                .iter()
+                .any(|k| query.name.contains(k.as_str()))
+        {
+            return false;
+        }
+        if !self.domain_regex.is_empty()
+            && !self.domain_regex.iter().any(|re| re.is_match(&query.name))
+        {
+            return false;
+        }
+        true
     }
 
     /// `option.LogicalDNSRule`: the action lives on the parent, the sub rules
@@ -359,8 +445,8 @@ impl Rule {
                 return false;
             }
         }
-        if !self.rule_sets.is_empty() && self.matches_rule_sets(meta, query) {
-            return true;
+        if !self.rule_sets.is_empty() && !self.matches_rule_sets(meta, query) {
+            return false;
         }
         if !self.domain_suffix.is_empty()
             && !self
@@ -387,17 +473,46 @@ impl Rule {
     }
 }
 
+fn parse_rcode(val: &Value) -> Result<Option<u8>, String> {
+    if let Some(n) = val.as_u64() {
+        return Ok(Some(n as u8));
+    }
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(n) = trimmed.parse::<u8>() {
+            return Ok(Some(n));
+        }
+        match trimmed.to_ascii_uppercase().as_str() {
+            "NOERROR" => Ok(Some(0)),
+            "FORMERR" => Ok(Some(1)),
+            "SERVFAIL" => Ok(Some(2)),
+            "NXDOMAIN" => Ok(Some(3)),
+            "NOTIMP" => Ok(Some(4)),
+            "REFUSED" => Ok(Some(5)),
+            "YXDOMAIN" => Ok(Some(6)),
+            "YXRRSET" => Ok(Some(7)),
+            "NXRRSET" => Ok(Some(8)),
+            "NOTAUTH" => Ok(Some(9)),
+            "NOTZONE" => Ok(Some(10)),
+            other => Err(format!("unknown rcode {other:?}")),
+        }
+    } else {
+        Err(format!("invalid rcode format {val:?}"))
+    }
+}
+
 /// `option.DNSRouteActionPredefined`: rcode plus wire-encoded records.
 fn build_predefined(
     map: &serde_json::Map<String, Value>,
     at: &str,
 ) -> anyhow::Result<PredefinedResponse> {
-    let rcode = match map.get("rcode").and_then(Value::as_str) {
-        None | Some("") => None,
-        Some(name) => Some(
-            name.parse::<u8>()
-                .map_err(|_| anyhow::anyhow!("{at}: bad option: unknown rcode {name:?}"))?,
-        ),
+    let rcode = match map.get("rcode") {
+        None | Some(Value::Null) => None,
+        Some(val) => parse_rcode(val)
+            .map_err(|err| anyhow::anyhow!("{at}: bad option: {err}"))?,
     };
     let records = |key: &str| -> anyhow::Result<Vec<hickory_proto::rr::Record>> {
         let list = match map.get(key) {

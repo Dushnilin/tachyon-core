@@ -739,7 +739,9 @@ impl Dialer {
             } else {
                 "[::]:0".parse().unwrap()
             };
-            return UdpSocket::bind(bind).await;
+            let sock = UdpSocket::bind(bind).await?;
+            sock.connect(addr).await?;
+            return Ok(sock);
         };
         let target = crate::inbound::Target::Ip(addr);
         match &cfg.detour {
@@ -807,9 +809,25 @@ async fn exchange_udp(
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     let socket = dialer.udp(cfg, addr).await?;
-    socket.send_to(query, addr).await?;
+    // Sockets connected via direct dial or loopback pair return EISCONN on Linux/POSIX
+    // if send_to is called with an address. Use send() on connected sockets,
+    // and fall back to send_to only if unconnected (ENOTCONN: 107 on Linux, 10057 on Windows).
+    match socket.send(query).await {
+        Ok(_) => {}
+        Err(e) if e.raw_os_error() == Some(107) || e.raw_os_error() == Some(10057) => {
+            socket.send_to(query, addr).await?;
+        }
+        Err(e) => return Err(e),
+    }
     let mut buf = vec![0u8; 65535];
-    let (n, _from) = socket.recv_from(&mut buf).await?;
+    let n = match socket.recv(&mut buf).await {
+        Ok(n) => n,
+        Err(e) if e.raw_os_error() == Some(107) || e.raw_os_error() == Some(10057) => {
+            let (n, _from) = socket.recv_from(&mut buf).await?;
+            n
+        }
+        Err(e) => return Err(e),
+    };
     buf.truncate(n);
     Ok(buf)
 }

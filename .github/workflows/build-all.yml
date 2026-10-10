@@ -126,9 +126,11 @@ jobs:
           (cd /tmp/musl-1.2.5 && \
             CROSS_COMPILE=mipsel-linux-gnu- ./configure --prefix=/opt/mipsel-musl && \
             make -j"$(nproc)" && sudo make install)
-          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; } void _Unwind_Resume(void *exc) { while(1); }' > /tmp/unwind.c
-          mipsel-linux-gnu-gcc -c /tmp/unwind.c -o /tmp/unwind.o
-          sudo mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a /tmp/unwind.o
+          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
+          mipsel-linux-gnu-gcc -c /tmp/dlfo.c -o /tmp/dlfo.o
+          rm -rf /tmp/eh-mipsel && mkdir -p /tmp/eh-mipsel
+          (cd /tmp/eh-mipsel && mipsel-linux-gnu-ar x "$(mipsel-linux-gnu-gcc -print-file-name=libgcc_eh.a)")
+          sudo mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a /tmp/eh-mipsel/*.o /tmp/dlfo.o
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-gnu-gcc"
@@ -149,9 +151,11 @@ jobs:
           (cd /tmp/musl-1.2.5 && \
             CROSS_COMPILE=mips-linux-gnu- ./configure --prefix=/opt/mips-musl && \
             make -j"$(nproc)" && sudo make install)
-          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; } void _Unwind_Resume(void *exc) { while(1); }' > /tmp/unwind.c
-          mips-linux-gnu-gcc -c /tmp/unwind.c -o /tmp/unwind.o
-          sudo mips-linux-gnu-ar crs /opt/mips-musl/lib/libunwind.a /tmp/unwind.o
+          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
+          mips-linux-gnu-gcc -c /tmp/dlfo.c -o /tmp/dlfo.o
+          rm -rf /tmp/eh-mips && mkdir -p /tmp/eh-mips
+          (cd /tmp/eh-mips && mips-linux-gnu-ar x "$(mips-linux-gnu-gcc -print-file-name=libgcc_eh.a)")
+          sudo mips-linux-gnu-ar crs /opt/mips-musl/lib/libunwind.a /tmp/eh-mips/*.o /tmp/dlfo.o
           {
             echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-gnu-gcc"

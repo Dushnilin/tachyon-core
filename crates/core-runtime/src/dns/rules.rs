@@ -31,9 +31,10 @@ pub enum Action {
         disable_cache: bool,
     },
     Reject,
-    /// `evaluate` — accepted for config compatibility; the exchange it would
-    /// launch is only observed by `match_response` rules (known gap).
-    Evaluate,
+    /// `evaluate` — evaluate query with the specified server.
+    Evaluate {
+        server: String,
+    },
     /// `respond` — known gap (requires evaluated responses).
     Respond,
     /// `predefined`: a synthesized answer (rcode + answer/ns/extra records).
@@ -191,7 +192,14 @@ impl Rule {
                 };
                 Action::Reject
             }
-            "evaluate" => Action::Evaluate,
+            "evaluate" => {
+                let server = map
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Action::Evaluate { server }
+            }
             "respond" => Action::Respond,
             "predefined" => Action::Predefined(build_predefined(map, at)?),
             other => anyhow::bail!("{at}: unknown dns rule action {other:?}"),

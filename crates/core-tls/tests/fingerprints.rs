@@ -12,7 +12,11 @@ use core_tls::hello::{build, parse_record};
 
 fn capture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/spikes/clienthello/captures")
+        .join(if matches!(name, "chrome" | "firefox" | "safari") {
+            "../../tests/spikes/clienthello/captures-sing-box-x"
+        } else {
+            "../../tests/spikes/clienthello/captures"
+        })
         .join(format!("{name}.bin"))
 }
 
@@ -74,6 +78,63 @@ fn every_table_rebuilds_its_capture() {
         assert!(
             same_except_grease(&rebuilt, &data),
             "{name}: the rebuilt hello differs from the capture outside GREASE"
+        );
+    }
+}
+
+#[test]
+fn modern_profiles_keep_hybrid_groups_shares_and_configured_alpn() {
+    use core_tls::hello::Ext;
+    use core_tls::keyshare::{MLKEM768_EK_LEN, Shares, X25519, X25519MLKEM768};
+    for name in ["chrome", "firefox", "safari"] {
+        let template = fingerprints::by_name(name).expect("modern profile");
+        let again = fingerprints::by_name(name).expect("stable profile");
+        assert_eq!(template.extensions, again.extensions);
+        assert_eq!(template.cipher_suites, again.cipher_suites);
+        let groups = template
+            .extensions
+            .iter()
+            .find_map(|e| match e {
+                Ext::Static(10, body) => Some(
+                    body[2..]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .expect("supported groups");
+        let key_body = template
+            .extensions
+            .iter()
+            .find_map(|e| match e {
+                Ext::KeyShare(body) => Some(body),
+                _ => None,
+            })
+            .expect("key shares");
+        let shares = Shares::for_body(key_body).expect("fresh keys");
+        assert!(groups.contains(&X25519MLKEM768));
+        assert!(shares.public(X25519MLKEM768).is_some());
+        if name == "firefox" {
+            assert_eq!(
+                shares.public(X25519).unwrap(),
+                &shares.public(X25519MLKEM768).unwrap()[MLKEM768_EK_LEN..]
+            );
+        }
+        let hello = build(
+            &template,
+            &[7; 32],
+            &[0; 32],
+            "example.com",
+            &[b"h2"],
+            Some(&shares),
+        )
+        .expect("build modern hello");
+        assert_eq!(
+            alpn_of(&parse_record(&hello).unwrap()),
+            vec![b"h2".to_vec()]
         );
     }
 }

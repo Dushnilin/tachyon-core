@@ -24,6 +24,9 @@ p256 = { version = "0.13.2", default-features = false, features = ["ecdh"] }
 sha2.workspace = true
 tokio = { version = "1", default-features = false, features = ["io-util", "rt", "macros", "time"] }
 webpki-roots = "0.26"
+brotli = "9"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.8"
 rustls-webpki = { version = "0.103.14", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]

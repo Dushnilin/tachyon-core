@@ -355,6 +355,9 @@ impl DnsService {
         let mut opts = WalkOptions::default();
         let mut target: Option<Arc<ServerConfig>> = None;
         for rule in &self.rules {
+            if rule.match_response {
+                continue;
+            }
             if !rule.matches(meta, &info) {
                 continue;
             }
@@ -416,9 +419,24 @@ impl DnsService {
                     self.record_reverse(&raw, false);
                     return Ok(raw);
                 }
-                Action::Evaluate | Action::Respond => {
+                Action::Evaluate { server } => {
+                    let tag = if server.is_empty() {
+                        self.final_tag.as_str()
+                    } else {
+                        server.as_str()
+                    };
+                    let Some(cfg) = self.servers.get(tag) else {
+                        crate::logging::warn(format_args!(
+                            "dns: transport not found for evaluate: {tag}"
+                        ));
+                        continue;
+                    };
+                    target = Some(Arc::clone(cfg));
+                    break;
+                }
+                Action::Respond => {
                     crate::logging::warn(format_args!(
-                        "dns: evaluate/respond actions are a known gap; rule ignored"
+                        "dns: respond action is a known gap; rule ignored"
                     ));
                 }
             }
@@ -730,13 +748,22 @@ impl DnsService {
                         "dns: domain_resolver must not be a fakeip server",
                     ));
                 }
-                let addrs = self.lookup_via(resolver, &cfg.server, depth + 1).await?;
-                let ip = pick_address(addrs, self.strategy)
-                    .ok_or_else(|| std::io::Error::other("dns: no addresses resolved"))?;
-                return Ok(SocketAddr::new(ip, cfg.port));
+                match self.lookup_via(resolver, &cfg.server, depth + 1).await {
+                    Ok(addrs) if !addrs.is_empty() => {
+                        let ip = pick_address(addrs, self.strategy)
+                            .ok_or_else(|| std::io::Error::other("dns: no addresses resolved"))?;
+                        return Ok(SocketAddr::new(ip, cfg.port));
+                    }
+                    Ok(_) | Err(_) => {
+                        crate::logging::warn(format_args!(
+                            "dns: domain_resolver {:?} failed for {:?}, falling back to system resolution",
+                            resolver_tag, cfg.server
+                        ));
+                    }
+                }
             }
             crate::logging::warn(format_args!(
-                "dns: server {:?} host {:?} resolved via system (no domain_resolver)",
+                "dns: server {:?} host {:?} resolved via system (no domain_resolver or fallback)",
                 cfg.tag, cfg.server
             ));
             let mut addrs = tokio::net::lookup_host((cfg.server.as_str(), cfg.port)).await?;

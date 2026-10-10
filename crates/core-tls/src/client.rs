@@ -409,10 +409,19 @@ impl<'a> Handshake<'a> {
         self.record_message(kind, &body);
 
         let (kind, body) = self.next_message(stream).await?;
-        if kind != HANDSHAKE_CERTIFICATE {
+        if kind != HANDSHAKE_CERTIFICATE && kind != 25 {
             return Err(bad("the server sent no certificate"));
         }
-        let certificate = CertificateMsg::parse(&body)?;
+        // RFC 8879: hash the compressed message exactly as received, but
+        // validate the certificate chain decoded from its uncompressed body.
+        let decoded;
+        let certificate_body = if kind == 25 {
+            decoded = crate::certificate_compression::decode(&body, self.config.template)?;
+            decoded.as_slice()
+        } else {
+            body.as_slice()
+        };
+        let certificate = CertificateMsg::parse(certificate_body)?;
         if certificate.entries.is_empty() {
             return Err(bad("the server sent an empty certificate chain"));
         }

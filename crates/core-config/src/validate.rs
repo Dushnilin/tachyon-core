@@ -5668,6 +5668,37 @@ fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Resu
 }
 
 fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), String> {
+    let uses_x_session_names = t.contains_key("session_id_length");
+    // Forkop/sing-box X use session_id_*; upstream Tachyon uses session_*.
+    // Validate both spellings with the same rules, without silently ignoring them.
+    let mut normalized = t.clone();
+    for (alias, canonical) in [
+        ("session_id_table", "session_table"),
+        ("session_id_length", "session_length"),
+    ] {
+        if let Some(value) = normalized.remove(alias) {
+            if normalized
+                .get(canonical)
+                .is_some_and(|existing| existing != &value)
+            {
+                return Err(format!("{at}: conflicting {alias} and {canonical}"));
+            }
+            normalized.insert(canonical.to_owned(), value);
+        }
+    }
+    for field in [
+        "x_padding_bytes",
+        "session_length",
+        "uplink_chunk_size",
+        "sc_max_each_post_bytes",
+        "sc_min_posts_interval_ms",
+        "sc_stream_up_server_secs",
+    ] {
+        if let Some(value) = normalized.get(field).and_then(Value::as_u64) {
+            normalized.insert(field.to_owned(), Value::String(value.to_string()));
+        }
+    }
+    let t = &normalized;
     const KNOWN: &[&str] = &[
         "type",
         "host",
@@ -5859,7 +5890,7 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if !table.is_empty() || !length.is_empty() {
+    if !table.is_empty() || (!length.is_empty() && !uses_x_session_names) {
         if table.is_empty() {
             return Err(format!(
                 "{at}.session_table: required when session_length is set"
@@ -5876,7 +5907,8 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
             return Err(format!("{at}.session_length: must be above 0"));
         }
         // id space: len(table)^min >= 2^31
-        let space = (table.chars().count() as u64).saturating_pow(lo.min(63) as u32);
+        let space = (crate::xhttp_session_table(&table).chars().count() as u64)
+            .saturating_pow(lo.min(63) as u32);
         if space < (1u64 << 31) {
             return Err(format!(
                 "{at}.session_length: session id space {space} is too small (want >= 2^31)"
@@ -5902,7 +5934,14 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
                 return Err(format!("{at}.xmux.{k}: json: unknown field \"{k}\""));
             }
         }
-        let has = |f: &str| xmux.get(f).is_some_and(|v| !v.is_null());
+        let has = |f: &str| {
+            xmux.get(f).is_some_and(|v| {
+                !v.is_null()
+                    && v.as_u64() != Some(0)
+                    && v.as_str() != Some("0")
+                    && v.as_str() != Some("0-0")
+            })
+        };
         if has("max_concurrency") && has("max_connections") {
             return Err(format!(
                 "{at}.xmux: max_concurrency and max_connections are mutually exclusive"

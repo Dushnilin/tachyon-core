@@ -46,6 +46,7 @@ pub struct FingerprintStream<S> {
     /// how far into `wbuf` the socket has taken; `None` between records
     out: Option<usize>,
     eof: bool,
+    direct_read: bool,
 }
 
 impl<S> FingerprintStream<S> {
@@ -62,6 +63,7 @@ impl<S> FingerprintStream<S> {
             wbuf: Vec::new(),
             out: None,
             eof: false,
+            direct_read: false,
         }
     }
 
@@ -75,6 +77,10 @@ impl<S> FingerprintStream<S> {
 
     pub fn into_inner(self) -> S {
         self.inner
+    }
+
+    pub(crate) fn enable_direct_read(&mut self) {
+        self.direct_read = true;
     }
 }
 
@@ -100,6 +106,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                     me.record_end = 0;
                 }
                 return Poll::Ready(Ok(()));
+            }
+            if me.direct_read {
+                // The last decrypted record may share a socket read with the
+                // first raw Vision records. Drain those bytes before the socket.
+                let take = (me.raw.len() - me.rpos).min(buf.remaining());
+                if take > 0 {
+                    buf.put_slice(&me.raw[me.rpos..me.rpos + take]);
+                    me.rpos += take;
+                    return Poll::Ready(Ok(()));
+                }
+                return Pin::new(&mut me.inner).poll_read(cx, buf);
             }
             if me.eof || me.connection.is_closed() {
                 return Poll::Ready(Ok(()));

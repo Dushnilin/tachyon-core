@@ -7,6 +7,22 @@ pub mod vless_enc;
 
 use serde_json::Value;
 
+/// Named session alphabets used by Xray/sing-box X XHTTP configurations.
+pub fn xhttp_session_table(table: &str) -> &str {
+    match table {
+        "ALPHABET" => "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "Alphabet" => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "BASE36" => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "Base62" => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "HEX" => "0123456789ABCDEF",
+        "alphabet" => "abcdefghijklmnopqrstuvwxyz",
+        "base36" => "0123456789abcdefghijklmnopqrstuvwxyz",
+        "hex" => "0123456789abcdef",
+        "number" => "0123456789",
+        _ => table,
+    }
+}
+
 /// Full `sing-box check` equivalent plus the reference's warning lines
 /// (deprecated `route.lx_idle_*` aliases and friends), which do not fail the
 /// check. FPTN token outbounds are validated as written, then expanded into

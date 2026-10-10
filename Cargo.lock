@@ -351,7 +351,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "brotli",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -410,11 +410,11 @@ dependencies = [
 
 [[package]]
 name = "core-experimental"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "core-runtime"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -478,11 +478,13 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes-gcm",
+ "brotli",
  "bytes",
  "core-crypto",
+ "flate2",
  "getrandom 0.3.4",
  "hkdf",
  "hmac",
@@ -493,6 +495,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-webpki",
+ "ruzstd",
  "sha2",
  "tokio",
  "tokio-rustls",
@@ -1990,6 +1993,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2354,6 +2366,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

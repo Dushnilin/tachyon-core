@@ -145,6 +145,22 @@ for name in names:
     with open(os.path.join(SRC, name + ".bin"), "rb") as fh:
         body.append(emit(name, parse(fh.read())))
 
+# Sing-Box X's modern profiles override the historical upstream captures.
+# Keep the other profiles' original provenance and byte tables.
+old_src, old_version = SRC, VERSION
+SRC = "tests/spikes/clienthello/captures-sing-box-x"
+VERSION = "1.14.2-x-1.0.3"
+for name in ["chrome", "firefox", "safari"]:
+    with open(os.path.join(SRC, name + ".bin"), "rb") as fh:
+        generated = emit(name, parse(fh.read())).replace(
+            "Captured from sing-box-lx", "Captured from Sing-Box X"
+        ).replace("tests/spikes/clienthello/captures/", SRC + "/")
+    if name in names:
+        body[names.index(name)] = generated
+    else:
+        body.append(generated)
+SRC, VERSION = old_src, old_version
+
 HEADER = '''//! The uTLS fingerprint tables, vendored from the reference's captures.
 //!
 //! A fingerprint is data, not code: which ciphers, which extensions in which
@@ -165,11 +181,12 @@ use super::hello::{Ext, Template};
 
 /// The reference build the tables were captured from.
 pub const CAPTURED_FROM: &str = "@VERSION@";
+/// Modern Chrome/Firefox/Safari come from our X build.
+pub const MODERN_CAPTURED_FROM: &str = "1.14.2-x-1.0.3";
 
 /// Every fingerprint name the reference accepts, and the table behind it. The
 /// six `chrome_*` names all resolve to the same `HelloChrome_Auto` in the
-/// reference (common/tls/utls_client.go), and `random` / `randomized` pick one
-/// per process, so they carry no table of their own.
+/// reference (common/tls/utls_client.go). Random profiles are outside this update.
 pub fn by_name(name: &str) -> Option<Template> {
     Some(match name {
         "" | "chrome" | "chrome_psk" | "chrome_psk_shuffle"

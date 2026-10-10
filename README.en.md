@@ -213,7 +213,7 @@ Features are split into phases with automatic differential testing against the r
 | **F7** | lx daemon and metrics: Windows service and `lxd` daemon compatibility, extended telemetry | Planned |
 | **F8** | libbox / Android: UniFFI/JNI bindings | Planned |
 | **F9** | MIPS spike: `mipsel`/`mips` softfloat musl targets via `-Zbuild-std` | **In progress** (CI builds exist) |
-| **F10** | Tachyon integration: autoinstaller, one-click core switch in LuCI | Planned |
+| **F10** | Tachyon integration: autoinstaller, one-click core switch in LuCI, route monitoring | **Completed** (Tachyon 1.5.0) |
 | **F11** | **Native configuration system and on-flash data storage** | **December 2026** |
 | **F12** | **Drop compatibility with sing-box configs** | **1 January 2027** |
 

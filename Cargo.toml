@@ -81,6 +81,16 @@ smoltcp = { version = "0.14", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 
+# A full-debuginfo dev build is what made target/debug 83 GB on the host and
+# 36 GB in the docker volume (~4000 test and dependency objects, DWARF/PDB each).
+# Line tables keep backtraces readable at a fraction of the size; third-party
+# crates need no debug info at all.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = true

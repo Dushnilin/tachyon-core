@@ -11,7 +11,7 @@ export SING_BOX_REF="${SING_BOX_REF:-/usr/local/bin/sing-box-ref}"
 # worthless here (tests always rebuild) and stale outputs are never reused, so
 # the cache is trimmed when it outgrows the budget below.
 export CARGO_INCREMENTAL=0
-TARGET_BUDGET_MB="${TARGET_BUDGET_MB:-10240}"
+TARGET_BUDGET_MB="${TARGET_BUDGET_MB:-8192}"
 
 trim_target() {
     local size_mb
@@ -23,6 +23,10 @@ trim_target() {
         find "$CARGO_TARGET_DIR" -mindepth 1 -delete
     fi
 }
+
+# `set -e` leaves on the first failing step, so a red gate used to skip the
+# trim at the bottom and the volume only ever grew; EXIT runs on both outcomes.
+trap trim_target EXIT
 
 echo "== target cache budget"
 trim_target
@@ -53,9 +57,5 @@ file "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core"
 
 echo "== differential vs $SING_BOX_REF (STRICT=1)"
 STRICT=1 bash tests/differential/run.sh
-
-# Trimming after the gate keeps the volume small; a big run leaves fresh
-# artifacts behind, and those are the only ones the next run can reuse.
-trim_target
 
 echo "ALL DOCKER TESTS PASSED"

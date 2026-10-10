@@ -112,35 +112,46 @@ jobs:
       # rust-lld's self-contained CRT only carries start files for the targets
       # rustup distributes a std for; the MIPS targets are tier-3 and have
       # none, so `link-self-contained=yes` hands lld bare `Scrt1.o` / `-lc`
-      # names it cannot resolve. Link those two through a real musl gcc driver
-      # instead, which carries its own crt and libc.
+      # names it cannot resolve. Build a real musl and link through the apt
+      # cross gcc driver with `-B` pointed at the musl lib dir. (musl.cc, the
+      # usual prebuilt toolchain for this, times out from the runner network.)
       - name: MIPS musl toolchain (mipsel)
         if: matrix.target == 'mipsel-unknown-linux-musl'
         run: |
-          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
-            https://musl.cc/mipsel-linux-musl-cross.tgz
-          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
-          echo "/opt/mipsel-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y gcc-mipsel-linux-gnu
+          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          tar -xzf /tmp/musl.tar.gz -C /tmp
+          (cd /tmp/musl-1.2.5 && \
+            ./configure --target=mipsel-linux-musl --prefix=/opt/mipsel-musl \
+              CC=mipsel-linux-gnu-gcc && \
+            make -j"$(nproc)" && sudo make install)
           {
-            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-musl-gcc"
-            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-musl-gcc"
+            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
+            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-gnu-gcc"
             # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
-            # array is repeated here minus everything that names lld:
-            # `--icf=safe` is an lld flag and GNU ld rejects it.
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            # array is repeated here minus everything that names lld: the
+            # driver is GNU ld now and it rejects `--icf=safe`.
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: MIPS musl toolchain (mips)
         if: matrix.target == 'mips-unknown-linux-musl'
         run: |
-          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
-            https://musl.cc/mips-linux-musl-cross.tgz
-          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
-          echo "/opt/mips-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y gcc-mips-linux-gnu
+          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          tar -xzf /tmp/musl.tar.gz -C /tmp
+          (cd /tmp/musl-1.2.5 && \
+            ./configure --target=mips-linux-musl --prefix=/opt/mips-musl \
+              CC=mips-linux-gnu-gcc && \
+            make -j"$(nproc)" && sudo make install)
           {
-            echo "CC_mips_unknown_linux_musl=mips-linux-musl-gcc"
-            echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-musl-gcc"
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"
+            echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-gnu-gcc"
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: Toolchain (prebuilt std)

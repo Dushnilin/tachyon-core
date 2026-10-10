@@ -233,11 +233,10 @@ pub(crate) struct Body {
 impl Body {
     pub(crate) fn new(io: AnyStream, head: &Head, pending: BytesMut) -> Self {
         let cursor = match head.framing {
+            Framing::Length(0) | Framing::None => Cursor::Done,
             Framing::Length(n) => Cursor::Length(n),
             Framing::Chunked => Cursor::Size,
             Framing::UntilClose => Cursor::UntilClose,
-            // a request can ask for no body; a response never frames that way
-            Framing::None => Cursor::Done,
         };
         Self {
             io,
@@ -255,7 +254,7 @@ impl Body {
     /// requests. `None` too when bytes past the body are still buffered: they
     /// belong to the next response, and the buffer does not travel with the socket.
     pub(crate) fn into_inner(self) -> Option<AnyStream> {
-        (matches!(self.cursor, Cursor::Done) && !self.close && self.pending.is_empty())
+        (matches!(self.cursor, Cursor::Done | Cursor::Length(0)) && !self.close && self.pending.is_empty())
             .then_some(self.io)
     }
 

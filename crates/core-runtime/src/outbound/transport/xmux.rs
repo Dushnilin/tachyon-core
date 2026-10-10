@@ -204,6 +204,10 @@ impl Client {
         self.io.lock().ok().and_then(|mut slot| slot.take())
     }
 
+    pub(crate) fn has_io(&self) -> bool {
+        self.io.lock().ok().is_some_and(|slot| slot.is_some())
+    }
+
     /// Put it back for the next request, unless it has been retired.
     pub(crate) fn give(&self, io: AnyStream) {
         if self.closed.load(Ordering::SeqCst) {
@@ -298,25 +302,24 @@ impl Pool {
         if guard.is_empty() {
             return None;
         }
-        if self.connections > 0 && guard.len() < self.connections as usize {
-            return None;
-        }
         let mut candidates: Vec<Arc<Client>> = Vec::with_capacity(guard.len());
         for client in guard.iter() {
             // `max_concurrency` counted streams on an HTTP/2 connection; over
             // HTTP/1.1 the equivalent ceiling is one request, which `take()`
             // already enforces. A value above one is therefore not a limit.
-            if self.concurrency <= 1 || client.open_usage.load(Ordering::SeqCst) == 0 {
+            if (self.concurrency <= 1 || client.open_usage.load(Ordering::SeqCst) == 0)
+                && client.has_io()
+            {
                 candidates.push(Arc::clone(client));
             }
         }
-        if candidates.is_empty() {
-            return None;
+        if !candidates.is_empty() {
+            let index = pick(candidates.len());
+            let client = Arc::clone(&candidates[index]);
+            client.acquire();
+            return Some(client);
         }
-        let index = pick(candidates.len());
-        let client = Arc::clone(&candidates[index]);
-        client.acquire();
-        Some(client)
+        None
     }
 
     /// Adds a freshly dialled connection, created for the caller.
@@ -421,5 +424,44 @@ mod tests {
             let value = IntRange(5, 9).roll();
             assert!((5..=9).contains(&value), "rolled {value} out of range");
         }
+    }
+
+    #[tokio::test]
+    async fn acquire_and_reuse_flow() {
+        let config = XmuxConfig::parse(
+            Some(&serde_json::json!({
+                "max_concurrency": "1-4",
+                "c_max_reuse_times": "32-64",
+                "h_max_request_times": "200-400",
+                "h_max_reusable_secs": "120-300",
+            })),
+            "xmux",
+        ).unwrap();
+        let pool = Pool::new(config);
+        
+        // 1. Initially empty
+        assert!(pool.acquire().await.is_none());
+
+        // 2. Insert mock stream
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (s2, _) = listener.accept().await.unwrap();
+        drop(s2);
+        let client = pool.insert(Box::new(s1)).await;
+        let io = client.take();
+        assert!(io.is_some());
+
+        // While in use, acquire should fail if concurrency <= 1 or client has no io
+        // 3. Put it back
+        client.give(io.unwrap());
+        pool.release(&client).await;
+
+        // 4. Now acquire should find it!
+        let acq = pool.acquire().await;
+        assert!(acq.is_some(), "should acquire released client");
+        let client2 = acq.unwrap();
+        let io2 = client2.take();
+        assert!(io2.is_some(), "should take io from released client");
     }
 }

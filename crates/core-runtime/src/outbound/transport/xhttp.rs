@@ -810,10 +810,11 @@ impl PostWriter {
     /// A keep-alive connection for one upload POST, out of the pool when there
     /// is a free one and dialled when there is not.
     async fn connection(&self) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream)> {
-        if let Some(client) = self.cfg.pool.acquire().await
-            && let Some(io) = client.take()
-        {
-            return Ok((client, io));
+        if let Some(client) = self.cfg.pool.acquire().await {
+            if let Some(io) = client.take() {
+                return Ok((client, io));
+            }
+            self.cfg.pool.release(&client).await;
         }
         let io = (self.dialer)().await?;
         let client = self.cfg.pool.insert(io).await;
@@ -1709,6 +1710,88 @@ mod tests {
         })
         .await
         .expect("roundtrip timed out");
+        tokio::time::timeout(timeout, server)
+            .await
+            .expect("server timed out")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wire_packet_up_keep_alive_reuse() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let timeout = std::time::Duration::from_secs(10);
+
+        let (client_io, mut get_io) = tokio::io::duplex(1 << 16);
+        let (post_tx, mut post_rx) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+            let post_tx = post_tx.clone();
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(1 << 16);
+                post_tx.send(server).expect("server side");
+                Ok(Box::new(client) as AnyStream)
+            })
+        });
+        let c = cfg(json!({"path": "/xhttp", "x_padding_bytes": "20-40"}));
+        let stream: AnyStream = Box::new(client_io);
+
+        let server = tokio::spawn(async move {
+            // GET
+            let _ = read_request_head(&mut get_io).await;
+            get_io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+
+            // POST 0
+            let mut post_io = post_rx.recv().await.expect("dialled connection 0");
+            let head0 = read_request_head(&mut post_io).await;
+            assert!(head0.contains("/0 HTTP/1.1"));
+            let mut body0 = [0u8; 4];
+            post_io.read_exact(&mut body0).await.unwrap();
+            assert_eq!(&body0, b"ping");
+            post_io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            eprintln!("SERVER: POST 0 complete");
+
+            // POST 1: MUST arrive on the SAME post_io, not a new dial!
+            let head1 = read_request_head(&mut post_io).await;
+            eprintln!("SERVER: POST 1 read: {}", head1.lines().next().unwrap_or(""));
+            assert!(head1.contains("/1 HTTP/1.1"), "got {head1:?}");
+            let mut body1 = [0u8; 4];
+            post_io.read_exact(&mut body1).await.unwrap();
+            assert_eq!(&body1, b"pong");
+            post_io
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            eprintln!("SERVER: POST 1 complete");
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(get_io);
+            drop(post_io);
+        });
+
+        let mut conn = tokio::time::timeout(
+            timeout,
+            super::connect(stream, false, "srv", 443, &c, dialer),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+
+        tokio::time::timeout(timeout, async {
+            conn.write_all(b"ping").await.expect("write 0");
+            conn.flush().await.expect("flush 0");
+            eprintln!("CLIENT: write 0 done");
+            conn.write_all(b"pong").await.expect("write 1");
+            conn.flush().await.expect("flush 1");
+            eprintln!("CLIENT: write 1 done");
+        })
+        .await
+        .expect("writes timed out");
+
         tokio::time::timeout(timeout, server)
             .await
             .expect("server timed out")

@@ -123,39 +123,42 @@ jobs:
           toolchain: nightly
           components: rust-src
       # rust-lld's self-contained CRT only carries start files for the targets
-      # rustup distributes a std for. mipsel is tier-3, its self-contained dir
-      # does not exist, and `link-self-contained=yes` hands lld bare `Scrt1.o`
-      # / `-lc` names it cannot resolve -- which is exactly how these jobs used
-      # to die at link time. A real musl gcc driver carries its own crt and
-      # libc, so the MIPS jobs link through it instead of through rust-lld.
+      # rustup distributes a std for. The MIPS targets are tier-3, their
+      # self-contained dir does not exist, and `link-self-contained=yes` hands
+      # lld bare `Scrt1.o` / `-lc` names it cannot resolve -- which is how
+      # these jobs died at link time. Build a real musl for the target: apt
+      # ships a MIPS cross gcc and musl builds with it in a minute, and the
+      # link then goes through that gcc driver with `-B` pointed at the musl
+      # lib dir so crt and libc come from the musl we just built.
+      # (musl.cc, the usual prebuilt toolchain for this, times out from the
+      # runner network: `curl: (28) Failed to connect to musl.cc port 443`.)
       - name: MIPS musl toolchain (mipsel)
         if: matrix.target == 'mipsel-unknown-linux-musl'
         run: |
-          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz \
-            https://musl.cc/mipsel-linux-musl-cross.tgz
-          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
-          echo "/opt/mipsel-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y gcc-mipsel-linux-gnu
+          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          tar -xzf /tmp/musl.tar.gz -C /tmp
+          (cd /tmp/musl-1.2.5 && \
+            ./configure --target=mipsel-linux-musl --prefix=/opt/mipsel-musl \
+              CC=mipsel-linux-gnu-gcc && \
+            make -j"$(nproc)" && sudo make install)
           {
-            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-musl-gcc"
-            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-musl-gcc"
+            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
+            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-gnu-gcc"
             # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
-            # array is repeated here. Everything that names lld is dropped:
-            # `--icf=safe` is an lld flag and GNU ld rejects it.
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            # array is repeated here minus everything that names lld: the
+            # driver is GNU ld now and it rejects `--icf=safe`.
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
-      # The toolchains are static musl: link with the bundled rust-lld and the
-      # self-contained CRT objects instead of a host gcc that is not there.
-      # Not set for aarch64 at all: cargo takes rustflags from exactly one
-      # place, and this env would win over the `[target.aarch64-*]` array in
-      # .cargo/config.toml, dropping its `--cfg aes_armv8`/`polyval_armv8`/
-      # `chacha20_force_neon` -- the cfgs that turn the RustCrypto ARMv8
-      # assembly on. Without them the router builds software AES-GCM (0.03
-      # GiB/s against 0.22 measured on a Cortex-A55), while the config alone
-      # already carries linker=rust-lld and link-self-contained=yes.
-      - name: Link musl with rust-lld
-        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' && !matrix.build-std }}
-        run: |
-          echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
+      # Every other musl target links exactly as `.cargo/config.toml` says:
+      # linker = "rust-lld" plus the self-contained CRT, and the per-target
+      # array carries the link-args (aarch64's --cfg trio included). There is
+      # deliberately no RUSTFLAGS step any more -- cargo takes rustflags from
+      # exactly one place, and an env value silently drops those arrays. For
+      # x86_64 that cost `-C target-cpu=x86-64-v3` and `--icf=safe`, and the
+      # binary came out 12.15 MiB against the 12 MiB ceiling.
       - name: Build
         run: |
           if [ -n "${{ matrix.build-std }}" ]; then

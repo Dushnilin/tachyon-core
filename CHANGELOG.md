@@ -3,6 +3,22 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.3
+
+Point release addressing compound headless rules matching in RuleSet, outbound proxy routing mark tagging, zero-downtime SIGHUP reload, and MIPS toolchain musl linker stability.
+
+### Fixes & Improvements
+
+- **Compound Headless Rule Matching in RuleSets**:
+  - Fixed matching logic in `RuleSetIndex` and `PlainRule::matches`: composite rule match criteria (e.g. `network: udp` and `port_range`) are now evaluated with strict `AND` semantics and stored in a composite fallback chain instead of independent `OR` checks.
+  - Eliminates false matching of DNS queries against port-restricted rules (such as Discord Voice UDP 50000-65535).
+- **Socket Mark on All Proxy Outbounds**:
+  - Ensured `apply_dial_defaults` applies `routing_mark` (`0x08000000`) across all outbound proxy transports (VLESS, Trojan, Shadowsocks, VMess, ShadowTLS, Naive, Snell), preventing TProxy packet re-injection loopback in nftables `TachyonTable`.
+- **MIPS & MIPSEL Musl Linker Stability**:
+  - Bundled `libgcc_eh.a` with `_dl_find_object` stubs into `libunwind.a` for clean musl target linking across MIPS softfloat and MIPSEL architectures.
+- **SIGHUP Reload (Zero Downtime)**:
+  - Implemented in-place configuration reload on `SIGHUP` signal (`run_reloadable`) in `core-runtime` without process exit or socket collisions.
+
 ## 0.0.2
 
 Point release improving network compatibility, DNS resilience, protocol framing, and TLS fingerprint fidelity.

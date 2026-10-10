@@ -52,29 +52,10 @@ mod rule_set;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Compatibility contract: Tachyon parses `sing-box version X` (generator.uc).
-/// When invoked through the `sing-box` name we print upstream-shaped output;
-/// under our own name we print tachyon-core output.
-fn bin_invoked_as_sing_box() -> bool {
-    std::env::args()
-        .next()
-        .map(|arg0| {
-            Path::new(&arg0)
-                .file_stem()
-                .is_some_and(|name| name == "sing-box")
-        })
-        .unwrap_or(false)
-}
+
 
 fn version_line() -> String {
-    if bin_invoked_as_sing_box() {
-        format!(
-            "sing-box version v{}-tachyon.0\n",
-            env!("CARGO_PKG_VERSION")
-        )
-    } else {
-        format!("tachyon-core {}\n", env!("CARGO_PKG_VERSION"))
-    }
+    format!("tachyon-core {}\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn collect_dir_configs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {

@@ -121,13 +121,14 @@ jobs:
           (cd /tmp/musl-1.2.5 && \
             CROSS_COMPILE=mipsel-linux-gnu- ./configure --prefix=/opt/mipsel-musl && \
             make -j"$(nproc)" && sudo make install)
+          sudo cp "$(mipsel-linux-gnu-gcc -print-file-name=libgcc_eh.a)" /opt/mipsel-musl/lib/libunwind.a 2>/dev/null || sudo mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-gnu-gcc"
             # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
             # array is repeated here minus everything that names lld: the
             # driver is GNU ld now and it rejects `--icf=safe`.
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-L/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: MIPS musl toolchain (mips)
@@ -141,10 +142,11 @@ jobs:
           (cd /tmp/musl-1.2.5 && \
             CROSS_COMPILE=mips-linux-gnu- ./configure --prefix=/opt/mips-musl && \
             make -j"$(nproc)" && sudo make install)
+          sudo cp "$(mips-linux-gnu-gcc -print-file-name=libgcc_eh.a)" /opt/mips-musl/lib/libunwind.a 2>/dev/null || sudo mips-linux-gnu-ar crs /opt/mips-musl/lib/libunwind.a
           {
             echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-gnu-gcc"
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C link-arg=-B/opt/mips-musl/lib -C link-arg=-L/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: Toolchain (prebuilt std)

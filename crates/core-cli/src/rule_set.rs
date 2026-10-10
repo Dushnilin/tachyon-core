@@ -21,7 +21,6 @@ fn flag_value(args: &[String], short: &str, long: &str) -> Option<String> {
     None
 }
 
-
 fn positional_args(args: &[String]) -> Vec<String> {
     let mut positional = Vec::new();
     let mut index = 0usize;
@@ -492,7 +491,9 @@ pub fn cmd_rule_set(args: &[String]) -> Result<(), String> {
         .ok_or("rule-set: missing subcommand (compile, decompile, match, format, upgrade)")?
         .clone();
     if sub == "-h" || sub == "--help" {
-        println!("Usage: sing-box rule-set [subcommand] (compile, decompile, match, format, upgrade)");
+        println!(
+            "Usage: sing-box rule-set [subcommand] (compile, decompile, match, format, upgrade)"
+        );
         return Ok(());
     }
     let rest: Vec<String> = args[1..].to_vec();
@@ -508,23 +509,39 @@ pub fn cmd_rule_set(args: &[String]) -> Result<(), String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_positional_args_flag_ordering() {
-        let args1 = vec!["--output".to_string(), "out.json".to_string(), "in.srs".to_string()];
+        let args1 = vec![
+            "--output".to_string(),
+            "out.json".to_string(),
+            "in.srs".to_string(),
+        ];
         assert_eq!(positional_args(&args1), vec!["in.srs".to_string()]);
-        assert_eq!(flag_value(&args1, "-o", "--output"), Some("out.json".to_string()));
+        assert_eq!(
+            flag_value(&args1, "-o", "--output"),
+            Some("out.json".to_string())
+        );
 
-        let args2 = vec!["in.srs".to_string(), "-o".to_string(), "out.json".to_string()];
+        let args2 = vec![
+            "in.srs".to_string(),
+            "-o".to_string(),
+            "out.json".to_string(),
+        ];
         assert_eq!(positional_args(&args2), vec!["in.srs".to_string()]);
-        assert_eq!(flag_value(&args2, "-o", "--output"), Some("out.json".to_string()));
+        assert_eq!(
+            flag_value(&args2, "-o", "--output"),
+            Some("out.json".to_string())
+        );
 
         let args3 = vec!["--output=out.json".to_string(), "in.srs".to_string()];
         assert_eq!(positional_args(&args3), vec!["in.srs".to_string()]);
-        assert_eq!(flag_value(&args3, "-o", "--output"), Some("out.json".to_string()));
+        assert_eq!(
+            flag_value(&args3, "-o", "--output"),
+            Some("out.json".to_string())
+        );
     }
 }

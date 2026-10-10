@@ -202,7 +202,12 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    async fn send(&self, framed: &[u8], source: SocketAddr, remote: SocketAddr) -> std::io::Result<()> {
+    async fn send(
+        &self,
+        framed: &[u8],
+        source: SocketAddr,
+        remote: SocketAddr,
+    ) -> std::io::Result<()> {
         match self {
             Reply::Socket(socket) => socket.send_to(framed, source).await.map(|_| ()),
             Reply::Stream(writer) => {

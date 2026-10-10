@@ -31,6 +31,9 @@ fn xhttp_accepts_extended_options_and_numbers() {
         check_str(&config.to_string()).unwrap();
     }
     assert_eq!(core_config::xhttp_session_table("hex"), "0123456789abcdef");
-    assert_eq!(core_config::xhttp_session_table("ALPHABET"), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    assert_eq!(
+        core_config::xhttp_session_table("ALPHABET"),
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    );
     assert_eq!(core_config::xhttp_session_table("number"), "0123456789");
 }

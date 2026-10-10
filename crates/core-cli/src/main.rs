@@ -16,11 +16,7 @@ static GLOBAL: allocstat::Counting = allocstat::Counting;
 #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
 mod allocstat;
 
-#[cfg(all(
-    target_os = "linux",
-    not(target_env = "msvc"),
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "linux", not(target_env = "msvc"), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
 }
@@ -240,9 +236,9 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
     .map_err(|e| format!("run: {e}"))?;
     runtime
-        .block_on(async move {
-            core_runtime::run_reloadable(move || load_config(&args_owned)).await
-        })
+        .block_on(
+            async move { core_runtime::run_reloadable(move || load_config(&args_owned)).await },
+        )
         .map_err(|e| format!("run: {e:#}"))
 }
 

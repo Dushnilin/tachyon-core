@@ -92,7 +92,7 @@ rustflags = [
 # build a plain x86-64 one for those.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v3", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v3", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
 # ARMv7-A: the baseline is already v7a + vfp3-d16, which is everything a
 # Cortex-A7/A8/A9/A15 has that the compiler will let us name. NEON is optional
@@ -119,7 +119,7 @@ rustflags = ["-C", "link-self-contained=yes", "-C", "link-arg=--icf=safe", "-C",
 # target has it, so there is nothing to turn on.
 [target.riscv64gc-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
 # The two tier-3 MIPS targets link rust-lld with the self-contained CRT, the
 # same route every other musl target above takes. Earlier they went through

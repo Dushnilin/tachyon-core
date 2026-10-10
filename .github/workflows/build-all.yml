@@ -101,6 +101,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl-tools (x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Toolchain (prebuilt std)
         if: ${{ !matrix.build-std }}
         uses: dtolnay/rust-toolchain@master
@@ -115,11 +121,8 @@ jobs:
           toolchain: nightly
           components: rust-src
 
-      # Link musl with rust-lld where needed. Skipped for aarch64 because .cargo/config.toml
-      # already configures rustflags with ARMv8 assembly features + neon + rust-lld.
-      - name: Link musl with rust-lld
-        if: ${{ matrix.use_musl_lld }}
-        run: echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
+      # All musl targets are explicitly configured in .cargo/config.toml with linker = "rust-lld"
+      # and target-specific rustflags. We do not set RUSTFLAGS in env to avoid wiping those flags.
 
       # Windows runner uses MSVC's link.exe from PATH
       - name: Windows linker override

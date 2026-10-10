@@ -13,6 +13,7 @@ pub mod hello;
 pub mod keyshare;
 pub mod messages;
 pub mod quic;
+mod random_fingerprints;
 pub mod reality;
 pub mod record;
 pub mod server;

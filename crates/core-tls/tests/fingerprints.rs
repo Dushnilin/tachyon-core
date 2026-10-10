@@ -142,11 +142,7 @@ fn modern_profiles_keep_hybrid_groups_shares_and_configured_alpn() {
 #[test]
 fn the_names_the_reference_accepts_all_resolve() {
     for name in fingerprints::NAMES {
-        match *name {
-            // per-process choices, the reference maps them to another table
-            "random" | "randomized" => continue,
-            _ => assert!(fingerprints::by_name(name).is_some(), "{name} has no table"),
-        }
+        assert!(fingerprints::by_name(name).is_some(), "{name} has no table");
     }
     assert!(
         fingerprints::by_name("nope").is_none(),
@@ -155,6 +151,28 @@ fn the_names_the_reference_accepts_all_resolve() {
     assert!(
         fingerprints::by_name("").is_some(),
         "an empty fingerprint is chrome, as in the reference"
+    );
+}
+
+#[test]
+fn random_policies_are_process_stable_and_random_is_a_browser() {
+    for name in ["random", "randomized"] {
+        let first = fingerprints::by_name(name).unwrap();
+        for _ in 0..16 {
+            let next = fingerprints::by_name(name).unwrap();
+            assert_eq!(first.cipher_suites, next.cipher_suites);
+            assert_eq!(first.extensions, next.extensions);
+        }
+    }
+    let random = fingerprints::by_name("random").unwrap();
+    assert!(
+        ["chrome", "firefox", "edge", "safari", "ios"]
+            .iter()
+            .any(|name| {
+                let browser = fingerprints::by_name(name).unwrap();
+                browser.cipher_suites == random.cipher_suites
+                    && browser.extensions == random.extensions
+            })
     );
 }
 

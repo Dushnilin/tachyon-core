@@ -282,6 +282,7 @@ impl FallbackRule {
                     subs.iter()
                         .map(|sub| match sub.as_object() {
                             Some(object) => FallbackRule::compile(object),
+                            // Preserve match_rule's rejection of non-objects.
                             None => FallbackRule::Never,
                         })
                         .collect()
@@ -298,6 +299,7 @@ impl FallbackRule {
 
     fn matches(&self, ctx: &ConnContext) -> bool {
         match self {
+            FallbackRule::Never => false,
             FallbackRule::Plain(rule) => rule.matches(ctx),
             FallbackRule::Logical {
                 all,
@@ -311,7 +313,6 @@ impl FallbackRule {
                 };
                 matched != *inverted
             }
-            FallbackRule::Never => false,
         }
     }
 }

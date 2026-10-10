@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -140,6 +141,9 @@ impl Tproxy {
                 return;
             };
             let hub = UdpHub::new(Arc::clone(&router), udp_timeout, DatagramFrame::Raw);
+            let _stop_hub = StopHub(Arc::clone(&hub));
+            let mut flows = tokio::task::JoinSet::new();
+            let mut reply_sockets = HashMap::<_, std::sync::Weak<UdpSocket>>::new();
             let fallback = Target::Ip(match sock.local_addr() {
                 Ok(a) => a,
                 Err(_) => return,
@@ -149,12 +153,9 @@ impl Tproxy {
             let mut oob = vec![0u8; 256];
             loop {
                 #[cfg(target_os = "linux")]
-                let received: io::Result<(usize, SocketAddr, Option<SocketAddr>)> = {
-                    use std::os::unix::io::AsRawFd;
-                    match sock.readable().await {
-                        Ok(()) => recvmsg_with_oob(sock.as_raw_fd(), &mut buf, &mut oob),
-                        Err(err) => Err(err),
-                    }
+                let received = tokio::select! {
+                    packet = recv_datagram(&sock, &mut buf, &mut oob) => packet,
+                    _ = flows.join_next(), if !flows.is_empty() => continue,
                 };
                 #[cfg(not(target_os = "linux"))]
                 let received: io::Result<(usize, SocketAddr, Option<SocketAddr>)> = {
@@ -164,7 +165,6 @@ impl Tproxy {
                 };
                 match received {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        // Ready guard from readable() already cleared readiness.
                         continue;
                     }
                     Err(err) => {
@@ -181,13 +181,75 @@ impl Tproxy {
                             continue;
                         }
                         let hub = Arc::clone(&hub);
-                        let reply = Reply::Socket(Arc::downgrade(&sock));
                         let tag = tag.clone();
                         let payload = buf[..n].to_vec();
-                        tokio::spawn(async move {
+                        reply_sockets.retain(|_, socket| socket.strong_count() != 0);
+                        if let Some(socket) = reply_sockets
+                            .get(&(source, dest))
+                            .and_then(std::sync::Weak::upgrade)
+                        {
+                            // The first packet is still opening its outbound. Reuse
+                            // its reply socket and receive pump for the whole burst.
+                            flows.spawn(async move {
+                                let _ = hub
+                                    .handle(
+                                        Reply::Socket(Arc::downgrade(&socket)),
+                                        source,
+                                        dest,
+                                        &payload,
+                                        &tag,
+                                    )
+                                    .await;
+                            });
+                            continue;
+                        }
+                        let socket = match bind_reply(dest, source) {
+                            Ok(socket) => Arc::new(socket),
+                            Err(err) => {
+                                logging::debug(format_args!(
+                                    "tproxy[{tag}] udp {source}: reply socket: {err}"
+                                ));
+                                continue;
+                            }
+                        };
+                        reply_sockets.insert((source, dest), Arc::downgrade(&socket));
+                        flows.spawn(async move {
+                            // A TPROXY reply must originate at the destination the
+                            // client contacted, not at the inbound listener's port.
+                            let reply = Reply::Socket(Arc::downgrade(&socket));
                             if let Err(err) = hub.handle(reply, source, dest, &payload, &tag).await
                             {
                                 logging::debug(format_args!("tproxy[{tag}] udp {source}: {err}"));
+                                return;
+                            }
+                            // Linux prefers this connected transparent socket
+                            // over the listener for subsequent client packets.
+                            let mut payload = vec![0u8; 65_535];
+                            loop {
+                                let n = match tokio::time::timeout(
+                                    udp_timeout,
+                                    socket.recv(&mut payload),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(n)) => n,
+                                    Err(_) if hub.has_active_flow(source, dest) => continue,
+                                    _ => break,
+                                };
+                                if !hub.try_existing(source, dest, &payload[..n])
+                                    && hub
+                                        .handle(
+                                            Reply::Socket(Arc::downgrade(&socket)),
+                                            source,
+                                            dest,
+                                            &payload[..n],
+                                            &tag,
+                                        )
+                                        .await
+                                        .is_err()
+                                {
+                                    break;
+                                }
                             }
                         });
                     }
@@ -199,6 +261,60 @@ impl Tproxy {
             _ = udp_loop => {}
         }
     }
+}
+
+struct StopHub(Arc<UdpHub>);
+
+impl Drop for StopHub {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn recv_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    oob: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Option<SocketAddr>)> {
+    use std::os::unix::io::AsRawFd;
+    // readable() alone leaves readiness set after a raw recvmsg returns
+    // EAGAIN. async_io clears it so the task yields once the queue is empty.
+    socket
+        .async_io(tokio::io::Interest::READABLE, || {
+            recvmsg_with_oob(socket.as_raw_fd(), buf, oob)
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+fn bind_reply(remote: SocketAddr, client: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if remote.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    if remote.is_ipv4() {
+        socket.set_ip_transparent_v4(true)?;
+    } else {
+        socket.set_ip_transparent_v6(true)?;
+    }
+    socket.bind(&remote.into())?;
+    socket.connect(&client.into())?;
+    socket.set_nonblocking(true)?;
+    let socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(socket)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_reply(_remote: SocketAddr, _client: SocketAddr) -> io::Result<UdpSocket> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tproxy is only supported on Linux",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -273,8 +389,7 @@ fn set_raw_int(socket: &socket2::Socket, level: libc::c_int, name: libc::c_int) 
 }
 
 #[cfg(target_os = "linux")]
-/// Blocking `recvmsg` with cmsg extraction; called from the async fn after
-/// `readable()` so WouldBlock is retried by the caller.
+/// Nonblocking `recvmsg` with cmsg extraction; async_io handles readiness.
 fn recvmsg_with_oob(
     fd: i32,
     buf: &mut [u8],
@@ -316,13 +431,13 @@ fn sockaddr_to_socket(
     unsafe {
         match i32::from(storage.ss_family) {
             libc::AF_INET if len as usize >= mem::size_of::<libc::sockaddr_in>() => {
-                let sa = *(&storage as *const _ as *const libc::sockaddr_in);
+                let sa = *(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in);
                 let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
                 let port = u16::from_be(sa.sin_port);
                 Ok(SocketAddr::from((ip, port)))
             }
             libc::AF_INET6 if len as usize >= mem::size_of::<libc::sockaddr_in6>() => {
-                let sa = *(&storage as *const _ as *const libc::sockaddr_in6);
+                let sa = *(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6);
                 let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
                 let port = u16::from_be(sa.sin6_port);
                 Ok(SocketAddr::from((ip, port)))
@@ -399,4 +514,69 @@ fn bind_tproxy_udp(_addr: SocketAddr) -> io::Result<UdpSocket> {
         io::ErrorKind::Unsupported,
         "tproxy is only supported on Linux",
     ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn raw_udp_preserves_peer_and_yields_after_queue_drain() {
+        for listen in ["127.0.0.1:0", "[::1]:0"] {
+            let receiver = UdpSocket::bind(listen).await.unwrap();
+            let sender = UdpSocket::bind(listen).await.unwrap();
+            let mut buf = [0u8; 64];
+            let mut oob = [0u8; 256];
+            for payload in [b"first".as_slice(), b"second".as_slice()] {
+                sender
+                    .send_to(payload, receiver.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (n, peer, _) = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    recv_datagram(&receiver, &mut buf, &mut oob),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(&buf[..n], payload);
+                assert_eq!(peer, sender.local_addr().unwrap());
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(20),
+                        recv_datagram(&receiver, &mut buf, &mut oob),
+                    )
+                    .await
+                    .is_err(),
+                    "empty queue must yield, not retain stale readiness"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transparent_udp_reply_uses_original_destination() {
+        for listen in ["127.0.0.1:0", "[::1]:0"] {
+            let client = UdpSocket::bind(listen).await.unwrap();
+            let remote = UdpSocket::bind(listen).await.unwrap().local_addr().unwrap();
+            let reply = match bind_reply(remote, client.local_addr().unwrap()) {
+                Ok(reply) => reply,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    eprintln!("transparent reply test skipped: {err}");
+                    return;
+                }
+                Err(err) => panic!("transparent reply bind failed: {err}"),
+            };
+            reply.send(b"reply").await.unwrap();
+            let mut buf = [0u8; 32];
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buf[..n], b"reply");
+            assert_eq!(from, remote);
+        }
+    }
 }

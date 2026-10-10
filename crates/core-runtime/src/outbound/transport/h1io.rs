@@ -254,8 +254,10 @@ impl Body {
     /// requests. `None` too when bytes past the body are still buffered: they
     /// belong to the next response, and the buffer does not travel with the socket.
     pub(crate) fn into_inner(self) -> Option<AnyStream> {
-        (matches!(self.cursor, Cursor::Done | Cursor::Length(0)) && !self.close && self.pending.is_empty())
-            .then_some(self.io)
+        (matches!(self.cursor, Cursor::Done | Cursor::Length(0))
+            && !self.close
+            && self.pending.is_empty())
+        .then_some(self.io)
     }
 
     /// Read and throw away the rest of the body, so a keep-alive connection can

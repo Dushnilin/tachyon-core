@@ -165,6 +165,10 @@ impl Direct {
             .unwrap_or_else(|| Err(io::Error::other("direct inbound: no listener")))
     }
 
+    pub(crate) fn shutdown_socket(&self) -> Option<std::sync::Weak<UdpSocket>> {
+        self.udp.as_ref().map(Arc::downgrade)
+    }
+
     pub async fn serve(self) {
         let Self {
             listener,
@@ -209,6 +213,8 @@ impl Direct {
                 return;
             };
             let hub = UdpHub::new(Arc::clone(&router), udp_timeout, DatagramFrame::Raw);
+            let _stop_hub = StopHub(Arc::clone(&hub));
+            let mut packets = tokio::task::JoinSet::new();
             let listen_addr = match sock.local_addr() {
                 Ok(a) => a,
                 Err(err) => {
@@ -218,7 +224,11 @@ impl Direct {
             };
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                match sock.recv_from(&mut buf).await {
+                let received = tokio::select! {
+                    packet = sock.recv_from(&mut buf) => packet,
+                    _ = packets.join_next(), if !packets.is_empty() => continue,
+                };
+                match received {
                     Ok((n, source)) => {
                         let dest = destination_for(&r#override, Some(listen_addr));
                         let Target::Ip(dest) = dest else {
@@ -231,7 +241,7 @@ impl Direct {
                         let reply = Reply::Socket(Arc::downgrade(&sock));
                         let tag = tag.clone();
                         let payload = buf[..n].to_vec();
-                        tokio::spawn(async move {
+                        packets.spawn(async move {
                             if let Err(err) = hub.handle(reply, source, dest, &payload, &tag).await
                             {
                                 logging::debug(format_args!("direct[{tag}] udp {source}: {err}"));
@@ -248,6 +258,14 @@ impl Direct {
             _ = tcp => {}
             _ = udp_loop => {}
         }
+    }
+}
+
+struct StopHub(Arc<UdpHub>);
+
+impl Drop for StopHub {
+    fn drop(&mut self) {
+        self.0.stop();
     }
 }
 

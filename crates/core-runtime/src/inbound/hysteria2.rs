@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::time::Duration;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -16,8 +16,8 @@ use super::udp::{DatagramFrame, Reply, TunReply, UdpHub};
 use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::hysteria2::{
-    AUTH_STATUS_OK, FRAME_TCP_REQUEST, MAX_ADDRESS, next_packet_id, pack_hy2, parse_hy2_packet,
-    read_exact_vec, read_varint_stream,
+    AUTH_STATUS_OK, FRAME_TCP_REQUEST, MAX_ADDRESS, parse_hy2_packet, read_exact_vec,
+    read_varint_stream, send_hy2_packet,
 };
 use crate::outbound::quic::{
     Defragger, QuicStream, SalamanderRelay, salamander_open, salamander_seal,
@@ -26,13 +26,54 @@ use crate::route::Router;
 
 const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(120);
+type H3ServerConnection = h3::server::Connection<h3_quinn::Connection, bytes::Bytes>;
+const MAX_UDP_SESSIONS: usize = 1024;
+
+struct Hy2UdpSession {
+    hub: Arc<UdpHub>,
+    reply: tokio::sync::mpsc::Sender<TunReply>,
+    defragger: Defragger,
+    last_activity: Instant,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Hy2UdpSession {
+    fn new(
+        router: Arc<Router>,
+        sid: u32,
+        output: tokio::sync::mpsc::Sender<(u32, TunReply)>,
+    ) -> Self {
+        let (reply, mut replies) = tokio::sync::mpsc::channel(128);
+        let pump = tokio::spawn(async move {
+            while let Some(packet) = replies.recv().await {
+                if output.send((sid, packet)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            hub: UdpHub::new(router, DEFAULT_UDP_TIMEOUT, DatagramFrame::Raw),
+            reply,
+            defragger: Defragger::new(),
+            last_activity: Instant::now(),
+            pump,
+        }
+    }
+}
+
+impl Drop for Hy2UdpSession {
+    fn drop(&mut self) {
+        self.pump.abort();
+        self.hub.stop();
+    }
+}
 
 pub struct Hysteria2 {
     tag: String,
     router: Arc<Router>,
     endpoint: quinn::Endpoint,
+    socket: Weak<dyn quinn::AsyncUdpSocket>,
     users: Arc<HashMap<String, String>>, // password -> username
-    hub: Arc<UdpHub>,
     local_addr: SocketAddr,
     _relay: Option<SalamanderRelay>,
 }
@@ -99,7 +140,7 @@ impl Hysteria2 {
         let runtime =
             quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("{at}: no quinn runtime"))?;
 
-        let (endpoint, local_addr, relay) = if let Some(pw) = obfs_password {
+        let (endpoint, socket, local_addr, relay) = if let Some(pw) = obfs_password {
             // Bind loopback socket for Quinn
             let ep_bind = if addr.is_ipv4() {
                 "127.0.0.1:0"
@@ -107,7 +148,9 @@ impl Hysteria2 {
                 "[::1]:0"
             };
             let ep_sock = std::net::UdpSocket::bind(ep_bind)?;
-            let ep = quinn::Endpoint::new(
+            let ep_sock = runtime.wrap_udp_socket(ep_sock)?;
+            let socket = Arc::downgrade(&ep_sock);
+            let ep = quinn::Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
                     &[9u8; 32],
                 ))),
@@ -158,10 +201,12 @@ impl Hysteria2 {
                 local: actual_local,
                 handles: vec![in_task, out_task],
             };
-            (ep, actual_local, Some(relay))
+            (ep, socket, actual_local, Some(relay))
         } else {
             let sock = std::net::UdpSocket::bind(addr)?;
-            let ep = quinn::Endpoint::new(
+            let sock = runtime.wrap_udp_socket(sock)?;
+            let socket = Arc::downgrade(&sock);
+            let ep = quinn::Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
                     &[9u8; 32],
                 ))),
@@ -170,17 +215,15 @@ impl Hysteria2 {
                 runtime,
             )?;
             let local = ep.local_addr()?;
-            (ep, local, None)
+            (ep, socket, local, None)
         };
-
-        let hub = UdpHub::new(Arc::clone(&router), DEFAULT_UDP_TIMEOUT, DatagramFrame::Raw);
 
         Ok(Self {
             tag,
             router,
             endpoint,
+            socket,
             users: Arc::new(users),
-            hub,
             local_addr,
             _relay: relay,
         })
@@ -190,6 +233,10 @@ impl Hysteria2 {
         Ok(self.local_addr)
     }
 
+    pub(crate) fn shutdown_endpoint(&self) -> (quinn::Endpoint, Weak<dyn quinn::AsyncUdpSocket>) {
+        (self.endpoint.clone(), self.socket.clone())
+    }
+
     pub async fn serve(self) {
         let tag = self.tag.clone();
         logging::info(format_args!(
@@ -197,14 +244,15 @@ impl Hysteria2 {
             self.local_addr
         ));
 
+        let mut connections = tokio::task::JoinSet::new();
         while let Some(incoming) = self.endpoint.accept().await {
+            while connections.try_join_next().is_some() {}
             let router = Arc::clone(&self.router);
             let users = Arc::clone(&self.users);
-            let hub = Arc::clone(&self.hub);
             let tag = self.tag.clone();
             let local_addr = self.local_addr;
 
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let conn = match incoming.await {
                     Ok(c) => c,
                     Err(e) => {
@@ -212,9 +260,10 @@ impl Hysteria2 {
                         return;
                     }
                 };
-                handle_hy2_connection(conn, router, users, hub, tag, local_addr).await;
+                handle_hy2_connection(conn, router, users, tag, local_addr).await;
             });
         }
+        connections.shutdown().await;
     }
 }
 
@@ -222,14 +271,13 @@ async fn handle_hy2_connection(
     conn: quinn::Connection,
     router: Arc<Router>,
     users: Arc<HashMap<String, String>>,
-    hub: Arc<UdpHub>,
     tag: String,
     local_addr: SocketAddr,
 ) {
     let peer = conn.remote_address();
 
     // Authenticate via HTTP/3 session
-    let user_name =
+    let (user_name, _h3_connection) =
         match tokio::time::timeout(DEFAULT_AUTH_TIMEOUT, authenticate_hy2(&conn, &users)).await {
             Ok(Ok(name)) => name,
             Ok(Err(e)) => {
@@ -248,18 +296,25 @@ async fn handle_hy2_connection(
         "hysteria2[{tag}] {peer} authenticated as {user_name}"
     ));
 
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<TunReply>(128);
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<(u32, TunReply)>(128);
 
     // UDP reply sender back to QUIC datagrams
     let conn_udp_send = conn.clone();
     let packet_counter = Arc::new(AtomicU32::new(0));
     let packet_counter_clone = Arc::clone(&packet_counter);
-    let reply_handle = tokio::spawn(async move {
-        while let Some(reply) = reply_rx.recv().await {
-            let pid = next_packet_id(&packet_counter_clone);
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        while let Some((sid, reply)) = reply_rx.recv().await {
             let src_str = reply.src.to_string();
-            let pkt = pack_hy2(0, pid, 0, 1, &src_str, &reply.payload);
-            let _ = conn_udp_send.send_datagram(pkt.into());
+            if let Err(err) = send_hy2_packet(
+                &conn_udp_send,
+                sid,
+                &src_str,
+                &reply.payload,
+                &packet_counter_clone,
+            ) {
+                logging::debug(format_args!("hysteria2 UDP reply {sid}: {err}"));
+            }
         }
     });
 
@@ -268,7 +323,8 @@ async fn handle_hy2_connection(
     let router_bi = Arc::clone(&router);
     let tag_bi = tag.clone();
     let user_bi = user_name.clone();
-    let bi_handle = tokio::spawn(async move {
+    tasks.spawn(async move {
+        let mut streams = tokio::task::JoinSet::new();
         loop {
             let (send, mut recv) = match conn_bi.accept_bi().await {
                 Ok(pair) => pair,
@@ -277,7 +333,8 @@ async fn handle_hy2_connection(
             let router = Arc::clone(&router_bi);
             let tag = tag_bi.clone();
             let _user = user_bi.clone();
-            tokio::spawn(async move {
+            while streams.try_join_next().is_some() {}
+            streams.spawn(async move {
                 let frame_type = match read_varint_stream(&mut recv).await {
                     Ok(v) => v,
                     Err(_) => return,
@@ -326,32 +383,43 @@ async fn handle_hy2_connection(
                 let _ = drive_framed(client, peer, target, &tag, &router).await;
             });
         }
+        streams.shutdown().await;
     });
 
     // Accept datagrams (UDP)
     let conn_dg = conn.clone();
-    let defragger = Arc::new(std::sync::Mutex::new(Defragger::new()));
-    let hub_dg = Arc::clone(&hub);
+    let router_dg = Arc::clone(&router);
     let tag_dg = tag.clone();
-    let dg_handle = tokio::spawn(async move {
+    tasks.spawn(async move {
+        // Session ID scopes both reassembly and the outbound UDP socket. Two
+        // client sessions to the same destination must not share a reply channel.
+        let mut sessions = HashMap::<u32, Hy2UdpSession>::new();
+        let mut cleanup = tokio::time::interval(Duration::from_secs(30));
         loop {
-            let data = match conn_dg.read_datagram().await {
-                Ok(d) => d,
-                Err(_) => break,
+            let data = tokio::select! {
+                result = conn_dg.read_datagram() => match result { Ok(d) => d, Err(_) => break },
+                _ = cleanup.tick() => {
+                    sessions.retain(|_, session| session.last_activity.elapsed() < DEFAULT_UDP_TIMEOUT);
+                    continue;
+                }
             };
-            let Some((_sid, pid, frag_id, frag_total, dest, payload)) = parse_hy2_packet(&data)
+            let Some((sid, pid, frag_id, frag_total, dest, payload)) = parse_hy2_packet(&data)
             else {
                 continue;
             };
-            let complete = {
-                let mut defrag = defragger.lock().expect("defragger");
-                defrag.feed(
-                    pid,
-                    frag_id,
-                    frag_total,
-                    bytes::Bytes::copy_from_slice(payload),
-                )
-            };
+            if !sessions.contains_key(&sid) && sessions.len() >= MAX_UDP_SESSIONS {
+                continue;
+            }
+            let session = sessions.entry(sid).or_insert_with(|| {
+                Hy2UdpSession::new(Arc::clone(&router_dg), sid, reply_tx.clone())
+            });
+            session.last_activity = Instant::now();
+            let complete = session.defragger.feed(
+                pid,
+                frag_id,
+                frag_total,
+                bytes::Bytes::copy_from_slice(payload),
+            );
             if let Some(pkt) = complete {
                 let target = match parse_target_str(dest) {
                     Some(t) => t,
@@ -366,10 +434,11 @@ async fn handle_hy2_connection(
                         }
                     }
                 };
-                let _ = hub_dg
+                let _ = session
+                    .hub
                     .handle(
                         Reply::Tun {
-                            sender: reply_tx.clone(),
+                            sender: session.reply.clone(),
                         },
                         peer,
                         dest_addr,
@@ -383,16 +452,14 @@ async fn handle_hy2_connection(
 
     // Wait until connection closes
     let _ = conn.closed().await;
-    bi_handle.abort();
-    dg_handle.abort();
-    reply_handle.abort();
+    tasks.shutdown().await;
     logging::info(format_args!("hysteria2[{tag}] {peer} disconnected"));
 }
 
 async fn authenticate_hy2(
     conn: &quinn::Connection,
     users: &HashMap<String, String>,
-) -> io::Result<String> {
+) -> io::Result<(String, H3ServerConnection)> {
     let h3 = h3_quinn::Connection::new(conn.clone());
     let mut h3_conn: h3::server::Connection<_, bytes::Bytes> = h3::server::builder()
         .build(h3)
@@ -438,13 +505,10 @@ async fn authenticate_hy2(
         .map_err(io::Error::other)?;
     stream.finish().await.map_err(io::Error::other)?;
 
-    // In Hysteria 2, HTTP/3 is only used for the initial handshake; proxy data is sent
-    // over raw QUIC bi-streams and datagrams. If `h3_conn` is dropped, its Drop impl sends
-    // an ApplicationClose (H3_NO_ERROR) frame over the entire QUIC connection.
-    // Forgetting the HTTP/3 connection driver keeps the underlying QUIC transport alive.
-    std::mem::forget(h3_conn);
-
-    Ok(user_name)
+    // Keep HTTP/3 alive until the QUIC connection closes: dropping it immediately
+    // sends H3_NO_ERROR over the proxy transport. Leaking it with mem::forget
+    // instead retains the UDP socket forever and prevents configuration reload.
+    Ok((user_name, h3_conn))
 }
 
 fn parse_target_str(s: &str) -> Option<Target> {
@@ -540,5 +604,44 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello hy2");
+
+        // A reply with SID=0 used to hide the bug for the first Rust-client
+        // session, but broke official clients and all later UDP sessions.
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_target = Target::Ip(echo.local_addr().unwrap());
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            for _ in 0..3 {
+                let (n, peer) = echo.recv_from(&mut buf).await.unwrap();
+                echo.send_to(&buf[..n], peer).await.unwrap();
+            }
+        });
+        let first = client.connect_udp(&udp_target).await.unwrap();
+        let second = client.connect_udp(&udp_target).await.unwrap();
+        first.send(b"session-zero").await.unwrap();
+        second.send(b"session-one").await.unwrap();
+        let mut first_buf = [0u8; 64];
+        let mut second_buf = [0u8; 64];
+        let a = tokio::time::timeout(Duration::from_secs(3), first.recv(&mut first_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(3), second.recv(&mut second_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first_buf[..a], b"session-zero");
+        assert_eq!(&second_buf[..b], b"session-one");
+        // Real media exceeds the QUIC datagram budget and requires response
+        // fragmentation, not silent TooLarge drops in the server sender.
+        let media = vec![0x5a; 1400];
+        first.send(&media).await.unwrap();
+        let mut media_buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), first.recv(&mut media_buf))
+            .await
+            .expect("large incoming media reply")
+            .unwrap();
+        assert_eq!(&media_buf[..n], media);
+        echo_task.await.unwrap();
     }
 }

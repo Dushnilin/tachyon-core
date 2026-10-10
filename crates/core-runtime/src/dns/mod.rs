@@ -431,7 +431,67 @@ impl DnsService {
                         ));
                         continue;
                     };
-                    target = Some(Arc::clone(cfg));
+                    let response = self.exchange_remote(cfg, query).await?;
+                    let answer_ips = codec::answer_ips(&response).unwrap_or_default();
+
+                    let mut matched_response = false;
+                    for resp_rule in &self.rules {
+                        if !resp_rule.match_response {
+                            continue;
+                        }
+                        if resp_rule.matches_response(meta, &info, &answer_ips) {
+                            matched_response = true;
+                            match &resp_rule.action {
+                                Action::Route {
+                                    server: r_server,
+                                    rewrite_ttl: r_ttl,
+                                    disable_cache: _,
+                                } => {
+                                    let resp_tag = if r_server.is_empty() {
+                                        self.final_tag.as_str()
+                                    } else {
+                                        r_server.as_str()
+                                    };
+                                    if let Some(target_cfg) = self.servers.get(resp_tag) {
+                                        if target_cfg.is_fakeip() && allow_fakeip {
+                                            let store = target_cfg.store.clone().ok_or_else(|| {
+                                                std::io::Error::other("dns: fakeip server without store")
+                                            })?;
+                                            return self.fakeip_answer(
+                                                &query_msg,
+                                                &info,
+                                                &store,
+                                                r_ttl.or(opts.rewrite_ttl),
+                                            );
+                                        }
+                                        target = Some(Arc::clone(target_cfg));
+                                        break;
+                                    }
+                                }
+                                Action::Reject => {
+                                    return match resp_rule.reject_method {
+                                        RejectMethod::Refused => {
+                                            codec::refused_response(&query_msg)
+                                                .map_err(std::io::Error::other)
+                                        }
+                                        RejectMethod::Drop => Err(std::io::Error::new(
+                                            std::io::ErrorKind::ConnectionReset,
+                                            "dns: query dropped by match_response rule",
+                                        )),
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !matched_response || target.is_none() {
+                        let rewritten: Arc<[u8]> = match opts.rewrite_ttl {
+                            Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
+                            None => response.into(),
+                        };
+                        self.record_reverse(&rewritten, false);
+                        return codec::set_id(&rewritten, info.id);
+                    }
                     break;
                 }
                 Action::Respond => {

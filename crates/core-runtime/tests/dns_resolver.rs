@@ -835,3 +835,32 @@ async fn tcp_transport_uses_the_detour_outbound() {
         .unwrap_err();
     assert!(error.to_string().contains("detour"), "{error}");
 }
+
+#[tokio::test]
+async fn predefined_noerror_and_ruleset_matching() {
+    let json_cfg = serde_json::json!({
+        "dns": {
+            "servers": [
+                { "type": "udp", "tag": "direct-dns", "server": "127.0.0.1" }
+            ],
+            "rules": [
+                {
+                    "action": "predefined",
+                    "query_type": ["HTTPS", "SVCB"],
+                    "rcode": "NOERROR"
+                }
+            ],
+            "final": "direct-dns"
+        }
+    });
+
+    let service = core_runtime::dns::DnsService::build(&json_cfg)
+        .expect("build dns service")
+        .expect("dns service configured");
+
+    let query_bytes = core_runtime::dns::codec::build_query(1, "example.com", hickory_proto::rr::RecordType::HTTPS).unwrap();
+    let meta = core_runtime::dns::QueryMeta::default();
+    let resp = service.exchange(&meta, &query_bytes, false).await.expect("exchange");
+    let resp_meta = core_runtime::dns::codec::response_meta(&resp).expect("meta");
+    assert_eq!(resp_meta.rcode, hickory_proto::op::ResponseCode::NoError);
+}

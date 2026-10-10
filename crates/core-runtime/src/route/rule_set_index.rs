@@ -507,7 +507,13 @@ impl RuleSetIndex {
                 || object.contains_key("source_port")
                 || object.contains_key("source_port_range")
                 || object.contains_key("source_ip_cidr");
-            if inverted || logical || has_non_dest {
+            let has_dest = object.contains_key("domain")
+                || object.contains_key("domain_suffix")
+                || object.contains_key("domain_keyword")
+                || object.contains_key("ip_cidr");
+            // A matcher-free object is a catch-all in the interpreter, not
+            // an empty destination pool. Preserve it as a compiled plain rule.
+            if inverted || logical || has_non_dest || !has_dest {
                 fallbacks.rules.push(FallbackRule::compile(object));
                 continue;
             }

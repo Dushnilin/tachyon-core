@@ -392,7 +392,6 @@ fn inverted_and_logical_rules_stay_on_the_interpreter() {
 fn nothing_to_match_means_no_match() {
     for rules in [
         vec![],
-        vec![json!({})],
         vec![json!({"domain": []})],
         vec![json!({"ip_cidr": ["nonsense"]})],
         vec![json!({"port_range": ["nonsense"]})],
@@ -412,6 +411,26 @@ fn nothing_to_match_means_no_match() {
             rules.len(),
             "rule_count still counts as loaded"
         );
+    }
+}
+
+/// A matcher-free object is the interpreter's catch-all; an empty set is not.
+#[test]
+fn matcher_free_objects_preserve_catch_all_semantics() {
+    for rule in [
+        json!({}),
+        json!({"unknown_field":"ignored"}),
+        json!({"invert":true}),
+    ] {
+        let set = RuleSet::new(vec!["s".into()], vec![rule.clone()]);
+        assert_eq!(set.fallback_count(), 1);
+        for ctx in contexts() {
+            assert_eq!(set.matches(&ctx), match_rule(&rule, &ctx));
+            assert_eq!(
+                set.matches(&ctx),
+                rule.get("invert") != Some(&Value::Bool(true))
+            );
+        }
     }
 }
 

@@ -4,17 +4,28 @@ set -euo pipefail
 cd /src
 mkdir -p dist
 rm -rf dist/*
-VER="v0.0.1"
+VER="${1:-v0.0.2}"
 
 pack_arch() {
     local arch="$1"
     local bin_path="$2"
     local out_name="tachyon-core-${arch}"
     
+    if [ ! -f "${bin_path}" ]; then
+        echo "=== Skipping ${arch}: ${bin_path} not found ==="
+        return 0
+    fi
+
     echo "=== Packaging ${arch} from ${bin_path} ==="
     cp "${bin_path}" "dist/${out_name}"
     chmod +x "dist/${out_name}"
     tar -czf "dist/${out_name}-${VER}.tar.gz" -C dist "${out_name}"
+    
+    local arch_short="${arch%-musl}"
+    if [ "${arch_short}" != "${arch}" ]; then
+        cp "dist/${out_name}-${VER}.tar.gz" "dist/tachyon-core-${arch_short}-${VER}.tar.gz"
+    fi
+
     rm -f "dist/${out_name}"
 }
 
@@ -39,5 +50,14 @@ pack_arch "x86_64-musl" "target/x86_64-unknown-linux-musl/release/tachyon-core"
 # 7. Linux amd64 (glibc Desktop/Server)
 pack_arch "linux-amd64" "target/x86_64-unknown-linux-gnu/release/tachyon-core"
 
+if [ -d "openwrt" ]; then
+    echo "=== Packaging OpenWrt Package Archive ==="
+    tar -czf "dist/tachyon-core-openwrt-package-${VER}.tar.gz" openwrt/
+fi
+
+cd dist
+sha256sum *.tar.gz > SHA256SUMS
+cat SHA256SUMS
+
 echo "=== Done with Linux/Router architectures ==="
-ls -lh dist/
+ls -lh

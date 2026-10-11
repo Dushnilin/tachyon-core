@@ -5,8 +5,10 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -140,83 +142,28 @@ impl Hysteria2 {
         let runtime =
             quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("{at}: no quinn runtime"))?;
 
-        let (endpoint, socket, local_addr, relay) = if let Some(pw) = obfs_password {
-            // Bind loopback socket for Quinn
-            let ep_bind = if addr.is_ipv4() {
-                "127.0.0.1:0"
+        let sock = std::net::UdpSocket::bind(addr)?;
+        let sock = runtime.wrap_udp_socket(sock)?;
+        let (sock, relay): (Arc<dyn quinn::AsyncUdpSocket>, Option<SalamanderRelay>) =
+            if let Some(pw) = obfs_password {
+                (
+                    Arc::new(SalamanderUdpSocket {
+                        inner: sock,
+                        password: pw,
+                    }),
+                    None,
+                )
             } else {
-                "[::1]:0"
+                (sock, None)
             };
-            let ep_sock = std::net::UdpSocket::bind(ep_bind)?;
-            let ep_sock = runtime.wrap_udp_socket(ep_sock)?;
-            let socket = Arc::downgrade(&ep_sock);
-            let ep = quinn::Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
-                    &[9u8; 32],
-                ))),
-                Some(server_config),
-                ep_sock,
-                runtime,
-            )?;
-            let ep_local = ep.local_addr()?;
-
-            // Public listening socket with salamander obfs
-            let public_sock = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
-            let actual_local = public_sock.local_addr()?;
-            let loop_sock = Arc::new(tokio::net::UdpSocket::bind(ep_bind).await?);
-            loop_sock.connect(ep_local).await?;
-
-            let pw_in = pw.clone();
-            let pub_in = Arc::clone(&public_sock);
-            let loop_in = Arc::clone(&loop_sock);
-            let in_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_535];
-                loop {
-                    let (n, _peer) = match pub_in.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    if let Some(plain) = salamander_open(&pw_in, &buf[..n]) {
-                        let _ = loop_in.send(&plain).await;
-                    }
-                }
-            });
-
-            let pw_out = pw;
-            let pub_out = Arc::clone(&public_sock);
-            let loop_out = Arc::clone(&loop_sock);
-            let out_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_535];
-                loop {
-                    let n = match loop_out.recv(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let sealed = salamander_seal(&pw_out, &buf[..n]);
-                    let _ = pub_out.send(&sealed).await;
-                }
-            });
-
-            let relay = SalamanderRelay {
-                local: actual_local,
-                handles: vec![in_task, out_task],
-            };
-            (ep, socket, actual_local, Some(relay))
-        } else {
-            let sock = std::net::UdpSocket::bind(addr)?;
-            let sock = runtime.wrap_udp_socket(sock)?;
-            let socket = Arc::downgrade(&sock);
-            let ep = quinn::Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
-                    &[9u8; 32],
-                ))),
-                Some(server_config),
-                sock,
-                runtime,
-            )?;
-            let local = ep.local_addr()?;
-            (ep, socket, local, None)
-        };
+        let socket = Arc::downgrade(&sock);
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9u8; 32]))),
+            Some(server_config),
+            sock,
+            runtime,
+        )?;
+        let local_addr = endpoint.local_addr()?;
 
         Ok(Self {
             tag,
@@ -522,6 +469,76 @@ fn parse_target_str(s: &str) -> Option<Target> {
         Some(Target::Ip(SocketAddr::new(ip, port)))
     } else {
         Some(Target::Domain(host.to_string(), port))
+    }
+}
+
+#[derive(Debug)]
+struct SalamanderUdpSocket {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    password: Vec<u8>,
+}
+
+impl quinn::AsyncUdpSocket for SalamanderUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        let sealed = salamander_seal(&self.password, transmit.contents);
+        let sealed_transmit = quinn::udp::Transmit {
+            destination: transmit.destination,
+            ecn: transmit.ecn,
+            contents: &sealed,
+            segment_size: None,
+            src_ip: transmit.src_ip,
+        };
+        self.inner.try_send(&sealed_transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let res = std::task::ready!(self.inner.poll_recv(cx, bufs, meta))?;
+            if res == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let mut out_count = 0;
+            for i in 0..res {
+                let len = meta[i].len;
+                if let Some(plain) = salamander_open(&self.password, &bufs[i][..len]) {
+                    bufs[out_count][..plain.len()].copy_from_slice(&plain);
+                    meta[out_count].addr = meta[i].addr;
+                    meta[out_count].len = plain.len();
+                    meta[out_count].stride = plain.len();
+                    meta[out_count].ecn = meta[i].ecn;
+                    meta[out_count].dst_ip = meta[i].dst_ip;
+                    out_count += 1;
+                }
+            }
+            if out_count > 0 {
+                return Poll::Ready(Ok(out_count));
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
     }
 }
 

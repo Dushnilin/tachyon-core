@@ -58,8 +58,8 @@ $extraArgs += @("--out", $outJson, "--html", $outHtml)
 $argStr = $extraArgs -join " "
 
 Write-Host "Launching All-Protocol Multi-Proxy Benchmark ($Profile profile) ..."
-docker run --rm --ulimit nofile=1048576:1048576 `
-    -v "${work}:/bench" python:3 `
+docker run --rm --privileged --ulimit nofile=1048576:1048576 `
+    -e STEER_DEBUG="$env:STEER_DEBUG" --device /dev/net/tun -v "${work}:/bench" python:3 `
     sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux /bench/steer/usr/bin/* /bench/steer/usr/sbin/* 2>/dev/null; python3 /bench/bench_proto_all.py $argStr"
 
 Write-Host "`nReport saved to: $work\proto-all-$Profile.html"

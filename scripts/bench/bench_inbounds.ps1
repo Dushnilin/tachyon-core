@@ -27,8 +27,8 @@ if ($Only) {
     $extraArgs += " --only $Only"
 }
 
-docker run --rm --ulimit nofile=1048576:1048576 `
-    -v "${work}:/bench" -w /bench python:3 `
+docker run --rm --privileged --ulimit nofile=1048576:1048576 `
+    --device /dev/net/tun -v "${work}:/bench" -w /bench python:3 `
     sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux /bench/steer/usr/bin/* /bench/steer/usr/sbin/* 2>/dev/null; python3 /bench/bench_inbounds.py $extraArgs"
 
 Write-Host "`nReport saved to: $work\inbound_bench.html"

@@ -491,16 +491,31 @@ unsafe fn raise_rlimit_nofile() {
         rlim_max: 0,
     };
     unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            let max_target = 65535;
-            if rlim.rlim_cur < max_target {
-                let new_cur = max_target.min(rlim.rlim_max.max(max_target));
-                rlim.rlim_cur = new_cur;
-                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            eprintln!(
+                "warning: getrlimit(RLIMIT_NOFILE): {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // Raise only the soft limit, respecting the inherited hard ceiling.
+        // A lower hard limit is common on OpenWrt and cannot be exceeded even
+        // by root without also changing rlim_max.
+        let target = 65535.min(rlim.rlim_max);
+        if rlim.rlim_cur < target {
+            rlim.rlim_cur = target;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                eprintln!(
+                    "warning: setrlimit(RLIMIT_NOFILE): {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux", not(target_env = "msvc")))]
+mod nofile_tests;
 
 fn usage() -> String {
     "usage: tachyon-core [options] <command> [command-options]\n\

@@ -454,13 +454,10 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
         if !status.starts_with('2') {
             return ProbeAttempt::Fail;
         }
-        // The recorded delay starts after the dial, like the clash delay
-        // click and the reference round do: the dial is TCP setup, not the
-        // link the number describes, and including it doubled the history
-        // on fast nodes (measured on the 42-member router group: round
-        // 261-272 ms against the reference's 138-162, clicks 128-170 on
-        // both cores). The full split stays in the debug log above.
-        ProbeAttempt::Done(head_at.saturating_sub(dial_ms).as_millis() as u64)
+        // Use the same post-handshake request metric as the manual Clash
+        // test. Dial/TLS failures and the full attempt budget still apply.
+        // No extra request or keep-alive support is required.
+        ProbeAttempt::Done(head_at.saturating_sub(tls_at).as_millis() as u64)
     };
     probe.await
 }

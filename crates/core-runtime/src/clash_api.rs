@@ -1332,7 +1332,8 @@ fn udp_capable(outbound: &Outbound) -> bool {
 }
 
 /// Reference `urltest.URLTest`: HEAD through the outbound, any HTTP response
-/// counts, delay measured from the dial (reset before the TLS handshake).
+/// counts. For HTTPS, measure the request after the complete TLS handshake;
+/// connection establishment still counts against the overall timeout.
 async fn delay_test(
     stream: &mut TcpStream,
     router: &Router,
@@ -1363,8 +1364,6 @@ async fn delay_test(
         };
         let dial_ms = start.elapsed();
         let mut stream: crate::inbound::AnyStream = if tls {
-            // Reference resets the clock after the dial, before the handshake.
-            start = Instant::now();
             match tls_client::wrap_probe(conn, &host).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1375,6 +1374,9 @@ async fn delay_test(
         } else {
             conn
         };
+        if tls {
+            start = Instant::now();
+        }
         let request =
             format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.ok()?;

@@ -1322,6 +1322,7 @@ async fn xhttp_download_task(conn: AnyStream, session: Arc<XhttpSession>) {
         let _ = conn
             .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n")
             .await;
+        let _ = conn.flush().await;
         return;
     };
     let (mut rd, mut wr) = tokio::io::split(conn);
@@ -1329,10 +1330,14 @@ async fn xhttp_download_task(conn: AnyStream, session: Arc<XhttpSession>) {
         session.close_up();
         return;
     }
+    if wr.flush().await.is_err() {
+        session.close_up();
+        return;
+    }
     tokio::select! {
         _ = async {
             while let Some(chunk) = down.recv().await {
-                if wr.write_all(&chunk).await.is_err() {
+                if wr.write_all(&chunk).await.is_err() || wr.flush().await.is_err() {
                     break;
                 }
             }
@@ -1377,6 +1382,9 @@ async fn xhttp_upload_task(
             .await
             .is_err()
         {
+            return;
+        }
+        if conn.flush().await.is_err() {
             return;
         }
         if let Err(err) = pump_request_body(&mut conn, &mut pending, framing, &session).await {
@@ -1434,6 +1442,10 @@ async fn xhttp_stream_one_task(
         session.close_up();
         return;
     }
+    if wr.flush().await.is_err() {
+        session.close_up();
+        return;
+    }
     tokio::select! {
         _ = async {
             if let Err(err) = pump_request_body(&mut rd, &mut pending, framing, &session).await {
@@ -1446,6 +1458,9 @@ async fn xhttp_stream_one_task(
         _ = async {
             while let Some(chunk) = down.recv().await {
                 if wr.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                if wr.flush().await.is_err() {
                     break;
                 }
             }

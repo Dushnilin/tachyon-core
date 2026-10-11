@@ -126,8 +126,11 @@ def ensure_steer_env(bin_path):
         if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
             subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # iproute2 provides `ip`, used by steer_net_setup to address the tunnel iface
-        subprocess.run(["apt-get", "install", "-y", "-qq", "iproute2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # iproute2 provides `ip`, used by steer_net_setup to address the tunnel iface.
+        # nftables provides `nft`, which steer's ctl needs to apply its ruleset
+        # (without it apply fails with `nft refused the ruleset` -> SOCKS 0x04).
+        subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "iproute2", "nftables"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         os.makedirs("/usr/sbin", exist_ok=True)
         os.makedirs("/usr/lib", exist_ok=True)
@@ -1013,7 +1016,7 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
         outbound = dict(spec, tag="proxy")
         cfg_path = os.path.join(d, "config.json")
         cfg = {
-            "log": {"level": "error"},
+            "log": {"level": "debug" if core_name == "steer" else "error"},
             "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
             "outbounds": [outbound],
             "route": {"final": "proxy"}

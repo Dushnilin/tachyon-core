@@ -747,7 +747,14 @@ impl Dialer {
                     .ok_or_else(|| io::Error::other(format!("dns: detour {tag:?} not found")))?;
                 router.connect_index(index, &target).await?.into_plain()
             }
-            None => router.connect(&target).await?.into_plain(),
+            None => {
+                if addr.ip().is_loopback() {
+                    let tcp = TcpStream::connect(addr).await?;
+                    let _ = tcp.set_nodelay(true);
+                    return Ok(Box::new(tcp));
+                }
+                router.connect(&target).await?.into_plain()
+            }
         }
     }
 
@@ -786,6 +793,16 @@ impl Dialer {
                 router.connect_udp_index(index, &target).await
             }
             None => {
+                if addr.ip().is_loopback() {
+                    let bind: SocketAddr = if addr.is_ipv4() {
+                        "0.0.0.0:0".parse().unwrap()
+                    } else {
+                        "[::]:0".parse().unwrap()
+                    };
+                    let sock = UdpSocket::bind(bind).await?;
+                    sock.connect(addr).await?;
+                    return Ok(sock);
+                }
                 router
                     .connect_udp_index(router.default_index(), &target)
                     .await

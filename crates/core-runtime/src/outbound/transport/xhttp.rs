@@ -760,8 +760,8 @@ pub(crate) async fn connect(
                 seq: 0,
                 dialer,
             };
-            let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let bytes_flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let bytes_written = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
+            let bytes_flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
             let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
             let task = tokio::spawn(packet_upload_worker(
                 worker_read,
@@ -978,8 +978,8 @@ struct SplitConn {
 struct PacketsUp {
     io: tokio::io::DuplexStream,
     failure: Failure,
-    bytes_written: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    bytes_flushed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bytes_written: std::sync::Arc<portable_atomic::AtomicU64>,
+    bytes_flushed: std::sync::Arc<portable_atomic::AtomicU64>,
     flush_notify: std::sync::Arc<tokio::sync::Notify>,
     flush_wait: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     task: tokio::task::JoinHandle<()>,
@@ -1205,7 +1205,7 @@ async fn packet_upload_worker(
     mut reader: tokio::io::DuplexStream,
     mut writer: PostWriter,
     failure: Failure,
-    bytes_flushed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bytes_flushed: std::sync::Arc<portable_atomic::AtomicU64>,
     flush_notify: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let max_each = writer.cfg.meta.sc_max_each_post.rand().max(1) as usize;

@@ -181,7 +181,7 @@ pub async fn apply_desync_tcp(
             {
                 use std::os::unix::io::AsRawFd;
                 let fd = stream.as_raw_fd();
-                let oob_byte = [b'a'];
+                let oob_byte = *b"a";
                 unsafe {
                     libc::send(fd, oob_byte.as_ptr() as *const _, 1, libc::MSG_OOB);
                 }

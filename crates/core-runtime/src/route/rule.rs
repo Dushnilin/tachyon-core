@@ -1070,6 +1070,7 @@ const ROUTE_ACTION_KEYS: &[&str] = &[
     "udp_connect",
     "udp_disable_domain_unmapping",
     "tls_fragment",
+    "tls_fragment_fallback_delay",
     "tls_record_fragment",
     "tls_spoof",
     "tls_spoof_method",

@@ -1,0 +1,21 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "port": 443,
+        "action": "route-options",
+        "network_strategy": "fastest"
+      }
+    ],
+    "final": "direct"
+  }
+}

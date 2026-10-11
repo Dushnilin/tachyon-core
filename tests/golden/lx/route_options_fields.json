@@ -1,0 +1,31 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "port": 443,
+        "action": "route-options",
+        "udp_timeout": "2m",
+        "network_strategy": "default",
+        "tls_fragment": true,
+        "tls_fragment_fallback_delay": "300ms"
+      },
+      {
+        "port": 53,
+        "ip_version": 6,
+        "action": "route",
+        "outbound": "direct",
+        "udp_timeout": "10s"
+      }
+    ],
+    "final": "direct"
+  }
+}

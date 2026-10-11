@@ -221,6 +221,7 @@ const NESTED_ACTION_KEYS: &[&str] = &[
     "udp_connect",
     "udp_disable_domain_unmapping",
     "tls_fragment",
+    "tls_fragment_fallback_delay",
     "tls_record_fragment",
     "tls_spoof",
     "tls_spoof_method",
@@ -4665,11 +4666,13 @@ const ROUTE_RULE_FIELDS: &[&str] = &[
     "invert",
     "ip_cidr",
     "ip_is_private",
+    "ip_version",
     "method",
     "mode",
     "network",
     "network_is_constrained",
     "network_is_expensive",
+    "network_strategy",
     "network_type",
     "no_drop",
     "outbound",
@@ -4700,11 +4703,13 @@ const ROUTE_RULE_FIELDS: &[&str] = &[
     "strategy",
     "timeout",
     "tls_fragment",
+    "tls_fragment_fallback_delay",
     "tls_record_fragment",
     "tls_spoof",
     "type",
     "udp_connect",
     "udp_disable_domain_unmapping",
+    "udp_timeout",
     "user",
     "user_id",
     "wifi_bssid",
@@ -4852,6 +4857,22 @@ fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), Strin
     if let Some(value) = rule.get("rule_set").filter(|value| !prunes_value(value)) {
         check_listable_string_field(value, &format!("{at}.rule_set"))?;
     }
+    check_route_option_values(rule, at)?;
+    if let Some(value) = rule.get("ip_version").filter(|value| !prunes_value(value)) {
+        match value.as_i64() {
+            Some(4 | 6) => {}
+            Some(other) => return Err(format!("{at}: invalid ip version: {other}")),
+            None => {
+                return Err(go_type_error(
+                    value,
+                    &format!("{at}.ip_version"),
+                    "RawDefaultRule",
+                    "ip_version",
+                    "int",
+                ));
+            }
+        }
+    }
     // the process matchers are listables too, and the reference decodes them
     // before it ever looks at a rule's contents
     for field in ["process_name", "process_path", "process_path_regex", "user"] {
@@ -4901,6 +4922,41 @@ fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), Strin
             }
         }
         other => return Err(format!("{at}: unknown rule type: {other}")),
+    }
+    Ok(())
+}
+
+/// reference `option.RawRouteOptionsActionOptions`: the route-options fields
+/// a rule decodes on `route` and `route-options` alike (probed on
+/// v1.14.2-lx.11; lx.8 had not shown them to the key sweep).
+fn check_route_option_values(rule: &Map<String, Value>, at: &str) -> Result<(), String> {
+    const GO: &str = "RouteActionOptions.RawRouteOptionsActionOptions";
+    let not_string = |value: &Value, field: &str| {
+        format!(
+            "{at}.{field}: json: cannot unmarshal {} into Go struct field {GO}.{field} of type string",
+            json_kind(value)
+        )
+    };
+    for field in ["udp_timeout", "tls_fragment_fallback_delay"] {
+        if let Some(value) = rule.get(field).filter(|value| !prunes_value(value)) {
+            let Some(text) = value.as_str() else {
+                return Err(not_string(value, field));
+            };
+            go_parse_duration(text).map_err(|m| format!("{at}.{field}: {m}"))?;
+        }
+    }
+    if let Some(value) = rule
+        .get("network_strategy")
+        .filter(|value| !prunes_value(value))
+    {
+        let Some(text) = value.as_str() else {
+            return Err(not_string(value, "network_strategy"));
+        };
+        if !NETWORK_STRATEGIES.contains(&text) {
+            return Err(format!(
+                "{at}.network_strategy: unknown network strategy: {text}"
+            ));
+        }
     }
     Ok(())
 }

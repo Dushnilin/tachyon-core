@@ -1335,7 +1335,7 @@ mod tests {
     /// Only SO_MARK needs privileges; do not skip the other socket options.
     #[cfg(target_os = "linux")]
     fn test_routing_mark(mark: u32) -> Option<u32> {
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: SocketAddr = "1.1.1.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
         let result = DialOptions {
             routing_mark: Some(mark),
@@ -1390,7 +1390,7 @@ mod tests {
             tcp_keep_alive_interval: Some(Duration::from_secs(11)),
             ..Default::default()
         };
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: SocketAddr = "1.1.1.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
         options.apply(fd, &addr, false).expect("apply");
         if let Some(mark) = options.routing_mark {
@@ -1398,6 +1398,13 @@ mod tests {
                 get_int(fd, libc::SOL_SOCKET, libc::SO_MARK),
                 mark as libc::c_int
             );
+
+            // loopback destinations deliberately skip routing mark to prevent ENETUNREACH
+            let loop_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let loop_fd = new_socket(&loop_addr, false).expect("socket");
+            options.apply(loop_fd, &loop_addr, false).expect("apply");
+            assert_eq!(get_int(loop_fd, libc::SOL_SOCKET, libc::SO_MARK), 0);
+            unsafe { libc::close(loop_fd) };
         }
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR), 1);
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);

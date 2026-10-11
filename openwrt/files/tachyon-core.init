@@ -49,9 +49,15 @@ start_service() {
 	# Pre-flight check: validate config syntax before starting procd instance
 	# Prevents endless respawn crash-loops if an invalid config was written
 	if ! "$PROG" check -c "$conf" >/dev/null 2>&1; then
-		logger -t "$NAME" "pre-flight check failed for '$conf', refusing to start"
+		logger -t "$NAME" "pre-flight check failed for '$conf'"
 		"$PROG" check -c "$conf" 2>&1 | logger -t "$NAME"
-		return 1
+		# Fallback to last-known-good configuration if available to prevent service outage
+		if [ "$conf" != "$FALLBACK_CONF" ] && [ -f "$FALLBACK_CONF" ] && "$PROG" check -c "$FALLBACK_CONF" >/dev/null 2>&1; then
+			logger -t "$NAME" "falling back to last-known-good configuration: $FALLBACK_CONF"
+			conf="$FALLBACK_CONF"
+		else
+			return 1
+		fi
 	fi
 
 	# Determine worker thread count: 1 on single-core / low-RAM routers

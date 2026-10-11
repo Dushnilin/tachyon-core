@@ -39,7 +39,6 @@ SERVER_PORT = 21200
 # destination makes the kernel drop the SYN-ACK as a martian, so steer steers to
 # a real lo address (198.18.0.1) instead. Other engines keep 127.0.0.1.
 STEER_SINK = "198.18.0.1"
-_socks_dest = "127.0.0.1"
 CHUNK = 1 << 20  # 1 MiB
 UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 SNELL_PSK = "bench-snell-psk-012345"
@@ -99,7 +98,7 @@ def socks_connect(timeout=10, retries=8):
             s.sendall(b"\x05\x01\x00")
             auth = recvn(s, 2)
             assert auth == b"\x05\x00", f"socks auth failed: {auth!r}"
-            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(_socks_dest) + struct.pack(">H", SINK_PORT))
+            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack(">H", SINK_PORT))
             reply = recvn(s, 10)
             assert reply[1] == 0, f"socks connect refused: {reply!r}"
             return s
@@ -993,9 +992,7 @@ def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None
 
 
 def launch_client(core_name, bin_path, case, client_cpus, workers=None):
-    global _socks_dest
     d = tempfile.mkdtemp(prefix=f"proto_cli_{core_name}_")
-    _socks_dest = STEER_SINK if core_name == "steer" else "127.0.0.1"
     env = os.environ.copy()
     if workers:
         env["TACHYON_WORKERS"] = str(workers)
@@ -1008,36 +1005,18 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
             return None, d
         if core_name == "steer":
             if not steer_available():
-                return None, d  # signal "unrunnable" -> reported as NO_TUN, not FAIL
+                return None, d  # -> reported as NO_TUN
             ensure_steer_env(bin_path)
             steer_net_setup()
             curr_ld = env.get("LD_LIBRARY_PATH", "")
             env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
-            # The tunnel module traces its packet path under STEER_TUN_TRACE; we
-            # keep a spare session so the latency echo's fresh stream is not the
-            # one that has to cold-open a session to the node.
-            env["STEER_TUN_TRACE"] = os.environ.get("STEER_TUN_TRACE", "0")
-            env.setdefault("STEER_TUN_SPARES", "1")
         outbound = dict(spec, tag="proxy")
-        if core_name == "steer":
-            # steer's module dials the node from its own netns; a 127.0.0.1 node
-            # is unreachable ("отвечать некому"), so point at the container eth0.
-            node_ip = container_ip()
-            if node_ip:
-                outbound["server"] = node_ip
         cfg_path = os.path.join(d, "config.json")
         cfg = {
-            "log": {"level": "debug" if core_name == "steer" else "error"},
+            "log": {"level": "error"},
             "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
             "outbounds": [outbound],
-            # steer only materialises an output when a route.rule references it;
-            # the dummy ip_cidr forces the `proxy` output to exist without
-            # matching the 198.18.0.1 sink traffic (that falls through to final).
-            "route": (
-                {"rules": [{"action": "route", "outbound": "proxy", "ip_cidr": ["192.0.2.0/24"]}], "final": "proxy"}
-                if core_name == "steer"
-                else {"final": "proxy"}
-            ),
+            "route": {"final": "proxy"}
         }
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
@@ -1092,8 +1071,7 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
         return None, d
 
     _log = open("/bench/steer-client.log", "w") if core_name == "steer" else subprocess.DEVNULL
-    proc = subprocess.Popen(cmd, stdout=_log, stderr=subprocess.STDOUT if core_name == "steer" else subprocess.DEVNULL,
-                            env=env, preexec_fn=pre)
+    proc = subprocess.Popen(cmd, stdout=_log, stderr=subprocess.STDOUT if core_name == "steer" else subprocess.DEVNULL, env=env, preexec_fn=pre)
     wait_listen(PROXY_PORT)
     if core_name == "steer":
         steer_wait_ready()

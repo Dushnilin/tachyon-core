@@ -40,6 +40,7 @@ const MAX_HEAD: usize = 8 * 1024;
 pub(crate) enum Kind {
     Ws,
     HttpUpgrade,
+    Http,
     Grpc,
     Xhttp,
 }
@@ -49,11 +50,12 @@ impl Kind {
         Ok(match ty {
             "ws" => Kind::Ws,
             "httpupgrade" => Kind::HttpUpgrade,
+            "http" | "h2" => Kind::Http,
             "grpc" => Kind::Grpc,
             "xhttp" => Kind::Xhttp,
             other => anyhow::bail!(
                 "{at}: server transport {other} is not implemented yet (ws, \
-                 httpupgrade, grpc and xhttp are; http and quic are not)"
+                 httpupgrade, http, grpc and xhttp are; quic is not)"
             ),
         })
     }
@@ -172,22 +174,62 @@ impl Transport {
         if self.kind == Kind::Grpc {
             return Accepted::grpc(stream, &self.service).await;
         }
-        // XHTTP reads the head itself: which request this is -- the download,
-        // an upload packet, or a whole stream-one session -- decides what
-        // happens to the connection, and a connection that is only attaching
-        // to a session never hands a stream over at all.
         if self.kind == Kind::Xhttp {
             if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
                 return Accepted::xhttp_h2(stream, self).await;
             }
             return self.xhttp_accept(stream).await.map(Accepted::Once);
         }
+        if self.kind == Kind::Http {
+            if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
+                return Accepted::http_h2(stream, &self.path).await;
+            }
+            let mut stream = stream;
+            let (head, leftover) = read_head_split(&mut stream).await?;
+            if head.starts_with(b"PRI * HTTP/2.0\r\n") {
+                let mut combined = head;
+                combined.extend_from_slice(&leftover);
+                let pref_stream: AnyStream = Box::new(PrefixStream {
+                    prefix: combined,
+                    prefix_pos: 0,
+                    inner: stream,
+                });
+                return Accepted::http_h2(pref_stream, &self.path).await;
+            }
+            let (_method, target, _headers) = parse_head(&head)?;
+            if !path_matches(&target, &self.path) {
+                anyhow::bail!("http: path {target:?} does not match {:?}", self.path);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+                .await?;
+            stream.flush().await?;
+            let body_stream: AnyStream = if leftover.is_empty() {
+                stream
+            } else {
+                Box::new(PrefixStream {
+                    prefix: leftover,
+                    prefix_pos: 0,
+                    inner: stream,
+                })
+            };
+            return Ok(Accepted::Once(body_stream));
+        }
         let mut stream = stream;
-        let head = read_head(&mut stream).await?;
+        let (head, leftover) = read_head_split(&mut stream).await?;
         let (method, target, headers) = parse_head(&head)?;
         if !path_matches(&target, &self.path) {
             anyhow::bail!("ws: path {target:?} does not match {:?}", self.path);
         }
+        let mut stream: AnyStream = if leftover.is_empty() {
+            stream
+        } else {
+            Box::new(PrefixStream {
+                prefix: leftover,
+                prefix_pos: 0,
+                inner: stream,
+            })
+        };
         match self.kind {
             Kind::Ws => {
                 let key = match crate::ws::validate(&headers) {
@@ -220,14 +262,18 @@ impl Transport {
                 Ok(Accepted::Once(stream))
             }
             // returned before the request head above
+            Kind::Http => unreachable!("http returns before the request head"),
             Kind::Grpc => unreachable!("grpc returns before the request head"),
             Kind::Xhttp => unreachable!("xhttp returns before the request head"),
         }
     }
 }
 
-/// Read up to the end of the request head, inclusive of the blank line.
-async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<Vec<u8>> {
+/// Read up to the end of the request head, inclusive of the blank line,
+/// and return unconsumed bytes that arrived in the same chunk.
+async fn read_head_split<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -236,8 +282,14 @@ async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<Vec<u
             anyhow::bail!("http: connection closed inside the request head");
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n") {
-            return Ok(buf);
+        let end = if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos + 4)
+        } else {
+            buf.windows(2).position(|w| w == b"\n\n").map(|pos| pos + 2)
+        };
+        if let Some(pos) = end {
+            let leftover = buf.split_off(pos);
+            return Ok((buf, leftover));
         }
         if buf.len() > MAX_HEAD {
             anyhow::bail!("http: request head over {MAX_HEAD} bytes");
@@ -303,6 +355,8 @@ pub(crate) enum Accepted {
     /// pooled corpse and fails with a closed pipe before it ever reaches us.
     /// Boxed: an h2 `Connection` is far bigger than the pipe it wraps.
     Grpc(Box<GrpcAccept>),
+    /// A v2ray HTTP/2 connection: one session per request stream.
+    HttpH2(Box<HttpH2Accept>),
     /// An XHTTP HTTP/2 connection: one session per stream (stream-one), or multiplexed.
     XhttpH2(Box<XhttpH2Accept>),
 }
@@ -317,6 +371,19 @@ impl Accepted {
         Ok(Self::Grpc(Box::new(GrpcAccept {
             conn: Some(conn),
             service: service.to_string(),
+            first: true,
+        })))
+    }
+
+    /// The v2ray HTTP/2 transport half: handshake, and accept streams on the path.
+    async fn http_h2(stream: AnyStream, path: &str) -> anyhow::Result<Self> {
+        let conn = crate::outbound::transport::h2io::server_builder()
+            .handshake(stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("http: h2 handshake: {e}"))?;
+        Ok(Self::HttpH2(Box::new(HttpH2Accept {
+            conn: Some(conn),
+            path: path.to_string(),
             first: true,
         })))
     }
@@ -412,6 +479,97 @@ impl GrpcAccept {
     }
 }
 
+pub(crate) struct HttpH2Accept {
+    conn: Option<h2::server::Connection<AnyStream, Bytes>>,
+    path: String,
+    first: bool,
+}
+
+impl HttpH2Accept {
+    async fn next(&mut self) -> anyhow::Result<Option<AnyStream>> {
+        loop {
+            let Some(conn) = self.conn.as_mut() else {
+                return Ok(None);
+            };
+            let (request, mut responder) = match conn.accept().await {
+                Some(Ok(pair)) => pair,
+                Some(Err(err)) if self.first => anyhow::bail!("http: h2 accept: {err}"),
+                Some(Err(_)) => return Ok(None),
+                None if self.first => {
+                    anyhow::bail!("http: the connection ended before a request")
+                }
+                None => return Ok(None),
+            };
+            let first = std::mem::replace(&mut self.first, false);
+            let path = request.uri().path().to_string();
+            if !path_matches(&path, &self.path) {
+                let response = http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(())
+                    .unwrap();
+                let _ = responder.send_response(response, true);
+                if first {
+                    anyhow::bail!("http: path {path:?} does not match {:?}", self.path);
+                }
+                continue;
+            }
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .body(())
+                .map_err(|e| anyhow::anyhow!("http: response: {e}"))?;
+            let send = responder
+                .send_response(response, false)
+                .map_err(|e| anyhow::anyhow!("http: send response: {e}"))?;
+            let recv = request.into_body();
+            let h2_stream = crate::outbound::transport::h2io::H2Stream::server(recv, send);
+            let stream: AnyStream =
+                Box::new(crate::outbound::transport::h2io::H2Io { h2: h2_stream });
+            return Ok(Some(stream));
+        }
+    }
+}
+
+struct PrefixStream {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    inner: AnyStream,
+}
+
+impl AsyncRead for PrefixStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.prefix_pos < this.prefix.len() {
+            let left = &this.prefix[this.prefix_pos..];
+            let take = left.len().min(buf.remaining());
+            buf.put_slice(&left[..take]);
+            this.prefix_pos += take;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PrefixStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Run the sessions [`Transport::accept`] gave out. Everything but gRPC
 /// carries one session and awaits it right here; a gRPC connection is driven
 /// by `accept` itself -- flow control, window updates and everything already
@@ -430,6 +588,16 @@ where
         Accepted::Grpc(mut grpc) => {
             let mut sessions = Vec::new();
             while let Some(stream) = grpc.next().await.map_err(io::Error::other)? {
+                sessions.push(tokio::spawn(make(stream)));
+            }
+            for session in sessions {
+                let _ = session.await;
+            }
+            Ok(())
+        }
+        Accepted::HttpH2(mut http) => {
+            let mut sessions = Vec::new();
+            while let Some(stream) = http.next().await.map_err(io::Error::other)? {
                 sessions.push(tokio::spawn(make(stream)));
             }
             for session in sessions {
@@ -940,11 +1108,8 @@ impl Transport {
     /// (or births it, if the upload wins the race), and the single
     /// bidirectional `POST` of stream-one, whose session nothing attaches to.
     async fn xhttp_accept(&self, mut stream: AnyStream) -> anyhow::Result<AnyStream> {
-        let raw = read_head(&mut stream).await?;
-        let end =
-            head_end(&raw).ok_or_else(|| anyhow::anyhow!("xhttp: request head has no end"))?;
-        let (method, target, headers) = parse_head(&raw[..end])?;
-        let pending = raw[end..].to_vec();
+        let (raw, pending) = read_head_split(&mut stream).await?;
+        let (method, target, headers) = parse_head(&raw)?;
 
         let (path, query) = match target.split_once('?') {
             Some((path, query)) => (path, Some(query)),
@@ -1581,15 +1746,21 @@ mod tests {
         assert_eq!(t.seq, Place::Path);
         assert_eq!(t.seq_key, "x_seq");
 
+        // http is served now
+        let obj = serde_json::json!({"transport": {"type": "http", "path": "/bench"}});
+        let t = Transport::from_inbound(&obj, "inbounds[0]").expect("read");
+        let t = t.expect("present");
+        assert_eq!(t.kind, Kind::Http);
+        assert_eq!(t.path, "/bench");
+
         // the ones we cannot serve are refused, by name
-        for ty in ["quic", "http"] {
-            let obj = serde_json::json!({"transport": {"type": ty}});
-            let err = Transport::from_inbound(&obj, "inbounds[0]")
-                .expect_err("not implemented")
-                .to_string();
-            assert!(err.contains(ty), "{ty}: {err}");
-            assert!(err.contains("not implemented yet"), "{ty}: {err}");
-        }
+        let ty = "quic";
+        let obj = serde_json::json!({"transport": {"type": ty}});
+        let err = Transport::from_inbound(&obj, "inbounds[0]")
+            .expect_err("not implemented")
+            .to_string();
+        assert!(err.contains(ty), "{ty}: {err}");
+        assert!(err.contains("not implemented yet"), "{ty}: {err}");
 
         // an xhttp value the reference does not have either refuses at startup
         let obj =
@@ -1813,5 +1984,81 @@ mod tests {
         assert_eq!(path_unescape("%zz"), None);
         assert_eq!(path_unescape("/a%2Fb").as_deref(), Some("/a/b"));
         assert_eq!(path_unescape("/plain").as_deref(), Some("/plain"));
+    }
+
+    #[tokio::test]
+    async fn http_transport_h1_accept() {
+        let obj = serde_json::json!({"transport": {"type": "http", "path": "/tunnel"}});
+        let t = Transport::from_inbound(&obj, "inbounds[0]")
+            .expect("read")
+            .expect("present");
+        let (client, server) = tokio::io::duplex(1024);
+        let accept_task = tokio::spawn(async move { t.accept(Box::new(server)).await });
+        let mut client = client;
+        client
+            .write_all(b"PUT /tunnel HTTP/1.1\r\nHost: example.com\r\n\r\nhello")
+            .await
+            .unwrap();
+        let mut resp = [0u8; 17];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"HTTP/1.1 200 OK\r\n");
+        let accepted = accept_task.await.unwrap().unwrap();
+        match accepted {
+            Accepted::Once(mut s) => {
+                let mut body = [0u8; 5];
+                s.read_exact(&mut body).await.unwrap();
+                assert_eq!(&body, b"hello");
+            }
+            _ => panic!("expected Accepted::Once"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_transport_h2_roundtrip() {
+        let obj = serde_json::json!({"transport": {"type": "http", "path": "/tunnel"}});
+        let t = Transport::from_inbound(&obj, "inbounds[0]")
+            .expect("read")
+            .expect("present");
+        let (client, server) = tokio::io::duplex(1024);
+        let accept_task = tokio::spawn(async move {
+            let accepted = t.accept(Box::new(server)).await.unwrap();
+            serve_sessions(accepted, |mut stream| async move {
+                let mut buf = [0u8; 5];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"ping!");
+                stream.write_all(b"pong!").await.unwrap();
+                stream.flush().await.unwrap();
+                stream.shutdown().await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+
+        let (send_request, connection) = crate::outbound::transport::h2io::client_builder()
+            .handshake(client)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut send_request = send_request.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("PUT")
+            .uri("https://example.com/tunnel")
+            .body(())
+            .unwrap();
+        let (response, mut send) = send_request.send_request(request, false).unwrap();
+        send.send_data(bytes::Bytes::from_static(b"ping!"), false)
+            .unwrap();
+        let resp = response.await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let mut recv = resp.into_body();
+        let chunk = recv.data().await.unwrap().unwrap();
+        assert_eq!(&chunk[..], b"pong!");
+
+        drop(send);
+        drop(recv);
+        drop(send_request);
+        let _ = accept_task.await;
     }
 }

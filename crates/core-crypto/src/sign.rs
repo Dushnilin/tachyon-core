@@ -3,7 +3,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::marker::PhantomData;
 
 use self::ecdsa::{EcdsaSigningKeyP256, EcdsaSigningKeyP384};
-use self::eddsa::Ed25519SigningKey;
+pub use self::eddsa::Ed25519SigningKey;
 use self::rsa::RsaSigningKey;
 
 use pki_types::PrivateKeyDer;

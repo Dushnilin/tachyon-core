@@ -796,7 +796,7 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
     ),
     ("vmess", &["users", "multiplex", "transport", "tls"]),
     ("vless", &["users", "multiplex", "transport", "tls"]),
-    ("anytls", &["users", "padding_scheme", "tls"]),
+    ("anytls", &["users", "password", "padding_scheme", "tls"]),
     (
         "naive",
         &["users", "network", "quic_congestion_control", "tls"],
@@ -1064,6 +1064,7 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     ("shadowtls", "handshake_for_server_name", "object"),
     ("shadowtls", "strict_mode", "bool"),
     ("shadowtls", "wildcard_sni", "int"),
+    ("anytls", "password", "string"),
     ("anytls", "padding_scheme", "listable_string"),
     ("trojan", "fallback_for_alpn", "fallback_map"),
     ("tuic", "zero_rtt_handshake", "bool"),
@@ -3260,9 +3261,14 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
             .or_else(|| value.get("protocol"))
             .and_then(Value::as_str)
             .unwrap_or("enabled");
-        if field == "transport" && matches!(kind, "ws" | "httpupgrade" | "grpc" | "xhttp") {
-            // these four are served, by `core_runtime::inbound::transport`: a
-            // websocket handshake, an httpupgrade 101, one HTTP/2 POST stream,
+        if field == "transport"
+            && matches!(
+                kind,
+                "ws" | "httpupgrade" | "grpc" | "xhttp" | "http" | "h2"
+            )
+        {
+            // these are served, by `core_runtime::inbound::transport`: a
+            // websocket handshake, an httpupgrade 101, HTTP/2 POST/PUT streams,
             // or the XHTTP download/upload requests, then the protocol bytes
             continue;
         }
@@ -10421,8 +10427,8 @@ mod tests {
                 "{ty}: {err}"
             );
             assert!(err.contains("outbounds[].transport"), "{ty}: {err}");
-            // ws, httpupgrade, grpc and xhttp are served now, on the inbound
-            for ok_ty in ["ws", "httpupgrade", "grpc", "xhttp"] {
+            // ws, httpupgrade, grpc, xhttp and http are served now, on the inbound
+            for ok_ty in ["ws", "httpupgrade", "grpc", "xhttp", "http"] {
                 let served = json!({
                     "inbounds": [{
                         "type": ty,

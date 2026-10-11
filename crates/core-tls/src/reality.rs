@@ -155,6 +155,51 @@ fn err_seal() -> io::Error {
     bad("the session id could not be sealed")
 }
 
+/// `HMAC-SHA512` under `key` over `message`.
+pub fn hmac_sha512(key: &[u8], message: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Build a REALITY self-signed Ed25519 certificate DER where the outer signature is HMAC-SHA512(auth_key, ed25519_pub).
+pub fn build_reality_certificate(ed25519_pub: &[u8; 32], auth_key: &[u8; 32]) -> Vec<u8> {
+    let sig = hmac_sha512(auth_key, ed25519_pub);
+
+    let mut tbs = Vec::with_capacity(97);
+    tbs.extend_from_slice(&[0x30, 0x5F]); // SEQUENCE, 95 bytes
+    tbs.extend_from_slice(&[0xA0, 0x03, 0x02, 0x01, 0x02]); // v3
+    tbs.extend_from_slice(&[0x02, 0x01, 0x01]); // serial 1
+    tbs.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]); // alg Ed25519
+    tbs.extend_from_slice(&[0x30, 0x00]); // issuer
+    tbs.extend_from_slice(&[
+        0x30, 0x1E, // validity SEQUENCE
+        0x17, 0x0D, b'2', b'0', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'Z',
+        0x17, 0x0D, b'4', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5', b'9', b'Z',
+    ]);
+    tbs.extend_from_slice(&[0x30, 0x00]); // subject
+    tbs.extend_from_slice(&[0x30, 0x2A]); // SPKI SEQUENCE, 42 bytes
+    tbs.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]); // alg Ed25519
+    tbs.extend_from_slice(&[0x03, 0x21, 0x00]); // BIT STRING, 33 bytes, 0 unused
+    tbs.extend_from_slice(ed25519_pub);
+
+    let sig_alg = [0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70];
+
+    let mut sig_val = Vec::with_capacity(67);
+    sig_val.extend_from_slice(&[0x03, 0x41, 0x00]);
+    sig_val.extend_from_slice(&sig);
+
+    let total_len = tbs.len() + sig_alg.len() + sig_val.len();
+    let mut cert = Vec::with_capacity(3 + total_len);
+    cert.extend_from_slice(&[0x30, 0x81, total_len as u8]);
+    cert.extend_from_slice(&tbs);
+    cert.extend_from_slice(&sig_alg);
+    cert.extend_from_slice(&sig_val);
+    cert
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +362,23 @@ mod tests {
             "a browser hello offers a second, plain X25519 and that is the one a \
              server uses"
         );
+    }
+
+    #[test]
+    fn build_reality_certificate_roundtrip_verification() {
+        use crate::verify::{AcceptsAnything, CertVerifier, RealityVerifier};
+        use rustls::pki_types::{CertificateDer, ServerName};
+
+        let pub_key = [42u8; 32];
+        let auth = [99u8; 32];
+        let cert_der = build_reality_certificate(&pub_key, &auth);
+
+        let verifier = RealityVerifier::new(Box::new(AcceptsAnything));
+        verifier.set_reality_auth_key(&auth);
+
+        let cert = CertificateDer::from(cert_der);
+        let name = ServerName::try_from("example.com").unwrap();
+        assert!(verifier.verify_chain(&cert, &[], &name).is_ok());
+        assert_eq!(verifier.verdict(), "the borrowed certificate checks out");
     }
 }

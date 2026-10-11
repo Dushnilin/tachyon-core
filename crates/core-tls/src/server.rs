@@ -50,15 +50,24 @@ fn suite_params(suite: u16) -> (Hash, usize) {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ServerReality {
+    pub private_key: [u8; 32],
+    pub short_ids: Vec<Vec<u8>>,
+    pub max_time_difference: Option<u64>,
+}
+
 pub struct Config {
     /// the chain to send, leaf first, DER
     pub chain: Vec<Vec<u8>>,
     /// the key the leaf belongs to
-    pub key: Arc<dyn SigningKey>,
+    pub key: Option<Arc<dyn SigningKey>>,
     /// protocols to pick from, in the order of preference; empty means none
     pub alpn: Vec<Vec<u8>>,
     /// cipher suites to accept/prefer, in order; empty means defaults [0x1301, 0x1303, 0x1302]
     pub cipher_suites: Vec<u16>,
+    /// optional REALITY server configuration
+    pub reality: Option<ServerReality>,
 }
 
 /// One handshake. [`Handshake::run`] is the whole thing.
@@ -84,8 +93,13 @@ pub struct Handshake {
 
 impl Handshake {
     pub fn new(config: Config) -> std::io::Result<Self> {
-        if config.chain.is_empty() {
-            return Err(bad("a server needs a certificate chain"));
+        if config.reality.is_none() {
+            if config.chain.is_empty() {
+                return Err(bad("a server needs a certificate chain"));
+            }
+            if config.key.is_none() {
+                return Err(bad("a server needs a signing key"));
+            }
         }
         // The share is generated the same way the client's is: a key_share body
         // naming the groups we serve, with the captured bytes left as noise.
@@ -184,6 +198,58 @@ impl Handshake {
             .x25519_public
             .ok_or_else(|| bad("the client sent no X25519 key share"))?;
         let secret = self.shares.complete(X25519, &peer)?;
+
+        if let Some(reality) = &self.config.reality {
+            if raw.len() < crate::reality::SESSION_ID_OFFSET + 32 {
+                return Err(bad("the hello is too short to carry a session id"));
+            }
+            let mut client_random = [0u8; 32];
+            client_random.copy_from_slice(&raw[11..43]);
+
+            let server_secret = x25519_dalek::StaticSecret::from(reality.private_key);
+            let peer_public = x25519_dalek::PublicKey::from(peer);
+            let shared_secret = server_secret.diffie_hellman(&peer_public);
+            let auth_key = crate::reality::auth_key(shared_secret.as_bytes(), &client_random);
+
+            let opened = crate::reality::open_session_id(&raw, &auth_key)?;
+            if opened[0] != crate::reality::VERSION[0] || opened[1] != crate::reality::VERSION[1] {
+                return Err(bad("unsupported reality version"));
+            }
+
+            let ts = u32::from_be_bytes(opened[4..8].try_into().unwrap()) as u64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let diff = ts.abs_diff(now);
+            let max_diff = reality.max_time_difference.unwrap_or(600);
+            if diff > max_diff {
+                return Err(bad(format!(
+                    "reality timestamp out of range: diff {diff}s > {max_diff}s"
+                )));
+            }
+
+            if !reality.short_ids.is_empty() {
+                let mut matched = false;
+                for expected in &reality.short_ids {
+                    let mut exp_padded = [0u8; 8];
+                    let take = expected.len().min(8);
+                    exp_padded[..take].copy_from_slice(&expected[..take]);
+                    if opened[8..16] == exp_padded {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return Err(bad("reality short_id mismatch"));
+                }
+            }
+
+            let (signing_key, ed25519_pub) = core_crypto::sign::Ed25519SigningKey::generate();
+            let cert_der = crate::reality::build_reality_certificate(&ed25519_pub, &auth_key);
+            self.config.chain = vec![cert_der];
+            self.config.key = Some(Arc::new(signing_key));
+        }
 
         // ALPN: our order decides, and only if the client asked
         let offered = alpn_list(hello.extension(0x0010).unwrap_or_default());
@@ -317,6 +383,8 @@ impl Handshake {
         let signer = self
             .config
             .key
+            .as_ref()
+            .ok_or_else(|| bad("the server has no signing key"))?
             .choose_scheme(&[
                 rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
                 rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
@@ -652,9 +720,10 @@ mod tests {
             // read_hello never looks at the chain, so a byte that is not a
             // certificate saves building a real one here
             chain: vec![vec![0x30, 0x03, 0x02, 0x01, 0x01]],
-            key: core_crypto::sign::any_supported_type(&der).expect("a signing key"),
+            key: Some(core_crypto::sign::any_supported_type(&der).expect("a signing key")),
             alpn: Vec::new(),
             cipher_suites: Vec::new(),
+            reality: None,
         })
         .expect("server config");
         handshake

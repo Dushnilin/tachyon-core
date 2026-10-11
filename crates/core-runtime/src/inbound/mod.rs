@@ -178,6 +178,10 @@ pub fn stream_alpn(stream: &AnyStream) -> Option<&[u8]> {
 pub enum Conn {
     Plain(AnyStream),
     Shadowsocks(Box<SsReader<AnyRead>>, SsWriter<AnyWrite>),
+    Desync(
+        Box<TcpStream>,
+        std::sync::Arc<crate::outbound::desync::DesyncConfig>,
+    ),
 }
 
 // A `Conn` is a finished upstream stream; the runtime fetches (rule-sets,
@@ -188,6 +192,7 @@ impl Conn {
     pub fn into_plain(self) -> io::Result<AnyStream> {
         match self {
             Conn::Plain(stream) => Ok(stream),
+            Conn::Desync(stream, _) => Ok(stream),
             Conn::Shadowsocks(_, _) => Err(io::Error::other(
                 "runtime fetch does not support the shadowsocks codec stream",
             )),
@@ -544,6 +549,50 @@ where
                 }
                 None => {
                     copy_bidirectional_pooled(&mut client, &mut upstream).await?;
+                }
+            }
+            Ok(())
+        }
+        Conn::Desync(mut upstream_tcp, desync_cfg) => {
+            let mut stack_buf = [0u8; 2048];
+            let mut stack_len = 0;
+            if prefix.is_empty()
+                && let Ok(Ok(n)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    client.read(&mut stack_buf),
+                )
+                .await
+            {
+                stack_len = n;
+            }
+            let data_to_desync = if !prefix.is_empty() {
+                prefix
+            } else {
+                &stack_buf[..stack_len]
+            };
+
+            if !data_to_desync.is_empty() {
+                crate::outbound::desync::apply_desync_tcp(
+                    &upstream_tcp,
+                    data_to_desync,
+                    &desync_cfg,
+                )
+                .await?;
+                if let Some(tracker) = tracker {
+                    tracker.add_upload(data_to_desync.len() as u64);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(client_tcp) = client_raw_tcp(&client) {
+                return relay::relay(client_tcp, &upstream_tcp, &[], tracker, false).await;
+            }
+
+            match tracker {
+                Some(tracker) => {
+                    relay_tracked(&mut client, &mut upstream_tcp, tracker).await?;
+                }
+                None => {
+                    copy_bidirectional_pooled(&mut client, &mut upstream_tcp).await?;
                 }
             }
             Ok(())

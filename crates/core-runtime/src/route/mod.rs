@@ -159,6 +159,7 @@ impl ConnContext {
 
 pub enum Outbound {
     Direct(Direct),
+    Desync(crate::outbound::desync::Desync),
     Block(Block),
     Socks(Socks),
     Http(HttpOut),
@@ -190,6 +191,7 @@ impl Outbound {
                 .connect(target)
                 .await
                 .map(|s| Conn::Plain(Box::new(s))),
+            Outbound::Desync(desync) => desync.connect(target).await,
             Outbound::Block(block) => block
                 .connect(target)
                 .await
@@ -229,6 +231,7 @@ impl Outbound {
     ) -> io::Result<tokio::net::UdpSocket> {
         match self {
             Outbound::Direct(direct) => direct.connect_udp(target).await,
+            Outbound::Desync(desync) => desync.connect_udp(target).await,
             Outbound::Socks(socks) => socks.connect_udp(target).await,
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
             Outbound::Fptn(fptn) => fptn.connect_udp(target).await,
@@ -272,6 +275,7 @@ impl Outbound {
 
         match self {
             Outbound::Direct(d) => apply(&mut d.dial),
+            Outbound::Desync(d) => apply(&mut d.dial),
             Outbound::Vless(v) => apply(&mut v.dial),
             Outbound::Trojan(t) => apply(&mut t.dial),
             Outbound::Shadowsocks(s) => apply(&mut s.dial),
@@ -296,6 +300,9 @@ impl Outbound {
             .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
         match ty {
             "direct" => Ok(Outbound::Direct(Direct::build(obj, at)?)),
+            "desync" => Ok(Outbound::Desync(crate::outbound::desync::Desync::build(
+                obj, at,
+            )?)),
             "block" => Ok(Outbound::Block(Block)),
             "socks" => Ok(Outbound::Socks(Socks::build(obj, at)?)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),

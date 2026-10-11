@@ -813,6 +813,7 @@ async fn dial_plain(
 ) -> io::Result<crate::inbound::AnyStream> {
     match router.connect_index(idx, dest).await {
         Ok(crate::inbound::Conn::Plain(s)) => Ok(s),
+        Ok(crate::inbound::Conn::Desync(s, _)) => Ok(s),
         Ok(crate::inbound::Conn::Shadowsocks(..)) => {
             stream
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")

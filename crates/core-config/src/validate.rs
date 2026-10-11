@@ -280,6 +280,7 @@ const KNOWN_OUTBOUND_TYPES: &[&str] = &[
     "mieru",
     "dns",
     "bridge",
+    "desync",
 ];
 
 /// `option.BridgeOutboundOptions` (protocol/bridge): no dialer/listen embedding,
@@ -1431,6 +1432,18 @@ const SSH_OUT_FIELDS: &[&str] = &[
     "kex_algorithm",
 ];
 const DIRECT_OUT_FIELDS: &[&str] = &["override_address", "override_port", "proxy_protocol"];
+const DESYNC_OUT_FIELDS: &[&str] = &[
+    "preset",
+    "mode",
+    "split_pos",
+    "fake_ttl",
+    "fake_sni",
+    "repeats",
+    "split_delay_ms",
+    "udp_fake",
+    "udp_repeats",
+    "udp_fake_ttl",
+];
 const TOR_OUT_FIELDS: &[&str] = &["executable_path", "extra_args", "data_directory", "torrc"];
 const SELECTOR_OUT_FIELDS: &[&str] = &[
     "type",
@@ -7180,6 +7193,22 @@ fn validate_direct_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> 
     Ok(())
 }
 
+fn validate_desync_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
+    let at = format!("outbounds[{i}]");
+    let mut allowed: Vec<&str> = DIALER_OUT_FIELDS.to_vec();
+    allowed.extend(DIRECT_OUT_FIELDS);
+    allowed.extend(DESYNC_OUT_FIELDS);
+    allowed.extend(["type", "tag"]);
+    reject_unknown_fields(obj, &allowed, &at)?;
+    check_dialer_fields(
+        &at,
+        &format!("initialize outbound[{i}] desync[{tag}]"),
+        obj,
+        "_DirectOutboundOptions",
+    )?;
+    Ok(())
+}
+
 fn validate_tor_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     let mut allowed: Vec<&str> = DIALER_OUT_FIELDS.to_vec();
@@ -7608,6 +7637,7 @@ fn validate_outbound(
             }
         }
         "direct" => validate_direct_out_decode(i, tag, obj)?,
+        "desync" => validate_desync_out_decode(i, tag, obj)?,
         "bridge" => {
             reject_unknown_fields(obj, BRIDGE_OUT_FIELDS, &format!("outbounds[{i}]"))?;
             for field in ["iproute2_table_index", "iproute2_rule_index"] {

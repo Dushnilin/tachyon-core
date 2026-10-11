@@ -1228,7 +1228,12 @@ fn proxies_view(router: &Router) -> Value {
         .collect();
     let all: Vec<String> = entries
         .iter()
-        .filter(|(_, _, outbound)| !matches!(outbound, Outbound::Direct(_) | Outbound::Block(_)))
+        .filter(|(_, _, outbound)| {
+            !matches!(
+                outbound,
+                Outbound::Direct(_) | Outbound::Block(_) | Outbound::Desync(_)
+            )
+        })
         .map(|(_, tag, _)| tag.clone())
         .collect();
     // Reference keeps config order and omits direct/reject.
@@ -1293,6 +1298,7 @@ fn proxy_info_outbound(router: &Router, index: usize, outbound: &Outbound, tag: 
 fn clash_type_name(outbound: &Outbound) -> &'static str {
     match outbound {
         Outbound::Direct(_) => "Direct",
+        Outbound::Desync(_) => "Desync",
         // Reference maps TypeBlock to its clash display name "Reject".
         Outbound::Block(_) => "Reject",
         Outbound::Socks(_) => "SOCKS",

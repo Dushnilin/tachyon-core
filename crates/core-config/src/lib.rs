@@ -62,6 +62,11 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_desync_outbound() {
+        check_str(r#"{"log":{"level":"warn"},"outbounds":[{"type":"desync","tag":"dpi","preset":"fake_split","split_pos":"midsld","fake_ttl":6}]}"#).unwrap();
+    }
+
+    #[test]
     fn a_section_it_knows_nothing_about_fails_the_check() {
         // the permissive struct this used to parse into is gone; the reference
         // rejects a section it does not know, and so do we

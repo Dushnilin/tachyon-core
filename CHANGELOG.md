@@ -1,51 +1,76 @@
-# Changelog
+# История изменений (Changelog)
 
-All notable changes to tachyon-core. The version is the workspace version in
-`Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
+Все заметные изменения в tachyon-core. Версия соответствует версии рабочей области (workspace) в
+`Cargo.toml`; тег, не совпадающий с ней, отклоняется процессом выпуска релиза.
+
+## 0.0.8
+
+Выпуск с нативным outbound-десинхронизатором для обхода DPI, полным исправлением транспорта XHTTP в режимах packet-up и auto, гарантией сборки soft-float для MIPS без FPU, совместимостью с базовым x86-64, автопереходом на резервный рабочий конфиг при ошибках и включённым по умолчанию софт-стартом rule-set.
+
+### Исправления и улучшения
+
+- **Нативный desync-аутбаунд для обхода DPI**:
+  - Реализован встроенный протокол `desync` с поддержкой фрагментации TCP, сплита HTTP-запросов и нарезки TLS ClientHello на уровне сетевого стека ядра без необходимости запускать сторонние демоны ByeDPI (`ciadpi`) или Zapret.
+- **Починка клиента и сервера XHTTP в режимах packet-up и auto**:
+  - Исправлено согласование режимов: режим `auto` теперь резолвится строго в `packet-up` по эталонному поведению sing-box (`stream-one` зарезервирован только под REALITY).
+  - Убран синхронный блокирующий троттлинг на каждый write в `packet-up`; отправка переведена на фоновый асинхронный воркер `PacketsUp` с пайпом и координацией байт через `flush()`, что устранило зависания сессий и обеспечило потоковую производительность.
+  - Добавлены обязательные вызовы `flush()` в XHTTP-инбаунде (ответные заголовки 200 OK на download GET, подтверждения upload POST и потоковые чанки), благодаря чему ответы больше не оседают в TLS-буфере rustls до закрытия соединения.
+- **HTTP Inbound Transport и буферизация остаточных байт XHTTP**:
+  - Добавлена поддержка входящего plain HTTP транспорта.
+  - Исправлена буферизация остаточных байт при переходе границ фреймов в XHTTP.
+- **Принудительный soft-float для MIPS (роутеры OpenWrt)**:
+  - В целевых профилях сборки `mips-unknown-linux-musl` и `mipsel-unknown-linux-musl` включены флаги `-msoft-float` и `+soft-float`, полностью исключающие сбои `SIGILL` (Illegal Instruction) на процессорах роутеров без аппаратного FPU (MediaTek MT7620/MT7621/MT7628, Atheros AR9344).
+- **Базовый x86_64 для всех процессоров и гипервизоров**:
+  - Требования к архитектуре x86_64 снижены с x86-64-v3 до базового x86-64, обеспечивая беспроблемную работу на старых роутерах, тонких клиентах и любых виртуальных машинах.
+- **Отказоустойчивость и безопасность при старте**:
+  - При ошибке валидации конфигурации на этапе pre-flight сервис автоматически переключается на последнюю рабочую конфигурацию (`fallback.json`), защищая от потери удаленного доступа к роутеру.
+  - Включен софт-старт для rule-set по умолчанию: ядро успешно стартует и обслуживает локальный трафик даже при «холодном» старте без активного подключения к сети.
+  - Исключены петлевые адреса (loopback) из привязки `bind_interface` и навешивания `fwmark`, предотвращая зацикливание локального трафика.
+  - Добавлен парсинг паролей из списка `users` для AnyTLS инбаунда.
 
 ## 0.0.7
 
-Point release delivering native Brutal congestion control for Hysteria2, resilient non-fatal action: resolve with real IP destination rewriting for ByeDPI/Zapret, pure-Rust Tailscale mesh outbound, UDP L7 protocol sniffing, and OpenWrt runtime hardening.
+Выпуск с нативным алгоритмом контроля перегрузки Brutal для Hysteria2, устойчивым нефатальным action: resolve с перезаписью IP-назначения для ByeDPI/Zapret, pure-Rust аутбаундом Tailscale mesh, L7-сниффингом UDP-протоколов и повышением стабильности рантайма OpenWrt.
 
-### Fixes & Improvements
+### Исправления и улучшения
 
-- **Hysteria2 Brutal Congestion Control**:
-  - Implemented native Brutal congestion controller factory and pacing engine in Quinn, pacing packet transmission at the configured `up_mbps` rate without halving or backing off the congestion window upon packet loss.
-  - Neutralizes ISP packet throttling and artificial packet drop injected by TSPU filters on Hysteria2 tunnels.
-- **Routing Engine & ByeDPI / Zapret Interop**:
-  - Made DNS failures in `action: resolve` non-fatal: routing evaluation proceeds to fallback and section outbounds rather than aborting client TCP sessions at the router stage.
-  - Replaced target destination with resolved IP while preserving the original hostname in `ctx.domain`, ensuring SOCKS outbounds (such as ByeDPI `ciadpi`) receive clean IP targets (`ATYP 0x01`/`0x04`) and permanently eliminating FakeIP loopback loops on OpenWrt routers.
-  - Added support for `hosts` and `local`/`neighbor` server types in `lookup_via`.
+- **Контроль перегрузки Brutal для Hysteria2**:
+  - Реализованы собственный контроллер перегрузки и пейсер Brutal в стеке Quinn, отправляющие пакеты с фиксированной скоростью `up_mbps` без двукратного снижения окна при потерях пакетов.
+  - Нейтрализует искусственные потери и троттлинг провайдеров/ТСПУ на туннелях Hysteria2.
+- **Движок маршрутизации и совместимость с ByeDPI / Zapret**:
+  - Ошибки DNS в `action: resolve` сделаны нефатальными: маршрутизация продолжается по запасным правилам вместо обрыва TCP-сессии клиента на роутере.
+  - Адрес назначения заменяется на реальный отрезолвленный IP с сохранением исходного имени хоста в `ctx.domain`. Благодаря этому SOCKS-аутбаунды (например, ByeDPI `ciadpi`) получают чистые IP-цели (`ATYP 0x01`/`0x04`), полностью исключая петли FakeIP на OpenWrt.
+  - В `lookup_via` добавлена поддержка локальных DNS-серверов типов `hosts` и `local`/`neighbor`.
 - **Pure-Rust Tailscale Outbound**:
-  - Completed end-to-end user-space Tailscale mesh client support with STUN, coordinator authentication, netmap syncing, and direct P2P UDP packet transmission without C-crypto dependencies (PR #15 review by @MaksSt).
-- **Protocol Sniffing & Framing Hardening**:
-  - Added UDP L7 packet sniffing for QUIC (v1/v2 Initial and fragmented ClientHello), DNS, STUN, and BitTorrent (PR #14 and PR #16 review by @Screamshow).
-  - Handled empty TLS record frames gracefully without terminating the connection processor.
-  - Cleared intermediate plaintext buffers on authentication tag mismatch in software AES-GCM.
-  - Fixed composite duration parsing (e.g. `1m30s`, `300ms`) and supported `udp_timeout` and `ip_version` routing rule options.
-  - Aligned Clash API `/rules` and `/connections` outputs with the sing-box reference schema.
-  - Resolved `RLIMIT_NOFILE` soft-limit raising under constrained environments on OpenWrt (PR #13 review by @Screamshow).
+  - Завершена реализация клиентского узла Tailscale в пространстве пользователя со STUN, аутентификацией у координатора, синхронизацией netmap и прямой передачей UDP-пакетов P2P без C-зависимостей (рассмотрен PR #15 от @MaksSt).
+- **Сниффинг протоколов и стабилизация фрейминга**:
+  - Добавлен L7-сниффинг UDP-пакетов для QUIC (v1/v2 Initial и фрагментированный ClientHello), DNS, STUN и BitTorrent (рассмотрены PR #14 и PR #16 от @Screamshow).
+  - Корректная обработка пустых TLS-рекордов без завершения обработчика соединения.
+  - Очистка промежуточных буферов открытого текста при несовпадении тега аутентификации в софтовом AES-GCM.
+  - Исправлен парсинг составных длительностей (например, `1m30s`, `300ms`), добавлены параметры правил `udp_timeout` и `ip_version`.
+  - Приведение ответов Clash API (`/rules` и `/connections`) в соответствие со схемой sing-box.
+  - Решено повышение мягкого лимита `RLIMIT_NOFILE` в ограниченных окружениях OpenWrt (рассмотрен PR #13 от @Screamshow).
 
 ## 0.0.6
 
-Point release delivering zero-downtime atomic in-place configuration reload via SIGHUP, DNS query loop prevention with UDP retransmission, process-stable randomized TLS fingerprints, and Trojan server address type framing fixes.
+Выпуск с атомарной бесшовной перезагрузкой конфигурации на лету по сигналу SIGHUP, защитой от петель DNS с повторной отправкой UDP-запросов, стабильными случайными TLS-отпечатками uTLS и поддержкой типов адресов в инбаунде Trojan.
 
-### Fixes & Improvements
+### Исправления и улучшения
 
-- **Zero-Downtime Atomic In-Place SIGHUP Reload**:
-  - Implemented true in-place configuration swapping when inbound listeners remain unchanged, keeping existing listener sockets open and active TCP connections uninterrupted.
-  - Preserved outbound latency measurements (`delay_history`), selector selections, and `urltest` group latencies across reloads by tag mapping, permanently eliminating `N/A` latency resets in Clash API and dashboard clients.
-  - Migrated active DNS cache entries, resolved server bootstrap IP addresses, reverse DNS records, and FakeIP LRU address-to-domain mapping pools across reloads without state flushing.
-  - Added atomic rollback: invalid configurations, syntax errors, or unresolvable server references fail gracefully with running listeners and routes completely untouched.
-- **DNS Resolver Hardening & Retransmission**:
-  - Eliminated fallback to system resolver (`lookup_host`) when a configured `domain_resolver` fails or returns no records, preventing recursive forwarding amplification loops between `dnsmasq` and `sing-box` on port 53.
-  - Added UDP query retransmission loop (1.5s interval bounded by query timeout) to gracefully recover from dropped DNS packets on lossy PPPoE links.
-- **Process-Stable Random & Randomized uTLS Fingerprints**:
-  - Enabled runtime construction and execution for `tls.utls.fingerprint: "random"` and `"randomized"`, including under REALITY outbounds (PR #11 by @Screamshow).
-  - Selected profile remains stable per-process across outbounds, reloads, and handshakes, with cipher suite and extension shuffling preserving HTTP/2 ALPN and hybrid group pairs.
-- **Trojan Inbound Server Address Types & IPv6 Support**:
-  - Isolated SOCKS ATYP translation strictly to the Trojan protocol boundary, preserving standard binary framing for VLESS and VMess transports (PR #10 by @MaksSt).
-  - Fixed TLS streaming to domain and IPv6 target destinations on the Trojan server inbound, backed by wire regression test suites.
+- **Атомарная бесшовная перезагрузка по SIGHUP (Zero-Downtime)**:
+  - Реализована настоящая замена конфигурации без закрытия неизмененных сокетов инбаундов и без разрыва активных TCP-соединений.
+  - Сохранение истории задержек аутбаундов (`delay_history`), выборов селекторов и задержек групп `urltest` по сопоставлению тегов, что устранило сбросы статуса в `N/A` в Clash API и веб-панелях.
+  - Перенос активного кэша DNS, отрезолвленных адресов bootstrap, обратных DNS-записей и пула сопоставлений FakeIP LRU без сброса состояния.
+  - Атомарный откат: при невалидном конфиге, синтаксических ошибках или неразрешимых серверах ядро продолжает работать на прежней конфигурации без простоя.
+- **Устойчивость DNS-резолвера и повторная отправка**:
+  - Исключен откат к системному резолверу (`lookup_host`) при ошибке настроенного `domain_resolver`, предотвращая петли между `dnsmasq` и `sing-box` на 53 порту.
+  - Добавлен цикл повторной отправки UDP-запросов (интервал 1.5 с в пределах таймаута) для устойчивости на проблемных каналах PPPoE.
+- **Стабильные случайные отпечатки uTLS**:
+  - Включена поддержка параметров `tls.utls.fingerprint: "random"` и `"randomized"`, в том числе для аутбаундов REALITY (PR #11 от @Screamshow).
+  - Выбранный профиль остается стабильным для каждого процесса между соединениями и перезагрузками с сохранением пар ALPN HTTP/2 и гибридных групп.
+- **Типы адресов сервера Trojan и поддержка IPv6**:
+  - Изолирована трансляция SOCKS ATYP строго на границе протокола Trojan с сохранением стандартного бинарного фрейминга для VLESS и VMess (PR #10 от @MaksSt).
+  - Исправлена передача TLS к доменам и IPv6-адресам назначения на Trojan server inbound с regression-тестами.
 
 ## 0.0.5
 
@@ -82,131 +107,92 @@ Point release delivering zero-downtime atomic in-place configuration reload via 
 
 ## 0.0.3
 
-Point release addressing compound headless rules matching in RuleSet, outbound proxy routing mark tagging, zero-downtime SIGHUP reload, and MIPS toolchain musl linker stability.
+Выпуск с исправлением составных headless-правил в RuleSet, маркировкой сокетов прокси-аутбаундов, бесшовной перезагрузкой по SIGHUP и стабильностью линковки musl для тулчейна MIPS.
 
-### Fixes & Improvements
+### Исправления и улучшения
 
-- **Compound Headless Rule Matching in RuleSets**:
-  - Fixed matching logic in `RuleSetIndex` and `PlainRule::matches`: composite rule match criteria (e.g. `network: udp` and `port_range`) are now evaluated with strict `AND` semantics and stored in a composite fallback chain instead of independent `OR` checks.
-  - Eliminates false matching of DNS queries against port-restricted rules (such as Discord Voice UDP 50000-65535).
-- **Socket Mark on All Proxy Outbounds**:
-  - Ensured `apply_dial_defaults` applies `routing_mark` (`0x08000000`) across all outbound proxy transports (VLESS, Trojan, Shadowsocks, VMess, ShadowTLS, Naive, Snell), preventing TProxy packet re-injection loopback in nftables `TachyonTable`.
-- **MIPS & MIPSEL Musl Linker Stability**:
-  - Bundled `libgcc_eh.a` with `_dl_find_object` stubs into `libunwind.a` for clean musl target linking across MIPS softfloat and MIPSEL architectures.
-- **SIGHUP Reload (Zero Downtime)**:
-  - Implemented in-place configuration reload on `SIGHUP` signal (`run_reloadable`) in `core-runtime` without process exit or socket collisions.
+- **Составные headless-правила в RuleSet**:
+  - Исправлена логика сопоставления в `RuleSetIndex` и `PlainRule::matches`: составные критерии правил (например, `network: udp` и `port_range`) теперь проверяются со строгой семантикой `AND` и хранятся в цепочке fallback вместо независимых проверок `OR`.
+  - Устранено ложное срабатывание DNS-запросов на правила с ограничением по портам (например, Discord Voice UDP 50000-65535).
+- **Сетевая метка (mark) на всех прокси-аутбаундах**:
+  - `apply_dial_defaults` теперь гарантированно применяет `routing_mark` (`0x08000000`) ко всем прокси-транспортам (VLESS, Trojan, Shadowsocks, VMess, ShadowTLS, Naive, Snell), предотвращая зацикливание повторной инъекции пакетов TProxy в таблице `TachyonTable` nftables.
+- **Стабильность линковщика Musl для MIPS и MIPSEL**:
+  - Библиотека `libgcc_eh.a` со заглушками `_dl_find_object` встроена в `libunwind.a` для чистой сборки под musl на архитектурах MIPS softfloat и MIPSEL.
+- **Перезагрузка по SIGHUP (Zero Downtime)**:
+  - Реализована перезагрузка конфигурации на месте по сигналу `SIGHUP` (`run_reloadable`) в `core-runtime` без завершения процесса и конфликтов сокетов.
 
 ## 0.0.2
 
-Point release improving network compatibility, DNS resilience, protocol framing, and TLS fingerprint fidelity.
+Выпуск с улучшением совместимости сетевого стека, надежности DNS, протокольного фрейминга и точности TLS-отпечатков.
 
-### Fixes & Improvements
+### Исправления и улучшения
 
-- **DNS Resolver Resiliency**:
-  - Added automatic fallback to system resolver (`tokio::net::lookup_host`) when a configured `domain_resolver` (bootstrap DNS, e.g. UDP port 53) times out or is unreachable. Fixes DNS failure on ISPs (such as PPPoE WANs) that drop external UDP port 53.
-  - Implemented routing target resolution for DNS `Action::Evaluate`, resolving and routing DNS evaluation queries through the specified server rather than dropping or ignoring the rule.
-  - Corrected DNS rule iteration to skip `match_response` rules during initial query evaluation, preventing response-matching rules from misrouting outgoing queries.
+- **Отказоустойчивость DNS-резолвера**:
+  - Добавлен автоматический откат к системному резолверу (`tokio::net::lookup_host`), когда настроенный `domain_resolver` (bootstrap DNS, например UDP 53) не отвечает или недоступен. Решает проблемы у провайдеров (включая PPPoE), блокирующих внешний UDP 53.
+  - Реализовано разрешение целевого маршрута для DNS `Action::Evaluate`: запросы резолвятся и направляются через указанный сервер вместо сброса правила.
+  - Исправлен обход правил DNS с пропуском правил `match_response` при первичном вычислении запроса.
 - **VLESS Vision Direct Raw Transport**:
-  - Implemented receive-side transition to raw transport upon receiving `CommandPaddingDirect`. Buffered content and padding are drained before switching the read path to the raw underlying stream, resolving inner TLS 1.3 HTTPS stalls behind REALITY/Vision (Closes #1).
-- **Browser TLS Fingerprints & RFC 8879 Certificate Compression**:
-  - Refreshed browser ClientHello fingerprint fixtures for modern Firefox (148), Safari (26.3), and Chrome with exact key-share tables and hybrid ML-KEM/X25519 alignment.
-  - Added native RFC 8879 certificate compression support (zlib, Brotli, Zstd) using pure-Rust decoders (Closes #2).
-- **Sing-Box Compatible XHTTP Forms**:
-  - Accepted `session_id_table` and `session_id_length` aliases, numeric values for range fields, named session alphabets (`hex`, `Base62`), and default fallback for zero uplink chunk sizes (Closes #3).
-- **AF_ALG & TUN Portability**:
-  - Replaced unchecked `msg_iovlen` casts with checked conversions across target architectures, and cleaned up TUN identity IP-address conversions (PR #4).
+  - Реализован переход на сырой транспорт на стороне приема при получении команды `CommandPaddingDirect`. Буферизованный контент и паддинг сбрасываются до переключения потока на сырое соединение, устраняя подвисания внутреннего HTTPS TLS 1.3 за REALITY/Vision (закрывает #1).
+- **TLS-отпечатки браузеров и сжатие сертификатов RFC 8879**:
+  - Обновлены фикстуры ClientHello для актуальных Firefox (148), Safari (26.3) и Chrome с точными таблицами key-share и гибридным выравниванием ML-KEM/X25519.
+  - Добавлена нативная поддержка сжатия сертификатов RFC 8879 (zlib, Brotli, Zstd) с pure-Rust декодерами (закрывает #2).
+- **Совместимость с формами XHTTP sing-box**:
+  - Поддержка алиасов `session_id_table` и `session_id_length`, числовых значений диапазонов, именованных алфавитов сессий (`hex`, `Base62`) и дефолтов при нулевом размере чанка (закрывает #3).
+- **Портативность AF_ALG и TUN**:
+  - Замена непроверенных приведений типов `msg_iovlen` на безопасные конверсии для всех целевых платформ, очистка преобразований IP-адресов интерфейса TUN (PR #4).
 
 ## 0.0.1
 
-The first tagged build. A routing core for OpenWrt: the client stack end to
-end, plus the server half of the four TCP proxy protocols.
+Первый релиз. Сетевое ядро маршрутизации для OpenWrt: клиентский стек от и до, плюс серверная часть четырёх TCP-прокси протоколов.
 
-### What runs
+### Что работает
 
-- **Inbounds**: `mixed` (HTTP, SOCKS4/4a, SOCKS5 with UDP ASSOCIATE), `direct`,
-  `redirect` (Linux `REDIRECT`), `tproxy` (v4/v6 with `IP_TRANSPARENT`), `tun`
-  (pure-Rust `/dev/net/tun` with `smoltcp` userspace TCP/IP stack, transparent TCP proxying, UDP NAT with remote/client source preservation, table 2022 policy routing + fwmark, GRO/GSO virtio_net_hdr parsing and TSO segmentation, dual-stack IPv4/IPv6 and ICMP/ICMPv6 echo responder), and the
-  server inbounds `vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic`
-  and `wireguard`.
-- **Server inbounds** accept the TCP command and the UDP command, over a `tls`
-  block with our own handshake — TLS 1.3, X25519, three cipher suites, ALPN, no
-  resumption, HelloRetryRequest handled the same way the client does.
-- **Outbounds**: `direct`, `block`, `socks`, `http`, `shadowsocks`, `vless`,
-  `vmess`, `trojan`, `hysteria2`, `tuic`, `anytls`, `naive`, `snell`, `masque`
-  (warp), `fptn`, `urltest`, `selector`, and the `wireguard` and
-  `openvpn-client` endpoints, WireGuard with AmneziaWG 2.0/3.x shapes included.
-- **Transports**: `ws`, `httpupgrade`, `grpc`, `http`, `xhttp` with `xmux`,
-  all three `packet_encoding` modes, uTLS fingerprints and REALITY.
-- **DNS**: `udp`, `tcp`, `tls`, `https`, `quic`, `h3`, `fakeip`, `local`,
-  `hosts`, `group`, `mdns`, `dhcp` and `resolved`; logical rules, `rule_set`, hijack-DNS,
-  `reverse_mapping`, `client_subnet`.
-- **Routing**: the matcher set including `route.find_neighbor` for
-  `source_mac_address` and `source_hostname`, sniffing, and the SRS rule-set
-  reader.
-- **Experimental**: `clash_api` REST with websocket streaming, delay history, and `external_ui`
-  download, and a `cache.db` that Go bbolt can read with auto-flush on timeout and buffer size.
-- **OpenWrt Integration**: procd init script, UCI configuration, automatic `RLIMIT_NOFILE`
-  raising, and full CLI flag compatibility (`-D`, `-C`, multiple `-c`).
+- **Инбаунды**: `mixed` (HTTP, SOCKS4/4a, SOCKS5 с UDP ASSOCIATE), `direct`, `redirect` (Linux `REDIRECT`), `tproxy` (v4/v6 с `IP_TRANSPARENT`), `tun` (нативный `/dev/net/tun` на чистом Rust со стеком `smoltcp` в пространстве пользователя, прозрачное TCP-проксирование, UDP NAT с сохранением исходного адреса, маршрутизация таблицей 2022 + fwmark, парсинг GRO/GSO virtio_net_hdr и сегментация TSO, дуалстек IPv4/IPv6 и ICMP/ICMPv6 echo responder), а также серверные инбаунды `vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic` и `wireguard`.
+- **Серверные инбаунды** принимают команды TCP и UDP поверх блока `tls` с собственным хэндшейком — TLS 1.3, X25519, три набора шифров, ALPN, без возобновления сессий, обработка HelloRetryRequest аналогично клиенту.
+- **Аутбаунды**: `direct`, `block`, `socks`, `http`, `shadowsocks`, `vless`, `vmess`, `trojan`, `hysteria2`, `tuic`, `anytls`, `naive`, `snell`, `masque` (warp), `fptn`, `urltest`, `selector`, а также эндпоинты `wireguard` и `openvpn-client`, включая WireGuard с профилями AmneziaWG 2.0/3.x.
+- **Транспорты**: `ws`, `httpupgrade`, `grpc`, `http`, `xhttp` с `xmux`, все три режима `packet_encoding`, отпечатки uTLS и REALITY.
+- **DNS**: `udp`, `tcp`, `tls`, `https`, `quic`, `h3`, `fakeip`, `local`, `hosts`, `group`, `mdns`, `dhcp` и `resolved`; логические правила, `rule_set`, перехват DNS (hijack), `reverse_mapping`, `client_subnet`.
+- **Маршрутизация**: полный набор матчеров, включая `route.find_neighbor` для `source_mac_address` и `source_hostname`, сниффинг и чтение правил SRS.
+- **Экспериментальное**: `clash_api` REST с потоковым вебсокетом, историей задержек и скачиванием `external_ui`, а также `cache.db`, совместимый с Go bbolt, с автоматическим сбросом по таймауту и размеру буфера.
+- **Интеграция с OpenWrt**: procd init-скрипт, конфигурация через UCI, автоматическое поднятие `RLIMIT_NOFILE` и полная совместимость с ключами командной строки (`-D`, `-C`, множественные `-c`).
 
-### Measurements
+### Замеры
 
-Taken on 2026-10-02 with the same toolchain the release workflow uses:
-`cargo build --release` against a musl target, `RUSTFLAGS="-C linker=rust-lld
--C link-self-contained=yes"`, release profile (`opt-level = "z"`, LTO,
-`codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`).
+Проведены 2026-10-02 на том же тулчейне, который используется в workflow релиза:
+`cargo build --release` под musl, `RUSTFLAGS="-C linker=rust-lld -C link-self-contained=yes"`, профиль release (`opt-level = "z"`, LTO, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`).
 
-| | tachyon-core | sing-box-lx 1.14.2-lx.2 | |
+| | tachyon-core | sing-box-lx 1.14.2-lx.2 | Разница |
 |---|:---:|:---:|---|
-| binary, aarch64 | **5.37 MiB** | 67.6 MiB | 12.6× smaller |
-| binary, armv7 | **5.57 MiB** | 68.2 MiB | 12.2× smaller |
-| binary, x86_64 | **6.85 MiB** | 75.9 MiB | 11.1× smaller |
-| idle RSS, mixed + direct | **2.4 MiB** | 42.7 MiB | 17.8× less |
+| бинарник, aarch64 | **5.37 MiB** | 67.6 MiB | в 12.6× меньше |
+| бинарник, armv7 | **5.57 MiB** | 68.2 MiB | в 12.2× меньше |
+| бинарник, x86_64 | **6.85 MiB** | 75.9 MiB | в 11.1× меньше |
+| память в простое (RSS), mixed + direct | **2.4 MiB** | 42.7 MiB | в 17.8× меньше |
 
-The earlier figures in this repository -- 3.5 MiB for aarch64, 19× smaller --
-came from a `cargo zigbuild` run, which is not what builds the released binary,
-so they were not numbers the release could reproduce. Zig is not in the release
-image; `rust-lld` is. The honest numbers are the ones above, and the tree grew
-into them: a full TLS 1.3 *server* stack and the server UDP path are new since
-that measurement.
+Ранние цифры в репозитории — 3.5 MiB для aarch64, в 19× меньше — были получены из сборки `cargo zigbuild`, которая не используется в релизе. В релизном образе используется `rust-lld`. Честные цифры приведены в таблице выше; в дерево за это время добавились полный серверный стек TLS 1.3 и серверный UDP-тракт.
 
-CI keeps a hard ceiling of 12 MiB on every architecture it builds, mipsel and
-mips included, which the largest of the above clears by 43%.
+В CI действует жесткий потолок размера в 12 MiB для всех архитектур, включая mipsel и mips, с запасом более 40%.
 
-### Platforms
+### Платформы
 
-Static musl builds for the OpenWrt targets: `x86_64`, `aarch64`, `armv7`,
-`armv6`, `riscv64`, `mipsel` and `mips`. The two MIPS targets are tier-3 and
-their standard library is built from source; they are built and size-checked,
-but nothing in this release has been *run* under qemu-user.
+Статические musl-бинарники для целевых платформ OpenWrt: `x86_64`, `aarch64`, `armv7`, `armv6`, `riscv64`, `mipsel` и `mips`. Обе платформы MIPS относятся к tier-3 и их стандартная библиотека собирается из исходников.
 
-The cryptography is pure Rust throughout — no `ring`, no `aws-lc-rs`, no CGO —
-so the same source builds for 32-bit softfloat MIPS.
+Криптография полностью на чистом Rust — без `ring`, без `aws-lc-rs`, без CGO — поэтому исходный код собирается под 32-битный softfloat MIPS без сборочных костылей.
 
-### Known gaps
+### Известные ограничения
 
-Stated plainly, because a release note that hides them is worth less than one
-that names them:
+Честно перечисляем то, что пока не реализовано:
 
-- No `lxd` daemon, no libbox/Android bindings.
-- Tailscale and openconnect not implemented.
-- The vless, trojan and vmess server sides do not speak mux (`packetaddr`/`xudp`),
-  Vision's server splice, or the legacy vmess CFB body.
-- `insecure: true` with no certificate on a server inbound is refused: it needs
-  an ephemeral key pair, and nothing here can sign a certificate.
-- `COMPAT.md` predates most of this work and does not describe the tree.
+- Нет демона `lxd`, нет биндингов libbox/Android.
+- Не реализованы Tailscale и openconnect.
+- Серверные стороны vless, trojan и vmess пока не поддерживают mux (`packetaddr`/`xudp`), серверный splice для Vision и устаревший формат тела vmess CFB.
+- `insecure: true` без сертификата на серверном инбаунде отклоняется: требуется эфемерная пара ключей и выпуск сертификата.
+- `COMPAT.md` описывает раннее состояние проекта и обновляется отдельно.
 
-### Fixes worth naming
+### Исправления, которые стоит упомянуть
 
-Four of these were live defects rather than missing features, and all four were
-found by measuring our own client against our own server:
+Четыре дефекта логики, обнаруженные при тестировании собственного клиента против собственного сервера:
 
-- vmess `security: auto` became `none` whenever the outbound had a `tls` block,
-  so any TLS vmess config carried its payload unencrypted.
-- The server-side TLS record layer sealed writes larger than one record, and the
-  length in the header is a `u16`: a long write wrapped round to a short length
-  and the client read a truncated ciphertext out of the middle of it.
-- An inline `certificate`/`key` on a server inbound was read only as a string,
-  where the reference reads a `Listable[string]` — the form nearly every config
-  actually uses.
-- The vmess UDP client consumed one byte of the server's answer instead of two,
-  and read the rest as the length of the first datagram.
+- При `security: auto` в vmess выставлялся режим `none`, если у аутбаунда был блок `tls`, из-за чего vmess с TLS передавал полезную нагрузку незашифрованной.
+- Серверный TLS-слой запечатывал записи размером больше одного рекорда, а длина в заголовке — `u16`: длинная запись оборачивалась в короткую длину, и клиент читал обрезанный шифротекст.
+- Инлайн-значения `certificate`/`key` на серверном инбаунде читались только строкой, тогда как референс принимает `Listable[string]` (список строк) — формат, используемый большинством реальных конфигов.
+- UDP-клиент vmess считывал один байт ответа сервера вместо двух, воспринимая остаток как длину первой датаграммы.

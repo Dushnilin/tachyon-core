@@ -280,9 +280,7 @@ impl Hysteria2 {
         } else {
             CongestionKind::Bbr
         };
-        let (ep_config, transport) =
-            self.quic
-                .build_configs(congestion, None, self.want_udp);
+        let (ep_config, transport) = self.quic.build_configs(congestion, None, self.want_udp);
         let mut endpoint = quinn::Endpoint::new(
             ep_config,
             None,

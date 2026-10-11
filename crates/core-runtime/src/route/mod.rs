@@ -939,6 +939,8 @@ impl RouterInner {
         for outbound in &self.outbounds {
             if let Outbound::WireGuard(wg) = outbound {
                 wg.start_listen().await?;
+            } else if let Outbound::Tailscale(ts) = outbound {
+                ts.shared().await?;
             }
         }
         Ok(())
@@ -1188,8 +1190,26 @@ impl Router {
         RouterInner::build(root)
     }
 
-    pub async fn apply_inner(self: &Arc<Self>, new_inner: RouterInner) -> anyhow::Result<()> {
+    pub async fn apply_inner(self: &Arc<Self>, mut new_inner: RouterInner) -> anyhow::Result<()> {
         let old_inner = self.inner();
+
+        // A new control stream for an unchanged identity would replace the old
+        // stream, and a second UDP bind would fail. Preserve the whole endpoint.
+        for (tag, &old_idx) in &old_inner.tags {
+            if let Some(Outbound::Tailscale(old)) = old_inner.outbounds.get(old_idx) {
+                let inherited = match new_inner
+                    .tags
+                    .get(tag)
+                    .and_then(|index| new_inner.outbounds.get_mut(*index))
+                {
+                    Some(Outbound::Tailscale(new)) => new.inherit(old),
+                    _ => false,
+                };
+                if !inherited {
+                    old.shutdown().await;
+                }
+            }
+        }
 
         // 1. Preserve delay history by tag across reloads
         for (tag, &old_idx) in &old_inner.tags {

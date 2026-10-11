@@ -233,6 +233,12 @@ impl BoxInstance {
     /// Abort all listeners and connection tasks.
     pub fn shutdown(&self) {
         self.abort_listeners();
+        let inner = self.router.inner();
+        for (_, _, outbound) in inner.outbound_table() {
+            if let crate::route::Outbound::Tailscale(endpoint) = outbound {
+                endpoint.abort();
+            }
+        }
     }
 
     fn abort_listeners(&self) {
@@ -253,6 +259,12 @@ impl BoxInstance {
     /// tproxy UDP socket with a session still holding it.
     pub async fn shutdown_wait(&mut self) {
         self.shutdown();
+        let inner = self.router.inner();
+        for (_, _, outbound) in inner.outbound_table() {
+            if let crate::route::Outbound::Tailscale(endpoint) = outbound {
+                endpoint.shutdown().await;
+            }
+        }
         for task in self.tasks.drain(..) {
             let _ = task.await;
         }

@@ -66,17 +66,17 @@ const RECOVERY_LADDER: [Duration; 4] = [
     Duration::from_secs(30),
 ];
 
-/// Opt-in: keep the engine running with an empty rule-set instead of aborting
-/// the start, and fetch it in the background. `TACHYON_RULESET_SOFT_START=1`.
+/// Keep the engine running with an empty rule-set instead of aborting
+/// the start when a remote set cannot be fetched immediately, and fetch it
+/// in the background via the recovery ladder.
 ///
-/// Off by default, because the reference aborts with `initial rule-set:
-/// <tag>` and an empty set means the rules pointing at it match nothing. A
-/// router booting before its WAN is up is the case this is for: failing to
-/// start there costs DNS as well as the proxy.
+/// On by default on OpenWrt routers so booting before WAN is established or
+/// transient DNS outages do not take down the entire proxy core and router DNS.
+/// Can be explicitly disabled via `TACHYON_RULESET_SOFT_START=0` or `"false"`.
 pub fn soft_start_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("TACHYON_RULESET_SOFT_START").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("0") | Ok("false") | Ok("no")
     )
 }
 
@@ -815,16 +815,19 @@ mod tests {
         let mut registry = RemoteRegistry::new();
         registry.push(remote("rs", &format!("http://{addr}/ruleset.srs")));
 
-        // the reference aborts the start
-        let error = registry.start_all(&router, None).await.unwrap_err();
+        // with soft start disabled explicitly, start aborts like the reference
+        let error = registry
+            .start_all_with(&router, None, false)
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("initial rule-set: rs"),
             "{error}"
         );
 
-        // soft start: the engine stays up, the set is empty for now
+        // soft start (enabled by default): engine stays up, set starts empty
         registry
-            .start_all_with(&router, None, true)
+            .start_all(&router, None)
             .await
             .expect("soft start");
         assert_eq!(registry.sets[0].lock().await.set.rule_count(), 0);

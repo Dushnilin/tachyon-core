@@ -491,13 +491,86 @@ unsafe fn raise_rlimit_nofile() {
         rlim_max: 0,
     };
     unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            let max_target = 65535;
-            if rlim.rlim_cur < max_target {
-                let new_cur = max_target.min(rlim.rlim_max.max(max_target));
-                rlim.rlim_cur = new_cur;
-                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            eprintln!(
+                "warning: getrlimit(RLIMIT_NOFILE): {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // Only the soft limit moves, and never past the inherited hard one:
+        // procd hands out 1024/4096 on OpenWrt, and asking for 65535 there is
+        // EINVAL, which used to leave the core at 1024.
+        let target = rlim.rlim_max.min(65535);
+        if rlim.rlim_cur < target {
+            rlim.rlim_cur = target;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                eprintln!(
+                    "warning: setrlimit(RLIMIT_NOFILE): {}",
+                    std::io::Error::last_os_error()
+                );
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(target_env = "msvc")))]
+mod nofile_tests {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    fn limit() -> libc::rlimit {
+        let mut l = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) }, 0);
+        l
+    }
+
+    /// The limit is per process, so every case runs in a child of the test
+    /// binary that starts with the limits procd would have handed it.
+    #[test]
+    fn the_soft_limit_rises_to_the_inherited_hard_one() {
+        const CASE: &str = "TACHYON_NOFILE_CASE";
+        let ceiling = limit().rlim_max;
+        // (soft, hard, expected soft); an unprivileged runner cannot raise its
+        // own hard limit, so every number is capped to what it inherited
+        let cases: [(libc::rlim_t, libc::rlim_t, libc::rlim_t); 4] = [
+            (1024, 4096, 4096),
+            (1024, 65535, 65535),
+            (1024, 70000, 65535),
+            (70000, 70000, 70000),
+        ]
+        .map(|(s, h, e)| (s.min(ceiling), h.min(ceiling), e.min(ceiling)));
+        if let Ok(i) = std::env::var(CASE) {
+            let (_, hard, expected) = cases[i.parse::<usize>().unwrap()];
+            unsafe { super::raise_rlimit_nofile() };
+            let got = limit();
+            assert_eq!((got.rlim_cur, got.rlim_max), (expected, hard));
+            return;
+        }
+        for (i, (soft, hard, _)) in cases.into_iter().enumerate() {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "nofile_tests::the_soft_limit_rises_to_the_inherited_hard_one",
+                "--nocapture",
+            ]);
+            child.env(CASE, i.to_string());
+            unsafe {
+                child.pre_exec(move || {
+                    let l = libc::rlimit {
+                        rlim_cur: soft,
+                        rlim_max: hard,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &l) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            assert!(child.status().unwrap().success(), "case {i}");
         }
     }
 }

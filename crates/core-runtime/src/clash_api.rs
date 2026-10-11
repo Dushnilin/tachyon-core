@@ -812,18 +812,25 @@ async fn handle_connection(
 
 fn connection_json(view: &clash_state::ConnView) -> Value {
     let (source_ip, source_port) = split_host_port(&view.meta.source);
-    let (dest_ip, dest_port) = split_host_port(&view.meta.destination);
+    let (dest_host, dest_port) = split_host_port(&view.meta.destination);
+    // `Destination.Addr` is the zero address for a domain destination
+    let dest_ip = if dest_host.parse::<std::net::IpAddr>().is_ok() {
+        dest_host
+    } else {
+        String::new()
+    };
     json!({
         "id": view.id,
         "metadata": {
             "network": view.meta.network,
-            "type": "Clash",
+            "type": view.meta.inbound,
             "sourceIP": source_ip,
             "sourcePort": source_port,
-            "host": view.meta.host,
             "destinationIP": dest_ip,
             "destinationPort": dest_port,
-            "chains": view.meta.chains,
+            "host": view.meta.host,
+            "dnsMode": "normal",
+            "processPath": view.meta.process_path,
         },
         "upload": view.upload,
         "download": view.download,

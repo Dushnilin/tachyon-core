@@ -19,6 +19,7 @@ fn meta(destination: &str) -> clash_state::ConnMeta {
         chains: vec!["direct".into()],
         rule: "port".into(),
         rule_payload: "443".into(),
+        process_path: String::new(),
     }
 }
 

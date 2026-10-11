@@ -19,13 +19,17 @@ use tokio::sync::Notify;
 #[derive(Clone, Debug)]
 pub struct ConnMeta {
     pub network: &'static str,
+    /// `inboundType/inboundTag`, the reference `metadata.type`.
     pub inbound: String,
     pub source: String,
+    /// The sniffed domain, else the destination's name, else empty.
     pub host: String,
     pub destination: String,
     pub chains: Vec<String>,
+    /// `<rule> => <action>`, or `final` when no rule matched.
     pub rule: String,
     pub rule_payload: String,
+    pub process_path: String,
 }
 
 struct Shared {
@@ -215,6 +219,7 @@ mod tests {
             chains: vec!["proxy".into()],
             rule: "DomainSuffix".into(),
             rule_payload: "example.com".into(),
+            process_path: String::new(),
         }
     }
 

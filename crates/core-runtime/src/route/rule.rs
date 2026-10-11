@@ -105,13 +105,22 @@ impl Action {
         }
     }
 
-    /// Reference `RuleAction.String()` for `GET /rules`.
+    /// Reference `RuleAction.String()` for `GET /rules` and the `rule` field
+    /// of `/connections`.
     pub fn clash_view(&self) -> String {
         match self {
-            Action::Route { outbound, .. } => format!("route({outbound})"),
-            Action::Bypass { outbound, .. } if outbound.is_empty() => "bypass()".to_string(),
-            Action::Bypass { outbound, .. } => format!("bypass({outbound})"),
-            Action::RouteOptions(_) => "route-options()".to_string(),
+            Action::Route { outbound, opts } | Action::Bypass { outbound, opts }
+                if !outbound.is_empty() =>
+            {
+                let mut parts = vec![outbound.clone()];
+                parts.extend(opts.descriptions());
+                format!("{}({})", self.type_name(), parts.join(","))
+            }
+            Action::Route { .. } => "route()".to_string(),
+            Action::Bypass { .. } => "bypass()".to_string(),
+            Action::RouteOptions(opts) => {
+                format!("route-options({})", opts.descriptions().join(","))
+            }
             Action::Direct => "direct".to_string(),
             Action::Reject { method, .. } => match method {
                 RejectMethod::Default => "reject".to_string(),
@@ -119,11 +128,28 @@ impl Action {
                 RejectMethod::Reply => "reject(reply)".to_string(),
             },
             Action::HijackDns => "hijack-dns".to_string(),
-            Action::Sniff { .. } => "sniff()".to_string(),
-            Action::Resolve(action) => match &action.server {
-                Some(server) => format!("route({server})"),
-                None => "route()".to_string(),
-            },
+            Action::Sniff { sniffer, timeout } => {
+                let mut parts = sniffer.clone();
+                if !timeout.is_zero() {
+                    parts.push(go_duration_string(*timeout));
+                }
+                if parts.is_empty() {
+                    "sniff".to_string()
+                } else {
+                    format!("sniff({})", parts.join(","))
+                }
+            }
+            Action::Resolve(action) => {
+                let mut parts: Vec<String> = action.server.iter().cloned().collect();
+                if let Some(name) = action.strategy.and_then(strategy_name) {
+                    parts.push(name.to_string());
+                }
+                if parts.is_empty() {
+                    "resolve".to_string()
+                } else {
+                    format!("resolve({})", parts.join(","))
+                }
+            }
         }
     }
 
@@ -137,6 +163,76 @@ impl Action {
             Action::HijackDns => "hijack-dns",
             Action::Sniff { .. } => "sniff",
             Action::Resolve(_) => "resolve",
+        }
+    }
+}
+
+impl RouteOptions {
+    /// `RuleActionRouteOptions.Descriptions`, limited to the options this
+    /// core carries. `udp-timeout` is a bare flag there too.
+    fn descriptions(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match &self.override_address {
+            Some(TargetOverride::Ip(ip)) => out.push(format!("override-address={ip}")),
+            Some(TargetOverride::Domain(host)) => out.push(format!("override-address={host}")),
+            None => {}
+        }
+        if let Some(port) = self.override_port.filter(|p| *p > 0) {
+            out.push(format!("override-port={port}"));
+        }
+        if self.udp_disable_domain_unmapping == Some(true) {
+            out.push("udp-disable-domain-unmapping".into());
+        }
+        if self.udp_timeout.is_some_and(|t| !t.is_zero()) {
+            out.push("udp-timeout".into());
+        }
+        if self.tls_fragment == Some(true) {
+            out.push("tls-fragment".into());
+        }
+        if self.tls_record_fragment == Some(true) {
+            out.push("tls-record-fragment".into());
+        }
+        out
+    }
+}
+
+/// `option.DomainStrategy` names; `as_is` prints nothing.
+fn strategy_name(strategy: crate::dns::Strategy) -> Option<&'static str> {
+    use crate::dns::Strategy;
+    match strategy {
+        Strategy::AsIs => None,
+        Strategy::PreferIPv4 => Some("prefer_ipv4"),
+        Strategy::PreferIPv6 => Some("prefer_ipv6"),
+        Strategy::IPv4Only => Some("ipv4_only"),
+        Strategy::IPv6Only => Some("ipv6_only"),
+    }
+}
+
+/// Go `time.Duration.String()`: `0s`, `300ms`, `1.5µs`, `1m30s`, `1h0m0s`.
+fn go_duration_string(d: Duration) -> String {
+    fn fixed(value: u128, digits: u32) -> String {
+        let scale = 10u128.pow(digits);
+        let (int, rem) = (value / scale, value % scale);
+        if rem == 0 {
+            return int.to_string();
+        }
+        let frac = format!("{rem:0width$}", width = digits as usize);
+        format!("{int}.{}", frac.trim_end_matches('0'))
+    }
+    let ns = d.as_nanos();
+    match ns {
+        0 => "0s".to_string(),
+        1..1_000 => format!("{ns}ns"),
+        1_000..1_000_000 => format!("{}\u{b5}s", fixed(ns, 3)),
+        1_000_000..1_000_000_000 => format!("{}ms", fixed(ns, 6)),
+        _ => {
+            let seconds = format!("{}s", fixed(ns % 60_000_000_000, 9));
+            let minutes = ns / 60_000_000_000;
+            match (minutes / 60, minutes % 60) {
+                (0, 0) => seconds,
+                (0, m) => format!("{m}m{seconds}"),
+                (h, m) => format!("{h}h{m}m{seconds}"),
+            }
         }
     }
 }
@@ -179,6 +275,8 @@ pub struct DefaultRule {
     has_items: bool,
     /// The rule sets this rule consults (empty when it has no `rule_set`).
     rule_sets: Vec<std::sync::Arc<super::rule_set::RuleSet>>,
+    /// The `rule_set` tags as configured, for the description.
+    rule_set_tags: Vec<String>,
     invert: bool,
     action: Action,
 }
@@ -223,7 +321,9 @@ enum AddressItem {
 #[derive(Debug, Clone)]
 enum PortItem {
     Ports(Vec<u16>),
-    Ranges(Vec<(u16, u16)>),
+    /// The parsed ranges, and the strings they came from: the reference
+    /// describes a range the way the config wrote it (`:3000`, `10:`).
+    Ranges(Vec<(u16, u16)>, Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -288,14 +388,17 @@ fn collapse_fields(parts: &[String]) -> String {
     out.join(" ")
 }
 
-/// `port=` / `source_port=`, with ranges in the `100-200` form.
-fn port_description(name: &str, item: &PortItem) -> String {
-    let mut values: Vec<String> = Vec::new();
+/// `port=` / `port_range=` (or the `source_` pair), as the reference items
+/// describe themselves.
+fn port_description(source: bool, item: &PortItem) -> String {
+    let prefix = if source { "source_" } else { "" };
     match item {
-        PortItem::Ports(ports) => values.extend(ports.iter().map(u16::to_string)),
-        PortItem::Ranges(ranges) => values.extend(ranges.iter().map(|(a, b)| format!("{a}-{b}"))),
+        PortItem::Ports(ports) => {
+            let values: Vec<String> = ports.iter().map(u16::to_string).collect();
+            field_list(&format!("{prefix}port"), &values)
+        }
+        PortItem::Ranges(_, raw) => field_list(&format!("{prefix}port_range"), raw),
     }
-    field_list(name, &values)
 }
 
 fn wrap_invert(invert: bool, payload: &str) -> String {
@@ -304,6 +407,39 @@ fn wrap_invert(invert: bool, payload: &str) -> String {
     } else {
         payload.to_string()
     }
+}
+
+/// A plain item's place in the reference order and its description. Ranks
+/// under 10 go before the domain items, the rest after the ports.
+fn plain_description(item: &PlainItem) -> Option<(u8, String)> {
+    let described = match item {
+        PlainItem::Inbound(list) => (0, field_list("inbound", list)),
+        PlainItem::IpVersion { is_v6 } => (1, format!("ip_version={}", if *is_v6 { 6 } else { 4 })),
+        PlainItem::Network(list) => (2, field_list("network", list)),
+        PlainItem::AuthUser(list) => (3, field_list("auth_user", list)),
+        PlainItem::Protocol(list) => (4, field_list("protocol", list)),
+        PlainItem::Client(list) => (5, field_list("client", list)),
+        PlainItem::ProcessName(list) => (10, field_list("process_name", list)),
+        PlainItem::ProcessPath(list) => (11, field_list("process_path", list)),
+        PlainItem::ProcessPathRegex(list) => {
+            let values: Vec<String> = list.iter().map(|re| re.as_str().into()).collect();
+            (12, field_list("process_path_regex", &values))
+        }
+        PlainItem::User(list) => (13, field_list("user", list)),
+        PlainItem::UserId(list) => {
+            let values: Vec<String> = list.iter().map(|n| n.to_string()).collect();
+            (14, field_list("user_id", &values))
+        }
+        PlainItem::ClashMode(list) => (15, field_list("clash_mode", list)),
+        PlainItem::SourceMac(list) => {
+            let values: Vec<String> = list.iter().map(super::neighbor::mac_string).collect();
+            (16, field_list("source_mac_address", &values))
+        }
+        PlainItem::SourceHostname(list) => (17, field_list("source_hostname", list)),
+        // package_name* and friends never match and carry no description
+        PlainItem::Unsupported => return None,
+    };
+    Some(described)
 }
 
 impl Rule {
@@ -461,13 +597,13 @@ impl Rule {
             source_port.push(PortItem::Ports(v));
         }
         if let Some(v) = string_list(map, "source_port_range", at)? {
-            source_port.push(PortItem::Ranges(parse_ranges(&v, at)?));
+            source_port.push(PortItem::Ranges(parse_ranges(&v, at)?, v));
         }
         if let Some(v) = port_list(map, "port", at)? {
             dest_port.push(PortItem::Ports(v));
         }
         if let Some(v) = string_list(map, "port_range", at)? {
-            dest_port.push(PortItem::Ranges(parse_ranges(&v, at)?));
+            dest_port.push(PortItem::Ranges(parse_ranges(&v, at)?, v));
         }
 
         const UNSUPPORTED: &[&str] = &[
@@ -555,6 +691,7 @@ impl Rule {
             dest_port,
             has_items,
             rule_sets,
+            rule_set_tags,
             invert,
             action,
         })))
@@ -599,56 +736,38 @@ impl Rule {
     }
 
     /// Reference `GET /rules` entry: `(type, payload, proxy)` where payload
-    /// is the item description string (`abstractDefaultRule.String`).
+    /// is the rule's `String()`.
     pub fn clash_view(&self) -> (String, String, String) {
-        let (kind, payload) = match self {
-            Rule::Default(r) => ("default", r.item_description()),
-            Rule::Logical(r) => {
-                let mode = if r.mode == LogicalMode::And {
-                    "and"
-                } else {
-                    "or"
-                };
-                let inner = r
-                    .rules
-                    .iter()
-                    .map(|sub| sub.clash_view().1)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let payload = format!("{mode}({inner})");
-                ("logical", wrap_invert(r.invert, &payload))
-            }
+        let kind = match self {
+            Rule::Default(_) => "default",
+            Rule::Logical(_) => "logical",
         };
-        (kind.to_string(), payload, self.action().clash_view())
+        (
+            kind.to_string(),
+            self.description(),
+            self.action().clash_view(),
+        )
     }
 
-    /// Label used for a connection in `/connections`: the leading condition of
-    /// the payload, with the sing-box field name.
-    pub fn clash_primary(&self) -> (String, String) {
-        let (kind, payload, _) = self.clash_view();
-        let field = payload
-            .split(['=', '['])
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let value = payload
-            .split_once('=')
-            .map(|(_, rest)| {
-                rest.trim()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .split(' ')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        if field.is_empty() {
-            (kind, String::new())
-        } else {
-            (field, value)
+    /// `rule.String()`: items for a default rule; for a logical one the
+    /// subrules joined by ` && ` / ` || `, unparenthesised.
+    fn description(&self) -> String {
+        match self {
+            Rule::Default(r) => r.item_description(),
+            Rule::Logical(r) => {
+                let op = match r.mode {
+                    LogicalMode::And => " && ",
+                    LogicalMode::Or => " || ",
+                };
+                let inner: Vec<String> = r.rules.iter().map(Rule::description).collect();
+                wrap_invert(r.invert, &inner.join(op))
+            }
         }
+    }
+
+    /// The `rule` field of a `/connections` entry: `<rule> => <action>`.
+    pub fn clash_primary(&self) -> String {
+        format!("{} => {}", self.description(), self.action().clash_view())
     }
 
     pub fn matches(&self, ctx: &ConnContext) -> bool {
@@ -684,51 +803,15 @@ impl DefaultRule {
     /// `abstractDefaultRule.String`: item descriptions joined by spaces,
     /// wrapped in `!(...)` for inverted rules.
     fn item_description(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for item in &self.plain {
-            match item {
-                PlainItem::Inbound(list) => parts.push(field_list("inbound", list)),
-                PlainItem::IpVersion { is_v6 } => {
-                    parts.push(format!("ip_version={}", if *is_v6 { 6 } else { 4 }));
-                }
-                PlainItem::Network(list) => parts.push(field_list("network", list)),
-                PlainItem::AuthUser(list) => parts.push(field_list("auth_user", list)),
-                PlainItem::Protocol(list) => parts.push(field_list("protocol", list)),
-                PlainItem::Client(list) => parts.push(field_list("client", list)),
-                PlainItem::ClashMode(list) => parts.push(field_list("clash_mode", list)),
-                PlainItem::SourceMac(list) => {
-                    let values: Vec<String> =
-                        list.iter().map(super::neighbor::mac_string).collect();
-                    parts.push(field_list("source_mac_address", &values));
-                }
-                PlainItem::SourceHostname(list) => parts.push(field_list("source_hostname", list)),
-                PlainItem::ProcessName(list) => parts.push(field_list("process_name", list)),
-                PlainItem::ProcessPath(list) => parts.push(field_list("process_path", list)),
-                PlainItem::ProcessPathRegex(list) => {
-                    let values: Vec<String> = list.iter().map(|re| re.as_str().into()).collect();
-                    parts.push(field_list("process_path_regex", &values));
-                }
-                PlainItem::UserId(list) => {
-                    let values: Vec<String> = list.iter().map(|n| n.to_string()).collect();
-                    parts.push(field_list("user_id", &values));
-                }
-                PlainItem::User(list) => parts.push(field_list("user", list)),
-                // package_name* and friends never match and carry no description
-                PlainItem::Unsupported => {}
-            }
-        }
-        for item in &self.source_address {
-            match item {
-                AddressItem::Cidr(list) => {
-                    let values: Vec<String> = list.iter().map(IpPrefix::to_cidr).collect();
-                    parts.push(field_list("source_ip_cidr", &values));
-                }
-                AddressItem::IsPrivate => parts.push("source_ip_cidr=lan".to_string()),
-            }
-        }
-        for item in &self.source_port {
-            parts.push(port_description("source_port", item));
-        }
+        // `NewDefaultRule` appends items in a fixed order: the connection
+        // items first, then domains, addresses, ports, the process and
+        // neighbour items, and the rule sets last
+        let mut plain: Vec<(u8, String)> =
+            self.plain.iter().filter_map(plain_description).collect();
+        plain.sort_by_key(|(rank, _)| *rank);
+        let (head, tail): (Vec<_>, Vec<_>) = plain.into_iter().partition(|(rank, _)| *rank < 10);
+
+        let mut parts: Vec<String> = head.into_iter().map(|(_, text)| text).collect();
         let domains: Vec<String> = self
             .dest_address
             .iter()
@@ -753,17 +836,36 @@ impl DefaultRule {
                 parts.push(field_list("domain_regex", &values));
             }
         }
+        for item in &self.source_address {
+            match item {
+                AddressItem::Cidr(list) => {
+                    let values: Vec<String> = list.iter().map(IpPrefix::to_cidr).collect();
+                    parts.push(field_list("source_ip_cidr", &values));
+                }
+                AddressItem::IsPrivate => parts.push("source_ip_is_private=true".to_string()),
+            }
+        }
         for item in &self.dest_ip_cidr {
             let values: Vec<String> = item.prefixes.iter().map(IpPrefix::to_cidr).collect();
             if !values.is_empty() {
                 parts.push(field_list("ip_cidr", &values));
             }
             if item.is_private {
-                parts.push("ip_cidr=lan".to_string());
+                parts.push("ip_is_private=true".to_string());
             }
         }
+        for item in &self.source_port {
+            parts.push(port_description(true, item));
+        }
         for item in &self.dest_port {
-            parts.push(port_description("port", item));
+            parts.push(port_description(false, item));
+        }
+        parts.extend(tail.into_iter().map(|(_, text)| text));
+        // `RuleSetItem.String` brackets every multi-tag list, never truncates
+        match self.rule_set_tags.as_slice() {
+            [] => {}
+            [tag] => parts.push(format!("rule_set={tag}")),
+            tags => parts.push(format!("rule_set=[{}]", tags.join(" "))),
         }
         wrap_invert(self.invert, &parts.join(" "))
     }
@@ -931,7 +1033,7 @@ impl PortItem {
     fn matches(&self, port: u16) -> bool {
         match self {
             PortItem::Ports(list) => list.contains(&port),
-            PortItem::Ranges(ranges) => ranges.iter().any(|(a, b)| port >= *a && port <= *b),
+            PortItem::Ranges(ranges, _) => ranges.iter().any(|(a, b)| port >= *a && port <= *b),
         }
     }
 }
@@ -1165,9 +1267,11 @@ fn build_action(map: &serde_json::Map<String, Value>, at: &str) -> anyhow::Resul
                     anyhow::bail!("{at}: unknown sniffer: {name}");
                 }
             }
+            // zero means unset: the sniffers fall back to the default, and
+            // the description prints only what the config gave
             let timeout = parse_duration(
                 map.get("timeout"),
-                DEFAULT_SNIFF_TIMEOUT,
+                Duration::ZERO,
                 &format!("{at}: timeout"),
             )?;
             Ok(Action::Sniff { sniffer, timeout })
@@ -1498,6 +1602,89 @@ mod tests {
         assert!(!rule.matches(&ctx), "and not after switching away");
         // the description follows the matcher
         assert_eq!(rule.clash_view().1, "clash_mode=global");
+    }
+
+    fn describe(rule: Value) -> (String, String) {
+        let (_, payload, action) = Rule::build(&rule, "r", true).unwrap().clash_view();
+        (payload, action)
+    }
+
+    #[test]
+    fn descriptions_follow_the_reference_order() {
+        // items print in `NewDefaultRule` order, whatever order the config used
+        let (payload, action) = describe(json!({
+            "port_range": ["10:20"], "source_port_range": ["30:"], "ip_is_private": true,
+            "source_ip_is_private": true, "process_name": ["curl"], "domain_suffix": ["b.com"],
+            "domain": ["a.com"], "network": ["tcp"], "inbound": ["in"],
+            "action": "route", "outbound": "direct", "override_port": 53, "tls_fragment": true,
+        }));
+        assert_eq!(
+            payload,
+            "inbound=in network=tcp domain=a.com domain_suffix=b.com \
+             source_ip_is_private=true ip_is_private=true source_port_range=30: \
+             port_range=10:20 process_name=curl"
+        );
+        assert_eq!(action, "route(direct,override-port=53,tls-fragment)");
+
+        let (payload, _) = describe(json!({
+            "type": "logical", "mode": "or", "invert": true, "action": "reject",
+            "rules": [{"port": 1}, {"type": "logical", "mode": "and",
+                       "rules": [{"port": 2}, {"network": "udp"}]}],
+        }));
+        assert_eq!(payload, "!(port=1 || port=2 && network=udp)");
+    }
+
+    #[test]
+    fn action_descriptions() {
+        let action = |extra: Value| {
+            let mut rule = json!({"port": 1});
+            rule.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            describe(rule).1
+        };
+        assert_eq!(action(json!({"action": "sniff"})), "sniff");
+        assert_eq!(
+            action(json!({"action": "sniff", "timeout": "1.5s"})),
+            "sniff(1.5s)"
+        );
+        assert_eq!(
+            action(json!({"action": "sniff", "sniffer": ["dns"], "timeout": "90s"})),
+            "sniff(dns,1m30s)"
+        );
+        assert_eq!(action(json!({"action": "resolve"})), "resolve");
+        assert_eq!(
+            action(json!({"action": "resolve", "server": "dns-u", "strategy": "ipv4_only"})),
+            "resolve(dns-u,ipv4_only)"
+        );
+        assert_eq!(
+            action(
+                json!({"action": "route-options", "override_address": "1.2.3.4",
+                          "udp_timeout": "5m"})
+            ),
+            "route-options(override-address=1.2.3.4,udp-timeout)"
+        );
+        assert_eq!(action(json!({"action": "bypass"})), "bypass()");
+        assert_eq!(
+            action(json!({"action": "reject", "method": "drop"})),
+            "reject(drop)"
+        );
+    }
+
+    #[test]
+    fn go_duration_strings() {
+        for (d, want) in [
+            (Duration::ZERO, "0s"),
+            (Duration::from_nanos(500), "500ns"),
+            (Duration::from_nanos(1_500), "1.5\u{b5}s"),
+            (Duration::from_millis(300), "300ms"),
+            (Duration::from_millis(1_500), "1.5s"),
+            (Duration::from_secs(90), "1m30s"),
+            (Duration::from_secs(3_600), "1h0m0s"),
+            (Duration::from_millis(120_500), "2m0.5s"),
+        ] {
+            assert_eq!(go_duration_string(d), want);
+        }
     }
 
     #[test]

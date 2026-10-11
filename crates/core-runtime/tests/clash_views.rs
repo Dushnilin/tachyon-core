@@ -147,13 +147,14 @@ async fn data_views_answer_over_http() {
     // an entry appears while it is held, then DELETE drops it
     let handle_conn = clash_state::ConnHandle::open(clash_state::ConnMeta {
         network: "tcp",
-        inbound: "dns-in".into(),
+        inbound: "mixed/mixed-in".into(),
         source: "192.168.1.10:5000".into(),
         host: "example.com".into(),
         destination: "example.com:443".into(),
         chains: vec!["direct".into()],
-        rule: "port".into(),
-        rule_payload: "443".into(),
+        rule: "port=443 => route(direct)".into(),
+        rule_payload: String::new(),
+        process_path: String::new(),
     });
     let id = handle_conn.id();
     let id_str = id.to_string();
@@ -164,9 +165,15 @@ async fn data_views_answer_over_http() {
         .iter()
         .find(|entry| entry["id"].as_str() == Some(id_str.as_str()))
         .expect("our entry is listed");
+    // reference `TrackerMetadata`: type/tag, no IP for a domain destination
+    assert_eq!(entry["metadata"]["type"], "mixed/mixed-in");
     assert_eq!(entry["metadata"]["host"], "example.com");
-    assert_eq!(entry["metadata"]["chains"][0], "direct");
-    assert_eq!(entry["rule"], "port");
+    assert_eq!(entry["metadata"]["destinationIP"], "");
+    assert_eq!(entry["metadata"]["destinationPort"], "443");
+    assert_eq!(entry["metadata"]["dnsMode"], "normal");
+    assert_eq!(entry["chains"][0], "direct");
+    assert_eq!(entry["rule"], "port=443 => route(direct)");
+    assert_eq!(entry["rulePayload"], "");
 
     let (head, _) = request(
         addr,

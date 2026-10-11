@@ -702,11 +702,12 @@ fn take_buf() -> Vec<u8> {
     }
 }
 
-fn give_buf(mut buf: Vec<u8>) {
+fn give_buf(buf: Vec<u8>) {
     if buf.capacity() < relay_buf() / 2 || buf.capacity() > relay_buf() * 2 {
         return;
     }
-    buf.clear();
+    // Retain initialized length: reusing a drained buffer does not need another
+    // zero-fill. Only the bytes actually filled by AsyncRead are forwarded.
     let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
     if pool.len() < POOL_CAP {
         pool.push(buf);
@@ -787,7 +788,13 @@ impl PooledBuffer {
 
     #[inline]
     fn buffer(&mut self) -> &mut [u8] {
-        self.buf.as_deref_mut().expect("pooled buffer present")
+        self.buf.get_or_insert_with(take_buf)
+    }
+
+    fn release_buffer(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            give_buf(buf);
+        }
     }
 
     fn poll_fill_buf<R>(
@@ -852,6 +859,10 @@ impl PooledBuffer {
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Pending => {
                         if self.pos == self.cap {
+                            // No unread bytes remain. A keep-alive or half-closed
+                            // connection must not pin a relay-sized allocation
+                            // merely because its next read (or flush) is pending.
+                            self.release_buffer();
                             if self.need_flush {
                                 ready!(writer.as_mut().poll_flush(cx))?;
                                 self.need_flush = false;
@@ -880,6 +891,7 @@ impl PooledBuffer {
             self.cap = 0;
 
             if self.read_done {
+                self.release_buffer();
                 ready!(writer.as_mut().poll_flush(cx))?;
                 return Poll::Ready(Ok(self.amt));
             }
@@ -889,9 +901,7 @@ impl PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if let Some(buf) = self.buf.take() {
-            give_buf(buf);
-        }
+        self.release_buffer();
     }
 }
 
@@ -1111,4 +1121,108 @@ where
 /// Dial the proxy target through the router's default outbound.
 pub async fn dial(router: &Arc<Router>, target: &Target) -> io::Result<Conn> {
     router.connect(target).await
+}
+
+#[cfg(test)]
+mod relay_buffer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drained_buffer_is_released_and_reused_without_losing_data() {
+        let payload = vec![0x5a; relay_buf() * 2 + 17];
+        let (mut source, mut reader) = tokio::io::duplex(payload.len());
+        let (mut writer, mut destination) = tokio::io::duplex(payload.len());
+        let mut buffer = PooledBuffer::new(take_buf());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        assert!(
+            buffer
+                .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                .is_pending()
+        );
+        assert!(buffer.buf.is_none(), "idle direction retains its buffer");
+        for _ in 0..2 {
+            source.write_all(&payload).await.unwrap();
+            assert!(
+                buffer
+                    .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                    .is_pending()
+            );
+            assert!(buffer.buf.is_none(), "drained direction retains its buffer");
+            let mut received = vec![0; payload.len()];
+            destination.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, payload);
+        }
+        source.shutdown().await.unwrap();
+        assert!(
+            matches!(buffer.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer)), Poll::Ready(Ok(n)) if n == (payload.len() * 2) as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn backpressure_keeps_unwritten_bytes_until_the_writer_resumes() {
+        let payload: Vec<u8> = (0..96).collect();
+        let (mut source, mut reader) = tokio::io::duplex(96);
+        let (mut writer, mut destination) = tokio::io::duplex(64);
+        let mut buffer = PooledBuffer::new(take_buf());
+        source.write_all(&payload).await.unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            buffer
+                .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                .is_pending()
+        );
+        assert!(buffer.buf.is_some());
+        assert_eq!(buffer.cap - buffer.pos, 32);
+        let mut received = vec![0; 96];
+        destination.read_exact(&mut received[..64]).await.unwrap();
+        assert!(
+            buffer
+                .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                .is_pending()
+        );
+        assert!(buffer.buf.is_none());
+        destination.read_exact(&mut received[64..]).await.unwrap();
+        assert_eq!(received, payload);
+    }
+
+    struct PendingFlush;
+
+    impl AsyncWrite for PendingFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_flush_does_not_pin_a_drained_buffer() {
+        for eof in [false, true] {
+            let (mut source, mut reader) = tokio::io::duplex(16);
+            source.write_all(b"request").await.unwrap();
+            if eof {
+                source.shutdown().await.unwrap();
+            }
+            let mut buffer = PooledBuffer::new(take_buf());
+            let mut writer = PendingFlush;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                buffer
+                    .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                    .is_pending()
+            );
+            assert!(buffer.need_flush);
+            assert!(buffer.buf.is_none());
+            assert_eq!(buffer.amt, 7);
+        }
+    }
 }

@@ -473,49 +473,56 @@ impl Tun {
                         }
 
                         let raw_packet = &buf[hdr_offset..n];
-                        let packets_to_process = if vnet_hdr && let Some(hdr) = VirtioNetHdr::parse(&buf[..VNET_HDR_LEN]) {
+                        let tso_packets = if vnet_hdr && let Some(hdr) = VirtioNetHdr::parse(&buf[..VNET_HDR_LEN]) {
                             segment_tso_packet(&hdr, raw_packet)
                         } else {
-                            vec![raw_packet.to_vec()]
+                            Vec::new()
                         };
 
-                        for packet in packets_to_process {
+                        let mut dispatch_packet = |packet: &[u8], device: &mut TunDevice, sockets: &mut SocketSet<'static>, tcp_sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>| {
                             if packet.is_empty() {
-                                continue;
+                                return;
                             }
-                            let version = packet[0] >> 4;
-                            match version {
+                            match packet[0] >> 4 {
                                 4 => {
                                     handle_ipv4_packet(
-                                        &packet,
+                                        packet,
                                         &self.tag,
                                         &self.router,
                                         &hub,
                                         &reply,
                                         &async_fd,
                                         vnet_hdr,
-                                        &mut device,
-                                        &mut sockets,
-                                        &mut tcp_sessions,
+                                        device,
+                                        sockets,
+                                        tcp_sessions,
                                         &notify,
                                     );
                                 }
                                 6 => {
                                     handle_ipv6_packet(
-                                        &packet,
+                                        packet,
                                         &self.tag,
                                         &self.router,
                                         &hub,
                                         &reply,
                                         &async_fd,
                                         vnet_hdr,
-                                        &mut device,
-                                        &mut sockets,
-                                        &mut tcp_sessions,
+                                        device,
+                                        sockets,
+                                        tcp_sessions,
                                         &notify,
                                     );
                                 }
                                 _ => {}
+                            }
+                        };
+
+                        if tso_packets.is_empty() {
+                            dispatch_packet(raw_packet, &mut device, &mut sockets, &mut tcp_sessions);
+                        } else {
+                            for packet in &tso_packets {
+                                dispatch_packet(packet, &mut device, &mut sockets, &mut tcp_sessions);
                             }
                         }
 
@@ -914,11 +921,12 @@ fn handle_ipv4_packet(
                 let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
                 let udp_len = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]) as usize;
                 if udp_len >= 8 && packet.len() >= ihl + udp_len {
-                    let payload = packet[ihl + 8..ihl + udp_len].to_vec();
+                    let payload = &packet[ihl + 8..ihl + udp_len];
                     let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
                     let dest = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
 
-                    if !hub.try_existing(source, dest, &payload) {
+                    if !hub.try_existing(source, dest, payload) {
+                        let payload = payload.to_vec();
                         let hub = Arc::clone(hub);
                         let reply = reply.clone();
                         let tag = tag.to_string();
@@ -1048,11 +1056,12 @@ fn handle_ipv6_packet(
                 let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
                 let udp_len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
                 if udp_len >= 8 && payload.len() >= udp_len {
-                    let data = payload[8..udp_len].to_vec();
+                    let data = &payload[8..udp_len];
                     let source = SocketAddr::new(IpAddr::V6(src_ip), src_port);
                     let dest = SocketAddr::new(IpAddr::V6(dst_ip), dst_port);
 
-                    if !hub.try_existing(source, dest, &data) {
+                    if !hub.try_existing(source, dest, data) {
+                        let data = data.to_vec();
                         let hub = Arc::clone(hub);
                         let reply = reply.clone();
                         let tag = tag.to_string();

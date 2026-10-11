@@ -711,6 +711,7 @@ pub struct RouterInner {
     pub(crate) delay_history: Vec<std::sync::Mutex<Option<(String, u32)>>>,
     /// Inbound tag -> type, for the `type/tag` of a Clash connection.
     pub(crate) inbound_types: HashMap<String, String>,
+    pub(crate) probe_tls: tokio_rustls::TlsConnector,
 }
 
 pub struct Router {
@@ -957,6 +958,7 @@ impl RouterInner {
             probe_tasks: std::sync::Mutex::new(Vec::new()),
             delay_history,
             inbound_types,
+            probe_tls: crate::tls_client::probe_connector(&root)?,
         })
     }
 
@@ -1052,7 +1054,7 @@ impl RouterInner {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        prepare(ctx, self.find_process);
+        prepare(ctx, self.find_process)?;
         for (i, rule) in self.rules.iter().enumerate() {
             if !rule.matches(ctx) {
                 continue;
@@ -1341,27 +1343,30 @@ pub enum SelectError {
 }
 
 /// FakeIP reverse mapping + ip_version before the rule walk.
-fn prepare(ctx: &mut ConnContext, want_process: bool) {
+fn prepare(ctx: &mut ConnContext, want_process: bool) -> io::Result<()> {
     if let Target::Ip(addr) = ctx.destination
         && let Some(dns) = dns::current()
-        && let Some(domain) = dns.fakeip_domain(addr.ip())
     {
-        ctx.origin_destination = Some(ctx.destination.clone());
-        ctx.destination = Target::Domain(domain, addr.port());
-        ctx.fakeip = true;
-        logging::debug(format_args!(
-            "route: found fakeip domain: {}",
-            ctx.destination
-        ));
-    } else if ctx.domain.is_none()
-        && let Target::Ip(addr) = ctx.destination
-        && let Some(dns) = dns::current()
-        && let Some(domain) = dns.reverse_domain(addr.ip())
-    {
-        // `dns.reverse_mapping`: the dial target stays the IP, only the
-        // domain rules get to see the name the answer came from
-        ctx.domain = Some(domain.clone());
-        logging::debug(format_args!("route: found reverse mapped domain: {domain}"));
+        if let Some(domain) = dns.fakeip_domain(addr.ip()) {
+            ctx.origin_destination = Some(ctx.destination.clone());
+            ctx.destination = Target::Domain(domain, addr.port());
+            ctx.fakeip = true;
+            logging::debug(format_args!(
+                "route: found fakeip domain: {}",
+                ctx.destination
+            ));
+        } else if dns.is_fakeip(addr.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "missing fakeip record",
+            ));
+        } else if ctx.domain.is_none()
+            && let Some(domain) = dns.reverse_domain(addr.ip())
+        {
+            // Reverse DNS affects domain matching, not the dial destination.
+            ctx.domain = Some(domain.clone());
+            logging::debug(format_args!("route: found reverse mapped domain: {domain}"));
+        }
     }
     // `route.find_neighbor`: the client's own identity, for the
     // `source_mac_address` / `source_hostname` rule items
@@ -1391,6 +1396,7 @@ fn prepare(ctx: &mut ConnContext, want_process: bool) {
         Target::Ip(a) => Some(if a.is_ipv6() { 6 } else { 4 }),
         Target::Domain(..) => None,
     };
+    Ok(())
 }
 
 fn reject_error(method: RejectMethod, no_drop: bool, flood: &rule::RejectFlood) -> io::Error {
@@ -1594,7 +1600,7 @@ mod tests {
             Target::Ip(server.local_addr().expect("server")),
             "tcp",
         );
-        prepare(&mut ctx, true);
+        prepare(&mut ctx, true).expect("ordinary destination");
         let owner = ctx.process.as_ref().expect("prepare found the owner");
         assert_eq!(owner.path, own.to_string_lossy(), "this very test binary");
         assert!(

@@ -207,13 +207,9 @@ fn emit(level: Level, msg: fmt::Arguments) {
         return;
     }
     let text = msg.to_string();
-    if let Ok(mut guard) = ring().lock() {
-        if guard.len() >= RING_CAPACITY {
-            guard.pop_front();
-        }
-        guard.push_back((level, text.clone()));
-    }
-    if let Ok(mut guard) = subscribers().lock() {
+    if let Ok(mut guard) = subscribers().lock()
+        && !guard.is_empty()
+    {
         guard.retain(|_, tx| match tx.try_send((level, text.clone())) {
             Ok(()) => true,
             // a slow reader misses lines; it never stalls the emitter
@@ -233,6 +229,12 @@ fn emit(level: Level, msg: fmt::Arguments) {
         start.elapsed().as_secs(),
         text
     );
+    if let Ok(mut guard) = ring().lock() {
+        if guard.len() >= RING_CAPACITY {
+            guard.pop_front();
+        }
+        guard.push_back((level, text));
+    }
     match SINK.get() {
         Some(Sink::Stderr) => eprintln!("{line}"),
         Some(Sink::Stdout) => println!("{line}"),

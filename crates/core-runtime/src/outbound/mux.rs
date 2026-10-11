@@ -193,15 +193,24 @@ impl AsyncWrite for MuxStream {
         let this = &mut *self;
         if let Some(request) = this.request.take() {
             // the request rides in front of the first write, like the reference
-            let mut first = request.clone();
+            let req_len = request.len();
+            let mut first = request;
             first.extend_from_slice(buf);
             match std::pin::Pin::new(&mut this.inner).poll_write(cx, &first) {
-                std::task::Poll::Ready(Ok(_)) => {
-                    return std::task::Poll::Ready(Ok(buf.len()));
+                std::task::Poll::Ready(Ok(n)) => {
+                    if n < req_len {
+                        first.truncate(req_len);
+                        first.drain(..n);
+                        this.request = Some(first);
+                        return std::task::Poll::Ready(Ok(0));
+                    } else {
+                        return std::task::Poll::Ready(Ok(n - req_len));
+                    }
                 }
                 std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                 std::task::Poll::Pending => {
-                    this.request = Some(request);
+                    first.truncate(req_len);
+                    this.request = Some(first);
                     return std::task::Poll::Pending;
                 }
             }

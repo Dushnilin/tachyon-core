@@ -276,7 +276,7 @@ impl Hysteria2 {
             bind_udp(addr)?
         };
         let congestion = if self.send_bps > 0 {
-            CongestionKind::Brutal(self.send_bps)
+            CongestionKind::Brutal((self.send_bps / 8).max(1))
         } else {
             CongestionKind::Bbr
         };
@@ -454,14 +454,22 @@ impl Hysteria2 {
                     Err(_) => break,
                 }
             }
-            shared_f.sessions.lock().expect("sessions").remove(&sid);
-            let mut out = Vec::with_capacity(4);
-            out.push(5);
-            out.push(3);
-            out.extend_from_slice(&sid.to_be_bytes());
-            let _ = shared_f.conn.send_datagram(out.into());
+            shared_f
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sid);
+            let mut out = [0u8; 6];
+            out[0] = 5;
+            out[1] = 3;
+            out[2..6].copy_from_slice(&sid.to_be_bytes());
+            let _ = shared_f
+                .conn
+                .send_datagram(bytes::Bytes::copy_from_slice(&out));
         });
-        shared.handles.lock().expect("handles").push(handle);
+        let mut handles = shared.handles.lock().unwrap_or_else(|e| e.into_inner());
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
         Ok(local)
     }
 }

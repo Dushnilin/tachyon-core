@@ -8,6 +8,7 @@
 pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
+pub mod kernel;
 pub mod noise;
 
 use std::collections::{HashMap, VecDeque};
@@ -142,7 +143,7 @@ struct PeerConfig {
 }
 
 #[derive(Clone, Debug)]
-struct WgConfig {
+pub(crate) struct WgConfig {
     tag: String,
     private_key: [u8; 32],
     public_key: [u8; 32],
@@ -158,18 +159,18 @@ struct WgConfig {
 }
 
 /// `UdpOpen` completion: local port + reply stream.
-type UdpReply = oneshot::Sender<Result<(u16, mpsc::Receiver<Vec<u8>>), String>>;
+type UdpReply = oneshot::Sender<Result<(u16, mpsc::Receiver<bytes::Bytes>), String>>;
 
 enum Cmd {
     TcpConnect {
         id: u32,
         dst: SocketAddr,
-        to_caller: mpsc::Sender<Vec<u8>>,
+        to_caller: mpsc::Sender<bytes::Bytes>,
         resp: oneshot::Sender<Result<(), String>>,
     },
     TcpData {
         id: u32,
-        bytes: Vec<u8>,
+        bytes: bytes::Bytes,
     },
     TcpClose {
         id: u32,
@@ -180,7 +181,7 @@ enum Cmd {
     },
     UdpSend {
         port: u16,
-        bytes: Vec<u8>,
+        bytes: bytes::Bytes,
     },
     UdpClose {
         port: u16,
@@ -197,14 +198,21 @@ struct WgShared {
 #[derive(Debug)]
 pub struct WireGuard {
     cfg: WgConfig,
+    system: bool,
+    interface_name: Option<String>,
+    #[allow(dead_code)]
+    kernel_guard: AsyncMutex<Option<Arc<kernel::KernelWireGuard>>>,
     shared: AsyncMutex<Option<Arc<WgShared>>>,
 }
 
 impl WireGuard {
     pub fn build(obj: &Map<String, Value>, at: &str) -> anyhow::Result<Self> {
-        if obj.get("system").and_then(Value::as_bool) == Some(true) {
-            anyhow::bail!("{at}: system wireguard is not implemented yet");
-        }
+        let system = obj.get("system").and_then(Value::as_bool).unwrap_or(false);
+        let interface_name = obj
+            .get("interface_name")
+            .or_else(|| obj.get("name"))
+            .and_then(Value::as_str)
+            .map(String::from);
         let awg = awg::AwgParams::from_obj(obj, at)?.map(Arc::new);
         for f in IGNORED_FIELDS {
             if obj.get(*f).is_some_and(|v| !v.is_null()) {
@@ -386,6 +394,9 @@ impl WireGuard {
                 udp_timeout,
                 awg,
             },
+            system,
+            interface_name,
+            kernel_guard: AsyncMutex::new(None),
             shared: AsyncMutex::new(None),
         })
     }
@@ -441,7 +452,26 @@ impl WireGuard {
         Ok(shared)
     }
 
+    async fn ensure_kernel(&self) -> io::Result<()> {
+        if !self.system {
+            return Ok(());
+        }
+        let mut guard = self.kernel_guard.lock().await;
+        if guard.is_none() {
+            let iface = self.interface_name.as_deref().unwrap_or("wg0");
+            let kwg = kernel::setup_kernel_wireguard(&self.cfg, iface)
+                .await
+                .map_err(|e| io::Error::other(format!("wireguard[{iface}]: kernel setup: {e}")))?;
+            *guard = Some(Arc::new(kwg));
+        }
+        Ok(())
+    }
+
     pub async fn start_listen(&self) -> io::Result<()> {
+        if self.system {
+            self.ensure_kernel().await?;
+            return Ok(());
+        }
         if self.cfg.listen_port > 0 {
             let _ = self.shared().await?;
         }
@@ -449,6 +479,22 @@ impl WireGuard {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
+        if self.system {
+            self.ensure_kernel().await?;
+            let iface = self.interface_name.as_deref().unwrap_or("wg0");
+            let dial = crate::outbound::dial::DialOptions {
+                bind_interface: Some(iface.to_string()),
+                inet4_bind_address: self.cfg.local_addr_v4.map(IpAddr::V4),
+                inet6_bind_address: self.cfg.local_addr_v6.map(IpAddr::V6),
+                ..Default::default()
+            };
+            let (host, port) = match target {
+                Target::Ip(sa) => (sa.ip().to_string(), sa.port()),
+                Target::Domain(d, p) => (d.clone(), *p),
+            };
+            let stream = crate::outbound::dial::connect_tcp(&host, port, &dial).await?;
+            return Ok(Box::new(stream));
+        }
         let dst = resolve_target(target).await?;
         let shared = self.shared().await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
@@ -483,7 +529,7 @@ impl WireGuard {
                         if cmd_tx
                             .send(Cmd::TcpData {
                                 id,
-                                bytes: buf[..n].to_vec(),
+                                bytes: bytes::Bytes::copy_from_slice(&buf[..n]),
                             })
                             .await
                             .is_err()
@@ -523,6 +569,19 @@ impl WireGuard {
     }
 
     pub async fn connect_udp(&self, target: &Target) -> io::Result<UdpSocket> {
+        if self.system {
+            self.ensure_kernel().await?;
+            let iface = self.interface_name.as_deref().unwrap_or("wg0");
+            let dial = crate::outbound::dial::DialOptions {
+                bind_interface: Some(iface.to_string()),
+                inet4_bind_address: self.cfg.local_addr_v4.map(IpAddr::V4),
+                inet6_bind_address: self.cfg.local_addr_v6.map(IpAddr::V6),
+                ..Default::default()
+            };
+            let dst = resolve_target(target).await?;
+            let sock = crate::outbound::dial::connect_udp(dst, &dial).await?;
+            return Ok(sock);
+        }
         let dst = resolve_target(target).await?;
         let shared = self.shared().await?;
         let (local, peer) = udp_loopback_pair().await?;
@@ -571,7 +630,7 @@ impl WireGuard {
                 if cmd_tx
                     .send(Cmd::UdpSend {
                         port,
-                        bytes: buf[..n].to_vec(),
+                        bytes: bytes::Bytes::copy_from_slice(&buf[..n]),
                     })
                     .await
                     .is_err()
@@ -590,10 +649,10 @@ struct TcpConn {
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
-    to_caller: mpsc::Sender<Vec<u8>>,
+    to_caller: mpsc::Sender<bytes::Bytes>,
     resp: Option<oneshot::Sender<Result<(), String>>>,
-    from_caller: VecDeque<Vec<u8>>,
-    stash: Option<Vec<u8>>,
+    from_caller: VecDeque<bytes::Bytes>,
+    stash: Option<bytes::Bytes>,
     created: Instant,
     caller_eof: bool,
 }
@@ -601,7 +660,7 @@ struct TcpConn {
 struct UdpSess {
     target: SocketAddr,
     peer: usize,
-    to_caller: mpsc::Sender<Vec<u8>>,
+    to_caller: mpsc::Sender<bytes::Bytes>,
 }
 
 struct HsRuntime {
@@ -1424,7 +1483,7 @@ impl Stack {
                 _ => None,
             };
             if let Some(sender) = sender {
-                let out = plain[hdr_len + 8..].to_vec();
+                let out = bytes::Bytes::copy_from_slice(&plain[hdr_len + 8..]);
                 self.recycle(plain);
                 let _ = sender.try_send(out);
                 return;
@@ -1473,8 +1532,7 @@ impl Stack {
                             conn.from_caller.pop_front();
                         }
                         Ok(n) => {
-                            let rest = front.split_off(n);
-                            *front = rest;
+                            *front = front.slice(n..);
                         }
                         Err(_) => {
                             conn.from_caller.clear();
@@ -1487,7 +1545,10 @@ impl Stack {
                     loop {
                         match sock.recv_slice(&mut rbuf) {
                             Ok(0) => break,
-                            Ok(n) => match conn.to_caller.try_send(rbuf[..n].to_vec()) {
+                            Ok(n) => match conn
+                                .to_caller
+                                .try_send(bytes::Bytes::copy_from_slice(&rbuf[..n]))
+                            {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(v)) => {
                                     conn.stash = Some(v);
@@ -2059,8 +2120,10 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_system_and_awg() {
-        WireGuard::build(&wg_obj(json!({"system": true})), "endpoints[0]").expect_err("system");
+    fn build_supports_system_and_awg() {
+        let wg =
+            WireGuard::build(&wg_obj(json!({"system": true})), "endpoints[0]").expect("system");
+        assert!(wg.system);
         // AWG 2.0 fields parse into obfuscation params.
         WireGuard::build(&wg_obj(json!({"jc": 4})), "endpoints[0]").expect("awg jc");
         WireGuard::build(&wg_obj(json!({"i1": "1"})), "endpoints[0]").expect("awg i1");

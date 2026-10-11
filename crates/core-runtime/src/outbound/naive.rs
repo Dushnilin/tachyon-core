@@ -37,7 +37,7 @@ const PADDING_COUNT: usize = 8;
 
 /// A `Padding` header value: 30 to 62 bytes, the first sixteen drawn from a
 /// punctuation set and the rest tildes, so the header reads as proxy noise.
-fn padding_header() -> String {
+pub(crate) fn padding_header() -> String {
     const NOISE: &[u8] = b"!#$()+<>?@[]^`{}";
     let mut random = [0u8; 8];
     let _ = getrandom::fill(&mut random);

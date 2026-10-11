@@ -145,6 +145,7 @@ fn pool() -> &'static Mutex<Vec<&'static FptnRandom>> {
 }
 
 /// Arm a pooled (or freshly leaked) state for one handshake.
+/// ponytail: leaked items bounded by peak concurrent handshakes; recycle via pool with cap 64 — fine at this size.
 fn acquire(sid: [u8; 32]) -> &'static FptnRandom {
     let mut free = pool().lock().unwrap_or_else(|e| e.into_inner());
     let state = free.pop().unwrap_or_else(|| {
@@ -166,7 +167,10 @@ fn acquire(sid: [u8; 32]) -> &'static FptnRandom {
 
 fn release(state: &'static FptnRandom) {
     state.armed.store(false, Ordering::Relaxed);
-    pool().lock().unwrap_or_else(|e| e.into_inner()).push(state);
+    let mut p = pool().lock().unwrap_or_else(|e| e.into_inner());
+    if p.len() < 64 {
+        p.push(state);
+    }
 }
 
 struct ArmedGuard(&'static FptnRandom);

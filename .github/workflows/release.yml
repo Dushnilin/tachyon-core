@@ -119,12 +119,12 @@ jobs:
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           tar -xzf /tmp/musl.tar.gz -C /tmp
           (cd /tmp/musl-1.2.5 && \
-            CROSS_COMPILE=mipsel-linux-gnu- ./configure --prefix=/opt/mipsel-musl && \
+            CROSS_COMPILE=mipsel-linux-gnu- CFLAGS="-msoft-float" ./configure --prefix=/opt/mipsel-musl && \
             make -j"$(nproc)" && sudo make install)
           echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
-          mipsel-linux-gnu-gcc -c /tmp/dlfo.c -o /tmp/dlfo.o
+          mipsel-linux-gnu-gcc -msoft-float -c /tmp/dlfo.c -o /tmp/dlfo.o
           rm -rf /tmp/eh-mipsel && mkdir -p /tmp/eh-mipsel
-          (cd /tmp/eh-mipsel && mipsel-linux-gnu-ar x "$(mipsel-linux-gnu-gcc -print-file-name=libgcc_eh.a)")
+          (cd /tmp/eh-mipsel && mipsel-linux-gnu-ar x "$(mipsel-linux-gnu-gcc -msoft-float -print-file-name=libgcc_eh.a)")
           sudo mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a /tmp/eh-mipsel/*.o /tmp/dlfo.o
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
@@ -132,7 +132,10 @@ jobs:
             # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
             # array is repeated here minus everything that names lld: the
             # driver is GNU ld now and it rejects `--icf=safe`.
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-L/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            # +soft-float and -msoft-float are mandatory: OpenWrt MIPS routers
+            # (e.g. MT7621, MT7628) have no hardware FPU and no kernel FPU
+            # emulator, so any FPU opcode triggers SIGILL (status 252).
+            echo "RUSTFLAGS=-C target-feature=+crt-static,+soft-float -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-msoft-float -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-L/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: MIPS musl toolchain (mips)
@@ -144,17 +147,17 @@ jobs:
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           tar -xzf /tmp/musl.tar.gz -C /tmp
           (cd /tmp/musl-1.2.5 && \
-            CROSS_COMPILE=mips-linux-gnu- ./configure --prefix=/opt/mips-musl && \
+            CROSS_COMPILE=mips-linux-gnu- CFLAGS="-msoft-float" ./configure --prefix=/opt/mips-musl && \
             make -j"$(nproc)" && sudo make install)
           echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
-          mips-linux-gnu-gcc -c /tmp/dlfo.c -o /tmp/dlfo.o
+          mips-linux-gnu-gcc -msoft-float -c /tmp/dlfo.c -o /tmp/dlfo.o
           rm -rf /tmp/eh-mips && mkdir -p /tmp/eh-mips
-          (cd /tmp/eh-mips && mips-linux-gnu-ar x "$(mips-linux-gnu-gcc -print-file-name=libgcc_eh.a)")
+          (cd /tmp/eh-mips && mips-linux-gnu-ar x "$(mips-linux-gnu-gcc -msoft-float -print-file-name=libgcc_eh.a)")
           sudo mips-linux-gnu-ar crs /opt/mips-musl/lib/libunwind.a /tmp/eh-mips/*.o /tmp/dlfo.o
           {
             echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-gnu-gcc"
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-B/opt/mips-musl/lib -C link-arg=-L/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "RUSTFLAGS=-C target-feature=+crt-static,+soft-float -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-msoft-float -C link-arg=-B/opt/mips-musl/lib -C link-arg=-L/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: Toolchain (prebuilt std)

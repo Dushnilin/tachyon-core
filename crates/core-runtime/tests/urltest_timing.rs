@@ -7,13 +7,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-async fn slow_tls_server() -> (String, tokio::task::JoinHandle<()>) {
+async fn tls_server(mut pem: &[u8], setup: Duration) -> (String, tokio::task::JoinHandle<()>) {
     core_tls::install_default_provider();
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(
-        &mut include_bytes!("../../../tests/golden/certs/localhost.crt").as_slice(),
-    )
-    .collect::<Result<_, _>>()
-    .unwrap();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem)
+        .collect::<Result<_, _>>()
+        .unwrap();
     let key = rustls_pemfile::private_key(
         &mut include_bytes!("../../../tests/golden/certs/localhost.key").as_slice(),
     )
@@ -33,7 +31,7 @@ async fn slow_tls_server() -> (String, tokio::task::JoinHandle<()>) {
         while let Ok((socket, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(350)).await;
+                tokio::time::sleep(setup).await;
                 let Ok(mut stream) = acceptor.accept(socket).await else {
                     return;
                 };
@@ -94,9 +92,14 @@ async fn api(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
 
 #[tokio::test]
 async fn manual_group_and_background_tests_exclude_tls_but_keep_timeout() {
-    let (url, server) = slow_tls_server().await;
+    let (url, server) = tls_server(
+        include_bytes!("../../../tests/golden/certs/urltest-valid.crt"),
+        Duration::from_millis(350),
+    )
+    .await;
     let instance = core_runtime::start(&json!({
         "log": {"level": "error"},
+        "certificate": {"certificate": include_str!("../../../tests/golden/certs/urltest-ca.crt")},
         "experimental": {"clash_api": {"external_controller": "127.0.0.1:0"}},
         "outbounds": [
             {"type": "direct", "tag": "node"},

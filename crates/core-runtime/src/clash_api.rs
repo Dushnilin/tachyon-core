@@ -1364,6 +1364,8 @@ async fn delay_test(
         };
         let dial_ms = start.elapsed();
         let mut stream: crate::inbound::AnyStream = if tls {
+            // Reference resets the clock after the dial, before the handshake.
+            start = Instant::now();
             match tls_client::wrap_probe(conn, &host).await {
                 Ok(s) => s,
                 Err(e) => {

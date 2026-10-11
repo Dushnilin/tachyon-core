@@ -108,16 +108,30 @@ impl Gcm {
             Gcm::Ni(ni) => ni.open(nonce, aad, buf, tag),
             #[cfg(target_arch = "aarch64")]
             Gcm::V8(v8) => v8.open(nonce, aad, buf, tag),
-            Gcm::Soft128(c) => c
-                .decrypt_in_place_detached(nonce.into(), aad, buf, Tag::from_slice(tag))
-                .is_ok(),
-            Gcm::Soft256(c) => c
-                .decrypt_in_place_detached(nonce.into(), aad, buf, Tag::from_slice(tag))
-                .is_ok(),
+            // RustCrypto checks the tag before decrypting and leaves the
+            // ciphertext in place on failure; the contract above is a zeroed
+            // buffer, which the other backends already keep.
+            Gcm::Soft128(c) => soft_wipe(
+                c.decrypt_in_place_detached(nonce.into(), aad, buf, Tag::from_slice(tag))
+                    .is_ok(),
+                buf,
+            ),
+            Gcm::Soft256(c) => soft_wipe(
+                c.decrypt_in_place_detached(nonce.into(), aad, buf, Tag::from_slice(tag))
+                    .is_ok(),
+                buf,
+            ),
             #[cfg(all(target_os = "linux", feature = "std"))]
             Gcm::Alg(a) => a.open(nonce, aad, buf, tag),
         }
     }
+}
+
+fn soft_wipe(ok: bool, buf: &mut [u8]) -> bool {
+    if !ok {
+        buf.fill(0);
+    }
+    ok
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1110,28 +1124,37 @@ mod tests {
         let mut seed = 11;
         for key_len in [16usize, 32] {
             let key = fill(&mut seed, key_len);
-            let gcm = Gcm::new(&key);
-            let nonce = [3u8; 12];
-            for len in [0usize, 1, 15, 16, 127, 128, 129, 1000] {
-                let pt = fill(&mut seed, len);
-                let mut buf = pt.clone();
-                let tag = gcm.seal(&nonce, b"aad", &mut buf);
+            let soft = match key_len {
+                16 => Gcm::Soft128(Box::new(Aes128Gcm::new(key.as_slice().into()))),
+                _ => Gcm::Soft256(Box::new(Aes256Gcm::new(key.as_slice().into()))),
+            };
+            // Gcm::new never lands on the RustCrypto path on a PCLMUL host, so
+            // the fallback a MIPS or old-x86 router runs is checked by name.
+            for gcm in [Gcm::new(&key), soft] {
+                let nonce = [3u8; 12];
+                for len in [0usize, 1, 15, 16, 127, 128, 129, 1000] {
+                    let pt = fill(&mut seed, len);
+                    let mut buf = pt.clone();
+                    let tag = gcm.seal(&nonce, b"aad", &mut buf);
 
-                let mut bad_tag = tag;
-                bad_tag[5] ^= 1;
-                let mut copy = buf.clone();
-                assert!(!gcm.open(&nonce, b"aad", &mut copy, &bad_tag));
-                assert!(copy.iter().all(|b| *b == 0), "plaintext leaked, len {len}");
-
-                if len > 0 {
+                    let mut bad_tag = tag;
+                    bad_tag[5] ^= 1;
                     let mut copy = buf.clone();
-                    copy[len / 2] ^= 0x40;
-                    assert!(!gcm.open(&nonce, b"aad", &mut copy, &tag));
+                    assert!(!gcm.open(&nonce, b"aad", &mut copy, &bad_tag));
+                    assert!(copy.iter().all(|b| *b == 0), "plaintext leaked, len {len}");
+
+                    if len > 0 {
+                        let mut copy = buf.clone();
+                        copy[len / 2] ^= 0x40;
+                        assert!(!gcm.open(&nonce, b"aad", &mut copy, &tag));
+                        assert!(copy.iter().all(|b| *b == 0), "ciphertext left, len {len}");
+                    }
+                    let mut copy = buf.clone();
+                    assert!(!gcm.open(&nonce, b"other", &mut copy, &tag));
+                    assert!(copy.iter().all(|b| *b == 0), "aad mismatch left, len {len}");
+                    assert!(gcm.open(&nonce, b"aad", &mut buf, &tag));
+                    assert_eq!(buf, pt);
                 }
-                let mut copy = buf.clone();
-                assert!(!gcm.open(&nonce, b"other", &mut copy, &tag));
-                assert!(gcm.open(&nonce, b"aad", &mut buf, &tag));
-                assert_eq!(buf, pt);
             }
         }
     }

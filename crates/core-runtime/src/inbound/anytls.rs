@@ -51,7 +51,7 @@ pub struct AnyTls {
     listener: TcpListener,
     tag: String,
     router: Arc<Router>,
-    password_hash: [u8; 32],
+    password_hashes: Arc<Vec<[u8; 32]>>,
     tls: Option<Arc<ServerTls>>,
 }
 
@@ -67,11 +67,20 @@ impl AnyTls {
             .to_string();
         let at = format!("inbound[{tag}]");
 
-        let password = object
-            .get("password")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("{at}: missing password"))?;
-        let password_hash: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+        let mut password_hashes: Vec<[u8; 32]> = Vec::new();
+        if let Some(list) = object.get("users").and_then(Value::as_array) {
+            for (i, u) in list.iter().enumerate() {
+                let pw = u
+                    .get("password")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("{at}.users[{i}]: missing password"))?;
+                password_hashes.push(Sha256::digest(pw.as_bytes()).into());
+            }
+        } else if let Some(pw) = object.get("password").and_then(Value::as_str) {
+            password_hashes.push(Sha256::digest(pw.as_bytes()).into());
+        } else {
+            anyhow::bail!("{at}: missing users or password");
+        }
 
         let listen = parse_listen(object, &at)?;
         let listener = super::bind_tcp(std::net::SocketAddr::from(listen))
@@ -83,7 +92,7 @@ impl AnyTls {
             listener,
             tag,
             router,
-            password_hash,
+            password_hashes: Arc::new(password_hashes),
             tls,
         })
     }
@@ -100,7 +109,7 @@ impl AnyTls {
                     let tag = self.tag.clone();
                     let router = Arc::clone(&self.router);
                     let tls = self.tls.clone();
-                    let expected_hash = self.password_hash;
+                    let expected_hashes = self.password_hashes.clone();
 
                     tokio::spawn(async move {
                         let local = stream.local_addr().unwrap_or(peer);
@@ -111,7 +120,7 @@ impl AnyTls {
                                         tls_stream,
                                         peer,
                                         local,
-                                        expected_hash,
+                                        expected_hashes,
                                         tag,
                                         router,
                                     )
@@ -120,7 +129,7 @@ impl AnyTls {
                                 Err(e) => Err(e),
                             },
                             None => {
-                                handle_session(stream, peer, local, expected_hash, tag, router)
+                                handle_session(stream, peer, local, expected_hashes, tag, router)
                                     .await
                             }
                         };
@@ -141,7 +150,7 @@ async fn handle_session<S>(
     mut stream: S,
     peer: SocketAddr,
     local: SocketAddr,
-    expected_hash: [u8; 32],
+    expected_hashes: Arc<Vec<[u8; 32]>>,
     tag: String,
     router: Arc<Router>,
 ) -> io::Result<()>
@@ -151,7 +160,7 @@ where
     // 1. Read greeting: 32 bytes password hash + 2 bytes padding length
     let mut greeting = [0u8; 34];
     stream.read_exact(&mut greeting).await?;
-    if greeting[..32] != expected_hash {
+    if !expected_hashes.iter().any(|h| greeting[..32] == *h) {
         return Err(io::Error::other("anytls: authentication failed"));
     }
     let pad_len = u16::from_be_bytes([greeting[32], greeting[33]]) as usize;
@@ -410,5 +419,56 @@ mod tests {
         data.extend_from_slice(&53u16.to_be_bytes());
         let target = parse_target(&data).unwrap();
         assert_eq!(target, Target::Ip("8.8.8.8:53".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn bind_with_users_and_password() {
+        let router = Router::new(&serde_json::json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }]
+        }))
+        .unwrap();
+
+        // Sing-box format: users array
+        let cfg_users = serde_json::json!({
+            "type": "anytls",
+            "listen": "127.0.0.1",
+            "listen_port": 0,
+            "users": [
+                { "password": "pass_one" },
+                { "password": "pass_two", "name": "user2" }
+            ]
+        });
+        let inbound = AnyTls::bind(&cfg_users, router.clone()).await.unwrap();
+        assert_eq!(inbound.password_hashes.len(), 2);
+        assert_eq!(
+            inbound.password_hashes[0],
+            <[u8; 32]>::from(Sha256::digest(b"pass_one"))
+        );
+        assert_eq!(
+            inbound.password_hashes[1],
+            <[u8; 32]>::from(Sha256::digest(b"pass_two"))
+        );
+
+        // Fallback: top-level password
+        let cfg_pw = serde_json::json!({
+            "type": "anytls",
+            "listen": "127.0.0.1",
+            "listen_port": 0,
+            "password": "legacy_pass"
+        });
+        let inbound_pw = AnyTls::bind(&cfg_pw, router.clone()).await.unwrap();
+        assert_eq!(inbound_pw.password_hashes.len(), 1);
+        assert_eq!(
+            inbound_pw.password_hashes[0],
+            <[u8; 32]>::from(Sha256::digest(b"legacy_pass"))
+        );
+
+        // Missing users and password errors out
+        let cfg_bad = serde_json::json!({
+            "type": "anytls",
+            "listen": "127.0.0.1",
+            "listen_port": 0
+        });
+        assert!(AnyTls::bind(&cfg_bad, router).await.is_err());
     }
 }

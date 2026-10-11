@@ -673,7 +673,7 @@ where
     }
     let mut fallbacks = Some(fallbacks);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, io::Result<T>)>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, io::Result<T>)>(2);
     // `tx` is borrowed for the whole race, which also keeps the channel open:
     // every racer reports before the loop can run out of results
     let start = |addrs: Option<Vec<SocketAddr>>,
@@ -686,7 +686,7 @@ where
         let dial = dial.clone();
         racers.push(tokio::spawn(async move {
             let result = dial_serial(addrs, dial).await;
-            let _ = tx.send((primary, result));
+            let _ = tx.send((primary, result)).await;
         }));
     };
 

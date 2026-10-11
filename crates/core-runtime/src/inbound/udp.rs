@@ -273,16 +273,16 @@ impl Reply {
             } => {
                 let socket = live(socket)?;
                 use crate::outbound::shadowsocks::crypto::{Cipher, derive_subkey, random_bytes};
-                let mut salt = vec![0u8; method.salt_len()];
-                random_bytes(&mut salt)?;
-                let subkey = derive_subkey(*method, master_key, &salt);
+                let salt_len = method.salt_len();
+                let mut packet = Vec::with_capacity(salt_len + framed.len() + 16);
+                packet.resize(salt_len, 0);
+                random_bytes(&mut packet[..salt_len])?;
+                let subkey = derive_subkey(*method, master_key, &packet[..salt_len]);
                 let cipher = Cipher::new(*method, &subkey.0[..subkey.1]);
-                let mut body = framed.to_vec();
+                packet.extend_from_slice(framed);
                 cipher
-                    .seal(0, &mut body)
+                    .seal_at(0, &mut packet, salt_len)
                     .map_err(|e| io::Error::other(format!("ss udp seal: {e}")))?;
-                let mut packet = salt;
-                packet.extend_from_slice(&body);
                 socket.send_to(&packet, source).await.map(|_| ())
             }
         }
@@ -299,9 +299,31 @@ pub(crate) struct UdpHub {
     /// more, in arrival order. Touched only under the flow's opening gate.
     held: Mutex<HashMap<FlowKey, Vec<Vec<u8>>>>,
     reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    sweep_task: Mutex<Option<tokio::task::AbortHandle>>,
     timeout: Duration,
     /// how replies are framed before they go back
     frame: DatagramFrame,
+}
+
+impl Drop for UdpHub {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .sweep_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+        for task in self
+            .reverse_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+    }
 }
 
 impl UdpHub {
@@ -312,6 +334,7 @@ impl UdpHub {
             opening: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
             reverse_tasks: Mutex::new(Vec::new()),
+            sweep_task: Mutex::new(None),
             timeout: if timeout.is_zero() {
                 DEFAULT_UDP_TIMEOUT
             } else {
@@ -320,7 +343,7 @@ impl UdpHub {
             frame,
         });
         let sweeper = Arc::downgrade(&hub);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(SWEEP_INTERVAL).await;
                 let Some(sweeper) = sweeper.upgrade() else {
@@ -329,16 +352,33 @@ impl UdpHub {
                 sweeper.sweep().await;
             }
         });
+        *hub.sweep_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task.abort_handle());
         hub
     }
 
     /// Release per-flow reply sockets when a transparent listener is stopped.
     pub fn stop(&self) {
-        for task in self.reverse_tasks.lock().expect("reverse tasks").drain(..) {
+        if let Some(task) = self
+            .sweep_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             task.abort();
         }
-        self.flows.write().expect("flows").clear();
-        self.held.lock().expect("held").clear();
+        for task in self
+            .reverse_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+        self.flows
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     async fn sweep(&self) {

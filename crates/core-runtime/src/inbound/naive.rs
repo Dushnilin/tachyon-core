@@ -182,14 +182,21 @@ where
             }
         };
 
-        let has_padding = request
+        let padding_header_val = request
+            .headers()
+            .get("padding")
+            .and_then(|v| v.to_str().ok());
+        let has_padding_version = request
             .headers()
             .get("padding-version")
             .and_then(|v| v.to_str().ok())
             == Some("1");
+        let has_padding = padding_header_val.is_some() || has_padding_version;
 
         let mut res_builder = http::Response::builder().status(http::StatusCode::OK);
-        if has_padding {
+        if padding_header_val.is_some() {
+            res_builder = res_builder.header("padding", crate::outbound::naive::padding_header());
+        } else if has_padding_version {
             res_builder = res_builder.header("padding-version", "1");
         }
         let response = res_builder
@@ -229,8 +236,18 @@ where
 fn parse_connect_target<B>(req: &http::Request<B>) -> io::Result<Target> {
     let auth = if let Some(authority) = req.uri().authority() {
         authority.as_str()
-    } else if let Some(host) = req.headers().get(http::header::HOST) {
-        host.to_str().map_err(|e| io::Error::other(e.to_string()))?
+    } else if let Some(ca) = req
+        .headers()
+        .get("-connect-authority")
+        .and_then(|v| v.to_str().ok())
+    {
+        ca
+    } else if let Some(host) = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        host
     } else {
         return Err(io::Error::other("naive: missing authority in CONNECT"));
     };
@@ -265,5 +282,17 @@ mod tests {
             .unwrap();
         let target = parse_connect_target(&req).unwrap();
         assert_eq!(target, Target::Domain("example.com".to_string(), 443));
+    }
+
+    #[test]
+    fn test_parse_connect_target_connect_authority() {
+        let req = http::Request::builder()
+            .method("CONNECT")
+            .uri("/")
+            .header("-connect-authority", "target.site:8443")
+            .body(())
+            .unwrap();
+        let target = parse_connect_target(&req).unwrap();
+        assert_eq!(target, Target::Domain("target.site".to_string(), 8443));
     }
 }

@@ -154,44 +154,63 @@ impl PacketWriter {
         Self { mode, named: false }
     }
 
-    pub(crate) fn frame(&mut self, target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn frame_into(
+        &mut self,
+        target: &Target,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         if payload.len() > u16::MAX as usize {
             return Err(io::Error::other("datagram too large"));
         }
-        let mut out = Vec::with_capacity(payload.len() + MAX_ADDR_PORT + 16);
+        out.clear();
         match self.mode {
             PacketEncoding::LengthPrefixed => {
+                out.reserve(payload.len() + 2);
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
             PacketEncoding::PacketAddr => {
-                // the address rides inside the length-prefixed frame, so the
-                // stream framing stays unambiguous
-                let mut body = Vec::with_capacity(MAX_ADDR_PORT + payload.len());
-                put_addr_port(&mut body, target)?;
-                body.extend_from_slice(payload);
-                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                out.extend_from_slice(&body);
+                let len_offset = out.len();
+                out.extend_from_slice(&[0, 0]);
+                let body_start = out.len();
+                put_addr_port(out, target)?;
+                out.extend_from_slice(payload);
+                let body_len = out.len() - body_start;
+                if body_len > u16::MAX as usize {
+                    return Err(io::Error::other("datagram too large"));
+                }
+                let len_bytes = (body_len as u16).to_be_bytes();
+                out[len_offset..len_offset + 2].copy_from_slice(&len_bytes);
             }
             PacketEncoding::Xudp => {
-                let mut meta = Vec::with_capacity(MAX_ADDR_PORT + 8);
-                meta.extend_from_slice(&[0, 0]); // mux session id
+                let meta_len_offset = out.len();
+                out.extend_from_slice(&[0, 0]);
+                let meta_start = out.len();
+                out.extend_from_slice(&[0, 0]); // mux session id
                 if self.named {
-                    meta.extend_from_slice(&[2, 1]); // Keep, opt
+                    out.extend_from_slice(&[2, 1]); // Keep, opt
                 } else {
-                    meta.extend_from_slice(&[1, 1, 2]); // New, opt, udp
-                    let address_start = meta.len();
-                    put_addr_port(&mut meta, target)?;
-                    // Xray common/xudp uses PortThenAddress, unlike packetaddr.
-                    meta[address_start..].rotate_right(2);
+                    out.extend_from_slice(&[1, 1, 2]); // New, opt, udp
+                    let address_start = out.len();
+                    put_addr_port(out, target)?;
+                    out[address_start..].rotate_right(2);
                     self.named = true;
                 }
-                out.extend_from_slice(&(meta.len() as u16).to_be_bytes());
-                out.extend_from_slice(&meta);
+                let meta_len = out.len() - meta_start;
+                let meta_len_bytes = (meta_len as u16).to_be_bytes();
+                out[meta_len_offset..meta_len_offset + 2].copy_from_slice(&meta_len_bytes);
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
         }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn frame(&mut self, target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(payload.len() + MAX_ADDR_PORT + 16);
+        self.frame_into(target, payload, &mut out)?;
         Ok(out)
     }
 }
@@ -272,46 +291,183 @@ async fn read_xudp_data(
     Ok(())
 }
 
+tokio::task_local! {
+    pub(crate) static UDP_BRIDGE_TIMEOUT: std::time::Duration;
+}
+
+pub(crate) fn udp_bridge_timeout() -> std::time::Duration {
+    UDP_BRIDGE_TIMEOUT
+        .try_with(|timeout| *timeout)
+        .unwrap_or(crate::inbound::udp::DEFAULT_UDP_TIMEOUT)
+}
+
 pub(crate) fn spawn_packet_bridge(
     stream: AnyStream,
     peer: UdpSocket,
     mode: PacketEncoding,
     target: Target,
 ) {
+    spawn_packet_bridge_with_timeout(stream, peer, mode, target, udp_bridge_timeout());
+}
+
+fn spawn_packet_bridge_with_timeout(
+    stream: AnyStream,
+    peer: UdpSocket,
+    mode: PacketEncoding,
+    target: Target,
+    timeout: std::time::Duration,
+) {
+    let (activity, idle) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let sent = activity.clone();
     let (mut reader, mut writer) = tokio::io::split(stream);
     let out_socket = Arc::new(peer);
     let in_socket = Arc::clone(&out_socket);
     let mut out = PacketWriter::new(mode);
-    tokio::spawn(async move {
+    let upstream = async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut framed = Vec::with_capacity(MAX_DATAGRAM + MAX_ADDR_PORT + 16);
         loop {
             let Ok(n) = in_socket.recv(&mut buf).await else {
                 break;
             };
-            let Ok(framed) = out.frame(&target, &buf[..n]) else {
+            sent.send_replace(tokio::time::Instant::now());
+            if out.frame_into(&target, &buf[..n], &mut framed).is_err() {
                 break;
-            };
+            }
             if writer.write_all(&framed).await.is_err() {
                 break;
             }
         }
-    });
+    };
     let mut input = PacketReader::new(mode);
-    tokio::spawn(async move {
+    let downstream = async move {
         loop {
             let Ok(packet) = input.read(&mut reader).await else {
                 break;
             };
+            activity.send_replace(tokio::time::Instant::now());
             if out_socket.send(&packet).await.is_err() {
                 break;
             }
         }
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = downstream => {},
+            _ = upstream => {},
+            _ = wait_bridge_idle(idle, timeout) => {}
+        }
     });
+}
+
+/// Either direction keeps a UDP tunnel alive; an abandoned local socket cannot
+/// signal EOF, so cancel both pumps once datagrams stop arriving.
+pub(crate) async fn wait_bridge_idle(
+    mut activity: tokio::sync::watch::Receiver<tokio::time::Instant>,
+    timeout: std::time::Duration,
+) {
+    loop {
+        let deadline = *activity.borrow_and_update() + timeout;
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                if tokio::time::Instant::now().duration_since(*activity.borrow()) >= timeout {
+                    return;
+                }
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn packet_bridge_releases_abandoned_udp_socket_with_open_tunnel() {
+        for mode in [PacketEncoding::LengthPrefixed, PacketEncoding::Xudp] {
+            for _ in 0..16 {
+                let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+                let address = peer.local_addr().unwrap();
+                let (stream, _remote) = tokio::io::duplex(1024);
+                spawn_packet_bridge_with_timeout(
+                    Box::new(stream),
+                    peer,
+                    mode,
+                    Target::Ip("127.0.0.1:53".parse().unwrap()),
+                    std::time::Duration::from_millis(50),
+                );
+                drop(client);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(
+                    UdpSocket::bind(address).await.is_ok(),
+                    "idle packet socket retained"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_only_packet_bridge_survives_multiple_idle_windows() {
+        let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+        let (stream, mut remote) = tokio::io::duplex(1024);
+        spawn_packet_bridge_with_timeout(
+            Box::new(stream),
+            peer,
+            PacketEncoding::LengthPrefixed,
+            Target::Ip("127.0.0.1:53".parse().unwrap()),
+            std::time::Duration::from_millis(150),
+        );
+        let mut buf = [0u8; 3];
+        for _ in 0..12 {
+            client.send(b"x").await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                remote.read_exact(&mut buf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(buf, [0, 1, b'x']);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_bridge_releases_udp_socket_after_remote_eof() {
+        for mode in [PacketEncoding::LengthPrefixed, PacketEncoding::Xudp] {
+            for _ in 0..32 {
+                let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+                let address = peer.local_addr().unwrap();
+                let (stream, remote) = tokio::io::duplex(1024);
+                spawn_packet_bridge(
+                    Box::new(stream),
+                    peer,
+                    mode,
+                    Target::Ip("127.0.0.1:53".parse().unwrap()),
+                );
+                drop(remote);
+                drop(client);
+                let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        if UdpSocket::bind(address).await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    released.is_ok(),
+                    "packet bridge retained UDP socket after remote EOF"
+                );
+            }
+        }
+    }
 
     async fn feed(framed: Vec<u8>, mode: PacketEncoding) -> Vec<Vec<u8>> {
         let (client, server) = tokio::io::duplex(8192);

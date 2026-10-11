@@ -51,6 +51,7 @@ getrandom.workspace = true
 h2.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
+quinn-proto = { version = "0.11.18", default-features = false }
 hickory-proto.workspace = true
 if-addrs.workspace = true
 hkdf.workspace = true
@@ -101,3 +102,6 @@ portable-atomic = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tracing = { version = "0.1", default-features = false, features = ["std"] }

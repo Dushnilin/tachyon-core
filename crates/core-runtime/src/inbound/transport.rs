@@ -739,9 +739,16 @@ impl XhttpH2Accept {
                         .header("content-type", "application/octet-stream")
                         .body(())
                         .unwrap();
-                    let send = responder
-                        .send_response(response, false)
-                        .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
+                    let send = match responder.send_response(response, false) {
+                        Ok(send) => send,
+                        Err(e) => {
+                            self.sessions
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&sid);
+                            return Err(anyhow::anyhow!("xhttp h2: response: {e}"));
+                        }
+                    };
                     spawn_h2_download_pump(send, session);
                     return Ok(Some(Box::new(XhttpStream {
                         inner: bridge,

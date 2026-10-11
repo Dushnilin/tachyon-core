@@ -428,7 +428,11 @@ impl ClientInstance {
 
         // 0-RTT attempt with a live ticket.
         if self.seconds > 0 {
-            let cached = self.ticket.lock().unwrap().clone();
+            let cached = self
+                .ticket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             if let Some(t) = cached
                 && std::time::Instant::now() < t.expire
             {
@@ -558,7 +562,7 @@ impl ClientInstance {
         if self.seconds > 0 && seconds > 0 {
             let mut t = [0u8; 16];
             t.copy_from_slice(&ticket_record[..16]);
-            *self.ticket.lock().unwrap() = Some(TicketState {
+            *self.ticket.lock().unwrap_or_else(|e| e.into_inner()) = Some(TicketState {
                 pfs_key,
                 ticket: t,
                 expire: std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64),

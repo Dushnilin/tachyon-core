@@ -71,12 +71,12 @@ impl Direct {
             (true, true, 0) => {
                 let mut last_error: Option<io::Error> = None;
                 let mut bound = None;
-                for _ in 0..8 {
+                for _ in 0..32 {
                     let udp_sock = match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
                         Ok(sock) => sock,
                         Err(e) => {
                             last_error = Some(e);
-                            break;
+                            continue;
                         }
                     };
                     let chosen = udp_sock.local_addr()?.port();

@@ -115,13 +115,16 @@ impl CacheFileOptions {
 /// The process-wide handle: the store is shared by the rule-set registry and
 /// the dns service, both of which outlive any single borrow.
 pub type SharedCacheFile = std::sync::Arc<std::sync::Mutex<CacheFile>>;
+type BucketValues = BTreeMap<Vec<u8>, Vec<u8>>;
+type CacheBuckets = BTreeMap<String, BucketValues>;
+type CacheChange<'a> = (&'a str, Vec<u8>, Option<Vec<u8>>);
 
 /// The in-memory mirror of the file, flushed on demand.
 #[derive(Debug)]
 pub struct CacheFile {
     options: CacheFileOptions,
     path: PathBuf,
-    buckets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    buckets: CacheBuckets,
     dirty: bool,
     /// Bytes written since the last flush, the measure `buffer_size` bounds.
     pending: usize,
@@ -187,7 +190,7 @@ impl CacheFile {
     pub fn get(&self, bucket: &str, key: &[u8]) -> Option<Vec<u8>> {
         self.buckets
             .get(bucket)
-            .and_then(|entries| entries.get(&key_str(key)))
+            .and_then(|entries| entries.get(key))
             .cloned()
     }
 
@@ -196,19 +199,37 @@ impl CacheFile {
         self.buckets
             .entry(bucket.to_string())
             .or_default()
-            .insert(key_str(key), value);
+            .insert(key.to_vec(), value);
         self.dirty = true;
         self.flush_if_due();
     }
 
     pub fn delete(&mut self, bucket: &str, key: &[u8]) {
         if let Some(entries) = self.buckets.get_mut(bucket)
-            && entries.remove(&key_str(key)).is_some()
+            && entries.remove(key).is_some()
         {
             self.pending += key.len();
             self.dirty = true;
             self.flush_if_due();
         }
+    }
+
+    /// Update paired records before a due flush can expose half an update.
+    pub(crate) fn apply_changes(&mut self, changes: Vec<CacheChange<'_>>) {
+        for (bucket, key, value) in changes {
+            let entries = self.buckets.entry(bucket.to_string()).or_default();
+            self.pending += key.len() + value.as_ref().map_or(0, Vec::len);
+            match value {
+                Some(value) => {
+                    entries.insert(key, value);
+                }
+                None => {
+                    entries.remove(&key);
+                }
+            }
+        }
+        self.dirty = true;
+        self.flush_if_due();
     }
 
     /// Write out if the pending bytes or the elapsed time says so.
@@ -223,7 +244,7 @@ impl CacheFile {
     ///
     /// A write failure is logged rather than propagated: a store that cannot be
     /// written must not take down the data path that is using it.
-    fn flush_if_due(&mut self) {
+    pub(crate) fn flush_if_due(&mut self) {
         if !self.dirty {
             return;
         }
@@ -244,7 +265,12 @@ impl CacheFile {
     pub fn keys(&self, bucket: &str) -> Vec<String> {
         self.buckets
             .get(bucket)
-            .map(|entries| entries.keys().cloned().collect())
+            .map(|entries| {
+                entries
+                    .keys()
+                    .filter_map(|key| String::from_utf8(key.clone()).ok())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -347,11 +373,7 @@ pub mod saved_binary {
     }
 }
 
-fn key_str(key: &[u8]) -> String {
-    String::from_utf8_lossy(key).to_string()
-}
-
-fn read_all(db: &Db) -> BTreeMap<String, BTreeMap<String, Vec<u8>>> {
+fn read_all(db: &Db) -> CacheBuckets {
     let mut buckets = BTreeMap::new();
     let mut load = |name: &str| {
         if !db.has_bucket(&[name]).unwrap_or(false) {
@@ -404,8 +426,8 @@ fn extra_buckets(db: &Db) -> Vec<String> {
 }
 
 /// Walk every key of a bucket through the page tree.
-fn collect(db: &Db, path: &[&str], out: &mut BTreeMap<String, Vec<u8>>) {
-    let Ok(Some(page)) = db.bucket_page(path) else {
+fn collect(db: &Db, path: &[&str], out: &mut BucketValues) {
+    let Ok(Some(page)) = db.bucket_page_raw(path) else {
         return;
     };
     for (key, value) in page {
@@ -416,13 +438,13 @@ fn collect(db: &Db, path: &[&str], out: &mut BTreeMap<String, Vec<u8>>) {
     }
 }
 
-fn build_tree(buckets: &BTreeMap<String, BTreeMap<String, Vec<u8>>>) -> NodeSpec {
+fn build_tree(buckets: &CacheBuckets) -> NodeSpec {
     let mut entries = Vec::with_capacity(buckets.len());
     for (name, kv) in buckets {
         let node = NodeSpec {
             entries: kv
                 .iter()
-                .map(|(key, value)| EntrySpec::Kv(key.clone(), value.clone()))
+                .map(|(key, value)| EntrySpec::RawKv(key.clone(), value.clone()))
                 .collect(),
         };
         entries.push(EntrySpec::Bucket {

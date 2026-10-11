@@ -1363,9 +1363,7 @@ async fn delay_test(
         };
         let dial_ms = start.elapsed();
         let mut stream: crate::inbound::AnyStream = if tls {
-            // Reference resets the clock after the dial, before the handshake.
-            start = Instant::now();
-            match tls_client::wrap_probe(conn, &host).await {
+            match tls_client::wrap_probe(conn, &host, &router.inner().probe_tls).await {
                 Ok(s) => s,
                 Err(e) => {
                     crate::logging::debug(format_args!("delay[{index}]: tls {host}: {e}"));
@@ -1375,6 +1373,9 @@ async fn delay_test(
         } else {
             conn
         };
+        if tls {
+            start = Instant::now();
+        }
         let request =
             format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.ok()?;

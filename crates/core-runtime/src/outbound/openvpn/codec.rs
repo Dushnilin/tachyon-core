@@ -475,7 +475,7 @@ fn pkcs7_pad(payload: &[u8], block_size: usize) -> Result<Vec<u8>, String> {
     Ok(padded)
 }
 
-fn pkcs7_unpad(payload: &[u8], block_size: usize) -> Result<Vec<u8>, String> {
+fn pkcs7_unpad_inplace(payload: &mut Vec<u8>, block_size: usize) -> Result<(), String> {
     if block_size == 0 || payload.is_empty() || !payload.len().is_multiple_of(block_size) {
         return Err("invalid static key payload padding".to_string());
     }
@@ -490,7 +490,15 @@ fn pkcs7_unpad(payload: &[u8], block_size: usize) -> Result<Vec<u8>, String> {
     {
         return Err("invalid static key payload padding".to_string());
     }
-    Ok(payload[..padding_start].to_vec())
+    payload.truncate(padding_start);
+    Ok(())
+}
+
+#[cfg(test)]
+fn pkcs7_unpad(payload: &[u8], block_size: usize) -> Result<Vec<u8>, String> {
+    let mut buf = payload.to_vec();
+    pkcs7_unpad_inplace(&mut buf, block_size)?;
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -669,38 +677,42 @@ impl StaticCodec {
             if !constant_time_eq(received_mac, &tag[..n]) {
                 return Err("invalid static key payload hmac".to_string());
             }
-            let mut plain_payload = rest.to_vec();
             let block_size = self.receive_candidates[candidate_index].cipher.block_size();
-            if block_size > 0 {
+            let plain_payload = if block_size > 0 {
                 if rest.len() < block_size * 2 || !rest.len().is_multiple_of(block_size) {
                     return Err("invalid static key payload".to_string());
                 }
                 let iv = &rest[..block_size];
-                plain_payload = rest[block_size..].to_vec();
+                let mut buf = rest[block_size..].to_vec();
                 self.receive_candidates[candidate_index]
                     .cipher
-                    .cbc_decrypt(iv, &mut plain_payload);
-                plain_payload = pkcs7_unpad(&plain_payload, block_size)?;
-            }
+                    .cbc_decrypt(iv, &mut buf);
+                pkcs7_unpad_inplace(&mut buf, block_size)?;
+                buf
+            } else {
+                rest.to_vec()
+            };
             return Self::finish_decode(plain_payload);
         }
-        let mut plain_payload = payload.to_vec();
         let block_size = self.receive_candidates[candidate_index].cipher.block_size();
-        if block_size > 0 {
+        let plain_payload = if block_size > 0 {
             if payload.len() < block_size * 2 || !payload.len().is_multiple_of(block_size) {
                 return Err("invalid static key payload".to_string());
             }
             let iv = &payload[..block_size];
-            plain_payload = payload[block_size..].to_vec();
+            let mut buf = payload[block_size..].to_vec();
             self.receive_candidates[candidate_index]
                 .cipher
-                .cbc_decrypt(iv, &mut plain_payload);
-            plain_payload = pkcs7_unpad(&plain_payload, block_size)?;
-        }
+                .cbc_decrypt(iv, &mut buf);
+            pkcs7_unpad_inplace(&mut buf, block_size)?;
+            buf
+        } else {
+            payload.to_vec()
+        };
         Self::finish_decode(plain_payload)
     }
 
-    fn finish_decode(plain_payload: Vec<u8>) -> Result<(u32, u32, Vec<u8>), String> {
+    fn finish_decode(mut plain_payload: Vec<u8>) -> Result<(u32, u32, Vec<u8>), String> {
         if plain_payload.len() < 8 {
             return Err("invalid static key payload".to_string());
         }
@@ -709,7 +721,8 @@ impl StaticCodec {
             return Err("invalid static key packet id".to_string());
         }
         let timestamp = u32::from_be_bytes(plain_payload[4..8].try_into().expect("4 bytes"));
-        Ok((packet_id, timestamp, plain_payload[8..].to_vec()))
+        plain_payload.drain(..8);
+        Ok((packet_id, timestamp, plain_payload))
     }
 }
 

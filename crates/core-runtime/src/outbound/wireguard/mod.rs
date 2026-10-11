@@ -1852,7 +1852,13 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 
 /// Wrap a payload into an IPv4/UDP packet (checksums: header computed, UDP
 /// left zero — legal for IPv4).
-fn build_ipv4_udp(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn build_ipv4_udp(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let total = 20 + 8 + payload.len();
     let mut pkt = Vec::with_capacity(total);
     pkt.extend_from_slice(&[
@@ -1914,7 +1920,13 @@ fn ipv6_udp_checksum(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, paylo
 }
 
 /// Wrap a payload into an IPv6/UDP packet with RFC-compliant checksum.
-fn build_ipv6_udp(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn build_ipv6_udp(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let ulen = 8 + payload.len();
     let total = 40 + ulen;
     let mut pkt = Vec::with_capacity(total);

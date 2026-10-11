@@ -13,7 +13,7 @@ use crate::outbound::urltest::parse_duration;
 pub const DEFAULT_CONTROL_URL: &str = "https://controlplane.tailscale.com";
 pub const DEFAULT_LISTEN_PORT: u16 = 41641;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TailscaleConfig {
     pub tag: String,
     pub state_directory: Option<PathBuf>,
@@ -119,11 +119,13 @@ impl TailscaleConfig {
             advertise_tags.push(s.to_string());
         }
 
-        let listen_port = obj
-            .get("listen_port")
-            .and_then(Value::as_u64)
-            .map(|p| p as u16)
-            .unwrap_or(DEFAULT_LISTEN_PORT);
+        let listen_port = match obj.get("listen_port") {
+            None => DEFAULT_LISTEN_PORT,
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| anyhow::anyhow!("{at}.listen_port: expected a port in 0..65535"))?,
+        };
 
         let relay_server_port = obj
             .get("relay_server_port")

@@ -3,17 +3,11 @@
 //! Handles registration, machine/node key persistence, Noise_IK establishment,
 //! and MapResponse peer/DERP streaming.
 
-use std::fs;
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::PublicKey;
 
 use crate::outbound::tailscale::derp::DerpMap;
-
-pub const DEFAULT_SERVER_PUBKEY_HEX: &str =
-    "a436df96f7c9e03d4103133ff0be3d65b7dd55745131e5f8f5370ae4f6b4be5e";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Hostinfo {
@@ -125,14 +119,6 @@ pub struct MapResponse {
     pub keep_alive: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedState {
-    #[serde(rename = "MachineKey")]
-    machine_key: String,
-    #[serde(rename = "NodeKey")]
-    node_key: String,
-}
-
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -147,49 +133,16 @@ pub fn from_hex(s: &str, out: &mut [u8]) -> Result<(), ()> {
     if s.len() != out.len() * 2 {
         return Err(());
     }
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| ())?;
+    for (pair, byte) in s.as_bytes().as_chunks::<2>().0.iter().zip(out.iter_mut()) {
+        let digit = |value: u8| match value {
+            b'0'..=b'9' => Ok(value - b'0'),
+            b'a'..=b'f' => Ok(value - b'a' + 10),
+            b'A'..=b'F' => Ok(value - b'A' + 10),
+            _ => Err(()),
+        };
+        *byte = digit(pair[0])? * 16 + digit(pair[1])?;
     }
     Ok(())
-}
-
-/// Loads or creates persistent/ephemeral machine key and node key.
-pub fn load_or_create_keys(
-    state_dir: Option<&Path>,
-    ephemeral: bool,
-) -> (StaticSecret, StaticSecret) {
-    if !ephemeral && let Some(dir) = state_dir {
-        let state_file = dir.join("tailscale.state");
-        if let Ok(content) = fs::read_to_string(&state_file)
-            && let Ok(state) = serde_json::from_str::<PersistedState>(&content)
-            && let (Some(m_bytes), Some(n_bytes)) = (
-                parse_key_hex(&state.machine_key),
-                parse_key_hex(&state.node_key),
-            )
-        {
-            return (StaticSecret::from(m_bytes), StaticSecret::from(n_bytes));
-        }
-
-        let m_sec = generate_secret();
-        let n_sec = generate_secret();
-        let state = PersistedState {
-            machine_key: to_hex(PublicKey::from(&m_sec).as_bytes()),
-            node_key: to_hex(PublicKey::from(&n_sec).as_bytes()),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = fs::create_dir_all(dir);
-            let _ = fs::write(state_file, json);
-        }
-        return (m_sec, n_sec);
-    }
-
-    (generate_secret(), generate_secret())
-}
-
-fn generate_secret() -> StaticSecret {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("getrandom secret");
-    StaticSecret::from(bytes)
 }
 
 pub fn parse_key_hex(s: &str) -> Option<[u8; 32]> {
@@ -214,13 +167,6 @@ pub fn node_key_str(pk: &PublicKey) -> String {
 /// Converts a public key into the Tailscale `"mkey:<hex>"` format.
 pub fn machine_key_str(pk: &PublicKey) -> String {
     format!("mkey:{}", to_hex(pk.as_bytes()))
-}
-
-/// Discovers the server public key for Noise_IK coordination.
-pub fn discover_server_key(_control_url: &str) -> PublicKey {
-    let mut bytes = [0u8; 32];
-    from_hex(DEFAULT_SERVER_PUBKEY_HEX, &mut bytes).expect("valid hex constant");
-    PublicKey::from(bytes)
 }
 
 #[cfg(test)]

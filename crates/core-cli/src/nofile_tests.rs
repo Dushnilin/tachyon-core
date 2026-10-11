@@ -4,12 +4,28 @@ use std::process::Command;
 #[test]
 fn inherited_limits() {
     const CHILD_CASE: &str = "TACHYON_NOFILE_TEST_CASE";
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) },
+        0
+    );
     let cases: [(libc::rlim_t, libc::rlim_t, libc::rlim_t); 4] = [
         (1024, 4096, 4096),
         (1024, 65535, 65535),
         (70000, 70000, 70000),
         (1024, 70000, 65535),
-    ];
+    ]
+    .map(|(soft, hard, expected)| {
+        // Unprivileged runners cannot raise their inherited hard limit.
+        (
+            soft.min(inherited.rlim_max),
+            hard.min(inherited.rlim_max),
+            expected.min(inherited.rlim_max),
+        )
+    });
     if let Ok(index) = std::env::var(CHILD_CASE) {
         let (_, hard, expected) = cases[index.parse::<usize>().unwrap()];
         unsafe {

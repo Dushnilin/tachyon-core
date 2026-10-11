@@ -999,8 +999,20 @@ impl RouterInner {
 
     pub async fn route_walk<S>(
         &self,
+        client: Option<&mut S>,
+        ctx: &mut ConnContext,
+    ) -> io::Result<Decision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.route_walk_packet(client, ctx, None).await
+    }
+
+    async fn route_walk_packet<S>(
+        &self,
         mut client: Option<&mut S>,
         ctx: &mut ConnContext,
+        packet: Option<&[u8]>,
     ) -> io::Result<Decision>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -1026,6 +1038,8 @@ impl RouterInner {
                 Action::Sniff { sniffer, timeout } => {
                     if let Some(c) = client.as_deref_mut() {
                         sniff::action_sniff(c, ctx, sniffer, *timeout).await;
+                    } else if let Some(packet) = packet {
+                        sniff::action_sniff_packet(packet, ctx, sniffer);
                     }
                 }
                 Action::Resolve(res) => {
@@ -1181,6 +1195,13 @@ impl Router {
     pub async fn route_raw(&self, ctx: &mut ConnContext) -> io::Result<Decision> {
         self.inner()
             .route_walk::<tokio::net::TcpStream>(None, ctx)
+            .await
+    }
+
+    /// Route a datagram without consuming or modifying its payload.
+    pub async fn route_packet(&self, ctx: &mut ConnContext, packet: &[u8]) -> io::Result<Decision> {
+        self.inner()
+            .route_walk_packet::<tokio::net::TcpStream>(None, ctx, Some(packet))
             .await
     }
 

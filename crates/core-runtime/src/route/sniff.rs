@@ -44,6 +44,19 @@ fn default_stream_sniffers() -> Vec<SnifferFn> {
     ]
 }
 
+/// Inspect one complete UDP datagram when a matching sniff action requests DNS.
+/// TCP sniffers require stream framing and must not be run on packet payloads.
+pub(crate) fn action_sniff_packet(packet: &[u8], ctx: &mut ConnContext, configured: &[String]) {
+    if ctx.protocol.is_some()
+        || (!configured.is_empty() && !configured.iter().any(|name| name == "dns"))
+    {
+        return;
+    }
+    if verify_dns_query_header(packet) && crate::dns::codec::parse_query(packet).is_ok() {
+        ctx.protocol = Some("dns".into());
+    }
+}
+
 /// Reference `actionSniff` for one TCP connection.
 pub(crate) async fn action_sniff<S>(
     client: &mut S,

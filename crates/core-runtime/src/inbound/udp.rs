@@ -429,7 +429,7 @@ impl UdpHub {
                     existing
                 } else {
                     let flow = self
-                        .open_flow(reply.clone(), source, dest, tag, target)
+                        .open_flow(reply.clone(), source, dest, tag, target, payload)
                         .await?;
                     flow.touch();
                     self.flows
@@ -449,6 +449,7 @@ impl UdpHub {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_flow(
         self: &Arc<Self>,
         reply: Reply,
@@ -456,9 +457,10 @@ impl UdpHub {
         dest: SocketAddr,
         tag: &str,
         target: &Target,
+        payload: &[u8],
     ) -> std::io::Result<Arc<Flow>> {
         let mut ctx = ConnContext::new(tag, source, target.clone(), "udp");
-        let decision = self.router.route_raw(&mut ctx).await?;
+        let decision = self.router.route_packet(&mut ctx, payload).await?;
         logging::debug(format_args!(
             "udp {tag} {source} -> {} => {:?}",
             ctx.destination, decision

@@ -35,6 +35,17 @@ type FlowKey = (SocketAddr, SocketAddr);
 /// the difference is only whether it also loses its budget.
 const UDP_BACKLOG_MAX: usize = 64;
 
+/// How many datagrams a flow may hold while a QUIC ClientHello comes
+/// together. A post-quantum hello takes two; past this it is not coming.
+const MAX_SNIFF_DATAGRAMS: usize = 8;
+
+/// What [`UdpHub::open_flow`] made of a flow's datagrams so far.
+enum Opened {
+    Flow(Arc<Flow>),
+    /// the sniff wants another datagram; route anyway after this long
+    Wait(Duration),
+}
+
 struct Flow {
     kind: FlowKind,
     last_ms: AtomicU64,
@@ -284,6 +295,9 @@ pub(crate) struct UdpHub {
     /// First packets for one tuple share an initialization gate, so a burst
     /// cannot create multiple proxy sessions whose idle tasks race each other.
     opening: Mutex<HashMap<FlowKey, Weak<tokio::sync::Mutex<()>>>>,
+    /// Datagrams of flows not routed yet because a packet sniff asked for
+    /// more, in arrival order. Touched only under the flow's opening gate.
+    held: Mutex<HashMap<FlowKey, Vec<Vec<u8>>>>,
     reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     timeout: Duration,
     /// how replies are framed before they go back
@@ -296,6 +310,7 @@ impl UdpHub {
             router,
             flows: RwLock::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
             reverse_tasks: Mutex::new(Vec::new()),
             timeout: if timeout.is_zero() {
                 DEFAULT_UDP_TIMEOUT
@@ -323,6 +338,7 @@ impl UdpHub {
             task.abort();
         }
         self.flows.write().expect("flows").clear();
+        self.held.lock().expect("held").clear();
     }
 
     async fn sweep(&self) {
@@ -410,36 +426,72 @@ impl UdpHub {
                 flow
             }
             None => {
-                let gate = {
-                    let mut opening = self.opening.lock().expect("opening");
-                    opening.retain(|_, gate| gate.strong_count() != 0);
-                    match opening.get(&key).and_then(Weak::upgrade) {
-                        Some(gate) => gate,
-                        None => {
-                            let gate = Arc::new(tokio::sync::Mutex::new(()));
-                            opening.insert(key, Arc::downgrade(&gate));
-                            gate
-                        }
-                    }
-                };
-                let _gate = gate.lock_owned().await;
+                let _gate = self.gate(key).lock_owned().await;
                 let found = self.flows.read().expect("flows").get(&key).cloned();
                 if let Some(existing) = found {
                     existing.touch();
                     existing
                 } else {
-                    let flow = self
-                        .open_flow(reply.clone(), source, dest, tag, target)
-                        .await?;
-                    flow.touch();
-                    self.flows
-                        .write()
-                        .expect("flows")
-                        .insert(key, Arc::clone(&flow));
-                    flow
+                    let mut held = self
+                        .held
+                        .lock()
+                        .expect("held")
+                        .remove(&key)
+                        .unwrap_or_default();
+                    let first = held.is_empty();
+                    held.push(payload.to_vec());
+                    let force = held.len() >= MAX_SNIFF_DATAGRAMS;
+                    match self
+                        .open_flow(reply.clone(), source, dest, tag, target, &held, force)
+                        .await?
+                    {
+                        Opened::Wait(timeout) => {
+                            self.held.lock().expect("held").insert(key, held);
+                            if first {
+                                self.route_held_after(key, timeout, reply, tag, target);
+                            }
+                            return Ok(());
+                        }
+                        Opened::Flow(flow) => {
+                            // the held ones go first; this datagram goes below
+                            held.pop();
+                            for earlier in &held {
+                                self.deliver(&flow, reply.clone(), source, dest, earlier, tag)
+                                    .await?;
+                            }
+                            flow
+                        }
+                    }
                 }
             }
         };
+        self.deliver(&flow, reply, source, dest, payload, tag).await
+    }
+
+    /// The opening gate of one tuple: first datagrams share it, so a burst
+    /// cannot create multiple proxy sessions whose idle tasks race each other.
+    fn gate(&self, key: FlowKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut opening = self.opening.lock().expect("opening");
+        opening.retain(|_, gate| gate.strong_count() != 0);
+        match opening.get(&key).and_then(Weak::upgrade) {
+            Some(gate) => gate,
+            None => {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                opening.insert(key, Arc::downgrade(&gate));
+                gate
+            }
+        }
+    }
+
+    async fn deliver(
+        &self,
+        flow: &Flow,
+        reply: Reply,
+        source: SocketAddr,
+        dest: SocketAddr,
+        payload: &[u8],
+        tag: &str,
+    ) -> std::io::Result<()> {
         match &flow.kind {
             FlowKind::Dns => self.hijack_one(reply, source, dest, payload, tag).await,
             FlowKind::Outbound { sock } => {
@@ -449,6 +501,56 @@ impl UdpHub {
         }
     }
 
+    /// The rest of a split ClientHello may never come: once the sniff
+    /// timeout runs out, route the flow on what it has and send what it held.
+    fn route_held_after(
+        self: &Arc<Self>,
+        key: FlowKey,
+        timeout: Duration,
+        reply: Reply,
+        tag: &str,
+        target: &Target,
+    ) {
+        let hub = Arc::downgrade(self);
+        let tag = tag.to_string();
+        let target = target.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let Some(hub) = hub.upgrade() else {
+                return;
+            };
+            let (source, dest) = key;
+            let _gate = hub.gate(key).lock_owned().await;
+            // a later datagram may have completed the sniff meanwhile
+            let Some(held) = hub.held.lock().expect("held").remove(&key) else {
+                return;
+            };
+            let flow = match hub
+                .open_flow(reply.clone(), source, dest, &tag, &target, &held, true)
+                .await
+            {
+                Ok(Opened::Flow(flow)) => flow,
+                Ok(Opened::Wait(_)) => return,
+                Err(err) => {
+                    logging::debug(format_args!("udp {tag} {source}: {err}"));
+                    return;
+                }
+            };
+            for datagram in &held {
+                if let Err(err) = hub
+                    .deliver(&flow, reply.clone(), source, dest, datagram, &tag)
+                    .await
+                {
+                    logging::debug(format_args!("udp {tag} {source}: {err}"));
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Route a new flow by its datagrams so far and open it. `force` routes
+    /// even when the sniff would rather see another datagram.
+    #[allow(clippy::too_many_arguments)]
     async fn open_flow(
         self: &Arc<Self>,
         reply: Reply,
@@ -456,9 +558,19 @@ impl UdpHub {
         dest: SocketAddr,
         tag: &str,
         target: &Target,
-    ) -> std::io::Result<Arc<Flow>> {
+        datagrams: &[Vec<u8>],
+        force: bool,
+    ) -> std::io::Result<Opened> {
+        let key = (source, dest);
         let mut ctx = ConnContext::new(tag, source, target.clone(), "udp");
-        let decision = self.router.route_raw(&mut ctx).await?;
+        let views: Vec<&[u8]> = datagrams.iter().map(Vec::as_slice).collect();
+        let decision = self.router.route_packet(&mut ctx, &views).await?;
+        if !force && ctx.sniff_error == Some(crate::route::SniffError::NeedMore) {
+            return Ok(Opened::Wait(
+                ctx.sniff_timeout
+                    .unwrap_or(crate::route::rule::DEFAULT_SNIFF_TIMEOUT),
+            ));
+        }
         logging::debug(format_args!(
             "udp {tag} {source} -> {} => {:?}",
             ctx.destination, decision
@@ -490,7 +602,7 @@ impl UdpHub {
                     tag,
                     timeout,
                     Arc::clone(self),
-                    (source, dest),
+                    key,
                 );
                 let mut tasks = self.reverse_tasks.lock().expect("reverse tasks");
                 tasks.retain(|task| !task.is_finished());
@@ -504,7 +616,12 @@ impl UdpHub {
                 }
             }
         };
-        Ok(Arc::new(flow))
+        let flow = Arc::new(flow);
+        self.flows
+            .write()
+            .expect("flows")
+            .insert(key, Arc::clone(&flow));
+        Ok(Opened::Flow(flow))
     }
 
     async fn hijack_one(

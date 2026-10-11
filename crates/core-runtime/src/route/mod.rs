@@ -9,6 +9,7 @@ pub mod rule_set;
 pub mod rule_set_index;
 pub mod rule_set_remote;
 pub mod sniff;
+mod sniff_quic;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -82,6 +83,8 @@ pub struct ConnContext {
     pub sniff_prefix: Vec<u8>,
     pub sniff_error: Option<SniffError>,
     pub sniffer_names: Vec<String>,
+    /// A packet sniff that wants another datagram: how long to wait for it.
+    pub sniff_timeout: Option<Duration>,
     pub ip_version: Option<u8>,
     pub route_original_destination: Option<Target>,
     /// Clash connection view: the rule that produced the decision.
@@ -121,6 +124,7 @@ impl Default for ConnContext {
             sniff_prefix: Vec::new(),
             sniff_error: None,
             sniffer_names: Vec::new(),
+            sniff_timeout: None,
             ip_version: None,
             route_original_destination: None,
             matched_rule: None,
@@ -999,7 +1003,21 @@ impl RouterInner {
 
     pub async fn route_walk<S>(
         &self,
+        client: Option<&mut S>,
+        ctx: &mut ConnContext,
+    ) -> io::Result<Decision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.walk(client, None, ctx).await
+    }
+
+    /// One walk of the rules. A `sniff` action reads the stream when there is
+    /// one, and looks at the datagrams when there are those instead.
+    async fn walk<S>(
+        &self,
         mut client: Option<&mut S>,
+        datagrams: Option<&[&[u8]]>,
         ctx: &mut ConnContext,
     ) -> io::Result<Decision>
     where
@@ -1026,6 +1044,8 @@ impl RouterInner {
                 Action::Sniff { sniffer, timeout } => {
                     if let Some(c) = client.as_deref_mut() {
                         sniff::action_sniff(c, ctx, sniffer, *timeout).await;
+                    } else if let Some(datagrams) = datagrams {
+                        sniff::action_sniff_packet(datagrams, ctx, sniffer, *timeout);
                     }
                 }
                 Action::Resolve(res) => {
@@ -1181,6 +1201,18 @@ impl Router {
     pub async fn route_raw(&self, ctx: &mut ConnContext) -> io::Result<Decision> {
         self.inner()
             .route_walk::<tokio::net::TcpStream>(None, ctx)
+            .await
+    }
+
+    /// Route a UDP flow by its datagrams so far (first one first). They are
+    /// only looked at: nothing is consumed or changed.
+    pub async fn route_packet(
+        &self,
+        ctx: &mut ConnContext,
+        datagrams: &[&[u8]],
+    ) -> io::Result<Decision> {
+        self.inner()
+            .walk::<tokio::net::TcpStream>(None, Some(datagrams), ctx)
             .await
     }
 

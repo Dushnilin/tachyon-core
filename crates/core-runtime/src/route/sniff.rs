@@ -1,6 +1,8 @@
 //! Stream protocol sniffing (TLS / HTTP / DNS / BitTorrent / SSH / RDP)
 //! with sing-box `PeekStream` semantics: accumulate payload under a deadline,
 //! re-run sniffers on the full prefix, replay the prefix upstream afterwards.
+//! Packet sniffing (DNS / QUIC / STUN / BitTorrent / DTLS / NTP) is
+//! `PeekPacket`: the datagrams are only looked at, never consumed.
 
 use std::time::{Duration, Instant};
 
@@ -42,6 +44,80 @@ fn default_stream_sniffers() -> Vec<SnifferFn> {
         sniff_ssh,
         sniff_rdp,
     ]
+}
+
+type PacketSnifferFn = fn(&[u8], &mut ConnContext) -> bool;
+
+/// The reference default set for a packet connection, in its order
+/// (`route/route.go` actionSniff). QUIC is not in the table: it alone needs
+/// every datagram of the flow, not just the first.
+const PACKET_SNIFFERS: [(&str, PacketSnifferFn); 6] = [
+    ("dns", sniff_dns_packet),
+    ("stun", sniff_stun),
+    ("bittorrent", sniff_utp),
+    ("bittorrent", sniff_udp_tracker),
+    ("dtls", sniff_dtls),
+    ("ntp", sniff_ntp),
+];
+
+/// Reference `actionSniff` for a packet connection: `datagrams` is every
+/// datagram the flow has sent so far, first one first. A QUIC ClientHello
+/// split across datagrams leaves `SniffError::NeedMore` and the timeout on the
+/// context, so the caller can hold the flow and come back with the next one.
+pub(crate) fn action_sniff_packet(
+    datagrams: &[&[u8]],
+    ctx: &mut ConnContext,
+    configured: &[String],
+    timeout: Duration,
+) {
+    if ctx.protocol.is_some() {
+        logging::debug(format_args!("duplicate sniff skipped"));
+        return;
+    }
+    let Some(first) = datagrams.first() else {
+        return;
+    };
+    let enabled = |name: &str| configured.is_empty() || configured.iter().any(|n| n == name);
+    ctx.sniffer_names = configured.to_vec();
+    ctx.sniff_error = None;
+    let (dns, rest) = PACKET_SNIFFERS.split_at(1);
+    let matched = dns
+        .iter()
+        .any(|(name, sniffer)| enabled(name) && sniffer(first, ctx))
+        || (enabled("quic") && sniff_quic_packets(datagrams, ctx, timeout))
+        || rest
+            .iter()
+            .any(|(name, sniffer)| enabled(name) && sniffer(first, ctx));
+    if matched {
+        logging::debug(format_args!(
+            "sniffed packet protocol: {:?}, domain: {:?}",
+            ctx.protocol, ctx.domain
+        ));
+    }
+}
+
+fn sniff_quic_packets(datagrams: &[&[u8]], ctx: &mut ConnContext, timeout: Duration) -> bool {
+    match super::sniff_quic::sniff(datagrams) {
+        super::sniff_quic::Quic::NoMatch => false,
+        super::sniff_quic::Quic::NeedMore => {
+            // already QUIC for `protocol` rules; the domain is what is missing
+            ctx.protocol = Some("quic".into());
+            ctx.sniff_error = Some(SniffError::NeedMore);
+            ctx.sniff_timeout = Some(if timeout.is_zero() {
+                DEFAULT_SNIFF_TIMEOUT
+            } else {
+                timeout
+            });
+            true
+        }
+        super::sniff_quic::Quic::Hello(sni) => {
+            ctx.protocol = Some("quic".into());
+            if sni.is_some() {
+                ctx.domain = sni;
+            }
+            true
+        }
+    }
 }
 
 /// Reference `actionSniff` for one TCP connection.
@@ -347,6 +423,80 @@ fn sniff_dns_stream(buf: &[u8], ctx: &mut ConnContext) -> Outcome {
     }
     ctx.protocol = Some("dns".into());
     Outcome::Matched
+}
+
+fn sniff_dns_packet(packet: &[u8], ctx: &mut ConnContext) -> bool {
+    if packet.len() < 12
+        || !verify_dns_query_header(packet)
+        || crate::dns::codec::parse_query(packet).is_err()
+    {
+        return false;
+    }
+    ctx.protocol = Some("dns".into());
+    true
+}
+
+/// RFC 5389 6: the magic cookie, and a body as long as the header says.
+fn sniff_stun(p: &[u8], ctx: &mut ConnContext) -> bool {
+    if p.len() < 20 || p[4..8] != [0x21, 0x12, 0xa4, 0x42] {
+        return false;
+    }
+    if p.len() < 20 + usize::from(u16::from_be_bytes([p[2], p[3]])) {
+        return false;
+    }
+    ctx.protocol = Some("stun".into());
+    true
+}
+
+/// BEP 29 uTP: version 1, a known type, and an extension chain that ends.
+fn sniff_utp(p: &[u8], ctx: &mut ConnContext) -> bool {
+    if p.len() < 20 || p[0] & 0x0f != 1 || p[0] >> 4 > 4 {
+        return false;
+    }
+    let mut extension = p[1];
+    let mut pos = 20;
+    while extension != 0 {
+        let (Some(&next), Some(&len)) = (p.get(pos), p.get(pos + 1)) else {
+            return false;
+        };
+        extension = next;
+        pos += 2 + usize::from(len);
+    }
+    ctx.protocol = Some("bittorrent".into());
+    true
+}
+
+/// BEP 15 connect request: the protocol id and action 0.
+fn sniff_udp_tracker(p: &[u8], ctx: &mut ConnContext) -> bool {
+    if p.len() < 16 || p[..8] != 0x0417_2710_1980u64.to_be_bytes() || p[8..12] != [0, 0, 0, 0] {
+        return false;
+    }
+    ctx.protocol = Some("bittorrent".into());
+    true
+}
+
+/// A DTLS 1.0/1.2 record header.
+fn sniff_dtls(p: &[u8], ctx: &mut ConnContext) -> bool {
+    if p.len() < 13 || !matches!(p[0], 20..=23 | 25) || p[1] != 0xfe || !matches!(p[2], 0xff | 0xfd)
+    {
+        return false;
+    }
+    ctx.protocol = Some("dtls".into());
+    true
+}
+
+/// An NTPv3/v4 client request whose root delay and dispersion stay under
+/// the 16 seconds the reference allows (16.16 fixed point).
+fn sniff_ntp(p: &[u8], ctx: &mut ConnContext) -> bool {
+    if p.len() < 48 || !matches!((p[0] >> 3) & 7, 3 | 4) || p[0] & 7 != 3 {
+        return false;
+    }
+    let root = |at: usize| u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+    if root(4) > 16 << 16 || root(8) > 16 << 16 {
+        return false;
+    }
+    ctx.protocol = Some("ntp".into());
+    true
 }
 
 fn sniff_bittorrent(buf: &[u8], ctx: &mut ConnContext) -> Outcome {

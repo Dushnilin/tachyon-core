@@ -396,7 +396,9 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
         let watchdog = attempt < 3;
         let tapped: AnyStream = Box::new(Tap::new(stream, member, watchdog));
         let mut stream: AnyStream = if shared.probe.tls {
-            match tls_client::wrap_probe(tapped, &shared.probe.host).await {
+            match tls_client::wrap_probe(tapped, &shared.probe.host, &router.inner().probe_tls)
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     logging::debug(format_args!(

@@ -768,13 +768,65 @@ where
     Ok(Box::new(connector.connect(name, stream).await?))
 }
 
-/// TLS wrap for runtime probes (urltest): any proxy stream, any certificate.
-pub(crate) async fn wrap_probe(stream: AnyStream, server_name: &str) -> io::Result<AnyStream> {
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+/// URLTest's trust is independent of the proxy node's TLS/REALITY options.
+/// Embedded Mozilla roots also work on OpenWrt without a system CA package.
+/// Additional roots use the existing top-level certificate configuration.
+pub(crate) fn probe_connector(root: &Value) -> anyhow::Result<TlsConnector> {
+    let mut roots = core_tls::verify::WebpkiVerifier::mozilla_store();
+    if let Some(options) = root.get("certificate") {
+        for field in ["certificate", "certificate_path"] {
+            let Some(value) = options.get(field).filter(|v| !v.is_null()) else {
+                continue;
+            };
+            let entries: Vec<&str> = match value {
+                Value::String(s) => vec![s],
+                Value::Array(items) => items
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .ok_or_else(|| anyhow::anyhow!("certificate.{field}: expected strings"))
+                    })
+                    .collect::<anyhow::Result<_>>()?,
+                _ => anyhow::bail!("certificate.{field}: expected a string or string array"),
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            // Inline entries may be individual PEM lines or complete PEM blocks.
+            let pems = if field == "certificate" {
+                vec![entries.join("\n").into_bytes()]
+            } else {
+                entries
+                    .iter()
+                    .map(std::fs::read)
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for pem in pems {
+                let mut parsed = Vec::new();
+                load_pem_certs(&pem, &mut parsed)?;
+                anyhow::ensure!(
+                    !parsed.is_empty(),
+                    "certificate.{field}: no PEM certificates"
+                );
+                for cert in parsed {
+                    roots.add(cert)?;
+                }
+            }
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(core_crypto::provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
         .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Authenticate the HTTPS test site, including its name and handshake signatures.
+pub(crate) async fn wrap_probe(
+    stream: AnyStream,
+    server_name: &str,
+    connector: &TlsConnector,
+) -> io::Result<AnyStream> {
     let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
         .map_err(|_| io::Error::other(format!("invalid probe server_name {server_name:?}")))?;
     Ok(Box::new(connector.connect(name, stream).await?))

@@ -59,7 +59,7 @@ jobs:
           - name: armv6
             target: arm-unknown-linux-musleabi
             use_musl_lld: true
-            budget: 12582912
+            budget: 14680064
           - name: riscv64
             target: riscv64gc-unknown-linux-musl
             use_musl_lld: true

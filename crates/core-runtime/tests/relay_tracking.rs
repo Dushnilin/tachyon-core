@@ -129,3 +129,32 @@ async fn untracked_relay_matches_copy_bidirectional() {
     assert!(tail.is_empty());
     relay.await.expect("relay task").expect("relay result");
 }
+
+#[tokio::test]
+async fn half_closed_client_still_receives_a_delayed_response() {
+    let (client, mut caller) = tokio::io::duplex(4096);
+    let (upstream, mut server) = tokio::io::duplex(4096);
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(client, Conn::Plain(Box::new(upstream)), &[], None).await
+    });
+    let peer = tokio::spawn(async move {
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request");
+        // Exercise an empty pending read after upload EOF, then reuse the
+        // download direction's buffer for a response that arrives later.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        server.write_all(b"response").await.unwrap();
+        server.shutdown().await.unwrap();
+    });
+    caller.write_all(b"request").await.unwrap();
+    caller.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), caller.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, b"response");
+    relay.await.unwrap().unwrap();
+    peer.await.unwrap();
+}

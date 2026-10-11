@@ -251,31 +251,39 @@ impl DialOptions {
             SocketAddr::V4(_) => self.inet4_bind_address,
             SocketAddr::V6(_) => self.inet6_bind_address,
         }?;
+        // If connecting to loopback (127.0.0.0/8, ::1), never bind to a non-loopback source address
+        if addr.ip().is_loopback() && !ip.is_loopback() {
+            return None;
+        }
         Some(SocketAddr::new(ip, 0))
     }
 
     #[cfg(unix)]
     /// Everything that has to be set before the socket connects.
-    /// Everything that has to be set before the socket connects.
     fn apply(&self, fd: RawFd, addr: &SocketAddr, udp: bool) -> io::Result<()> {
-        let _ = addr;
+        let is_loopback = addr.ip().is_loopback();
         if self.reuse_addr {
             set_bool(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
         }
         #[cfg(target_os = "linux")]
         {
-            if let Some(mark) = self.routing_mark {
-                set_int(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as libc::c_int)?;
+            // The reference (common/dialer/default.go) never sets bind_interface or routing_mark
+            // on loopback destinations: loopback traffic is local and binding to a physical interface
+            // (e.g. wan/pppoe-wan) makes 127.0.0.0/8 return ENETUNREACH (e.g. local AdGuardHome).
+            if !is_loopback {
+                if let Some(mark) = self.routing_mark {
+                    set_int(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as libc::c_int)?;
+                }
+                if let Some(iface) = &self.bind_interface {
+                    set_bytes(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_BINDTODEVICE,
+                        iface.as_bytes(),
+                    )?;
+                }
             }
-            if let Some(iface) = &self.bind_interface {
-                set_bytes(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_BINDTODEVICE,
-                    iface.as_bytes(),
-                )?;
-            }
-            if self.bind_address_no_port {
+            if self.bind_address_no_port && !is_loopback {
                 set_int(fd, libc::IPPROTO_IP, 24, 1)?;
             }
             if udp && !self.udp_fragment {
@@ -1459,5 +1467,23 @@ mod tests {
             .await
             .expect("accept must not block")
             .expect("accept");
+    }
+
+    #[test]
+    fn loopback_bypasses_interface_and_foreign_bind() {
+        let options = DialOptions {
+            bind_interface: Some("eth0".to_string()),
+            routing_mark: test_routing_mark(0x2022),
+            inet4_bind_address: Some("192.168.1.1".parse().unwrap()),
+            ..Default::default()
+        };
+        let loopback_addr = "127.0.0.10:53".parse().unwrap();
+        assert_eq!(options.bind_address(&loopback_addr), None);
+
+        let external_addr = "8.8.8.8:53".parse().unwrap();
+        assert_eq!(
+            options.bind_address(&external_addr),
+            Some("192.168.1.1:0".parse().unwrap())
+        );
     }
 }

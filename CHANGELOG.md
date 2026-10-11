@@ -17,13 +17,14 @@ Point release delivering native Brutal congestion control for Hysteria2, resilie
   - Replaced target destination with resolved IP while preserving the original hostname in `ctx.domain`, ensuring SOCKS outbounds (such as ByeDPI `ciadpi`) receive clean IP targets (`ATYP 0x01`/`0x04`) and permanently eliminating FakeIP loopback loops on OpenWrt routers.
   - Added support for `hosts` and `local`/`neighbor` server types in `lookup_via`.
 - **Pure-Rust Tailscale Outbound**:
-  - Completed end-to-end user-space Tailscale mesh client support with STUN, coordinator authentication, netmap syncing, and direct P2P UDP packet transmission without C-crypto dependencies.
+  - Completed end-to-end user-space Tailscale mesh client support with STUN, coordinator authentication, netmap syncing, and direct P2P UDP packet transmission without C-crypto dependencies (PR #15 review by @MaksSt).
 - **Protocol Sniffing & Framing Hardening**:
-  - Added UDP L7 packet sniffing for QUIC (v1/v2 Initial and fragmented ClientHello), DNS, STUN, and BitTorrent.
+  - Added UDP L7 packet sniffing for QUIC (v1/v2 Initial and fragmented ClientHello), DNS, STUN, and BitTorrent (PR #14 and PR #16 review by @Screamshow).
   - Handled empty TLS record frames gracefully without terminating the connection processor.
   - Cleared intermediate plaintext buffers on authentication tag mismatch in software AES-GCM.
   - Fixed composite duration parsing (e.g. `1m30s`, `300ms`) and supported `udp_timeout` and `ip_version` routing rule options.
   - Aligned Clash API `/rules` and `/connections` outputs with the sing-box reference schema.
+  - Resolved `RLIMIT_NOFILE` soft-limit raising under constrained environments on OpenWrt (PR #13 review by @Screamshow).
 
 ## 0.0.6
 

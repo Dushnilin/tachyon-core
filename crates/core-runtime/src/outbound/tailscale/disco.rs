@@ -99,7 +99,11 @@ fn parse(bytes: &[u8]) -> Option<Message> {
             source: address(&data[12..30])?,
         }),
         3 if data.len().is_multiple_of(18) && data.len() <= 8 * 18 => Some(Message::CallMeMaybe(
-            data.chunks_exact(18).filter_map(address).collect(),
+            data.as_chunks::<18>()
+                .0
+                .iter()
+                .filter_map(|bytes| address(bytes))
+                .collect(),
         )),
         _ => None,
     }

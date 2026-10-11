@@ -133,7 +133,7 @@ pub fn from_hex(s: &str, out: &mut [u8]) -> Result<(), ()> {
     if s.len() != out.len() * 2 {
         return Err(());
     }
-    for (pair, byte) in s.as_bytes().chunks_exact(2).zip(out.iter_mut()) {
+    for (pair, byte) in s.as_bytes().as_chunks::<2>().0.iter().zip(out.iter_mut()) {
         let digit = |value: u8| match value {
             b'0'..=b'9' => Ok(value - b'0'),
             b'a'..=b'f' => Ok(value - b'a' + 10),

@@ -20,6 +20,8 @@ Reports: --out JSON, --html HTML, --md Markdown.
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import socket
@@ -48,6 +50,12 @@ LABELS = {"tachyon": "tachyon-core", "sing-box": "sing-box-lx",
 
 
 # --------------------------------------------------------------------- certs
+def pem_to_der(pem):
+    """xray pins the SHA256 of the DER cert, so unwrap the PEM first."""
+    body = b"".join(l for l in pem.splitlines() if not l.startswith(b"-----"))
+    return base64.b64decode(body)
+
+
 def make_certs(d):
     """Two certs: `cert.pem` for our own TLS, `reality.pem` for REALITY, which
     has to carry the SNI of the site it pretends to be."""
@@ -67,7 +75,10 @@ def make_certs(d):
          "-addext", "subjectAltName=DNS:www.microsoft.com"],
         check=True, capture_output=True,
     )
-    return {"cert": crt, "key": key, "reality": rcrt, "reality_key": rkey}
+    with open(crt, "rb") as f:
+        der = pem_to_der(f.read())
+    return {"cert": crt, "key": key, "reality": rcrt, "reality_key": rkey,
+            "pin": base64.b64encode(hashlib.sha256(der).digest()).decode()}
 
 
 # ------------------------------------------------------------------- the sink
@@ -276,6 +287,8 @@ def measure_throughput(streams, seconds):
 # --------------------------------------------------------------------- cases
 def build_cases(C):
     crt, key = C["cert"], C["key"]
+    # xray dropped allowInsecure and offers no private-CA flag, so it pins
+    PIN = C["pin"]
 
     def tls(server_name="localhost", insecure=False):
         t = {"enabled": True, "server_name": server_name,
@@ -366,7 +379,7 @@ def build_cases(C):
         {"protocol": "vmess", "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT,
                                   "users": [{"id": UUID_STR, "alterId": 0}]}]},
          "streamSettings": {"security": "tls",
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         {"type": "vmess", "uuid": UUID_STR, "alterId": 0, "cipher": "auto",
          "tls": True, "skip-cert-verify": True, "servername": "localhost"})
@@ -381,7 +394,7 @@ def build_cases(C):
                                   "users": [{"id": UUID_STR, "alterId": 0}]}]},
          "streamSettings": {"network": "ws", "security": "tls",
                             "wsSettings": {"path": "/ws"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -395,7 +408,7 @@ def build_cases(C):
                                   "users": [{"id": UUID_STR, "alterId": 0}]}]},
          "streamSettings": {"network": "grpc", "security": "tls",
                             "grpcSettings": {"serviceName": "grpc"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -419,7 +432,7 @@ def build_cases(C):
                                  "users": [{"id": UUID_STR,
                                             "encryption": "none"}]}]},
          "streamSettings": {"security": "tls",
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         {"type": "vless", "uuid": UUID_STR, "tls": True, "skip-cert-verify": True,
          "servername": "localhost"})
@@ -434,7 +447,7 @@ def build_cases(C):
                                  "users": [{"id": UUID_STR, "encryption": "none",
                                             "flow": "xtls-rprx-vision"}]}]},
          "streamSettings": {"security": "tls",
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -450,7 +463,7 @@ def build_cases(C):
                                             "encryption": "none"}]}]},
          "streamSettings": {"network": "ws", "security": "tls",
                             "wsSettings": {"path": "/ws"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -466,7 +479,7 @@ def build_cases(C):
                                             "encryption": "none"}]}]},
          "streamSettings": {"network": "grpc", "security": "tls",
                             "grpcSettings": {"serviceName": "grpc"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -482,7 +495,7 @@ def build_cases(C):
                                             "encryption": "none"}]}]},
          "streamSettings": {"network": "httpupgrade", "security": "tls",
                             "httpupgradeSettings": {"path": "/hu"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -496,7 +509,7 @@ def build_cases(C):
                                  "users": [{"id": UUID_STR,
                                             "encryption": "none"}]}]},
          "streamSettings": {"network": "http", "security": "tls",
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -576,7 +589,7 @@ def build_cases(C):
          "settings": {"servers": [{"address": "127.0.0.1", "port": SERVER_PORT,
                                    "password": "p"}]},
          "streamSettings": {"security": "tls",
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         {"type": "trojan", "password": "p", "sni": "localhost",
          "skip-cert-verify": True})
@@ -592,7 +605,7 @@ def build_cases(C):
                                    "password": "p"}]},
          "streamSettings": {"network": "ws", "security": "tls",
                             "wsSettings": {"path": "/ws"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 
@@ -607,7 +620,7 @@ def build_cases(C):
                                    "password": "p"}]},
          "streamSettings": {"network": "grpc", "security": "tls",
                             "grpcSettings": {"serviceName": "grpc"},
-                            "tlsSettings": {"serverName": "localhost",
+                            "tlsSettings": {"serverName": "localhost", "pinnedPeerCertificateChainSha256": [PIN],
                                             "allowInsecure": True}}},
         None)
 

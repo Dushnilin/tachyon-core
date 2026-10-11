@@ -44,6 +44,9 @@ jobs:
       - run: cargo test --workspace
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
+      - name: Brutal controlled QUIC transfer
+        if: runner.os == 'Linux'
+        run: cargo test -p core-runtime --lib brutal_wire -- --ignored --nocapture
       # The exit gate needs CAP_NET_ADMIN (tproxy); re-run it as root so CI
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)

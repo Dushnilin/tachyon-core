@@ -1335,7 +1335,7 @@ mod tests {
     /// Only SO_MARK needs privileges; do not skip the other socket options.
     #[cfg(target_os = "linux")]
     fn test_routing_mark(mark: u32) -> Option<u32> {
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: SocketAddr = "198.51.100.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
         let result = DialOptions {
             routing_mark: Some(mark),
@@ -1390,7 +1390,7 @@ mod tests {
             tcp_keep_alive_interval: Some(Duration::from_secs(11)),
             ..Default::default()
         };
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: SocketAddr = "198.51.100.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
         options.apply(fd, &addr, false).expect("apply");
         if let Some(mark) = options.routing_mark {
@@ -1399,6 +1399,17 @@ mod tests {
                 mark as libc::c_int
             );
         }
+        let local: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let local_fd = new_socket(&local, false).expect("loopback socket");
+        DialOptions {
+            routing_mark: Some(0x1234),
+            bind_interface: Some("nonexistent-test-interface".into()),
+            ..Default::default()
+        }
+        .apply(local_fd, &local, false)
+        .expect("loopback ignores mark/interface");
+        assert_eq!(get_int(local_fd, libc::SOL_SOCKET, libc::SO_MARK), 0);
+        unsafe { libc::close(local_fd) };
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR), 1);
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 42);

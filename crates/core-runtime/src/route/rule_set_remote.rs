@@ -826,10 +826,7 @@ mod tests {
         );
 
         // soft start (enabled by default): engine stays up, set starts empty
-        registry
-            .start_all(&router, None)
-            .await
-            .expect("soft start");
+        registry.start_all(&router, None).await.expect("soft start");
         assert_eq!(registry.sets[0].lock().await.set.rule_count(), 0);
 
         // and the background ladder fills it without help

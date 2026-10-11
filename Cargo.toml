@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/quinn-proto"]
 members = [
     "crates/core-cli",
     "crates/core-config",
@@ -17,6 +18,7 @@ members = [
 # (2.63 vs 2.74 Gbit/s). Vendored: upstream h2 has no knob for this ratio.
 [patch.crates-io]
 h2 = { path = "vendor/h2" }
+quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.package]
 version = "0.0.7"

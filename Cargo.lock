@@ -458,6 +458,7 @@ dependencies = [
  "ml-kem",
  "portable-atomic",
  "quinn",
+ "quinn-proto",
  "rand_core 0.6.4",
  "regex",
  "ripemd",
@@ -473,6 +474,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "x25519-dalek",
 ]
 
@@ -1736,8 +1738,6 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",

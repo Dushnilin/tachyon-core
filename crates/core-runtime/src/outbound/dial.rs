@@ -1390,7 +1390,7 @@ mod tests {
             tcp_keep_alive_interval: Some(Duration::from_secs(11)),
             ..Default::default()
         };
-        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let addr: SocketAddr = "192.0.2.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
         options.apply(fd, &addr, false).expect("apply");
         if let Some(mark) = options.routing_mark {

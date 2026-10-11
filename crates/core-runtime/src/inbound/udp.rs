@@ -592,7 +592,11 @@ impl UdpHub {
                     &ctx.destination
                 };
                 let timeout = ctx.udp_timeout.unwrap_or(self.timeout);
-                let sock = self.router.connect_udp_index(idx, target).await?;
+                // Outbound bridges read the per-flow idle policy before spawning
+                // their pumps, including route-options overrides.
+                let sock = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
+                    .scope(timeout, self.router.connect_udp_index(idx, target))
+                    .await?;
                 let sock = Arc::new(sock);
                 let task = spawn_reverse(
                     Arc::clone(&sock),

@@ -103,7 +103,7 @@ impl Gcm {
     /// Decrypt `buf` in place. On a bad tag nothing of the plaintext is left
     /// in `buf` and the answer is `false`.
     pub fn open(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
-        match self {
+        let authenticated = match self {
             #[cfg(target_arch = "x86_64")]
             Gcm::Ni(ni) => ni.open(nonce, aad, buf, tag),
             #[cfg(target_arch = "aarch64")]
@@ -116,7 +116,13 @@ impl Gcm {
                 .is_ok(),
             #[cfg(all(target_os = "linux", feature = "std"))]
             Gcm::Alg(a) => a.open(nonce, aad, buf, tag),
+        };
+        // RustCrypto authenticates before decryption and leaves ciphertext on
+        // failure. Keep the same buffer-clearing contract for every backend.
+        if !authenticated {
+            buf.fill(0);
         }
+        authenticated
     }
 }
 
@@ -1132,6 +1138,37 @@ mod tests {
                 assert!(!gcm.open(&nonce, b"other", &mut copy, &tag));
                 assert!(gcm.open(&nonce, b"aad", &mut buf, &tag));
                 assert_eq!(buf, pt);
+            }
+        }
+    }
+
+    #[test]
+    fn software_fallback_wipes_on_authentication_failure() {
+        for gcm in [
+            Gcm::Soft128(Box::new(Aes128Gcm::new((&[7u8; 16]).into()))),
+            Gcm::Soft256(Box::new(Aes256Gcm::new((&[7u8; 32]).into()))),
+        ] {
+            let nonce = [3u8; 12];
+            for len in [0usize, 1, 16, 129, 1000] {
+                let plaintext = vec![0x5a; len];
+                let mut ciphertext = plaintext.clone();
+                let tag = gcm.seal(&nonce, b"aad", &mut ciphertext);
+                let mut bad_tag = tag;
+                bad_tag[5] ^= 1;
+                let mut copy = ciphertext.clone();
+                assert!(!gcm.open(&nonce, b"aad", &mut copy, &bad_tag));
+                assert!(copy.iter().all(|b| *b == 0));
+                let mut copy = ciphertext.clone();
+                assert!(!gcm.open(&nonce, b"other", &mut copy, &tag));
+                assert!(copy.iter().all(|b| *b == 0));
+                if len > 0 {
+                    let mut copy = ciphertext.clone();
+                    copy[len / 2] ^= 0x40;
+                    assert!(!gcm.open(&nonce, b"aad", &mut copy, &tag));
+                    assert!(copy.iter().all(|b| *b == 0));
+                }
+                assert!(gcm.open(&nonce, b"aad", &mut ciphertext, &tag));
+                assert_eq!(ciphertext, plaintext);
             }
         }
     }

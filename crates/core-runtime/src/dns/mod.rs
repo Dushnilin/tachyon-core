@@ -1083,6 +1083,19 @@ impl DnsService {
         host: &str,
         depth: u8,
     ) -> std::io::Result<Vec<IpAddr>> {
+        if resolver.kind == Kind::Hosts {
+            if let Some(sources) = resolver.hosts.as_ref() {
+                return Ok(sources.lookup(host));
+            }
+            return Ok(Vec::new());
+        }
+        if matches!(resolver.kind, Kind::Local | Kind::Dhcp | Kind::Resolved) {
+            let addrs = match self.neighbor_lookup(resolver, host) {
+                Some(addresses) => addresses,
+                None => system_lookup(host).await,
+            };
+            return Ok(addrs);
+        }
         let mut out = Vec::new();
         let mut last_err = None;
         for qtype in self.strategy.query_types() {

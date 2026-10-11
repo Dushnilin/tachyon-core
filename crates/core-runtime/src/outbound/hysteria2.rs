@@ -42,6 +42,7 @@ pub struct Hysteria2 {
     hop_interval_max: Option<Duration>,
     password: String,
     receive_bps: u64,
+    send_bps: u64,
     want_tcp: bool,
     want_udp: bool,
     obfs_password: Option<Vec<u8>>,
@@ -167,9 +168,12 @@ impl Hysteria2 {
 
         let down_mbps = obj.get("down_mbps").and_then(Value::as_u64).unwrap_or(0);
         let receive_bps = down_mbps.saturating_mul(MBPS_TO_BPS);
-        if obj.get("up_mbps").and_then(Value::as_u64).unwrap_or(0) > 0 {
-            logging::warn(format_args!(
-                "{at}: hysteria brutal congestion control is not implemented; using BBR"
+        let up_mbps = obj.get("up_mbps").and_then(Value::as_u64).unwrap_or(0);
+        let send_bps = up_mbps.saturating_mul(MBPS_TO_BPS);
+        let brutal_debug = obj.get("brutal_debug").and_then(Value::as_bool) == Some(true);
+        if send_bps > 0 && brutal_debug {
+            logging::info(format_args!(
+                "{at}: using hysteria brutal congestion control ({up_mbps} Mbps)"
             ));
         }
         if let Some(p) = obj.get("bbr_profile").and_then(Value::as_str)
@@ -178,11 +182,6 @@ impl Hysteria2 {
         {
             logging::warn(format_args!(
                 "{at}: bbr_profile {p:?} not implemented; using standard"
-            ));
-        }
-        if obj.get("brutal_debug").and_then(Value::as_bool) == Some(true) {
-            logging::warn(format_args!(
-                "{at}: brutal_debug is not implemented (ignored)"
             ));
         }
 
@@ -203,6 +202,7 @@ impl Hysteria2 {
             hop_interval_max,
             password,
             receive_bps,
+            send_bps,
             want_tcp: network_includes_tcp(obj),
             want_udp: network_includes_udp(obj),
             obfs_password,
@@ -275,9 +275,14 @@ impl Hysteria2 {
         } else {
             bind_udp(addr)?
         };
+        let congestion = if self.send_bps > 0 {
+            CongestionKind::Brutal(self.send_bps)
+        } else {
+            CongestionKind::Bbr
+        };
         let (ep_config, transport) =
             self.quic
-                .build_configs(CongestionKind::Bbr, None, self.want_udp);
+                .build_configs(congestion, None, self.want_udp);
         let mut endpoint = quinn::Endpoint::new(
             ep_config,
             None,

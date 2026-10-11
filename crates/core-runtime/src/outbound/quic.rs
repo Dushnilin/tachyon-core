@@ -65,6 +65,95 @@ pub(crate) enum CongestionKind {
     Bbr,
     Cubic,
     NewReno,
+    Brutal(u64), // bps
+}
+
+/// Hysteria Brutal Congestion Controller.
+/// Paces transmission at a fixed bandwidth rate (bps) and sets the congestion window
+/// proportional to (bandwidth * RTT * 1.5), without backing off on packet loss.
+#[derive(Debug, Clone)]
+pub struct Brutal {
+    config: Arc<BrutalConfig>,
+    current_mtu: u64,
+    window: u64,
+    bps: u64,
+}
+
+#[derive(Debug)]
+pub struct BrutalConfig {
+    pub bps: u64,
+    pub initial_window: u64,
+}
+
+impl BrutalConfig {
+    pub fn new(bps: u64) -> Self {
+        let b_bytes_per_sec = bps / 8;
+        let initial_50ms = (b_bytes_per_sec / 20).max(10 * 1200);
+        Self {
+            bps,
+            initial_window: initial_50ms,
+        }
+    }
+}
+
+impl quinn::congestion::ControllerFactory for BrutalConfig {
+    fn build(
+        self: Arc<Self>,
+        _now: std::time::Instant,
+        current_mtu: u16,
+    ) -> Box<dyn quinn::congestion::Controller> {
+        let mtu = (current_mtu as u64).max(1200);
+        let init_win = self.initial_window.max(10 * mtu);
+        Box::new(Brutal {
+            config: Arc::clone(&self),
+            current_mtu: mtu,
+            window: init_win,
+            bps: self.bps,
+        })
+    }
+}
+
+impl quinn::congestion::Controller for Brutal {
+    fn on_congestion_event(
+        &mut self,
+        _now: std::time::Instant,
+        _sent: std::time::Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        // Brutal ignores loss! No congestion backoff or window reduction.
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = (new_mtu as u64).max(1200);
+        let min_win = 10 * self.current_mtu;
+        if self.window < min_win {
+            self.window = min_win;
+        }
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
+        let mut m = quinn::congestion::ControllerMetrics::default();
+        m.congestion_window = self.window;
+        m.pacing_rate = Some(self.bps);
+        m
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
 }
 
 /// Parsed `QUICOutFields` with per-protocol defaults applied at build time.
@@ -202,6 +291,7 @@ impl QuicTunnelOptions {
             CongestionKind::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
             CongestionKind::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
             CongestionKind::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+            CongestionKind::Brutal(bps) => Arc::new(BrutalConfig::new(bps)),
         });
         (endpoint, transport)
     }

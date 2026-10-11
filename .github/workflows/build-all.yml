@@ -26,7 +26,7 @@ jobs:
           - name: x86_64-musl
             target: x86_64-unknown-linux-musl
             arch: "x86_64"
-            desc: "x86-64-v3 routers, mini-PCs, Proxmox"
+            desc: "x86_64 routers, mini-PCs, Proxmox"
             use_musl_lld: true
             budget: 14680064
           - name: aarch64-musl

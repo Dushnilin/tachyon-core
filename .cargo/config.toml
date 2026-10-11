@@ -86,13 +86,14 @@ rustflags = [
 # symlinks on a Linux one; rust-lld with the self-contained CRT is the only
 # combination that links everywhere.
 #
-# x86-64-v3 (AVX2 era) so the autovectorized bulk loops get the wide units;
-# the crypto crates stay on runtime detection either way. A CPU older than
-# Haswell / Excavator (pre-2013, some atoms) will SIGILL on these binaries --
-# build a plain x86-64 one for those.
+# Baseline x86-64 (v1) so the binary runs universally on all OpenWrt routers
+# (including Intel Celeron/Atom J1900, J4125, N5105) and default VM profiles
+# (Proxmox kvm64). The RustCrypto crates (AES-NI, ChaCha20, Poly1305) use
+# runtime CPUID dispatch on x86, so hardware acceleration is used whenever
+# the host CPU supports it.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "target-cpu=x86-64-v3", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "target-cpu=x86-64", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
 
 # ARMv7-A: the baseline is already v7a + vfp3-d16, which is everything a
 # Cortex-A7/A8/A9/A15 has that the compiler will let us name. NEON is optional

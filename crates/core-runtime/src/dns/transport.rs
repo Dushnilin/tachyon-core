@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::inbound::AnyStream;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -244,6 +244,7 @@ pub struct FakeIpStore {
     v4: Option<IpPrefix>,
     v6: Option<IpPrefix>,
     state: Mutex<FakeIpState>,
+    cache: RwLock<Option<crate::cache_file::SharedCacheFile>>,
 }
 
 /// Fake-ip maps are keyed by things that never stop arriving (names) or get
@@ -284,6 +285,7 @@ impl FakeIpStore {
         Self {
             v4: v4.filter(IpPrefix::is_v4),
             v6: v6.filter(|p| !p.is_v4()),
+            cache: RwLock::new(None),
             state: Mutex::new(FakeIpState {
                 cur4,
                 cur6,
@@ -300,6 +302,133 @@ impl FakeIpStore {
 
     pub fn prefixes(&self) -> (Option<IpPrefix>, Option<IpPrefix>) {
         (self.v4, self.v6)
+    }
+
+    /// The domain/address buckets use the reference Go cache representation.
+    /// Metadata is four big-endian length-prefixed netip binary fields.
+    pub fn attach_cache(&self, cache: Option<crate::cache_file::SharedCacheFile>) {
+        let cache = cache.filter(|cache| cache.lock().expect("cache").options().store_fakeip);
+        if let Some(cache) = &cache {
+            let mut cache = cache.lock().expect("cache");
+            let mut state = self.state.lock().expect("fakeip state");
+            for (bucket, v6) in [("fakeip_domain4", false), ("fakeip_domain6", true)] {
+                for domain in cache.keys(bucket) {
+                    if let Some(ip) = cache
+                        .get(bucket, domain.as_bytes())
+                        .and_then(|raw| cached_ip(&raw))
+                        && self.contains(ip)
+                    {
+                        match ip {
+                            IpAddr::V4(ip) if !v6 => {
+                                state.cur4 = Some(state.cur4.map_or(ip, |cur| cur.max(ip)))
+                            }
+                            IpAddr::V6(ip) if v6 => {
+                                state.cur6 = Some(state.cur6.map_or(ip, |cur| cur.max(ip)))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if let Some(raw) = cache.get("fakeip_address", b"fakeip_metadata")
+                && let Some((cur4, cur6)) = self.decode_metadata(&raw)
+            {
+                state.cur4 = cur4;
+                state.cur6 = cur6;
+            }
+            cache.put(
+                "fakeip_address",
+                b"fakeip_metadata",
+                self.encode_metadata(&state),
+            );
+        }
+        *self.cache.write().expect("fakeip cache") = cache;
+    }
+
+    fn persist(&self, state: &FakeIpState, ip: IpAddr, domain: &str) {
+        let cache = self.cache.read().expect("fakeip cache").clone();
+        let Some(cache) = cache else { return };
+        let mut cache = cache.lock().expect("cache");
+        let address = ip_bytes(ip);
+        let bucket = if ip.is_ipv4() {
+            "fakeip_domain4"
+        } else {
+            "fakeip_domain6"
+        };
+        let mut changes = Vec::new();
+        if let Some(previous) = cache.get("fakeip_address", &address) {
+            changes.push((bucket, previous, None));
+        }
+        changes.push((
+            "fakeip_address",
+            address.clone(),
+            Some(domain.as_bytes().to_vec()),
+        ));
+        changes.push((bucket, domain.as_bytes().to_vec(), Some(address)));
+        changes.push((
+            "fakeip_address",
+            b"fakeip_metadata".to_vec(),
+            Some(self.encode_metadata(state)),
+        ));
+        cache.apply_changes(changes);
+    }
+
+    fn prefix_bytes(prefix: Option<IpPrefix>) -> Vec<u8> {
+        match prefix {
+            Some(prefix) => {
+                let mut bytes = ip_bytes(prefix.addr);
+                bytes.push(prefix.bits);
+                bytes
+            }
+            None => vec![255],
+        }
+    }
+
+    fn encode_metadata(&self, state: &FakeIpState) -> Vec<u8> {
+        let fields = [
+            Self::prefix_bytes(self.v4),
+            Self::prefix_bytes(self.v6),
+            state
+                .cur4
+                .map(|ip| ip.octets().to_vec())
+                .unwrap_or_default(),
+            state
+                .cur6
+                .map(|ip| ip.octets().to_vec())
+                .unwrap_or_default(),
+        ];
+        let mut output = Vec::new();
+        for field in fields {
+            output.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            output.extend_from_slice(&field);
+        }
+        output
+    }
+
+    fn decode_metadata(&self, mut raw: &[u8]) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
+        let mut fields = Vec::new();
+        for _ in 0..4 {
+            let len = u16::from_be_bytes(raw.get(..2)?.try_into().ok()?) as usize;
+            fields.push(raw.get(2..2 + len)?);
+            raw = raw.get(2 + len..)?;
+        }
+        if !raw.is_empty()
+            || fields[0] != Self::prefix_bytes(self.v4)
+            || fields[1] != Self::prefix_bytes(self.v6)
+        {
+            return None;
+        }
+        let cur4 = match cached_ip(fields[2]) {
+            Some(IpAddr::V4(ip)) if self.contains(IpAddr::V4(ip)) => Some(ip),
+            None if fields[2].is_empty() && self.v4.is_none() => None,
+            _ => return None,
+        };
+        let cur6 = match cached_ip(fields[3]) {
+            Some(IpAddr::V6(ip)) if self.contains(IpAddr::V6(ip)) => Some(ip),
+            None if fields[3].is_empty() && self.v6.is_none() => None,
+            _ => return None,
+        };
+        Some((cur4, cur6))
     }
 
     /// Migrate active FakeIP state from an earlier pool if the prefixes match.
@@ -333,24 +462,55 @@ impl FakeIpStore {
     }
 
     pub fn lookup_domain(&self, ip: IpAddr) -> Option<String> {
-        self.state
+        let memory = self
+            .state
             .lock()
             .expect("fakeip state")
             .addr_to_domain
             .get(&ip)
-            .cloned()
+            .cloned();
+        memory.or_else(|| {
+            if !self.contains(ip) {
+                return None;
+            }
+            let cache = self.cache.read().expect("fakeip cache").clone()?;
+            let value = cache
+                .lock()
+                .expect("cache")
+                .get("fakeip_address", &ip_bytes(ip))?;
+            String::from_utf8(value)
+                .ok()
+                .filter(|domain| !domain.is_empty())
+        })
     }
 
     pub fn lookup_address(&self, domain: &str, v6: bool) -> Option<IpAddr> {
         let mut state = self.state.lock().expect("fakeip state");
-        if v6 {
+        let memory = if v6 {
             state.domain_to_v6.get(domain).map(|a| IpAddr::V6(*a))
         } else {
             state.domain_to_v4.get(domain).map(|a| IpAddr::V4(*a))
-        }
+        };
+        drop(state);
+        memory.or_else(|| {
+            let cache = self.cache.read().expect("fakeip cache").clone()?;
+            let bucket = if v6 {
+                "fakeip_domain6"
+            } else {
+                "fakeip_domain4"
+            };
+            let value = cache
+                .lock()
+                .expect("cache")
+                .get(bucket, domain.as_bytes())?;
+            cached_ip(&value).filter(|ip| ip.is_ipv6() == v6 && self.contains(*ip))
+        })
     }
 
     pub fn create(&self, domain: &str, v6: bool) -> io::Result<IpAddr> {
+        if let Some(ip) = self.lookup_address(domain, v6) {
+            return Ok(ip);
+        }
         let mut state = self.state.lock().expect("fakeip state");
         if v6 {
             if let Some(existing) = state.domain_to_v6.get(domain) {
@@ -364,10 +524,7 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet6 range"))?;
             let next = next_v6(cur, prefix);
             state.cur6 = Some(next);
-            state.domain_to_v6.put(domain.to_string(), next);
-            if state.domain_to_v6.len() > FAKEIP_MAP_CAPACITY
-                && let Some((_evicted, addr)) = state.domain_to_v6.pop_lru()
-            {
+            if let Some((_evicted, addr)) = state.domain_to_v6.push(domain.to_string(), next) {
                 state.addr_to_domain.remove(&IpAddr::V6(addr));
             }
             if let Some(previous) = state
@@ -378,6 +535,7 @@ impl FakeIpStore {
                 // claims; drop that claim or forward and reverse disagree
                 let _ = state.domain_to_v6.pop(&previous);
             }
+            self.persist(&state, IpAddr::V6(next), domain);
             Ok(IpAddr::V6(next))
         } else {
             if let Some(existing) = state.domain_to_v4.get(domain) {
@@ -391,10 +549,7 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet4 range"))?;
             let next = next_v4(cur, prefix);
             state.cur4 = Some(next);
-            state.domain_to_v4.put(domain.to_string(), next);
-            if state.domain_to_v4.len() > FAKEIP_MAP_CAPACITY
-                && let Some((_evicted, addr)) = state.domain_to_v4.pop_lru()
-            {
+            if let Some((_evicted, addr)) = state.domain_to_v4.push(domain.to_string(), next) {
                 state.addr_to_domain.remove(&IpAddr::V4(addr));
             }
             if let Some(previous) = state
@@ -405,8 +560,24 @@ impl FakeIpStore {
                 // claims; drop that claim or forward and reverse disagree
                 let _ = state.domain_to_v4.pop(&previous);
             }
+            self.persist(&state, IpAddr::V4(next), domain);
             Ok(IpAddr::V4(next))
         }
+    }
+}
+
+fn ip_bytes(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+fn cached_ip(raw: &[u8]) -> Option<IpAddr> {
+    match raw.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(raw).ok()?))),
+        16 => Some(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(raw).ok()?))),
+        _ => None,
     }
 }
 

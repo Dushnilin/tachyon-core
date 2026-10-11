@@ -147,6 +147,7 @@ fn branch_elems(page: &[u8]) -> io::Result<Vec<Elem>> {
 
 /// A bucket's key/value pairs, in key order.
 pub type BucketEntries = Vec<(String, Vec<u8>)>;
+pub type RawBucketEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub struct Db {
     data: Vec<u8>,
@@ -235,6 +236,16 @@ impl Db {
 
     /// Every key/value of a bucket (depth first, in key order).
     pub fn bucket_page(&self, path: &[&str]) -> io::Result<Option<BucketEntries>> {
+        Ok(self.bucket_page_raw(path)?.map(|entries| {
+            entries
+                .into_iter()
+                .map(|(key, value)| (String::from_utf8_lossy(&key).to_string(), value))
+                .collect()
+        }))
+    }
+
+    /// Preserve binary keys such as sing-box's packed FakeIP addresses.
+    pub fn bucket_page_raw(&self, path: &[&str]) -> io::Result<Option<RawBucketEntries>> {
         let mut page = self.load_page(self.meta.root)?;
         for segment in path {
             let entry = self
@@ -257,12 +268,12 @@ impl Db {
         Ok(())
     }
 
-    fn collect_pairs(&self, page: &[u8], out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
+    fn collect_pairs(&self, page: &[u8], out: &mut RawBucketEntries) -> io::Result<()> {
         for elem in self.all_elems(page)? {
             if elem.flags & BUCKET_LEAF_FLAG != 0 {
                 continue;
             }
-            out.push((String::from_utf8_lossy(&elem.key).to_string(), elem.value));
+            out.push((elem.key, elem.value));
         }
         Ok(())
     }
@@ -376,6 +387,7 @@ fn find_in_bytes(page: &[u8], key: &[u8]) -> io::Result<Option<Elem>> {
 #[derive(Clone)]
 pub enum EntrySpec {
     Kv(String, Vec<u8>),
+    RawKv(Vec<u8>, Vec<u8>),
     Bucket {
         name: String,
         seq: u64,
@@ -389,10 +401,11 @@ pub struct NodeSpec {
 }
 
 impl EntrySpec {
-    fn key(&self) -> &str {
+    fn key(&self) -> &[u8] {
         match self {
-            EntrySpec::Kv(k, _) => k,
-            EntrySpec::Bucket { name, .. } => name,
+            EntrySpec::Kv(k, _) => k.as_bytes(),
+            EntrySpec::RawKv(k, _) => k,
+            EntrySpec::Bucket { name, .. } => name.as_bytes(),
         }
     }
 }
@@ -403,6 +416,7 @@ fn sorted_tree(node: &NodeSpec) -> NodeSpec {
         .iter()
         .map(|e| match e {
             EntrySpec::Kv(k, v) => EntrySpec::Kv(k.clone(), v.clone()),
+            EntrySpec::RawKv(k, v) => EntrySpec::RawKv(k.clone(), v.clone()),
             EntrySpec::Bucket { name, seq, node } => EntrySpec::Bucket {
                 name: name.clone(),
                 seq: *seq,
@@ -410,7 +424,7 @@ fn sorted_tree(node: &NodeSpec) -> NodeSpec {
             },
         })
         .collect();
-    entries.sort_by_key(|e| e.key().as_bytes().to_vec());
+    entries.sort_by_key(|e| e.key().to_vec());
     NodeSpec { entries }
 }
 
@@ -458,6 +472,11 @@ impl Writer {
             match entry {
                 EntrySpec::Kv(key, value) => inodes.push(Inode {
                     key: key.as_bytes().to_vec(),
+                    flags: 0,
+                    value: value.clone(),
+                }),
+                EntrySpec::RawKv(key, value) => inodes.push(Inode {
+                    key: key.clone(),
                     flags: 0,
                     value: value.clone(),
                 }),

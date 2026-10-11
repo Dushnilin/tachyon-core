@@ -346,6 +346,18 @@ impl DnsService {
             .find_map(|s| s.store.as_ref().and_then(|f| f.lookup_domain(ip)))
     }
 
+    pub fn is_fakeip(&self, ip: IpAddr) -> bool {
+        self.servers
+            .values()
+            .any(|s| s.store.as_ref().is_some_and(|store| store.contains(ip)))
+    }
+
+    pub fn attach_cache(&self, cache: Option<crate::cache_file::SharedCacheFile>) {
+        for store in self.fakeip_stores() {
+            store.attach_cache(cache.clone());
+        }
+    }
+
     /// `dns.reverse_mapping` on: every A/AAAA answer becomes `ip → domain`
     /// for its TTL, so a connection that dials that IP can still match
     /// domain rules. FakeIP answers are skipped — they have their own map.

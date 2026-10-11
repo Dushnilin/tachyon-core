@@ -427,17 +427,20 @@ pub fn clash_meta(
     router: &Router,
     outbound_index: usize,
 ) -> clash_state::ConnMeta {
-    let host = match &ctx.destination {
-        Target::Ip(addr) => addr.ip().to_string(),
-        Target::Domain(host, _) => host.clone(),
+    // reference `TrackerMetadata`: the sniffed domain wins over the
+    // destination's own name, an IP destination has no host at all
+    let host = match (&ctx.domain, &ctx.destination) {
+        (Some(domain), _) if !domain.is_empty() => domain.clone(),
+        (_, Target::Domain(host, _)) => host.clone(),
+        _ => String::new(),
     };
     let mut chains = Vec::new();
     let mut index = Some(outbound_index);
+    let inner = router.inner();
     // expand selector groups into their selected member (one level, like the
     // reference chain display for group proxies)
     for _ in 0..8 {
         let Some(current) = index else { break };
-        let inner = router.inner();
         let Some((_, tag, outbound)) = inner.outbound_table().find(|(i, _, _)| *i == current)
         else {
             break;
@@ -449,19 +452,34 @@ pub fn clash_meta(
             _ => None,
         };
     }
-    let (rule, rule_payload) = ctx
-        .matched_rule
-        .clone()
-        .unwrap_or_else(|| ("".to_string(), String::new()));
+    let tag = ctx.inbound.clone().unwrap_or_default();
+    let inbound = match inner.inbound_type(&tag) {
+        Some(ty) if tag.is_empty() => ty.to_string(),
+        Some(ty) => format!("{ty}/{tag}"),
+        None => tag,
+    };
     clash_state::ConnMeta {
         network: ctx.network,
-        inbound: ctx.inbound.clone().unwrap_or_default(),
+        inbound,
         source: ctx.source.to_string(),
         host,
         destination: ctx.destination.to_string(),
         chains,
-        rule,
-        rule_payload,
+        rule: ctx.matched_rule.clone().unwrap_or_else(|| "final".into()),
+        rule_payload: String::new(),
+        process_path: ctx.process.as_ref().map(process_label).unwrap_or_default(),
+    }
+}
+
+/// Reference `processPath`: the path with its owner in brackets, or just the
+/// uid when the path is unknown.
+fn process_label(info: &crate::route::process::ProcessInfo) -> String {
+    match (info.path.as_str(), &info.user_name, info.user_id) {
+        ("", _, Some(uid)) => uid.to_string(),
+        ("", _, None) => String::new(),
+        (path, Some(name), _) if !name.is_empty() => format!("{path} ({name})"),
+        (path, _, Some(uid)) => format!("{path} ({uid})"),
+        (path, _, None) => path.to_string(),
     }
 }
 

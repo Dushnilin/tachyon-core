@@ -87,8 +87,9 @@ pub struct ConnContext {
     pub sniff_timeout: Option<Duration>,
     pub ip_version: Option<u8>,
     pub route_original_destination: Option<Target>,
-    /// Clash connection view: the rule that produced the decision.
-    pub matched_rule: Option<(String, String)>,
+    /// Clash connection view: `<rule> => <action>` of the rule that produced
+    /// the decision.
+    pub matched_rule: Option<String>,
     /// `route.find_neighbor`: the client's hardware address, when the
     /// neighbour tables know it.
     pub source_mac: Option<neighbor::MacAddr>,
@@ -701,6 +702,8 @@ pub struct RouterInner {
     /// Clash `DelayHistory` slots, one per outbound: reference keeps a
     /// single record per proxy, replaced by every successful probe.
     pub(crate) delay_history: Vec<std::sync::Mutex<Option<(String, u32)>>>,
+    /// Inbound tag -> type, for the `type/tag` of a Clash connection.
+    pub(crate) inbound_types: HashMap<String, String>,
 }
 
 pub struct Router {
@@ -925,6 +928,17 @@ impl RouterInner {
         let delay_history = (0..outbounds.len())
             .map(|_| std::sync::Mutex::new(None))
             .collect();
+        let inbound_types = root
+            .get("inbounds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|inbound| {
+                let tag = inbound.get("tag").and_then(Value::as_str)?;
+                let ty = inbound.get("type").and_then(Value::as_str)?;
+                Some((tag.to_string(), ty.to_string()))
+            })
+            .collect();
         Ok(RouterInner {
             outbounds,
             tags,
@@ -935,7 +949,13 @@ impl RouterInner {
             find_process,
             probe_tasks: std::sync::Mutex::new(Vec::new()),
             delay_history,
+            inbound_types,
         })
+    }
+
+    /// The configured type of the inbound tagged `tag`.
+    pub fn inbound_type(&self, tag: &str) -> Option<&str> {
+        self.inbound_types.get(tag).map(String::as_str)
     }
 
     /// Start listening endpoints (e.g. WireGuard server listeners).

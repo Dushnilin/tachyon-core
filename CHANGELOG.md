@@ -3,6 +3,28 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.7
+
+Point release delivering native Brutal congestion control for Hysteria2, resilient non-fatal action: resolve with real IP destination rewriting for ByeDPI/Zapret, pure-Rust Tailscale mesh outbound, UDP L7 protocol sniffing, and OpenWrt runtime hardening.
+
+### Fixes & Improvements
+
+- **Hysteria2 Brutal Congestion Control**:
+  - Implemented native Brutal congestion controller factory and pacing engine in Quinn, pacing packet transmission at the configured `up_mbps` rate without halving or backing off the congestion window upon packet loss.
+  - Neutralizes ISP packet throttling and artificial packet drop injected by TSPU filters on Hysteria2 tunnels.
+- **Routing Engine & ByeDPI / Zapret Interop**:
+  - Made DNS failures in `action: resolve` non-fatal: routing evaluation proceeds to fallback and section outbounds rather than aborting client TCP sessions at the router stage.
+  - Replaced target destination with resolved IP while preserving the original hostname in `ctx.domain`, ensuring SOCKS outbounds (such as ByeDPI `ciadpi`) receive clean IP targets (`ATYP 0x01`/`0x04`) and permanently eliminating FakeIP loopback loops on OpenWrt routers.
+  - Added support for `hosts` and `local`/`neighbor` server types in `lookup_via`.
+- **Pure-Rust Tailscale Outbound**:
+  - Completed end-to-end user-space Tailscale mesh client support with STUN, coordinator authentication, netmap syncing, and direct P2P UDP packet transmission without C-crypto dependencies.
+- **Protocol Sniffing & Framing Hardening**:
+  - Added UDP L7 packet sniffing for QUIC (v1/v2 Initial and fragmented ClientHello), DNS, STUN, and BitTorrent.
+  - Handled empty TLS record frames gracefully without terminating the connection processor.
+  - Cleared intermediate plaintext buffers on authentication tag mismatch in software AES-GCM.
+  - Fixed composite duration parsing (e.g. `1m30s`, `300ms`) and supported `udp_timeout` and `ip_version` routing rule options.
+  - Aligned Clash API `/rules` and `/connections` outputs with the sing-box reference schema.
+
 ## 0.0.6
 
 Point release delivering zero-downtime atomic in-place configuration reload via SIGHUP, DNS query loop prevention with UDP retransmission, process-stable randomized TLS fingerprints, and Trojan server address type framing fixes.

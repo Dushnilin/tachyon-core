@@ -27,9 +27,19 @@ import tempfile
 import threading
 import time
 
+try:
+    import fcntl
+except ImportError:  # non-Linux; steer needs a tun device anyway
+    fcntl = None
+
 SINK_PORT = 45001
 PROXY_PORT = 45002
 SERVER_PORT = 21200
+# steer's module answers over the TUN with a non-loopback source; a 127.0.0.1
+# destination makes the kernel drop the SYN-ACK as a martian, so steer steers to
+# a real lo address (198.18.0.1) instead. Other engines keep 127.0.0.1.
+STEER_SINK = "198.18.0.1"
+_socks_dest = "127.0.0.1"
 CHUNK = 1 << 20  # 1 MiB
 UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 SNELL_PSK = "bench-snell-psk-012345"
@@ -65,8 +75,16 @@ def run_sink(cpus):
 
     async def main():
         srv = await asyncio.start_server(handle, "127.0.0.1", SINK_PORT, backlog=4096)
+        try:
+            srv6 = await asyncio.start_server(handle, "::", SINK_PORT, backlog=4096)
+        except OSError:
+            srv6 = None
         async with srv:
-            await srv.serve_forever()
+            if srv6:
+                async with srv6:
+                    await asyncio.gather(srv.serve_forever(), srv6.serve_forever())
+            else:
+                await srv.serve_forever()
 
     asyncio.run(main())
 
@@ -81,7 +99,7 @@ def socks_connect(timeout=10, retries=8):
             s.sendall(b"\x05\x01\x00")
             auth = recvn(s, 2)
             assert auth == b"\x05\x00", f"socks auth failed: {auth!r}"
-            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack(">H", SINK_PORT))
+            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(_socks_dest) + struct.pack(">H", SINK_PORT))
             reply = recvn(s, 10)
             assert reply[1] == 0, f"socks connect refused: {reply!r}"
             return s
@@ -109,6 +127,8 @@ def ensure_steer_env(bin_path):
         if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
             subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # iproute2 provides `ip`, used by steer_net_setup to address the tunnel iface
+        subprocess.run(["apt-get", "install", "-y", "-qq", "iproute2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         os.makedirs("/usr/sbin", exist_ok=True)
         os.makedirs("/usr/lib", exist_ok=True)
@@ -161,6 +181,91 @@ def ensure_steer_env(bin_path):
         print(f"Warning: ensure_steer_env error: {e}", file=sys.stderr)
 
 
+def container_ip():
+    """The container's eth0 IPv4 — reachable by steer's module, unlike 127.0.0.1."""
+    try:
+        out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "eth0"], text=True)
+        return out.split()[3].split("/")[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return None
+
+
+_steered_net = False
+
+
+def steer_available():
+    """steer's data plane is a TUN module; without /dev/net/tun it cannot run."""
+    return os.path.exists("/dev/net/tun")
+
+
+def _set_addr(iface, ip, prefix="24"):
+    """Assign an address, preferring `ip` and falling back to `ifconfig`."""
+    try:
+        r = subprocess.run(["ip", "addr", "add", f"{ip}/{prefix}", "dev", iface],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+    except (FileNotFoundError, OSError):
+        pass
+    try:
+        r = subprocess.run(["ifconfig", iface, f"{ip}", "netmask",
+                            ".".join(["255"] * (4 - prefix // 24) + ["0"] * (prefix // 24))],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def steer_net_setup():
+    """One-time netns prep so steer's TUN handshake survives.
+
+    accept_local=1 lets the module's SYN-ACK (src=the sink addr) back in through
+    sbx0 instead of being dropped as a martian; needs --privileged. And we add the
+    sink addr (198.18.0.1) to lo so it is a real, non-loopback destination.
+    """
+    global _steered_net
+    if _steered_net:
+        return
+    _steered_net = True
+    try:
+        import glob
+
+        for f in glob.glob("/proc/sys/net/ipv4/conf/*/accept_local"):
+            with open(f, "w") as fh:
+                fh.write("1\n")
+    except Exception as e:
+        print(f"Warning: accept_local not set (need --privileged): {e}", file=sys.stderr)
+    if not _set_addr("lo", STEER_SINK, prefix="32"):
+        print(f"Warning: cannot add {STEER_SINK} to lo", file=sys.stderr)
+
+
+def steer_wait_ready(timeout=15):
+    """steer races its own startup: ctl apply runs before sbx0 is up, so the first
+    apply fails with `on_fail=drop` and the proxy answers EOF until the --watch
+    supervisor reapplies. Poll until a real SOCKS CONNECT to the sink succeeds."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout:
+        try:
+            s = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=0.5)
+            s.settimeout(0.5)
+            s.sendall(b"\x05\x01\x00")
+            if s.recv(2) == b"\x05\x00":
+                s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(STEER_SINK) + struct.pack(">H", SINK_PORT))
+                reply = s.recv(10)
+                print(f"[steer_wait_ready] CONNECT reply: {reply!r}", file=sys.stderr)
+                if reply[1] == 0:
+                    s.close()
+                    return
+            s.close()
+        except OSError:
+            pass
+        time.sleep(0.2)
+    print("Warning: steer tunnel not ready after %.0fs" % (time.perf_counter() - t0), file=sys.stderr)
+
+
 def steer_component(case):
     """Which steer module handles this protocol (for the report column)."""
     cid = case.get("id", "")
@@ -203,10 +308,16 @@ def cpu_split(pid):
 def measure_latency(rounds=800):
     s = socks_connect(timeout=10)
     s.sendall(MODE_ECHO)
+    if os.environ.get("STEER_DEBUG"):
+        s.settimeout(3)
     msg = b"x" * 64
-    for _ in range(30):
+    for i in range(30):
         s.sendall(msg)
-        recvn(s, 64)
+        try:
+            recvn(s, 64)
+        except Exception as e:
+            print(f"[steer latency] warmup round {i} err: {e}", file=sys.stderr)
+            raise
     samples = []
     for _ in range(rounds):
         t = time.perf_counter_ns()
@@ -226,6 +337,13 @@ def measure_throughput(streams, seconds, pid):
         try:
             s = socks_connect(timeout=10)
             s.sendall(MODE_SOURCE)
+            if os.environ.get("STEER_DEBUG"):
+                s.settimeout(3)
+                try:
+                    n0 = s.recv(64)
+                    print(f"[steer data] first read: {len(n0)} bytes {n0[:16]!r}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[steer data] first read err: {e}", file=sys.stderr)
             buf = bytearray(CHUNK)
             view = memoryview(buf)
             while not stop.is_set():
@@ -875,7 +993,9 @@ def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None
 
 
 def launch_client(core_name, bin_path, case, client_cpus, workers=None):
+    global _socks_dest
     d = tempfile.mkdtemp(prefix=f"proto_cli_{core_name}_")
+    _socks_dest = STEER_SINK if core_name == "steer" else "127.0.0.1"
     env = os.environ.copy()
     if workers:
         env["TACHYON_WORKERS"] = str(workers)
@@ -887,16 +1007,37 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
         if not spec:
             return None, d
         if core_name == "steer":
+            if not steer_available():
+                return None, d  # signal "unrunnable" -> reported as NO_TUN, not FAIL
             ensure_steer_env(bin_path)
+            steer_net_setup()
             curr_ld = env.get("LD_LIBRARY_PATH", "")
             env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
+            # The tunnel module traces its packet path under STEER_TUN_TRACE; we
+            # keep a spare session so the latency echo's fresh stream is not the
+            # one that has to cold-open a session to the node.
+            env["STEER_TUN_TRACE"] = os.environ.get("STEER_TUN_TRACE", "0")
+            env.setdefault("STEER_TUN_SPARES", "1")
         outbound = dict(spec, tag="proxy")
+        if core_name == "steer":
+            # steer's module dials the node from its own netns; a 127.0.0.1 node
+            # is unreachable ("отвечать некому"), so point at the container eth0.
+            node_ip = container_ip()
+            if node_ip:
+                outbound["server"] = node_ip
         cfg_path = os.path.join(d, "config.json")
         cfg = {
-            "log": {"level": "error"},
+            "log": {"level": "debug" if core_name == "steer" else "error"},
             "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
             "outbounds": [outbound],
-            "route": {"final": "proxy"}
+            # steer only materialises an output when a route.rule references it;
+            # the dummy ip_cidr forces the `proxy` output to exist without
+            # matching the 198.18.0.1 sink traffic (that falls through to final).
+            "route": (
+                {"rules": [{"action": "route", "outbound": "proxy", "ip_cidr": ["192.0.2.0/24"]}], "final": "proxy"}
+                if core_name == "steer"
+                else {"final": "proxy"}
+            ),
         }
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
@@ -950,8 +1091,12 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
     else:
         return None, d
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
+    _log = open("/bench/steer-client.log", "w") if core_name == "steer" else subprocess.DEVNULL
+    proc = subprocess.Popen(cmd, stdout=_log, stderr=subprocess.STDOUT if core_name == "steer" else subprocess.DEVNULL,
+                            env=env, preexec_fn=pre)
     wait_listen(PROXY_PORT)
+    if core_name == "steer":
+        steer_wait_ready()
     time.sleep(0.06)  # allow route engine warmup
     return proc, d
 
@@ -971,7 +1116,10 @@ def print_comparison_table(results):
         def fmt_cell(cdata):
             if not cdata:
                 return "—"
-            if cdata.get("status") != "OK":
+            st = cdata.get("status")
+            if st == "NO_TUN":
+                return "—"
+            if st != "OK":
                 return "FAIL"
             t1 = cdata.get("tput_1", "-")
             t8 = cdata.get("tput_8", "-")
@@ -1574,7 +1722,10 @@ def main():
             try:
                 cli_proc, cli_dir = launch_client(c_name, c_bin, case, client_cpus, workers)
                 if not cli_proc:
-                    case_res[c_name] = None
+                    case_res[c_name] = (
+                        {"status": "NO_TUN", "error": "steer needs /dev/net/tun (unavailable in this container)"}
+                        if c_name == "steer" else None
+                    )
                     continue
 
                 t1, cpu1 = measure_throughput(1, args.seconds, cli_proc.pid)

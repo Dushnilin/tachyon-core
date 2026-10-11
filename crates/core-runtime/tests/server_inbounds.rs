@@ -1217,6 +1217,78 @@ async fn hysteria2_shutdown_releases_port_with_live_connections() {
 }
 
 #[tokio::test]
+async fn hysteria2_server_with_salamander_obfs_roundtrip() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let udp_echo = spawn_udp_echo().await;
+    let config = cfg(
+        json!({
+            "type": "hysteria2", "tag": "hy2", "listen": "127.0.0.1",
+            "listen_port": 0, "password": "salamander-test", "tls": {
+                "enabled": true,
+                "certificate": [include_str!("../../../tests/golden/certs/localhost.crt")],
+                "key": [include_str!("../../../tests/golden/certs/localhost.key")]
+            },
+            "obfs": {
+                "type": "salamander",
+                "password": "obfs-secret-password"
+            }
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    );
+    let mut instance = core_runtime::start(&config)
+        .await
+        .expect("start hy2 with obfs");
+    let addr = inbound_addr(&instance, "hy2");
+    let client_config = json!({
+        "type": "hysteria2", "server": "127.0.0.1", "server_port": addr.port(),
+        "password": "salamander-test", "tls": client_tls(),
+        "obfs": {
+            "type": "salamander",
+            "password": "obfs-secret-password"
+        }
+    });
+
+    let client = core_runtime::outbound::hysteria2::Hysteria2::build(
+        client_config.as_object().expect("client config"),
+        "obfs client",
+    )
+    .expect("build hy2 client");
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.connect(&core_runtime::inbound::Target::Ip(echo)),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect hy2");
+    stream.write_all(b"live-obfs").await.expect("write echo");
+    let mut payload = [0u8; 9];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_exact(&mut payload),
+    )
+    .await
+    .expect("echo timeout")
+    .expect("read echo");
+    assert_eq!(&payload, b"live-obfs");
+
+    let udp = client
+        .connect_udp(&core_runtime::inbound::Target::Ip(udp_echo))
+        .await
+        .expect("connect hy2 udp");
+    udp.send(b"udp-obfs").await.expect("send udp");
+    let mut datagram = [0u8; 16];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv(&mut datagram))
+        .await
+        .expect("udp timeout")
+        .expect("receive udp");
+    assert_eq!(&datagram[..n], b"udp-obfs");
+
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
 async fn vless_server_over_tls_carries_our_own_client_traffic() {
     let _guard = test_guard().await;
     let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
@@ -1367,6 +1439,50 @@ async fn a_xhttp_server_refuses_another_path() {
         got.is_empty(),
         "a refused xhttp session must not carry the payload: {got:?}"
     );
+}
+
+#[tokio::test]
+async fn vless_server_over_xhttp_h2_stream_one_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut s_tls = server_tls();
+    s_tls["alpn"] = json!(["h2"]);
+    server["tls"] = s_tls;
+
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "stream-one"});
+    let mut c_tls = client_tls();
+    c_tls["alpn"] = json!(["h2"]);
+    client["tls"] = c_tls;
+
+    let got = through_our_own_client(server, client, b"through-h2-stream-one")
+        .await
+        .expect("vless over xhttp h2 stream-one round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-h2-stream-one");
+}
+
+#[tokio::test]
+async fn vless_server_over_xhttp_h2_packet_up_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut s_tls = server_tls();
+    s_tls["alpn"] = json!(["h2"]);
+    server["tls"] = s_tls;
+
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "packet-up"});
+    let mut c_tls = client_tls();
+    c_tls["alpn"] = json!(["h2"]);
+    client["tls"] = c_tls;
+
+    let got = through_our_own_client(server, client, b"through-h2-packet-up")
+        .await
+        .expect("vless over xhttp h2 packet-up round trip");
+    assert_eq!(String::from_utf8_lossy(&got), "through-h2-packet-up");
 }
 
 #[tokio::test]

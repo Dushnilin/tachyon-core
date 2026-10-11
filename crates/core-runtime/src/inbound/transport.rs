@@ -178,7 +178,7 @@ impl Transport {
         // to a session never hands a stream over at all.
         if self.kind == Kind::Xhttp {
             if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
-                return Accepted::xhttp_h2(stream, &self.path).await;
+                return Accepted::xhttp_h2(stream, self).await;
             }
             return self.xhttp_accept(stream).await.map(Accepted::Once);
         }
@@ -322,14 +322,19 @@ impl Accepted {
     }
 
     /// The XHTTP HTTP/2 half: handshake, and accept streams on the path.
-    async fn xhttp_h2(stream: AnyStream, path: &str) -> anyhow::Result<Self> {
+    async fn xhttp_h2(stream: AnyStream, transport: &Transport) -> anyhow::Result<Self> {
         let conn = crate::outbound::transport::h2io::server_builder()
             .handshake(stream)
             .await
             .map_err(|e| anyhow::anyhow!("xhttp h2: handshake: {e}"))?;
         Ok(Self::XhttpH2(Box::new(XhttpH2Accept {
             conn: Some(conn),
-            path: path.to_string(),
+            path: transport.path.clone(),
+            session_place: transport.session,
+            session_key: transport.session_key.clone(),
+            seq_place: transport.seq,
+            seq_key: transport.seq_key.clone(),
+            sessions: Arc::clone(&transport.sessions),
             first: true,
         })))
     }
@@ -448,6 +453,11 @@ where
 pub(crate) struct XhttpH2Accept {
     conn: Option<h2::server::Connection<AnyStream, Bytes>>,
     path: String,
+    session_place: Place,
+    session_key: String,
+    seq_place: Place,
+    seq_key: String,
+    sessions: SessionTable,
     first: bool,
 }
 
@@ -467,52 +477,203 @@ impl XhttpH2Accept {
                 None => return Ok(None),
             };
             let first = std::mem::replace(&mut self.first, false);
-            let req_path = request.uri().path().to_string();
+            let target = request
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or_else(|| request.uri().path());
             let method = request.method().as_str().to_string();
 
-            if method != "POST" || !xhttp_h2_path_matches(&req_path, &self.path) {
-                let response = http::Response::builder().status(404).body(()).unwrap();
-                let _ = responder.send_response(response, true);
-                if first {
-                    let conn = self
-                        .conn
-                        .take()
-                        .expect("xhttp: connection exists before first stream");
-                    let _ = xhttp_h2_drive(conn).await;
-                    anyhow::bail!(
-                        "xhttp h2: rejected {method} {req_path:?} (expected POST {})",
-                        self.path
-                    );
+            let (path, query) = match target.split_once('?') {
+                Some((path, query)) => (path, Some(query)),
+                None => (target, None),
+            };
+            let rest = match path.strip_prefix(self.path.as_str()) {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+                _ => {
+                    let response = http::Response::builder().status(404).body(()).unwrap();
+                    let _ = responder.send_response(response, true);
+                    if first {
+                        let conn = self
+                            .conn
+                            .take()
+                            .expect("xhttp: connection exists before first stream");
+                        let _ = xhttp_h2_drive(conn).await;
+                        anyhow::bail!(
+                            "xhttp h2: rejected {method} {target:?} (expected path {})",
+                            self.path
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
 
-            let response = http::Response::builder()
-                .status(200)
-                .header("content-type", "application/grpc")
-                .body(())
-                .unwrap();
-            let send = responder
-                .send_response(response, false)
-                .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
-            let recv = request.into_body();
-            let h2_stream = crate::outbound::transport::h2io::H2Stream::server(recv, send);
-            return Ok(Some(Box::new(crate::outbound::transport::h2io::H2Io {
-                h2: h2_stream,
-            })));
+            let trimmed = rest.trim_matches('/');
+            let segments: Vec<&str> = if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                trimmed.split('/').collect()
+            };
+
+            let header_pairs: Vec<(String, String)> = request
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|val| (k.as_str().to_string(), val.to_string()))
+                })
+                .collect();
+
+            let sid = match self.session_place {
+                Place::Path => segments.first().map(|id| id.to_string()),
+                Place::Query => query.and_then(|q| lookup_param(q, &self.session_key)),
+                Place::Header => lookup_header(&header_pairs, &self.session_key),
+                Place::Cookie => lookup_cookie(&header_pairs, &self.session_key),
+            };
+            let seq = match self.seq_place {
+                Place::Path => {
+                    segments.len()
+                        > if self.session_place == Place::Path {
+                            1
+                        } else {
+                            0
+                        }
+                }
+                Place::Query => query.is_some_and(|q| lookup_param(q, &self.seq_key).is_some()),
+                Place::Header => lookup_header(&header_pairs, &self.seq_key).is_some(),
+                Place::Cookie => lookup_cookie(&header_pairs, &self.seq_key).is_some(),
+            };
+
+            match (&method[..], sid) {
+                ("GET", Some(sid)) if !seq => {
+                    let mut table = self.sessions.lock().expect("xhttp table poisoned");
+                    if let Some(existing) = table.get(&sid) {
+                        let session = Arc::clone(existing);
+                        drop(table);
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/octet-stream")
+                            .body(())
+                            .unwrap();
+                        let send = responder
+                            .send_response(response, false)
+                            .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
+                        spawn_h2_download_pump(send, session);
+                        continue;
+                    }
+                    let (session, up_rx, down_tx) = XhttpSession::new();
+                    let bridge = xhttp_bridge(up_rx, down_tx);
+                    table.insert(sid.clone(), Arc::clone(&session));
+                    drop(table);
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/octet-stream")
+                        .body(())
+                        .unwrap();
+                    let send = responder
+                        .send_response(response, false)
+                        .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
+                    spawn_h2_download_pump(send, session);
+                    return Ok(Some(Box::new(XhttpStream {
+                        inner: bridge,
+                        listed: Some((Arc::clone(&self.sessions), sid)),
+                    })));
+                }
+                ("POST", None) if segments.is_empty() => {
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let send = responder
+                        .send_response(response, false)
+                        .map_err(|e| anyhow::anyhow!("xhttp h2: response: {e}"))?;
+                    let recv = request.into_body();
+                    let h2_stream = crate::outbound::transport::h2io::H2Stream::server(recv, send);
+                    return Ok(Some(Box::new(crate::outbound::transport::h2io::H2Io {
+                        h2: h2_stream,
+                    })));
+                }
+                ("POST", Some(sid)) => {
+                    let mut table = self.sessions.lock().expect("xhttp table poisoned");
+                    let (session, is_new, up_rx, down_tx) = if let Some(existing) = table.get(&sid)
+                    {
+                        (Arc::clone(existing), false, None, None)
+                    } else {
+                        let (session, up_rx, down_tx) = XhttpSession::new();
+                        table.insert(sid.clone(), Arc::clone(&session));
+                        (session, true, Some(up_rx), Some(down_tx))
+                    };
+                    drop(table);
+
+                    spawn_h2_upload_sink(request.into_body(), responder, session);
+
+                    if is_new {
+                        let bridge = xhttp_bridge(up_rx.unwrap(), down_tx.unwrap());
+                        return Ok(Some(Box::new(XhttpStream {
+                            inner: bridge,
+                            listed: Some((Arc::clone(&self.sessions), sid)),
+                        })));
+                    }
+                    continue;
+                }
+                _ => {
+                    let response = http::Response::builder().status(404).body(()).unwrap();
+                    let _ = responder.send_response(response, true);
+                    continue;
+                }
+            }
         }
     }
 }
 
-fn xhttp_h2_path_matches(target: &str, configured: &str) -> bool {
-    let (path, _query) = match target.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (target, None),
-    };
-    match path.strip_prefix(configured) {
-        Some(rest) => rest.is_empty() || rest.starts_with('/'),
-        None => false,
-    }
+fn spawn_h2_download_pump(mut send: h2::SendStream<Bytes>, session: Arc<XhttpSession>) {
+    tokio::spawn(async move {
+        if let Some(mut rx) = session.take_down() {
+            while let Some(chunk) = rx.recv().await {
+                let mut data = Bytes::from(chunk);
+                while !data.is_empty() {
+                    let to_send = data.len();
+                    send.reserve_capacity(to_send);
+                    let avail = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                        Some(Ok(n)) => n,
+                        _ => return,
+                    };
+                    let take = to_send.min(avail);
+                    let part = data.split_to(take);
+                    if send.send_data(part, false).is_err() {
+                        return;
+                    }
+                }
+            }
+            let _ = send.send_data(Bytes::new(), true);
+        }
+    });
+}
+
+fn spawn_h2_upload_sink(
+    mut recv: h2::RecvStream,
+    mut responder: h2::server::SendResponse<Bytes>,
+    session: Arc<XhttpSession>,
+) {
+    tokio::spawn(async move {
+        while let Some(chunk) = recv.data().await {
+            match chunk {
+                Ok(bytes) => {
+                    let len = bytes.len();
+                    let _ = recv.flow_control().release_capacity(len);
+                    if session.push(bytes.to_vec()).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = recv.trailers().await;
+        let response = http::Response::builder().status(200).body(()).unwrap();
+        let _ = responder.send_response(response, true);
+    });
 }
 
 fn xhttp_h2_drive(

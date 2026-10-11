@@ -1,6 +1,7 @@
 pub mod anytls;
 pub mod block;
 pub mod chain;
+pub mod desync;
 pub mod dial;
 pub mod direct;
 pub mod fptn;

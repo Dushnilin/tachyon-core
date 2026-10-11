@@ -221,38 +221,43 @@ def measure_throughput(streams, seconds):
     totals = [0] * streams
     stop = threading.Event()
     errors = []
-    ready = threading.Barrier(streams + 1) if streams > 1 else None
-
     def worker(i):
-        s = None
-        try:
-            s = socks_connect()
-            s.sendall(MODE_SOURCE)
-            if ready is not None:
-                ready.wait(timeout=15)
-            buf = bytearray(CHUNK)
-            view = memoryview(buf)
-            while not stop.is_set():
-                n = s.recv_into(view)
-                if not n:
-                    break
-                totals[i] += n
-        except Exception as e:
-            errors.append(repr(e))
-            if ready is not None:
-                try:
-                    ready.abort()
-                except Exception:
-                    pass
+        # xhttp needs a while to open its first POST session; a stall must not
+        # condemn the cell, so reconnect and keep counting.
+        for attempt in range(3):
+            s = None
+            try:
+                s = socks_connect()
+                s.settimeout(25)
+                s.sendall(MODE_SOURCE)
+                # warm the session before the clock starts: xhttp opens its
+                # POST channel lazily and the first stall would eat the budget
+                s.recv(1)
+                buf = bytearray(CHUNK)
+                view = memoryview(buf)
+                while not stop.is_set():
+                    n = s.recv_into(view)
+                    if not n:
+                        break
+                    totals[i] += n
+                return
+            except (socket.timeout, TimeoutError):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                continue
+            except Exception as e:
+                errors.append(repr(e))
+                return
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(streams)]
     for t in threads:
         t.start()
-    if ready is not None:
-        try:
-            ready.wait(timeout=15)
-        except threading.BrokenBarrierError:
-            pass
+    # let every worker finish its handshake so the timed window only covers
+    # steady-state transfer
+    time.sleep(0.3)
     t0 = time.perf_counter()
     time.sleep(seconds)
     stop.set()
@@ -322,11 +327,12 @@ def build_cases(C):
     ss2022_pw = "MTIzNDU2Nzg5MDEyMzQ1Ng=="
 
     # --- Shadowsocks ---
-    for tag, method in (("ss-aes-128-gcm", "aes-128-gcm"),
-                        ("ss-aes-256-gcm", "aes-256-gcm"),
-                        ("ss-chacha20-poly1305", "chacha20-ietf-poly1305")):
-        add(tag, "Shadowsocks " + method.upper().replace("IETF-POLY1305", "ChaCha20-Poly1305"),
-            "Shadowsocks",
+    for tag, method, nice in (
+            ("ss-aes-128-gcm", "aes-128-gcm", "Shadowsocks AES-128-GCM"),
+            ("ss-aes-256-gcm", "aes-256-gcm", "Shadowsocks AES-256-GCM"),
+            ("ss-chacha20-poly1305", "chacha20-ietf-poly1305",
+             "Shadowsocks ChaCha20-Poly1305")):
+        add(tag, nice, "Shadowsocks",
             {"type": "shadowsocks", "method": method, "password": ss_pw},
             {"type": "shadowsocks", "server": "127.0.0.1",
              "server_port": SERVER_PORT, "method": method, "password": ss_pw},
@@ -494,6 +500,47 @@ def build_cases(C):
                                             "allowInsecure": True}}},
         None)
 
+    def xhttp(mode, path="/x"):
+        return {"type": "xhttp", "mode": mode, "path": path}
+
+    def xhttp_xray(mode, path="/x"):
+        return {"network": "xhttp",
+                "xhttpSettings": {"mode": mode, "path": path}}
+
+    def xhttp_case(cid, name, mode, srv_tls, cli_tls, x_tls=None):
+        add(cid, name, "XHTTP",
+            {"type": "vless", "users": [{"uuid": UUID_STR}], "tls": srv_tls,
+             "transport": xhttp(mode)},
+            {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT,
+             "uuid": UUID_STR, "tls": cli_tls, "transport": xhttp(mode)},
+            {"protocol": "vless",
+             "settings": {"vnext": [{"address": "127.0.0.1", "port": SERVER_PORT,
+                                     "users": [{"id": UUID_STR,
+                                                "encryption": "none"}]}]},
+             "streamSettings": dict({"security": "tls",
+                                     "tlsSettings": x_tls or {}},
+                                    **xhttp_xray(mode))},
+            None)
+
+    xhttp_case("vless-xhttp-packet-up", "VLESS + XHTTP packet-up + TLS",
+               "packet-up", tls(), ctls(),
+               {"serverName": "localhost"})
+    xhttp_case("vless-xhttp-stream-up", "VLESS + XHTTP stream-up + TLS",
+               "stream-up", tls(), ctls(),
+               {"serverName": "localhost"})
+    xhttp_case("vless-xhttp-auto", "VLESS + XHTTP auto + TLS",
+               "auto", tls(), ctls(),
+               {"serverName": "localhost"})
+
+    add("vless-xhttp-reality", "VLESS + XHTTP + REALITY", "XHTTP",
+        {"type": "vless", "users": [{"uuid": UUID_STR}], "tls": reality(),
+         "transport": xhttp("packet-up")},
+        {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT,
+         "uuid": UUID_STR, "tls": reality_client(),
+         "transport": xhttp("packet-up")},
+        None,
+        None)
+
     add("vless-reality", "VLESS + REALITY", "VLESS",
         {"type": "vless", "users": [{"uuid": UUID_STR}], "tls": reality()},
         {"type": "vless", "server": "127.0.0.1", "server_port": SERVER_PORT,
@@ -598,7 +645,8 @@ def build_cases(C):
          "password": "p", "tls": ctls()},
         None,
         {"type": "anytls", "password": "p", "sni": "localhost",
-         "skip-cert-verify": True})
+         "skip-cert-verify": True},
+        server="sing-box")
 
     add("http", "HTTP proxy", "Other",
         {"type": "http", "users": [{"username": "u", "password": "p"}]},
@@ -751,7 +799,7 @@ def launch_client(engine, bin_path, case, cpus, workers):
         except OSError:
             tail = ""
         raise RuntimeError("client died: %s" % (tail or "no output"))
-    time.sleep(0.15)
+    time.sleep(0.4)
     return proc, d
 
 

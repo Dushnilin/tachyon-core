@@ -136,6 +136,13 @@ fn extract_x25519(body: &[u8]) -> io::Result<Option<[u8; 32]>> {
             return Ok(Some(key.try_into().expect("32 bytes")));
         }
     }
+    for (group, key) in keyshare::entries(body)? {
+        if (group == keyshare::X25519MLKEM768 || group == 0x45ac || group == 0x6399)
+            && key.len() == 1184 + 32
+        {
+            return Ok(Some(key[1184..].try_into().expect("32 bytes")));
+        }
+    }
     Ok(None)
 }
 

@@ -35,9 +35,10 @@ const CLOSE_NOTIFY: [u8; 2] = [1, 0];
 /// What `tls` on an inbound gives us: the chain, the key and the protocols.
 pub struct ServerTls {
     chain: Vec<Vec<u8>>,
-    key: Arc<dyn core_tls::rustls::sign::SigningKey>,
+    key: Option<Arc<dyn core_tls::rustls::sign::SigningKey>>,
     alpn: Vec<Vec<u8>>,
     cipher_suites: Vec<u16>,
+    reality: Option<core_tls::server::ServerReality>,
 }
 
 impl ServerTls {
@@ -72,6 +73,11 @@ impl ServerTls {
         match ty {
             Some("grpc") if !this.alpn.iter().any(|p| p == b"h2") => {
                 this.alpn.push(b"h2".to_vec());
+            }
+            Some("http" | "h2") => {
+                if !this.alpn.iter().any(|p| p == b"h2") {
+                    this.alpn.insert(0, b"h2".to_vec());
+                }
             }
             Some("xhttp") => {
                 if !this.alpn.iter().any(|p| p == b"h2") {
@@ -123,33 +129,100 @@ impl ServerTls {
             );
         }
 
-        let certificate = match object.get("certificate_path").and_then(Value::as_str) {
-            Some(path) => std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("{at}: tls: read certificate: {e}"))?,
-            None => listable(object, "certificate")
-                .ok_or_else(|| anyhow::anyhow!("{at}: tls: missing certificate"))?,
-        };
-        let key_pem = match object.get("key_path").and_then(Value::as_str) {
-            Some(path) => std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("{at}: tls: read key: {e}"))?,
-            None => {
-                listable(object, "key").ok_or_else(|| anyhow::anyhow!("{at}: tls: missing key"))?
-            }
-        };
+        let reality_cfg = object.get("reality").filter(|r| !r.is_null());
+        let reality_enabled = reality_cfg
+            .and_then(|r| r.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        let mut chain = Vec::new();
-        for cert in rustls_pemfile::certs(&mut certificate.as_bytes()) {
-            let der = cert.map_err(|e| anyhow::anyhow!("{at}: tls: certificate: {e}"))?;
-            chain.push(der.to_vec());
-        }
-        if chain.is_empty() {
-            anyhow::bail!("{at}: tls: the certificate holds no certificate");
-        }
-        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .map_err(|e| anyhow::anyhow!("{at}: tls: key: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("{at}: tls: the key file holds no key"))?;
-        let signing = core_crypto::sign::any_supported_type(&key)
-            .map_err(|e| anyhow::anyhow!("{at}: tls: parse x509 key pair: {e}"))?;
+        let (chain, key, reality) = if reality_enabled {
+            let robj = reality_cfg
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("{at}: tls: reality: must be an object"))?;
+            let priv_key_str = robj
+                .get("private_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("{at}: tls: reality: missing private_key"))?;
+            let private_key = crate::tls_client::parse_reality_key(priv_key_str)
+                .map_err(|e| anyhow::anyhow!("{at}: tls: reality: parse private_key: {e}"))?;
+
+            let mut short_ids = Vec::new();
+            if let Some(sids) = robj.get("short_id") {
+                match sids {
+                    Value::String(s) => {
+                        short_ids.push(
+                            crate::tls_client::parse_short_id(s)
+                                .map_err(|e| anyhow::anyhow!("{at}: tls: reality: {e}"))?,
+                        );
+                    }
+                    Value::Array(list) => {
+                        for item in list {
+                            if let Some(s) = item.as_str() {
+                                short_ids.push(
+                                    crate::tls_client::parse_short_id(s)
+                                        .map_err(|e| anyhow::anyhow!("{at}: tls: reality: {e}"))?,
+                                );
+                            }
+                        }
+                    }
+                    _ => anyhow::bail!(
+                        "{at}: tls: reality: short_id must be string or array of strings"
+                    ),
+                }
+            }
+
+            let max_time_difference = robj.get("max_time_difference").and_then(|v| {
+                if v.is_string() {
+                    crate::outbound::urltest::parse_duration(
+                        Some(v),
+                        std::time::Duration::from_secs(600),
+                        at,
+                    )
+                    .ok()
+                    .map(|d| d.as_secs())
+                } else {
+                    v.as_u64()
+                }
+            });
+
+            (
+                Vec::new(),
+                None,
+                Some(core_tls::server::ServerReality {
+                    private_key,
+                    short_ids,
+                    max_time_difference,
+                }),
+            )
+        } else {
+            let certificate = match object.get("certificate_path").and_then(Value::as_str) {
+                Some(path) => std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("{at}: tls: read certificate: {e}"))?,
+                None => listable(object, "certificate")
+                    .ok_or_else(|| anyhow::anyhow!("{at}: tls: missing certificate"))?,
+            };
+            let key_pem = match object.get("key_path").and_then(Value::as_str) {
+                Some(path) => std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("{at}: tls: read key: {e}"))?,
+                None => listable(object, "key")
+                    .ok_or_else(|| anyhow::anyhow!("{at}: tls: missing key"))?,
+            };
+
+            let mut chain = Vec::new();
+            for cert in rustls_pemfile::certs(&mut certificate.as_bytes()) {
+                let der = cert.map_err(|e| anyhow::anyhow!("{at}: tls: certificate: {e}"))?;
+                chain.push(der.to_vec());
+            }
+            if chain.is_empty() {
+                anyhow::bail!("{at}: tls: the certificate holds no certificate");
+            }
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .map_err(|e| anyhow::anyhow!("{at}: tls: key: {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("{at}: tls: the key file holds no key"))?;
+            let signing = core_crypto::sign::any_supported_type(&key)
+                .map_err(|e| anyhow::anyhow!("{at}: tls: parse x509 key pair: {e}"))?;
+            (chain, Some(signing), None)
+        };
 
         // `alpn` is a Listable[string]: one name or a list of them
         let alpn = match object.get("alpn") {
@@ -174,9 +247,10 @@ impl ServerTls {
 
         Ok(ServerTls {
             chain,
-            key: signing,
+            key,
             alpn,
             cipher_suites,
+            reality,
         })
     }
 
@@ -274,9 +348,10 @@ impl ServerTls {
     {
         let mut handshake = Handshake::new(Config {
             chain: self.chain.clone(),
-            key: Arc::clone(&self.key),
+            key: self.key.clone(),
             alpn: self.alpn.clone(),
             cipher_suites: self.cipher_suites.clone(),
+            reality: self.reality.clone(),
         })?;
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run(&mut stream)).await {
             Ok(result) => result?,

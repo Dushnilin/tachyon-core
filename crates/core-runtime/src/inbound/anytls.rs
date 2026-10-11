@@ -76,9 +76,13 @@ impl AnyTls {
                     .ok_or_else(|| anyhow::anyhow!("{at}.users[{i}]: missing password"))?;
                 password_hashes.push(Sha256::digest(pw.as_bytes()).into());
             }
-        } else if let Some(pw) = object.get("password").and_then(Value::as_str) {
+        }
+        if password_hashes.is_empty()
+            && let Some(pw) = object.get("password").and_then(Value::as_str)
+        {
             password_hashes.push(Sha256::digest(pw.as_bytes()).into());
-        } else {
+        }
+        if password_hashes.is_empty() {
             anyhow::bail!("{at}: missing users or password");
         }
 

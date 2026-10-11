@@ -22,3 +22,5 @@ scripts/bench/__pycache__/
 proto-result.json
 proto-result.md
 PONYTAIL_AUDIT.md
+scratch/
+

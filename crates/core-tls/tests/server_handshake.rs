@@ -69,9 +69,10 @@ async fn our_server_completes_a_handshake_with_rustls_client() {
 
     let mut handshake = Handshake::new(Config {
         chain,
-        key,
+        key: Some(key),
         alpn: vec![b"h2".to_vec()],
         cipher_suites: Vec::new(),
+        reality: None,
     })
     .expect("server config");
     handshake.run(&mut ours).await.expect("handshake");
@@ -164,9 +165,10 @@ async fn refused(input: Vec<u8>) -> String {
     let (chain, key) = load();
     let mut handshake = Handshake::new(Config {
         chain,
-        key,
+        key: Some(key),
         alpn: Vec::new(),
         cipher_suites: Vec::new(),
+        reality: None,
     })
     .expect("server config");
     let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
@@ -227,9 +229,10 @@ async fn a_server_without_a_certificate_chain_is_not_built() {
     let (_chain, key) = load();
     let err = Handshake::new(Config {
         chain: Vec::new(),
-        key,
+        key: Some(key),
         alpn: Vec::new(),
         cipher_suites: Vec::new(),
+        reality: None,
     })
     .err()
     .expect("an empty chain must not build");
@@ -244,9 +247,10 @@ async fn server_enforces_cipher_suite_preference() {
     // Server restricted to ChaCha20-Poly1305 (0x1303) only
     let mut handshake = Handshake::new(Config {
         chain,
-        key,
+        key: Some(key),
         alpn: Vec::new(),
         cipher_suites: vec![0x1303],
+        reality: None,
     })
     .expect("server config");
 
@@ -265,4 +269,98 @@ async fn server_enforces_cipher_suite_preference() {
         resp.windows(2).any(|w| w == [0x13, 0x03]),
         "server negotiated 0x1303"
     );
+}
+
+#[tokio::test]
+async fn our_server_completes_a_handshake_with_reality_client() {
+    core_tls::install_default_provider();
+
+    let reality_priv = [7u8; 32];
+    let secret = x25519_dalek::StaticSecret::from(reality_priv);
+    let reality_pub: [u8; 32] = *x25519_dalek::PublicKey::from(&secret).as_bytes();
+    let short_id = vec![0x12, 0x34, 0x56, 0x78];
+
+    let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+
+    let client = tokio::spawn({
+        let short_id = short_id.clone();
+        async move {
+            let template = core_tls::fingerprints::by_name("chrome").expect("chrome template");
+            let verifier =
+                core_tls::verify::RealityVerifier::new(Box::new(core_tls::verify::AcceptsAnything));
+            let config = core_tls::client::Config {
+                template: &template,
+                server_name: "example.com",
+                alpn: &[b"h2"],
+                verifier: &verifier,
+                reality: Some(core_tls::client::RealitySeal {
+                    public_key: &reality_pub,
+                    short_id: &short_id,
+                }),
+                fragment: false,
+                cipher_suites: Vec::new(),
+            };
+            let mut handshake = core_tls::client::Handshake::new(config).expect("client handshake");
+            handshake
+                .run(&mut theirs)
+                .await
+                .expect("client handshake run");
+            let mut conn = core_tls::client::Connection::new(&mut handshake).expect("client conn");
+            let mut buf = [0u8; 128];
+            theirs.read_exact(&mut buf[..5]).await.expect("read header");
+            let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            theirs
+                .read_exact(&mut buf[5..5 + len])
+                .await
+                .expect("read body");
+            let rec = conn
+                .read_record_in_place(&mut buf[..5 + len])
+                .expect("open")
+                .expect("record");
+            match rec {
+                core_tls::client::Record::Data { start, end, .. } => {
+                    assert_eq!(&buf[start..end], b"ping");
+                }
+                _ => panic!("expected Data record"),
+            }
+            let pong_record = conn.write_record(b"pong").expect("write record");
+            theirs.write_all(&pong_record).await.expect("send pong");
+        }
+    });
+
+    let mut handshake = Handshake::new(Config {
+        chain: Vec::new(),
+        key: None,
+        alpn: vec![b"h2".to_vec()],
+        cipher_suites: Vec::new(),
+        reality: Some(core_tls::server::ServerReality {
+            private_key: reality_priv,
+            short_ids: vec![short_id],
+            max_time_difference: Some(600),
+        }),
+    })
+    .expect("server config");
+
+    handshake.run(&mut ours).await.expect("server handshake");
+    assert_eq!(handshake.alpn.as_deref(), Some(&b"h2"[..]));
+    let (mut sealer, mut opener) = handshake.application.take().expect("application keys");
+
+    let sealed = sealer
+        .seal(ContentType::ApplicationData, b"ping")
+        .expect("seal");
+    ours.write_all(&sealed).await.expect("write ping");
+
+    let mut buf = [0u8; 128];
+    ours.read_exact(&mut buf[..5])
+        .await
+        .expect("read pong header");
+    let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    ours.read_exact(&mut buf[5..5 + len])
+        .await
+        .expect("read pong body");
+    let unsealed = opener.open(&buf[..5 + len]).expect("open pong");
+    assert_eq!(unsealed.0, ContentType::ApplicationData);
+    assert_eq!(unsealed.1, b"pong");
+
+    client.await.expect("client task");
 }

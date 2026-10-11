@@ -727,7 +727,7 @@ impl TlsOptions {
 }
 
 /// A REALITY public key: 32 bytes of X25519, base64url without padding.
-fn parse_reality_key(value: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_reality_key(value: &str) -> Result<[u8; 32], String> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
@@ -737,7 +737,7 @@ fn parse_reality_key(value: &str) -> Result<[u8; 32], String> {
 }
 
 /// A REALITY short id: an even number of hex digits, at most 16.
-fn parse_short_id(value: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn parse_short_id(value: &str) -> Result<Vec<u8>, String> {
     if value.is_empty() {
         return Ok(Vec::new());
     }

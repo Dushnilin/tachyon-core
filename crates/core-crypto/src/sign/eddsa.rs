@@ -38,6 +38,28 @@ impl TryFrom<&PrivateKeyDer<'_>> for Ed25519SigningKey {
     }
 }
 
+impl Ed25519SigningKey {
+    pub fn from_key(key: ed25519_dalek::SigningKey) -> Self {
+        Self {
+            key: Arc::new(key),
+            scheme: SignatureScheme::ED25519,
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self::from_key(ed25519_dalek::SigningKey::from_bytes(bytes))
+    }
+
+    pub fn generate() -> (Self, [u8; 32]) {
+        let mut rng = rand_core::OsRng;
+        let mut seed = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut rng, &mut seed);
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pub_bytes = key.verifying_key().to_bytes();
+        (Self::from_key(key), pub_bytes)
+    }
+}
+
 impl SigningKey for Ed25519SigningKey {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
         if offered.contains(&self.scheme) {

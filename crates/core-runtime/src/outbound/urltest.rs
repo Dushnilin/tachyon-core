@@ -497,8 +497,10 @@ fn parse_probe_url(url: &str, at: &str) -> anyhow::Result<UrlProbe> {
     })
 }
 
-/// badoption.Duration: strings with ms/s/m/h suffixes, integers in
-/// nanoseconds (Go time.Duration JSON semantics).
+/// badoption.Duration: Go `time.ParseDuration` strings (`1m30s`, `1.5h`,
+/// `250us`, plus the `d` badoption adds), integers in nanoseconds (Go
+/// time.Duration JSON semantics). A bare number string still reads as
+/// seconds; `check` refuses it before `run` gets here anyway.
 pub(crate) fn parse_duration(
     value: Option<&Value>,
     default: Duration,
@@ -519,25 +521,60 @@ pub(crate) fn parse_duration(
             if raw.is_empty() {
                 return Ok(default);
             }
-            let (digits, unit) = raw.split_at(
-                raw.find(|c: char| !c.is_ascii_digit() && c != '.')
-                    .unwrap_or(raw.len()),
-            );
-            let value: f64 = digits
-                .parse()
-                .map_err(|_| anyhow::anyhow!("{at}: invalid duration {raw:?}"))?;
-            let scale = match unit {
-                "" | "s" => 1.0,
-                "ms" => 0.001,
-                "m" => 60.0,
-                "h" => 3600.0,
-                "d" => 86400.0,
-                other => anyhow::bail!("{at}: unknown duration unit {other:?}"),
-            };
-            Ok(Duration::from_secs_f64(value * scale))
+            if let Ok(seconds) = raw.parse::<f64>() {
+                return Duration::try_from_secs_f64(seconds)
+                    .map_err(|_| anyhow::anyhow!("{at}: invalid duration {raw:?}"));
+            }
+            go_duration(raw).map_err(|err| anyhow::anyhow!("{at}: {err}"))
         }
         other => anyhow::bail!("{at}: invalid duration value {other}"),
     }
+}
+
+/// `time.ParseDuration`: one or more `<number><unit>` segments. A negative
+/// duration is a timeout that never waits, so it comes out as zero.
+fn go_duration(raw: &str) -> Result<Duration, String> {
+    let (negative, mut rest) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if rest.is_empty() {
+        return Err(format!("invalid duration {raw:?}"));
+    }
+    let mut nanos = 0f64;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let number: f64 = rest[..digits]
+            .parse()
+            .map_err(|_| format!("invalid duration {raw:?}"))?;
+        rest = &rest[digits..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let scale = match &rest[..unit_len] {
+            "ns" => 1.0,
+            "us" | "\u{b5}s" | "\u{3bc}s" => 1e3,
+            "ms" => 1e6,
+            "s" => 1e9,
+            "m" => 60e9,
+            "h" => 3600e9,
+            "d" => 86400e9,
+            "" => return Err(format!("missing unit in duration {raw:?}")),
+            other => return Err(format!("unknown duration unit {other:?} in {raw:?}")),
+        };
+        rest = &rest[unit_len..];
+        nanos += (number * scale).round();
+    }
+    if negative {
+        return Ok(Duration::ZERO);
+    }
+    if nanos >= u64::MAX as f64 {
+        return Err(format!("invalid duration {raw:?}"));
+    }
+    Ok(Duration::from_nanos(nanos as u64))
 }
 
 #[cfg(test)]
@@ -589,6 +626,25 @@ mod tests {
             Duration::from_secs(7)
         );
         assert!(parse_duration(Some(&json!("3w")), Duration::ZERO, "t").is_err());
+    }
+
+    /// `check` takes every Go duration, so `run` has to read them too.
+    #[test]
+    fn compound_go_durations() {
+        let read = |raw: &str| parse_duration(Some(&json!(raw)), Duration::ZERO, "t");
+        assert_eq!(read("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(read("1h0m0s").unwrap(), Duration::from_secs(3600));
+        assert_eq!(read("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(read("2s500ms").unwrap(), Duration::from_millis(2500));
+        assert_eq!(read("250us").unwrap(), Duration::from_micros(250));
+        assert_eq!(read("250\u{b5}s").unwrap(), Duration::from_micros(250));
+        assert_eq!(read("40ns").unwrap(), Duration::from_nanos(40));
+        assert_eq!(read("+1d2h").unwrap(), Duration::from_secs(93_600));
+        assert_eq!(read("-5s").unwrap(), Duration::ZERO);
+        assert_eq!(read("10").unwrap(), Duration::from_secs(10));
+        for bad in ["1m30", "s", "-", "1..2s", "1x", "1e3s"] {
+            assert!(read(bad).is_err(), "{bad}");
+        }
     }
 }
 

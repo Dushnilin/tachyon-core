@@ -597,8 +597,8 @@ impl XhttpConfig {
 
     fn resolved_mode(&self, tls: bool, is_h2: bool) -> Mode {
         match self.mode {
-            // In HTTP/2 or Reality, auto resolves to stream-one; otherwise packet-up.
-            Mode::Auto if is_h2 => Mode::StreamOne,
+            // In reference sing-box (scratch/dialer.go:333), auto resolves to packet-up
+            // (stream-one is only for REALITY).
             Mode::Auto => Mode::PacketUp,
             other => {
                 let _ = (tls, is_h2);
@@ -750,17 +750,34 @@ pub(crate) async fn connect(
         }
         // packet-up (and auto→packet-up)
         _ => {
-            this.up = Up::Packets(Box::new(PacketsState {
-                writer: Some(PostWriter {
-                    cfg: cfg.clone(),
-                    scheme: scheme.to_string(),
-                    authority: authority.clone(),
-                    session_id: this.session_id.clone(),
-                    seq: 0,
-                    last_post: None,
-                    dialer,
-                }),
-                in_flight: None,
+            let (client_write, worker_read) = tokio::io::duplex(128 * 1024);
+            let failure = Failure::default();
+            let writer = PostWriter {
+                cfg: cfg.clone(),
+                scheme: scheme.to_string(),
+                authority: authority.clone(),
+                session_id: this.session_id.clone(),
+                seq: 0,
+                dialer,
+            };
+            let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let bytes_flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            let task = tokio::spawn(packet_upload_worker(
+                worker_read,
+                writer,
+                failure.clone(),
+                std::sync::Arc::clone(&bytes_flushed),
+                std::sync::Arc::clone(&flush_notify),
+            ));
+            this.up = Up::Packets(Box::new(PacketsUp {
+                io: client_write,
+                failure,
+                bytes_written,
+                bytes_flushed,
+                flush_notify,
+                flush_wait: None,
+                task,
             }));
         }
     }
@@ -802,7 +819,6 @@ struct PostWriter {
     authority: String,
     session_id: String,
     seq: u64,
-    last_post: Option<std::time::Instant>,
     dialer: std::sync::Arc<Dialer>,
 }
 
@@ -829,19 +845,6 @@ impl PostWriter {
     /// Send one upload chunk as a single sequenced POST (reference
     /// `packetConn.sendPacket`).
     async fn send_packet(&mut self, chunk: &[u8]) -> io::Result<()> {
-        // Anti-burst throttle: enforce the minimum inter-post interval.
-        let interval = std::time::Duration::from_millis(self.cfg.meta.sc_min_interval_ms.rand());
-        let now = std::time::Instant::now();
-        if let Some(last) = self.last_post
-            && interval > std::time::Duration::ZERO
-        {
-            let earliest = last + interval;
-            if earliest > now {
-                tokio::time::sleep(earliest - now).await;
-            }
-        }
-        self.last_post = Some(std::time::Instant::now());
-
         let seq = self.seq;
         self.seq += 1;
         // One line per packet-up POST: which sequence number went out and how much
@@ -971,17 +974,20 @@ struct SplitConn {
     session_id: String,
 }
 
-type InFlight = Option<tokio::sync::oneshot::Receiver<io::Result<(PostWriter, usize)>>>;
-
-/// One packet-up write in progress: the writer plus its bounded POST run.
-struct PacketsState {
-    writer: Option<PostWriter>,
-    in_flight: InFlight,
+/// One packet-up upload stream: pipe into background upload worker.
+struct PacketsUp {
+    io: tokio::io::DuplexStream,
+    failure: Failure,
+    bytes_written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bytes_flushed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    flush_notify: std::sync::Arc<tokio::sync::Notify>,
+    flush_wait: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 enum Up {
     Stream(Box<StreamUp>),
-    Packets(Box<PacketsState>),
+    Packets(Box<PacketsUp>),
     None,
 }
 
@@ -1113,45 +1119,16 @@ impl AsyncWrite for XhttpConn {
                 Pin::new(&mut state.io).poll_write(cx, buf)
             }
             Up::Packets(state) => {
-                // Split like the reference Write: sc_max_each_post_bytes
-                // bounds one POST; the whole buffer is reported written
-                // once every POST completed.
-                if buf.is_empty() {
-                    return Poll::Ready(Ok(0));
+                if let Some(e) = state.failure.take() {
+                    return Poll::Ready(Err(e));
                 }
-                if state.in_flight.is_none() {
-                    let writer = state.writer.take().expect("post writer present");
-                    let data = buf.to_vec();
-                    // The POST runs on its own task: rustls reports a write as
-                    // done once the plaintext is buffered (tokio-rustls
-                    // `poll_write` returns Ready while the TLS record flush is
-                    // still Pending), so nothing is guaranteed to poll us
-                    // again -- the upload must not depend on that.
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    tokio::spawn(async move {
-                        let _ = tx.send(write_packets(writer, data).await);
-                    });
-                    state.in_flight = Some(rx);
+                let res = Pin::new(&mut state.io).poll_write(cx, buf);
+                if let Poll::Ready(Ok(n)) = &res {
+                    state
+                        .bytes_written
+                        .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                match std::future::Future::poll(
-                    Pin::new(state.in_flight.as_mut().expect("set above")),
-                    cx,
-                ) {
-                    Poll::Ready(Ok(Ok((writer, n)))) => {
-                        state.writer = Some(writer);
-                        state.in_flight = None;
-                        Poll::Ready(Ok(n.min(buf.len())))
-                    }
-                    Poll::Ready(Ok(Err(e))) => {
-                        state.in_flight = None;
-                        Poll::Ready(Err(e))
-                    }
-                    Poll::Ready(Err(_recv)) => {
-                        state.in_flight = None;
-                        Poll::Ready(Err(io::Error::other("xhttp: upload task gone")))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
+                res
             }
             Up::None => Poll::Ready(Err(io::Error::other("xhttp: no upload stream"))),
         }
@@ -1159,18 +1136,55 @@ impl AsyncWrite for XhttpConn {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let split = &mut *self.split;
-        if let Up::Stream(state) = &mut split.up {
-            return Pin::new(&mut state.io).poll_flush(cx);
+        match &mut split.up {
+            Up::Stream(state) => Pin::new(&mut state.io).poll_flush(cx),
+            Up::Packets(state) => {
+                if let Some(e) = state.failure.take() {
+                    return Poll::Ready(Err(e));
+                }
+                let written = state
+                    .bytes_written
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let flushed = state
+                    .bytes_flushed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if flushed >= written {
+                    state.flush_wait = None;
+                    return Pin::new(&mut state.io).poll_flush(cx);
+                }
+                if state.flush_wait.is_none() {
+                    let notify = std::sync::Arc::clone(&state.flush_notify);
+                    state.flush_wait = Some(Box::pin(async move {
+                        notify.notified().await;
+                    }));
+                }
+                if let Some(fut) = &mut state.flush_wait {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(()) => {
+                            state.flush_wait = None;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    Poll::Pending
+                }
+            }
+            Up::None => Poll::Ready(Ok(())),
         }
-        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let split = &mut *self.split;
-        if let Up::Stream(state) = &mut split.up {
-            // ends the chunked request body; a packet-up upload has nothing to
-            // close, its last POST already went out whole
-            ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
+        match &mut split.up {
+            Up::Stream(state) => {
+                ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
+            }
+            Up::Packets(state) => {
+                ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
+            }
+            Up::None => {}
         }
         split.dl_task.abort();
         Poll::Ready(Ok(()))
@@ -1180,22 +1194,55 @@ impl AsyncWrite for XhttpConn {
 impl Drop for SplitConn {
     fn drop(&mut self) {
         self.dl_task.abort();
+        if let Up::Packets(state) = &mut self.up {
+            state.task.abort();
+        }
     }
 }
 
-/// Sequential throttled POST upload (reference `packetConn.Write`).
-async fn write_packets(mut writer: PostWriter, data: Vec<u8>) -> io::Result<(PostWriter, usize)> {
-    let mut max_each = writer.cfg.meta.sc_max_each_post.rand();
-    if max_each == 0 {
-        max_each = data.len().max(1) as u64;
+/// Background worker reading from the write pipe and uploading sequential POST packets.
+async fn packet_upload_worker(
+    mut reader: tokio::io::DuplexStream,
+    mut writer: PostWriter,
+    failure: Failure,
+    bytes_flushed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    flush_notify: std::sync::Arc<tokio::sync::Notify>,
+) {
+    let max_each = writer.cfg.meta.sc_max_each_post.rand().max(1) as usize;
+    let min_interval = std::time::Duration::from_millis(writer.cfg.meta.sc_min_interval_ms.rand());
+    let mut buf = vec![0u8; max_each];
+    let mut last_post: Option<std::time::Instant> = None;
+
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                failure.set(e);
+                break;
+            }
+        };
+
+        if let Some(last) = last_post
+            && min_interval > std::time::Duration::ZERO
+        {
+            let elapsed = std::time::Instant::now().saturating_duration_since(last);
+            if elapsed < min_interval {
+                tokio::time::sleep(min_interval - elapsed).await;
+            }
+        }
+        last_post = Some(std::time::Instant::now());
+
+        if let Err(e) = writer.send_packet(&buf[..n]).await {
+            crate::logging::debug(format_args!("xhttp packet upload failed: {e}"));
+            failure.set(e);
+            break;
+        }
+
+        bytes_flushed.fetch_add(n as u64, std::sync::atomic::Ordering::Release);
+        flush_notify.notify_waiters();
     }
-    let mut written = 0usize;
-    while written < data.len() {
-        let end = ((written as u64) + max_each).min(data.len() as u64) as usize;
-        writer.send_packet(&data[written..end]).await?;
-        written = end;
-    }
-    Ok((writer, data.len()))
+    flush_notify.notify_waiters();
 }
 
 impl XhttpConfig {

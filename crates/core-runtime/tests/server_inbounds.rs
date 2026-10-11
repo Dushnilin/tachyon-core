@@ -905,6 +905,78 @@ async fn through_our_own_client_to(
     Ok(got)
 }
 
+async fn through_our_own_client_rounds(
+    server_inbound: Value,
+    client_outbound: Value,
+    rounds: &[&[u8]],
+) -> std::io::Result<()> {
+    let echo = spawn_echo().await;
+    let tag = server_inbound["tag"]
+        .as_str()
+        .expect("the server inbound needs a tag")
+        .to_string();
+    let server = core_runtime::start(&cfg(
+        server_inbound,
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start server");
+    let server_addr = inbound_addr(&server, &tag);
+    let mut outbound = client_outbound
+        .as_object()
+        .expect("the client outbound must be an object")
+        .clone();
+    outbound.insert("server".into(), json!("127.0.0.1"));
+    outbound.insert("server_port".into(), json!(server_addr.port()));
+    let client = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port()
+        }],
+        "outbounds": [Value::Object(outbound)],
+        "route": {"final": "out"}
+    }))
+    .await
+    .expect("start client");
+    let socks = inbound_addr(&client, "mixed-in");
+
+    let mut stream = tokio::net::TcpStream::connect(socks).await?;
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    assert_eq!(greeting, [0x05, 0x00], "socks greeting");
+    let mut request = vec![0x05, 0x01, 0x00, 1];
+    match echo.ip() {
+        IpAddr::V4(ip) => request.extend_from_slice(&ip.octets()),
+        _ => panic!("v4 echo"),
+    }
+    request.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&request).await?;
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await?;
+    assert_eq!(reply[1], 0x00, "socks connect succeeded");
+
+    for (i, round) in rounds.iter().enumerate() {
+        stream.write_all(round).await?;
+        let mut got = vec![0u8; round.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_exact(&mut got),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::other(format!("timeout waiting for echo response in round {i}"))
+        })??;
+        assert_eq!(&got, round);
+    }
+    drop(client);
+    drop(server);
+    Ok(())
+}
+
 fn vmess_server(uuid: &str) -> Value {
     json!({
         "type": "vmess",
@@ -1483,6 +1555,94 @@ async fn vless_server_over_xhttp_h2_packet_up_carries_our_own_client_traffic() {
         .await
         .expect("vless over xhttp h2 packet-up round trip");
     assert_eq!(String::from_utf8_lossy(&got), "through-h2-packet-up");
+}
+
+#[tokio::test]
+async fn vless_server_over_xhttp_packet_up_multi_write() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "packet-up"});
+
+    through_our_own_client_rounds(
+        server,
+        client,
+        &[
+            b"packet-up-round-1",
+            b"packet-up-round-2",
+            b"packet-up-round-3",
+        ],
+    )
+    .await
+    .expect("packet-up multi write round trip");
+}
+
+#[tokio::test]
+async fn vless_server_over_xhttp_auto_multi_write() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "auto"});
+
+    through_our_own_client_rounds(
+        server,
+        client,
+        &[b"auto-round-1", b"auto-round-2", b"auto-round-3"],
+    )
+    .await
+    .expect("auto multi write round trip");
+}
+
+#[tokio::test]
+async fn vless_server_over_xhttp_tls_packet_up_multi_write() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    server["tls"] = server_tls();
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "packet-up"});
+    client["tls"] = client_tls();
+
+    through_our_own_client_rounds(
+        server,
+        client,
+        &[
+            b"tls-packet-up-round-1",
+            b"tls-packet-up-round-2",
+            b"tls-packet-up-round-3",
+        ],
+    )
+    .await
+    .expect("tls packet-up multi write round trip");
+}
+
+#[tokio::test]
+async fn vless_server_over_xhttp_tls_auto_multi_write() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type": "xhttp", "path": "/bench"});
+    server["tls"] = server_tls();
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type": "xhttp", "path": "/bench", "mode": "auto"});
+    client["tls"] = client_tls();
+
+    through_our_own_client_rounds(
+        server,
+        client,
+        &[
+            b"tls-auto-round-1",
+            b"tls-auto-round-2",
+            b"tls-auto-round-3",
+        ],
+    )
+    .await
+    .expect("tls auto multi write round trip");
 }
 
 #[tokio::test]

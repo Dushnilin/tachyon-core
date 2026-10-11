@@ -479,7 +479,7 @@ impl Tun {
                             Vec::new()
                         };
 
-                        let mut dispatch_packet = |packet: &[u8], device: &mut TunDevice, sockets: &mut SocketSet<'static>, tcp_sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>| {
+                        let dispatch_packet = |packet: &[u8], device: &mut TunDevice, sockets: &mut SocketSet<'static>, tcp_sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>| {
                             if packet.is_empty() {
                                 return;
                             }

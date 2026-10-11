@@ -48,11 +48,11 @@ if [[ -n "$c_artifacts" ]]; then
     exit 1
 fi
 
-echo "== musl static build + size budget (<= 12 MiB)"
+echo "== musl static build + size budget (<= 14 MiB, matching ci.yml / release.yml)"
 cargo build --workspace --release --target x86_64-unknown-linux-musl
 size=$(stat -c%s "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core")
 echo "size=$size bytes"
-test "$size" -le 12582912
+test "$size" -le "${MUSL_BUDGET:-14680064}"
 file "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core"
 
 echo "== differential vs $SING_BOX_REF (STRICT=1)"

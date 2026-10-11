@@ -60,23 +60,6 @@ fn spawn(config: &std::path::Path) -> std::process::Child {
         .expect("spawn tachyon-core run")
 }
 
-/// Wait for the port to answer, and say what happened instead if it never does.
-fn wait_for_listener(port: u16, child: &mut std::process::Child) -> SocketAddr {
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("address");
-    let deadline = Instant::now() + STARTUP;
-    while Instant::now() < deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("tachyon-core run exited before it listened: {status}");
-        }
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return addr;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    panic!("tachyon-core run did not listen on {addr} within {STARTUP:?}");
-}
-
 /// The whole point: `run` takes the same configuration the library does, comes
 /// up, and serves.
 #[test]
@@ -84,17 +67,30 @@ fn run_starts_and_serves() {
     let port = free_port();
     let path = write_config("run", &config(port));
     let mut child = spawn(&path);
-    let addr = wait_for_listener(port, &mut child);
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("address");
 
-    // A SOCKS5 greeting, so "it is listening" and "it is serving" are not the
-    // same claim: a process can hold a port and answer nothing on it.
-    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("a read deadline");
-    stream.write_all(&[0x05, 0x01, 0x00]).expect("greeting");
+    let deadline = Instant::now() + STARTUP;
     let mut greeting = [0u8; 2];
-    stream.read_exact(&mut greeting).expect("greeting back");
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("tachyon-core run exited before it served: {status}");
+        }
+        if let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
+        {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            if stream.write_all(&[0x05, 0x01, 0x00]).is_ok()
+                && stream.read_exact(&mut greeting).is_ok()
+            {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("tachyon-core run did not serve socks on {addr} within {STARTUP:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         greeting,
         [0x05, 0x00],

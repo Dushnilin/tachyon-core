@@ -1848,7 +1848,10 @@ mod tests {
             Target::Domain("www.youtube.com".into(), 443),
             "tcp",
         );
-        let decision = router.route_raw(&mut ctx).await.expect("route should succeed");
+        let decision = router
+            .route_raw(&mut ctx)
+            .await
+            .expect("route should succeed");
         let Decision::Outbound(idx) = decision else {
             panic!("expected outbound decision");
         };
@@ -1856,7 +1859,10 @@ mod tests {
         // Verify ctx.domain is preserved for subsequent rules
         assert_eq!(ctx.domain.as_deref(), Some("www.youtube.com"));
         // Verify ctx.destination is rewritten to resolved IP:
-        assert_eq!(ctx.destination, Target::Ip("142.250.186.206:443".parse().unwrap()));
+        assert_eq!(
+            ctx.destination,
+            Target::Ip("142.250.186.206:443".parse().unwrap())
+        );
 
         crate::dns::set_service(None);
     }

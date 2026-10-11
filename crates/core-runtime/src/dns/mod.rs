@@ -930,6 +930,10 @@ impl DnsService {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<SocketAddr>> + Send + 'a>>
     {
         Box::pin(async move {
+            if cfg.kind == Kind::Tailscale {
+                // This transport addresses an endpoint, never a network host.
+                return Ok(SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0));
+            }
             if let Some(ip) = transport::is_ip_literal(&cfg.server) {
                 return Ok(SocketAddr::new(ip, cfg.port));
             }

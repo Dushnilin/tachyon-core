@@ -423,6 +423,7 @@ mod hash;
 mod hmac;
 mod kx;
 mod misc;
+pub mod nacl;
 pub mod quic;
 pub mod sign;
 pub mod verify;

@@ -11,15 +11,20 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// State for encrypting/decrypting payload with ChaCha20-Poly1305 and a counter nonce.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CipherState {
     k: Option<[u8; 32]>,
     n: u64,
+    big_endian: bool,
 }
 
 impl CipherState {
     pub fn new(key: Option<[u8; 32]>) -> Self {
-        Self { k: key, n: 0 }
+        Self {
+            k: key,
+            n: 0,
+            big_endian: false,
+        }
     }
 
     pub fn has_key(&self) -> bool {
@@ -31,10 +36,21 @@ impl CipherState {
         self.n = 0;
     }
 
-    fn make_nonce(n: u64) -> Nonce {
+    pub fn into_transport(mut self) -> Self {
+        // controlbase.Conn differs from Noise's handshake nonce convention.
+        self.big_endian = true;
+        self.n = 0;
+        self
+    }
+
+    fn make_nonce(&self) -> Nonce {
         let mut nonce_bytes = [0u8; 12];
         // 4 bytes 0 + 8 bytes counter in little-endian (Noise spec)
-        nonce_bytes[4..].copy_from_slice(&n.to_le_bytes());
+        nonce_bytes[4..].copy_from_slice(&if self.big_endian {
+            self.n.to_be_bytes()
+        } else {
+            self.n.to_le_bytes()
+        });
         *Nonce::from_slice(&nonce_bytes)
     }
 
@@ -43,7 +59,7 @@ impl CipherState {
             return plaintext.to_vec();
         };
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let nonce = Self::make_nonce(self.n);
+        let nonce = self.make_nonce();
         self.n = self.n.checked_add(1).expect("nonce overflow");
 
         let mut buffer = plaintext.to_vec();
@@ -62,8 +78,10 @@ impl CipherState {
             anyhow::bail!("ciphertext too short for auth tag");
         }
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let nonce = Self::make_nonce(self.n);
-        self.n = self.n.checked_add(1).expect("nonce overflow");
+        if self.n == u64::MAX {
+            anyhow::bail!("noise nonce exhausted");
+        }
+        let nonce = self.make_nonce();
 
         let split_pos = ciphertext.len() - 16;
         let mut buffer = ciphertext[..split_pos].to_vec();
@@ -72,12 +90,13 @@ impl CipherState {
         cipher
             .decrypt_in_place_detached(&nonce, ad, &mut buffer, tag)
             .map_err(|_| anyhow::anyhow!("noise auth tag verification failed"))?;
+        self.n += 1;
         Ok(buffer)
     }
 }
 
 /// Noise symmetric state tracking chaining key `ck` and handshake hash `h`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SymmetricState {
     pub h: [u8; 32],
     pub ck: [u8; 32],
@@ -204,6 +223,10 @@ impl NoiseIkInitiator {
     pub fn write_msg1(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut e_bytes = [0u8; 32];
         getrandom::fill(&mut e_bytes).expect("getrandom ephemeral key");
+        self.write_msg1_with_ephemeral(payload, e_bytes)
+    }
+
+    fn write_msg1_with_ephemeral(&mut self, payload: &[u8], e_bytes: [u8; 32]) -> Vec<u8> {
         let e = StaticSecret::from(e_bytes);
         let e_pub = PublicKey::from(&e);
 
@@ -252,9 +275,15 @@ impl NoiseIkInitiator {
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing ephemeral key"))?;
         let ee = e.diffie_hellman(&re_pub);
+        if !ee.was_contributory() {
+            anyhow::bail!("non-contributory responder ephemeral key");
+        }
         self.sym.mix_key(ee.as_bytes());
 
         let se = self.s.diffie_hellman(&re_pub);
+        if !se.was_contributory() {
+            anyhow::bail!("non-contributory responder ephemeral key");
+        }
         self.sym.mix_key(se.as_bytes());
 
         let payload = self.sym.decrypt_and_hash(&msg[32..])?;
@@ -334,6 +363,47 @@ impl NoiseIkResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_controlbase_handshake_and_big_endian_record_vectors() {
+        // Generated independently with tailscale.com/control/controlbase
+        // v1.86.5 (protocol 46), fixed private and ephemeral test keys.
+        let decode = |text: &str| {
+            let mut bytes = vec![0; text.len() / 2];
+            super::super::control::from_hex(text, &mut bytes).unwrap();
+            bytes
+        };
+        let initial = decode(
+            "002e0100605dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef2210da5742e8e73a0e407ca3bb3cded09a5b4a07adfc63441676643114028ee45099c9e995bc26eaa00c6081609410015df90dfd517c6b616855dcadcb01ff2364",
+        );
+        let server = decode(
+            "0200305dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22545cd9d6a3243e03a5cbfb1f3265add604001c890400205175b3d1494362bb9f1e8f945bdffe6e3788bc3a3d6a256e04001dba6f124961116c084ff75a415d888973b9e5b0e2b5a73ce016c5fbe543",
+        );
+        let machine = StaticSecret::from([11; 32]);
+        let control = StaticSecret::from([22; 32]);
+        let mut noise = NoiseIkInitiator::new(
+            machine,
+            PublicKey::from(&control),
+            b"Tailscale Control Protocol v46",
+        );
+        assert_eq!(noise.write_msg1_with_ephemeral(&[], [3; 32]), initial[5..]);
+        let (payload, (_, rx)) = noise.read_msg2(&server[3..51]).unwrap();
+        assert!(payload.is_empty());
+        let mut rx = rx.into_transport();
+        let mut offset = 51;
+        for plaintext in [b"first record".as_slice(), b"second record"] {
+            assert_eq!(server[offset], 4);
+            let size = usize::from(u16::from_be_bytes([server[offset + 1], server[offset + 2]]));
+            offset += 3;
+            assert_eq!(
+                rx.decrypt_with_ad(&[], &server[offset..offset + size])
+                    .unwrap(),
+                plaintext
+            );
+            offset += size;
+        }
+        assert_eq!(offset, server.len());
+    }
 
     #[test]
     fn test_noise_ik_handshake_roundtrip() {

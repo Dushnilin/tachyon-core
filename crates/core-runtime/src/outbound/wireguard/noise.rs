@@ -380,6 +380,8 @@ pub struct InitiationResult {
     pub e_pub: [u8; 32],
     pub ck: [u8; 32],
     pub h: [u8; 32],
+    /// Authenticated TAI64N timestamp for the responder's replay check.
+    pub timestamp: [u8; 12],
 }
 
 /// Process an incoming handshake initiation as a responder.
@@ -435,7 +437,10 @@ pub fn process_initiation(
     let (temp, ck3) = mix_key(&ck2, &dh(our_static_priv, &sender_static_pub));
     let key_ts = key2(&temp, &ck3);
     let enc_ts = &msg[88..116];
-    let _ts = aead_open(&key_ts, 0, enc_ts, &h).ok_or("initiation timestamp decrypt failed")?;
+    let ts = aead_open(&key_ts, 0, enc_ts, &h).ok_or("initiation timestamp decrypt failed")?;
+    let timestamp = ts
+        .try_into()
+        .map_err(|_| "invalid initiation timestamp length")?;
     h = hash_concat(&h, enc_ts);
 
     Ok(InitiationResult {
@@ -444,6 +449,7 @@ pub fn process_initiation(
         e_pub,
         ck: ck3,
         h,
+        timestamp,
     })
 }
 

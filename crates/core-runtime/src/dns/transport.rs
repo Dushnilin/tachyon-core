@@ -22,6 +22,8 @@ pub(crate) const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    /// MagicDNS and split DNS from a running native Tailscale endpoint.
+    Tailscale,
     Udp,
     Tcp,
     Tls,
@@ -444,6 +446,7 @@ impl ServerConfig {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("{at}: missing type"))?;
         let kind = match kind_raw {
+            "tailscale" => Kind::Tailscale,
             "udp" => Kind::Udp,
             "tcp" => Kind::Tcp,
             "tls" => Kind::Tls,
@@ -499,7 +502,11 @@ impl ServerConfig {
             .unwrap_or_default()
             .to_string();
         let server = map
-            .get("server")
+            .get(if kind == Kind::Tailscale {
+                "endpoint"
+            } else {
+                "server"
+            })
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
@@ -512,6 +519,7 @@ impl ServerConfig {
                 Kind::Https | Kind::H3 => 443,
                 Kind::Quic => 853,
                 Kind::Fakeip
+                | Kind::Tailscale
                 | Kind::Local
                 | Kind::Hosts
                 | Kind::Mdns
@@ -580,6 +588,7 @@ impl ServerConfig {
         let needs_server = !matches!(
             kind,
             Kind::Fakeip
+                | Kind::Tailscale
                 | Kind::Local
                 | Kind::Hosts
                 | Kind::Mdns
@@ -589,6 +598,9 @@ impl ServerConfig {
         );
         if needs_server && server.is_empty() {
             anyhow::bail!("{at}: missing server");
+        }
+        if kind == Kind::Tailscale && server.is_empty() {
+            anyhow::bail!("{at}: tailscale DNS requires endpoint");
         }
         let detour = map
             .get("detour")
@@ -791,6 +803,22 @@ pub async fn exchange(
 ) -> io::Result<Vec<u8>> {
     let fut = async {
         match cfg.kind {
+            Kind::Tailscale => {
+                let router = dialer.router.as_ref().ok_or_else(|| {
+                    io::Error::other("dns: Tailscale endpoint registry unavailable")
+                })?;
+                let inner = router.inner();
+                let endpoint = inner
+                    .outbound_table()
+                    .find_map(|(_, tag, outbound)| match outbound {
+                        crate::route::Outbound::Tailscale(endpoint) if tag == cfg.server => {
+                            Some(endpoint.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| io::Error::other("dns: Tailscale endpoint not found"))?;
+                endpoint.dns_exchange(query).await
+            }
             // mdns has no server address: the router runs it before it gets here
             Kind::Mdns => Err(io::Error::other("dns: mdns server has no address")),
             Kind::Udp => exchange_udp(dialer, cfg, addr, query).await,

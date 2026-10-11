@@ -7,17 +7,20 @@ use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const FRAME_CLIENT_INFO: u8 = 0x01;
-pub const FRAME_SERVER_INFO: u8 = 0x02;
-pub const FRAME_SEND_PACKET: u8 = 0x03;
-pub const FRAME_RECV_PACKET: u8 = 0x04;
-pub const FRAME_KEEP_ALIVE: u8 = 0x05;
-pub const FRAME_NOTE_PREFERRED: u8 = 0x06;
-pub const FRAME_PEER_GONE: u8 = 0x07;
+pub const FRAME_SERVER_KEY: u8 = 0x01;
+pub const FRAME_CLIENT_INFO: u8 = 0x02;
+pub const FRAME_SERVER_INFO: u8 = 0x03;
+pub const FRAME_SEND_PACKET: u8 = 0x04;
+pub const FRAME_RECV_PACKET: u8 = 0x05;
+pub const FRAME_KEEP_ALIVE: u8 = 0x06;
+pub const FRAME_NOTE_PREFERRED: u8 = 0x07;
+pub const FRAME_PEER_GONE: u8 = 0x08;
+pub const FRAME_PING: u8 = 0x12;
+pub const FRAME_PONG: u8 = 0x13;
 
-pub const DERP_MAGIC: &[u8] = b"DERP\x00";
+pub const DERP_MAGIC: &[u8] = b"DERP\xf0\x9f\x94\x91";
 
-/// Encodes a client registration frame (`0x01`).
+/// Encodes a client registration frame (`0x02`).
 pub fn encode_client_info(client_key: &[u8; 32], info_json: &[u8]) -> Vec<u8> {
     let payload_len = 32 + info_json.len();
     let mut buf = Vec::with_capacity(5 + payload_len);
@@ -28,7 +31,7 @@ pub fn encode_client_info(client_key: &[u8; 32], info_json: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Encodes a WireGuard packet to be forwarded to a target peer (`0x03`).
+/// Encodes a WireGuard packet to be forwarded to a target peer (`0x04`).
 pub fn encode_send_packet(dst_key: &[u8; 32], packet: &[u8]) -> Vec<u8> {
     let payload_len = 32 + packet.len();
     let mut buf = Vec::with_capacity(5 + payload_len);
@@ -39,12 +42,12 @@ pub fn encode_send_packet(dst_key: &[u8; 32], packet: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Encodes a keepalive frame (`0x05`).
+/// Encodes a keepalive frame (`0x06`).
 pub fn encode_keepalive() -> [u8; 5] {
     [FRAME_KEEP_ALIVE, 0, 0, 0, 0]
 }
 
-/// Encodes a note-preferred frame (`0x06`).
+/// Encodes a note-preferred frame (`0x07`).
 pub fn encode_note_preferred(preferred: bool) -> [u8; 6] {
     [
         FRAME_NOTE_PREFERRED,
@@ -140,12 +143,14 @@ pub struct DerpNode {
     pub region_id: u16,
     #[serde(rename = "HostName")]
     pub host_name: String,
-    #[serde(rename = "Port", default = "default_derp_port")]
+    #[serde(rename = "DERPPort", alias = "Port", default = "default_derp_port")]
     pub port: u16,
     #[serde(rename = "IPv4", default)]
     pub ipv4: Option<String>,
     #[serde(rename = "IPv6", default)]
     pub ipv6: Option<String>,
+    #[serde(rename = "STUNOnly", default)]
+    pub stun_only: bool,
 }
 
 fn default_derp_port() -> u16 {

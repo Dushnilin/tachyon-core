@@ -11,7 +11,7 @@
 | `wireguard` | Работает: WireGuard и AmneziaWG 2.0/3.x. |
 | `openvpn-client` | Работает: режим `static_key` поверх UDP и TCP. |
 | `openconnect` | Принимается конфигом, в рантайме ошибка `not implemented yet (config check parity only)`. |
-| `tailscale` | То же. |
+| `tailscale` | Нативный userspace endpoint: control, DISCO, WireGuard/DERP, MagicDNS и TCP/UDP subnet routing. Ограничения ниже. |
 
 ## Поля WireGuard и AmneziaWG
 
@@ -100,3 +100,61 @@
   }
 }
 ```
+
+## Tailscale
+
+Реализация использует имеющиеся в workspace Rust-примитивы; отдельный
+`tailscaled`, Go runtime, geiserx, дополнительные crate и системные пакеты
+не нужны. Control соединяется по HTTPS с проверкой сертификата и Noise IK;
+DERP переносит зашифрованные WireGuard-пакеты. DISCO Ping/Pong проверяет
+прямой UDP-путь, а недоступные прямые адреса используют DERP.
+
+| Поле | По умолчанию | Описание |
+|---|---|---|
+| `type` | — | `tailscale`. |
+| `tag` | — | Имя endpoint для route и DNS. |
+| `state_directory` | — | Обязателен для постоянного узла; содержит private identity. |
+| `auth_key` | — | Ключ первоначальной регистрации; секрет, не помещать в журналы. |
+| `hostname` | `tachyon-core` | Имя узла. |
+| `control_url` | `https://controlplane.tailscale.com` | Только HTTPS origin без embedded credentials. |
+| `ephemeral` | `false` | Временная identity без сохранения. |
+| `listen_port` | `41641` | UDP-порт WireGuard/DISCO; `0` выбирает свободный порт. |
+| `advertise_routes` | `[]` | Публикуемые CIDR subnet routes; одобрение маршрутов выполняется в control plane. |
+| `accept_routes` | `false` | Разрешить исходящие соединения к subnet routes других узлов. |
+| `advertise_tags` | `[]` | Запрашиваемые теги согласно политике tailnet. |
+| `udp_timeout` | общий UDP timeout | Время простоя LAN UDP-сессии. |
+| `system_interface_mtu` | `1280` | MTU userspace stack, не создание системного интерфейса. |
+
+Для DNS сервер `type: "tailscale"` ссылается на `endpoint`, например:
+
+```json
+{
+  "dns": {
+    "servers": [{"type": "tailscale", "tag": "tailnet-dns", "endpoint": "tailnet"}]
+  },
+  "endpoints": [{
+    "type": "tailscale",
+    "tag": "tailnet",
+    "state_directory": "/var/lib/tachyon/tailscale",
+    "hostname": "router",
+    "advertise_routes": ["192.0.2.0/24"]
+  }]
+}
+```
+
+MagicDNS сохраняет transaction ID клиента и отвечает A/AAAA; split DNS
+использует IP resolvers из netmap. Оригинальный `tailscaled.state` читается
+для импорта machine/node keys и не переписывается. Новая private identity
+хранится в `tachyon-native-identity.json`; повреждённая identity вызывает
+ошибку, а не создание другого узла. При неизменённых параметрах reload
+сохраняет endpoint и соединения; при изменении старые задачи завершаются.
+
+Входящие новые TCP/UDP соединения проходят проверку source AllowedIPs,
+advertised destination и packet ACL. Просроченная или неавторизованная
+identity не получает трафик. Tailnet lock, системный интерфейс, exit node,
+Taildrop и размещение relay server пока не поддерживаются: конфигурация
+завершается ошибкой. ICMP/TSMP, IP fragmentation, IPv6 extension headers,
+STUN и peer relay discovery не реализованы; `tailscale ping --tsmp` не
+служит проверкой TCP/UDP. Direct discovery пока использует IPv4; DERP
+остаётся запасным транспортом. Общие dialer options для этого endpoint
+пока не применяются.

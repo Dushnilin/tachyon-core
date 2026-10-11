@@ -55,7 +55,9 @@ pub fn parse_record(data: &[u8]) -> io::Result<ParsedHello> {
         return Err(err("short record"));
     }
     let hs = &data[5..5 + rec_len];
-    if hs[0] != 0x01 {
+    // `16 03 01 00 00` is a whole record with nothing in it; indexing it was
+    // a panic, and release builds abort on panic
+    if hs.first() != Some(&0x01) {
         return Err(err("not a ClientHello"));
     }
     let mut off = 4;
@@ -258,4 +260,41 @@ pub fn key_share_group(body: &[u8]) -> io::Result<Vec<u16>> {
         .into_iter()
         .map(|(group, _)| group)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sniffers hand this parser whatever a client sent. It may refuse,
+    /// it may not panic: release builds abort on panic.
+    #[test]
+    fn no_input_makes_the_parser_panic() {
+        assert!(parse_record(&[0x16, 0x03, 0x01, 0x00, 0x00]).is_err());
+        let mut sni = vec![0x00, 0x00];
+        let body = build_sni("example.com").unwrap();
+        sni.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        sni.extend_from_slice(&body);
+        let mut hs = vec![0x03, 0x03];
+        hs.extend_from_slice(&[7; 32]);
+        hs.extend_from_slice(&[0, 0, 2, 0x13, 0x01, 1, 0]);
+        hs.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&sni);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&((hs.len() + 4) as u16).to_be_bytes());
+        record.push(0x01);
+        record.extend_from_slice(&(hs.len() as u32).to_be_bytes()[1..]);
+        record.extend_from_slice(&hs);
+        assert_eq!(parse_record(&record).unwrap().sni, "example.com");
+        for len in 0..record.len() {
+            let _ = parse_record(&record[..len]);
+        }
+        for at in 0..record.len() {
+            for value in [0x00, 0x01, 0x7f, 0x80, 0xff] {
+                let mut bent = record.clone();
+                bent[at] = value;
+                let _ = parse_record(&bent);
+            }
+        }
+    }
 }

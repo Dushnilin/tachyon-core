@@ -1472,6 +1472,143 @@ const DNS_HIJACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve length-prefixed TCP DNS queries through the dns service
 /// (`action: hijack-dns`); `prefix` is sniffed bytes already read.
+fn is_doh_request(buf: &[u8]) -> bool {
+    buf.starts_with(b"GET ") || buf.starts_with(b"POST ") || buf.starts_with(b"HEAD ")
+}
+
+async fn handle_doh_request<S>(
+    client: &mut S,
+    buf: &mut Vec<u8>,
+    ctx: &ConnContext,
+    dns: &Arc<crate::dns::DnsService>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            if buf.len() > 64 * 1024 {
+                return Err(io::Error::other("doh-trap: header too large"));
+            }
+            match tokio::time::timeout(DNS_HIJACK_TIMEOUT, client.read(&mut chunk)).await {
+                Ok(Ok(0)) => {
+                    if buf.is_empty() {
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "doh-trap: eof in header",
+                    ));
+                }
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "doh-trap: read timeout",
+                    ));
+                }
+            }
+        }
+        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let header_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let mut lines = header_str.lines();
+        let req_line = lines.next().unwrap_or_default();
+        let mut req_parts = req_line.split_whitespace();
+        let method = req_parts.next().unwrap_or_default();
+        let path = req_parts.next().unwrap_or_default();
+
+        let mut content_length = 0usize;
+        let mut is_close = false;
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                let k_trim = k.trim();
+                let v_trim = v.trim();
+                if k_trim.eq_ignore_ascii_case("content-length") {
+                    content_length = v_trim.parse().unwrap_or(0);
+                } else if k_trim.eq_ignore_ascii_case("connection")
+                    && v_trim.eq_ignore_ascii_case("close")
+                {
+                    is_close = true;
+                }
+            }
+        }
+
+        let body_start = header_end + 4;
+        let query_bytes = if method.eq_ignore_ascii_case("GET") {
+            buf.drain(..body_start);
+            if let Some((_, query_part)) = path.split_once('?') {
+                let mut dns_b64 = None;
+                for param in query_part.split('&') {
+                    if let Some((k, v)) = param.split_once('=')
+                        && k == "dns"
+                    {
+                        dns_b64 = Some(v);
+                        break;
+                    }
+                }
+                if let Some(b64) = dns_b64 {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(b64)
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
+                        .map_err(|e| io::Error::other(format!("doh-trap: base64 decode: {e}")))?
+                } else {
+                    return Err(io::Error::other("doh-trap: missing ?dns= in GET"));
+                }
+            } else {
+                return Err(io::Error::other("doh-trap: no query string in GET"));
+            }
+        } else if method.eq_ignore_ascii_case("POST") {
+            while buf.len() < body_start + content_length {
+                match tokio::time::timeout(DNS_HIJACK_TIMEOUT, client.read(&mut chunk)).await {
+                    Ok(Ok(0)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "doh-trap: truncated body",
+                        ));
+                    }
+                    Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "doh-trap: read timeout",
+                        ));
+                    }
+                }
+            }
+            let query = buf[body_start..body_start + content_length].to_vec();
+            buf.drain(..body_start + content_length);
+            query
+        } else {
+            return Err(io::Error::other(format!(
+                "doh-trap: unsupported method {method}"
+            )));
+        };
+
+        let meta = QueryMeta {
+            inbound: ctx.inbound.clone(),
+            source: Some(ctx.source.ip()),
+            network: Some("tcp".to_string()),
+        };
+        let resp = dns.exchange(&meta, &query_bytes, true).await?;
+
+        let conn_header = if is_close { "close" } else { "keep-alive" };
+        let resp_head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+            resp.len(),
+            conn_header
+        );
+        client.write_all(resp_head.as_bytes()).await?;
+        client.write_all(&resp).await?;
+        if is_close {
+            return Ok(());
+        }
+    }
+}
+
 pub async fn hijack_dns<S>(client: &mut S, ctx: &ConnContext) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1480,6 +1617,24 @@ where
         dns::current().ok_or_else(|| io::Error::other("hijack-dns: dns service not configured"))?;
     let mut buf = ctx.sniff_prefix.clone();
     let mut chunk = vec![0u8; 4096];
+
+    while buf.len() < 4 {
+        match tokio::time::timeout(DNS_HIJACK_TIMEOUT, client.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "hijack-dns: read timeout",
+                ));
+            }
+        }
+    }
+    if is_doh_request(&buf) {
+        return handle_doh_request(client, &mut buf, ctx, &dns).await;
+    }
+
     loop {
         while buf.len() < 2 {
             match tokio::time::timeout(DNS_HIJACK_TIMEOUT, client.read(&mut chunk)).await {
@@ -1876,6 +2031,107 @@ mod tests {
             ctx.destination,
             Target::Ip("142.250.186.206:443".parse().unwrap())
         );
+
+        crate::dns::set_service(None);
+    }
+
+    #[tokio::test]
+    async fn test_hijack_dns_doh_post_and_get() {
+        use base64::Engine;
+
+        let _g = test_guard().await;
+        let dns_config = json!({
+            "dns": {
+                "servers": [
+                    {
+                        "type": "hosts",
+                        "tag": "local-dns",
+                        "predefined": {
+                            "example.com": "93.184.216.34"
+                        }
+                    }
+                ],
+                "final": "local-dns"
+            }
+        });
+        let dns = crate::dns::DnsService::build(&dns_config).unwrap().unwrap();
+        crate::dns::set_service(Some(dns));
+
+        let ctx = ConnContext::new(
+            "tun",
+            "192.168.1.100:12345".parse().unwrap(),
+            Target::Domain("1.1.1.1".into(), 443),
+            "tcp",
+        );
+
+        // Standard DNS A query for example.com (12 bytes header)
+        let query = [
+            0x12, 0x34, // ID
+            0x01, 0x00, // standard query, RD=1
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00, // example.com
+            0x00, 0x01, // TYPE A
+            0x00, 0x01, // CLASS IN
+        ];
+
+        // 1. Test POST /dns-query
+        {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let ctx_clone = ctx.clone();
+            let hijack_task =
+                tokio::spawn(async move { hijack_dns(&mut server, &ctx_clone).await });
+
+            let req = format!(
+                "POST /dns-query HTTP/1.1\r\nHost: 1.1.1.1\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                query.len()
+            );
+            client.write_all(req.as_bytes()).await.unwrap();
+            client.write_all(&query).await.unwrap();
+
+            let mut resp_buf = vec![0u8; 1024];
+            let n = client.read(&mut resp_buf).await.unwrap();
+            let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+            assert!(
+                resp_str.starts_with("HTTP/1.1 200 OK"),
+                "POST expected 200 OK, got: {resp_str}"
+            );
+            assert!(resp_str.contains("application/dns-message"));
+
+            drop(client);
+            let _ = hijack_task.await;
+        }
+
+        // 2. Test GET /dns-query?dns=<base64url>
+        {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let ctx_clone = ctx.clone();
+            let hijack_task = tokio::spawn(async move {
+                let _ = hijack_dns(&mut server, &ctx_clone).await;
+            });
+
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(query);
+            let req = format!(
+                "GET /dns-query?dns={} HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n",
+                b64
+            );
+            client.write_all(req.as_bytes()).await.unwrap();
+
+            let mut resp_buf = vec![0u8; 1024];
+            let n = client.read(&mut resp_buf).await.unwrap();
+            let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+            assert!(
+                resp_str.starts_with("HTTP/1.1 200 OK"),
+                "GET expected 200 OK, got: {resp_str}"
+            );
+            assert!(resp_str.contains("application/dns-message"));
+
+            drop(client);
+            let _ = hijack_task.await;
+        }
 
         crate::dns::set_service(None);
     }

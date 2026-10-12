@@ -346,7 +346,15 @@ fn sniff_http(buf: &[u8], ctx: &mut ConnContext) -> Outcome {
         host = Some(request_target.to_string());
     }
 
-    ctx.protocol = Some("http".into());
+    let is_doh = request_target.starts_with("/dns-query")
+        || text
+            .to_ascii_lowercase()
+            .contains("application/dns-message");
+    if is_doh {
+        ctx.protocol = Some("dns".into());
+    } else {
+        ctx.protocol = Some("http".into());
+    }
     if let Some(raw) = host {
         let fqdn = strip_authority_port(&raw);
         if !fqdn.is_empty() {

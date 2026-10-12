@@ -420,6 +420,30 @@ async fn providers_configs_and_mode() {
     )
     .await;
     assert_eq!(res.status, 204);
+
+    // --- GET /metrics (Prometheus format) ------------------------------
+    let res = request(addr, &anonymous("/metrics")).await;
+    assert_eq!(res.status, 401, "/metrics authenticates with the secret");
+    let res = request(addr, &authed("/metrics")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+    let body = res.text();
+    assert!(
+        body.contains("tachyon_connections_active"),
+        "metrics contains active conns: {body}"
+    );
+    assert!(
+        body.contains("tachyon_traffic_upload_bytes_total"),
+        "metrics contains up total: {body}"
+    );
+    assert!(
+        body.contains("tachyon_traffic_download_bytes_total"),
+        "metrics contains down total: {body}"
+    );
+
     instance.shutdown();
 }
 

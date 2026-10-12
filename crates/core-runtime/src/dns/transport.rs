@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::inbound::AnyStream;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;

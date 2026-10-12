@@ -89,6 +89,10 @@ impl ServerTls {
             }
             _ => {}
         }
+        let inbound_ty = obj.get("type").and_then(Value::as_str);
+        if inbound_ty == Some("naive") && !this.alpn.iter().any(|p| p == b"h2") {
+            this.alpn.insert(0, b"h2".to_vec());
+        }
         Ok(Some(Arc::new(this)))
     }
 

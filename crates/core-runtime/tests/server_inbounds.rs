@@ -1774,3 +1774,201 @@ async fn an_inbound_tls_without_a_certificate_does_not_start() {
         assert!(chain.contains("tls:"), "{tls}: {chain}");
     }
 }
+
+#[tokio::test]
+async fn mieru_server_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let username = "alice";
+    let password = "alicepassword123";
+    let mut instance = core_runtime::start(&cfg(
+        json!({
+            "type": "mieru",
+            "tag": "mieru-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "transport": "TCP",
+            "users": [{"name": username, "password": password}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start mieru server");
+    let server_addr = inbound_addr(&instance, "mieru-in");
+
+    let client_outbound = core_runtime::outbound::mieru::Mieru::build(
+        json!({
+            "type": "mieru",
+            "server": "127.0.0.1",
+            "server_port": server_addr.port(),
+            "transport": "TCP",
+            "username": username,
+            "password": password
+        })
+        .as_object()
+        .unwrap(),
+        "outbounds[0]",
+    )
+    .expect("build mieru outbound");
+
+    let mut stream = client_outbound
+        .connect(&core_runtime::inbound::Target::Ip(echo))
+        .await
+        .expect("connect mieru client to echo");
+    stream
+        .write_all(b"mieru-echo-payload")
+        .await
+        .expect("write payload");
+    let mut buf = [0u8; 18];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("read echo payload");
+    assert_eq!(&buf, b"mieru-echo-payload");
+
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
+async fn naive_server_over_tls_carries_our_own_client_traffic() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let username = "bob";
+    let password = "bobpassword123";
+    let mut server = json!({
+        "type": "naive",
+        "tag": "naive-in",
+        "listen": "127.0.0.1",
+        "listen_port": free_port(),
+        "users": [{"username": username, "password": password}]
+    });
+    server["tls"] = server_tls();
+    let mut instance =
+        core_runtime::start(&cfg(server, json!([{"type": "direct", "tag": "direct"}])))
+            .await
+            .expect("start naive server");
+    let server_addr = inbound_addr(&instance, "naive-in");
+
+    let client_outbound = core_runtime::outbound::naive::Naive::build(
+        json!({
+            "type": "naive",
+            "server": "127.0.0.1",
+            "server_port": server_addr.port(),
+            "username": username,
+            "password": password,
+            "tls": {
+                "enabled": true,
+                "server_name": "localhost",
+                "certificate_path": cert_file("localhost.crt")
+            }
+        })
+        .as_object()
+        .unwrap(),
+        "outbounds[0]",
+    )
+    .expect("build naive outbound");
+
+    let mut stream = client_outbound
+        .connect(&core_runtime::inbound::Target::Ip(echo))
+        .await
+        .expect("connect naive client to echo");
+    stream
+        .write_all(b"naive-echo-payload")
+        .await
+        .expect("write payload");
+    let mut buf = [0u8; 18];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("read echo payload");
+    assert_eq!(&buf, b"naive-echo-payload");
+
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
+async fn mieru_server_refuses_wrong_password() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let mut instance = core_runtime::start(&cfg(
+        json!({
+            "type": "mieru",
+            "tag": "mieru-in",
+            "listen": "127.0.0.1",
+            "listen_port": free_port(),
+            "transport": "TCP",
+            "users": [{"name": "alice", "password": "correctpassword"}]
+        }),
+        json!([{"type": "direct", "tag": "direct"}]),
+    ))
+    .await
+    .expect("start mieru server");
+    let server_addr = inbound_addr(&instance, "mieru-in");
+
+    let client_outbound = core_runtime::outbound::mieru::Mieru::build(
+        json!({
+            "type": "mieru",
+            "server": "127.0.0.1",
+            "server_port": server_addr.port(),
+            "transport": "TCP",
+            "username": "alice",
+            "password": "wrongpassword"
+        })
+        .as_object()
+        .unwrap(),
+        "outbounds[0]",
+    )
+    .expect("build mieru outbound");
+
+    let err = client_outbound
+        .connect(&core_runtime::inbound::Target::Ip(echo))
+        .await;
+    assert!(err.is_err(), "wrong password must be refused");
+
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
+async fn naive_server_refuses_wrong_password() {
+    let _guard = test_guard().await;
+    let echo = spawn_echo().await;
+    let mut server = json!({
+        "type": "naive",
+        "tag": "naive-in",
+        "listen": "127.0.0.1",
+        "listen_port": free_port(),
+        "users": [{"username": "bob", "password": "correctpassword"}]
+    });
+    server["tls"] = server_tls();
+    let mut instance =
+        core_runtime::start(&cfg(server, json!([{"type": "direct", "tag": "direct"}])))
+            .await
+            .expect("start naive server");
+    let server_addr = inbound_addr(&instance, "naive-in");
+
+    let client_outbound = core_runtime::outbound::naive::Naive::build(
+        json!({
+            "type": "naive",
+            "server": "127.0.0.1",
+            "server_port": server_addr.port(),
+            "username": "bob",
+            "password": "wrongpassword",
+            "tls": {
+                "enabled": true,
+                "server_name": "localhost",
+                "certificate_path": cert_file("localhost.crt")
+            }
+        })
+        .as_object()
+        .unwrap(),
+        "outbounds[0]",
+    )
+    .expect("build naive outbound");
+
+    let err = client_outbound
+        .connect(&core_runtime::inbound::Target::Ip(echo))
+        .await;
+    assert!(err.is_err(), "wrong password must be refused");
+
+    instance.shutdown_wait().await;
+}

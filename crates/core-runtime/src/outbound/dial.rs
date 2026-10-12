@@ -81,6 +81,8 @@ pub struct DialOptions {
     /// `fallback_delay`: how long the first address gets before the other
     /// family starts (RFC 6555).
     pub fallback_delay: Option<Duration>,
+    /// Detour outbound tag to route or dial through.
+    pub detour: Option<String>,
     /// The reference dials a resolved name in parallel unless something makes
     /// its own serial dialer necessary: `dialOptions.Detour == "" &&
     /// !options.TCPFastOpen`.
@@ -190,6 +192,11 @@ impl DialOptions {
                 }
             },
             fallback_delay: seconds("fallback_delay")?,
+            detour: obj
+                .get("detour")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             parallel: obj
                 .get("detour")
                 .and_then(serde_json::Value::as_str)
@@ -1235,6 +1242,9 @@ mod tests {
             let obj = serde_json::json!({field: value});
             let options = DialOptions::parse(obj.as_object().expect("object")).expect("options");
             assert!(!options.parallel, "{field} must turn the race off");
+            if field == "detour" {
+                assert_eq!(options.detour.as_deref(), Some("other"));
+            }
         }
         assert!(
             DialOptions::parse(

@@ -188,6 +188,25 @@ pub fn close_all() -> usize {
     entries.len()
 }
 
+/// Close all live connections whose chain/route matches `tag`.
+pub fn close_by_tag(tag: &str) -> usize {
+    if tag.is_empty() {
+        return 0;
+    }
+    let entries: Vec<Arc<Shared>> = registry()
+        .lock()
+        .map(|guard| guard.values().cloned().collect())
+        .unwrap_or_default();
+    let mut count = 0;
+    for entry in &entries {
+        if entry.meta.chains.iter().any(|c| c == tag) {
+            trigger(&entry.closed, &entry.notify);
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Count UDP payload bytes so `/traffic` sees datagram traffic too.
 pub fn add_udp(upload: u64, download: u64) {
     UPLOAD_TOTAL.fetch_add(upload, Ordering::Relaxed);
@@ -297,5 +316,40 @@ mod tests {
                 .any(|view| view.meta.destination == destination),
             "dropping the handle removes the entry"
         );
+    }
+
+    #[tokio::test]
+    async fn close_by_tag_only_closes_matching_chains() {
+        let _serial = guard().lock().await;
+        let mut meta1 = unique_meta("tag1.example:443");
+        meta1.chains = vec![
+            "inbound".into(),
+            "select1".into(),
+            "chain_a".into(),
+            "exit_a".into(),
+        ];
+        let mut meta2 = unique_meta("tag2.example:443");
+        meta2.chains = vec![
+            "inbound".into(),
+            "select1".into(),
+            "chain_b".into(),
+            "exit_b".into(),
+        ];
+
+        let h1 = ConnHandle::open(meta1);
+        let s1 = h1.close_signal();
+        let h2 = ConnHandle::open(meta2);
+        let s2 = h2.close_signal();
+
+        let closed = close_by_tag("exit_a");
+        assert!(closed >= 1);
+
+        tokio::select! {
+            _ = s1.wait() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                panic!("close signal not delivered to h1")
+            }
+        }
+        assert!(!s2.closed.load(std::sync::atomic::Ordering::Acquire));
     }
 }

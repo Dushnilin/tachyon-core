@@ -32,6 +32,8 @@ fn positional_args(args: &[String]) -> Vec<String> {
             || arg == "--domain"
             || arg == "-i"
             || arg == "--ip"
+            || arg == "-f"
+            || arg == "--format"
         {
             index += 2;
             continue;
@@ -42,6 +44,8 @@ fn positional_args(args: &[String]) -> Vec<String> {
             || arg.starts_with("-d=")
             || arg.starts_with("--ip=")
             || arg.starts_with("-i=")
+            || arg.starts_with("--format=")
+            || arg.starts_with("-f=")
         {
             index += 1;
             continue;
@@ -280,10 +284,18 @@ fn cmd_rule_set_match(args: &[String]) -> Result<(), String> {
             .cloned()
             .unwrap_or_default()
     };
-    let domain = flag_value(args, "-d", "--domain");
-    let ip = flag_value(args, "-i", "--ip");
+    let mut domain = flag_value(args, "-d", "--domain");
+    let mut ip = flag_value(args, "-i", "--ip");
     if domain.is_none() && ip.is_none() {
-        return Err("rule-set match: one of --domain or --ip is required".to_string());
+        if let Some(target) = positional.get(1) {
+            if target.parse::<std::net::IpAddr>().is_ok() {
+                ip = Some(target.clone());
+            } else {
+                domain = Some(target.clone());
+            }
+        } else {
+            return Err("rule-set match: one of --domain or --ip is required".to_string());
+        }
     }
     let mut hits = 0usize;
     for (index, rule) in rules.iter().enumerate() {
@@ -543,5 +555,47 @@ mod tests {
             flag_value(&args3, "-o", "--output"),
             Some("out.json".to_string())
         );
+
+        let args4 = vec![
+            "in.srs".to_string(),
+            "youtube.com".to_string(),
+            "-f".to_string(),
+            "binary".to_string(),
+        ];
+        assert_eq!(
+            positional_args(&args4),
+            vec!["in.srs".to_string(), "youtube.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_cmd_rule_set_match_positional() {
+        let temp_dir = std::env::temp_dir();
+        let rule_path = temp_dir.join("test_ruleset_match.json");
+        let json_content = r#"{
+            "version": 1,
+            "rules": [
+                {
+                    "domain_suffix": ["youtube.com"],
+                    "ip_cidr": ["192.168.1.0/24"]
+                }
+            ]
+        }"#;
+        std::fs::write(&rule_path, json_content).unwrap();
+        let p_str = rule_path.to_str().unwrap().to_string();
+
+        // Positional domain with -f binary
+        assert!(cmd_rule_set_match(&[p_str.clone(), "www.youtube.com".into(), "-f".into(), "binary".into()]).is_ok());
+
+        // Positional IP
+        assert!(cmd_rule_set_match(&[p_str.clone(), "192.168.1.50".into()]).is_ok());
+
+        // Explicit domain flag
+        assert!(cmd_rule_set_match(&[p_str.clone(), "--domain".into(), "youtube.com".into()]).is_ok());
+
+        // Missing both domain and ip
+        assert!(cmd_rule_set_match(&[p_str.clone()]).is_err());
+
+        let _ = std::fs::remove_file(rule_path);
     }
 }

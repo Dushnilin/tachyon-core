@@ -57,15 +57,15 @@ if (-not (Test-Path $sbArm)) {
     "$root\scripts\bench\night_load.py" "$root\scripts\bench\overnight.sh" "${Router}:/tmp/bench/" | Out-Null
 & ssh @sshOpt $Router "chmod +x /tmp/bench/tachyon-core /tmp/bench/sing-box /tmp/bench/overnight.sh" 2>$null
 
-if ((RemoteState "grep -qs night_load /proc/[0-9]*/cmdline && echo RUN || echo IDLE") -ne "RUN") {
+if ((RemoteState "grep -qs '[n]ight_load' /proc/[0-9]*/cmdline && echo RUN || echo IDLE") -ne "RUN") {
     # если ещё идёт полный прогон матрицы — не мешаем, дождаться его конца
     while ((Get-Date) -lt $stopTime -and
-           (RemoteState "grep -qs proto.py /proc/[0-9]*/cmdline && echo BUSY || echo FREE") -eq "BUSY") {
+           (RemoteState "grep -qs '[p]roto.py' /proc/[0-9]*/cmdline && echo BUSY || echo FREE") -eq "BUSY") {
         Write-Host ("    {0:HH:mm} — жду конца идущей матрицы..." -f (Get-Date))
         Start-Sleep -Seconds 120
     }
     Write-Host "==> запуск ночи: $Conns коннектов, $Minutes мин/протокол, стоп в $StopAt"
-    & ssh @sshOpt $Router "cd /tmp/bench && CONNS=$Conns MINUTES=$Minutes setsid nohup sh overnight.sh </dev/null >/dev/null 2>&1 & sleep 2; grep -qs night_load /proc/[0-9]*/cmdline && echo запущено" 2>$null
+    & ssh @sshOpt $Router "cd /tmp/bench && CONNS=$Conns MINUTES=$Minutes setsid nohup sh overnight.sh </dev/null >/dev/null 2>&1 & sleep 2; grep -qs '[n]ight_load' /proc/[0-9]*/cmdline && echo запущено" 2>$null
     Start-Sleep -Seconds 180
     Write-Host "    первые шаги прогона:"
     & ssh @sshOpt $Router "tail -5 /tmp/bench/night.log 2>/dev/null" 2>$null
@@ -74,13 +74,13 @@ else { Write-Host "==> ночь уже идёт, перехожу к опрос�
 
 Write-Host "==> опрос каждые 10 минут, стоп в $StopAt"
 while ($true) {
-    if ((RemoteState "grep -qs night_load /proc/[0-9]*/cmdline && echo RUN || echo IDLE") -eq "IDLE") {
+    if ((RemoteState "grep -qs '[n]ight_load' /proc/[0-9]*/cmdline && echo RUN || echo IDLE") -eq "IDLE") {
         Write-Host "    роутер закончил"
         break
     }
     if ((Get-Date) -ge $stopTime) {
         Write-Host "    $StopAt — снимаю ночной прогон (SIGTERM, ядра остановятся сами)"
-        & ssh @sshOpt $Router "pgrep -f night_load | while read p; do kill -TERM `$p; done" 2>$null
+        & ssh @sshOpt $Router "pgrep -f '[n]ight_load' | while read p; do kill -TERM `$p; done" 2>$null
         Start-Sleep -Seconds 30
         break
     }

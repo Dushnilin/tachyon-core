@@ -98,7 +98,7 @@ async fn a_multiplexed_stream_carries_its_request_and_the_reply() {
     client
         .set_dialer(Arc::new(move || {
             Box::pin(async move {
-                let socket = tokio::net::TcpStream::connect(("127.0.0.1", port as u16))
+                let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 Ok(Box::new(socket) as AnyStream)

@@ -31,6 +31,7 @@ use bytes::BytesMut;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::blake3;
 use crate::inbound::AnyStream;
 
 use aes::cipher::KeyInit as AeadKeyInit;
@@ -97,11 +98,10 @@ fn rand_between(from: i64, to: i64) -> i64 {
 // --- blake3 helpers (reference uses lukechampine.com/blake3) ----------------
 
 fn derive_key_aead(ctx: &[u8], key: &[u8]) -> [u8; 32] {
-    // The reference passes the ctx as a Go string — raw bytes preserved.
-    // blake3 derive_key hashes the context bytes verbatim, so bypass the
-    // UTF-8 check (Go's string(byte-slice) does the same).
-    let ctx_str = unsafe { std::str::from_utf8_unchecked(ctx) };
-    blake3::derive_key(ctx_str, key)
+    // The reference passes the ctx as a Go string — raw bytes preserved
+    // (Go strings hold arbitrary bytes: pfs pubkey, server random), and our
+    // derive hashes context bytes directly, like Go's string(byte-slice).
+    blake3::derive_key_bytes(ctx, key)
 }
 
 fn blake3_sum256(data: &[u8]) -> [u8; 32] {
@@ -932,6 +932,31 @@ impl VlessEncryption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte-context derive must hash exactly what upstream's `&str`
+    /// API hashes for UTF-8 input (the reference hashes Go strings, i.e.
+    /// raw bytes), and stay stable for binary contexts.
+    #[test]
+    fn derive_key_bytes_matches_str_api() {
+        let key = [0x42u8; 32];
+        for ctx in ["", "vless mlkem record", "unicode контекст"] {
+            assert_eq!(
+                blake3::derive_key_bytes(ctx.as_bytes(), &key),
+                blake3::derive_key(ctx, &key),
+                "ctx = {ctx:?}"
+            );
+        }
+        // A binary context like the real ones (pfs pubkey / server random,
+        // never valid UTF-8): golden, so the wire format cannot drift.
+        let binary = [0xFF, 0x00, 0xC3, 0x28, 0x80, 0xF0, 0x9F, 0x92];
+        assert_eq!(
+            blake3::derive_key_bytes(&binary, &key),
+            [
+                68, 81, 56, 34, 128, 181, 60, 254, 223, 71, 30, 33, 171, 109, 135, 93, 25, 213,
+                156, 10, 241, 104, 193, 41, 48, 178, 146, 154, 98, 88, 169, 23,
+            ]
+        );
+    }
 
     /// Minimal in-process responder mirroring Xray-core
     /// `proxy/vless/encryption/server.go` (native appearance, no 0-RTT):

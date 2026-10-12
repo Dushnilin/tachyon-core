@@ -86,8 +86,8 @@ fn addr_hex(ip: IpAddr, port: u16) -> String {
         IpAddr::V6(v6) => {
             let mut out = String::with_capacity(37);
             use std::fmt::Write as _;
-            for chunk in v6.octets().chunks_exact(4) {
-                let w = u32::from_ne_bytes(chunk.try_into().expect("4 bytes"));
+            for chunk in v6.octets().as_chunks::<4>().0 {
+                let w = u32::from_ne_bytes(*chunk);
                 let _ = write!(out, "{w:08X}");
             }
             let _ = write!(out, ":{port:04X}");

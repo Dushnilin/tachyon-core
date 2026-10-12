@@ -53,6 +53,39 @@ async fn spawn_udp_dns_after(answer_ip: Ipv4Addr, delay: Duration) -> (SocketAdd
     (addr, hits)
 }
 
+/// A udp responder on a v4-only uplink: it answers A and silently drops
+/// AAAA, the way an ISP that filters v6 DNS does.
+async fn spawn_udp_dns_v4_only(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hits) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+    let addr = sock.local_addr().expect("udp addr");
+    let a_hits = Arc::new(AtomicUsize::new(0));
+    let aaaa_hits = Arc::new(AtomicUsize::new(0));
+    let a2 = Arc::clone(&a_hits);
+    let aaaa2 = Arc::clone(&aaaa_hits);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok(query) = Message::from_vec(&buf[..n]) else {
+                continue;
+            };
+            let qtype = query.queries.first().map(|q| q.query_type());
+            if qtype == Some(hickory_proto::rr::RecordType::AAAA) {
+                aaaa2.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            a2.fetch_add(1, Ordering::SeqCst);
+            let resp = build_answer(&query, answer_ip);
+            if sock.send_to(&resp, from).await.is_err() {
+                return;
+            }
+        }
+    });
+    (addr, a_hits, aaaa_hits)
+}
+
 async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
     let addr = sock.local_addr().expect("udp addr");
@@ -177,11 +210,13 @@ async fn spawn_dot_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
 }
 
 /// DNS-over-HTTPS with h2: one request/response per stream.
-async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
+async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hits) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind doh");
     let addr = listener.local_addr().expect("doh addr");
     let hits = Arc::new(AtomicUsize::new(0));
+    let conns = Arc::new(AtomicUsize::new(0));
     let hits2 = Arc::clone(&hits);
+    let conns2 = Arc::clone(&conns);
     tokio::spawn(async move {
         let tls_cfg = server_tls_config(&["h2"]);
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
@@ -189,6 +224,7 @@ async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
+            conns2.fetch_add(1, Ordering::SeqCst);
             let hits = Arc::clone(&hits2);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
@@ -234,7 +270,7 @@ async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
             });
         }
     });
-    (addr, hits)
+    (addr, hits, conns)
 }
 
 async fn spawn_echo() -> SocketAddr {
@@ -596,7 +632,7 @@ async fn dot_transport_tls_exchange() {
 
 #[tokio::test]
 async fn doh_h2_transport_exchange() {
-    let (addr, hits) = spawn_doh_h2_dns(Ipv4Addr::new(10, 0, 0, 3)).await;
+    let (addr, hits, _conns) = spawn_doh_h2_dns(Ipv4Addr::new(10, 0, 0, 3)).await;
     let root = json!({
         "dns": {
             "servers": [{
@@ -613,6 +649,73 @@ async fn doh_h2_transport_exchange() {
     let ips = core_runtime::dns::codec::answer_ips(&resp).expect("decode");
     assert_eq!(ips, vec![ip(10, 0, 0, 3)]);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn doh_h2_reuses_one_connection_for_many_queries() {
+    let (addr, hits, conns) = spawn_doh_h2_dns(Ipv4Addr::new(10, 0, 0, 4)).await;
+    let root = json!({
+        "dns": {
+            "servers": [{
+                "type": "https", "tag": "doh-pool", "server": "127.0.0.1",
+                "server_port": addr.port(),
+                "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
+            }],
+            "final": "doh-pool",
+            "disable_cache": true
+        }
+    });
+    let svc = service(&root);
+    for i in 0..3 {
+        let resp = exchange_ok(&svc, &query(&format!("pool{i}.test"), "A")).await;
+        let ips = core_runtime::dns::codec::answer_ips(&resp).expect("decode");
+        assert_eq!(ips, vec![ip(10, 0, 0, 4)]);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        1,
+        "one TLS + h2 handshake for three queries"
+    );
+}
+
+#[tokio::test]
+async fn prefer_ipv4_returns_without_waiting_for_a_dropped_aaaa() {
+    let (addr, a_hits, aaaa_hits) = spawn_udp_dns_v4_only(Ipv4Addr::new(10, 0, 0, 7)).await;
+    let root = json!({
+        "dns": {
+            "strategy": "prefer_ipv4",
+            "servers": [
+                {"type": "udp", "tag": "local", "server": "127.0.0.1", "server_port": addr.port()}
+            ],
+            "final": "local",
+            "disable_cache": true
+        }
+    });
+    let svc = service(&root);
+    let started = std::time::Instant::now();
+    let addrs = svc
+        .resolve_via("local", "v4only.test")
+        .await
+        .expect("resolve");
+    // The A answer stands on its own: waiting out the dropped AAAA probe
+    // would cost the server's whole timeout.
+    assert_eq!(addrs, vec![ip(10, 0, 0, 7)]);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "waited {:?}",
+        started.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Both probes went out — the AAAA one was dropped, not skipped
+    assert!(
+        a_hits.load(Ordering::SeqCst) >= 1,
+        "no A query reached the server"
+    );
+    assert!(
+        aaaa_hits.load(Ordering::SeqCst) >= 1,
+        "no AAAA probe was sent"
+    );
 }
 
 #[tokio::test]
@@ -871,4 +974,43 @@ async fn predefined_noerror_and_ruleset_matching() {
         .expect("exchange");
     let resp_meta = core_runtime::dns::codec::response_meta(&resp).expect("meta");
     assert_eq!(resp_meta.rcode, hickory_proto::op::ResponseCode::NoError);
+}
+
+#[tokio::test]
+async fn domain_resolver_v4_only_uplink_does_not_timeout_on_dropped_aaaa() {
+    let (addr, a_hits, aaaa_hits) = spawn_udp_dns_v4_only(Ipv4Addr::new(93, 184, 216, 34)).await;
+    let root = json!({
+        "dns": {
+            "servers": [
+                {
+                    "type": "udp",
+                    "tag": "bootstrap",
+                    "server": "127.0.0.1",
+                    "server_port": addr.port()
+                },
+                {
+                    "type": "udp",
+                    "tag": "upstream",
+                    "server": "example.com",
+                    "domain_resolver": "bootstrap",
+                    "server_port": 53
+                }
+            ],
+            "final": "upstream",
+            "disable_cache": true
+        }
+    });
+    let svc = service(&root);
+    // Should resolve without timing out after 5s despite AAAA being dropped
+    let resp = tokio::time::timeout(
+        Duration::from_secs(3),
+        exchange_ok(&svc, &query("test.domain", "A")),
+    )
+    .await;
+    assert!(
+        resp.is_ok(),
+        "timed out waiting for domain_resolver on dropped AAAA"
+    );
+    assert!(a_hits.load(Ordering::SeqCst) >= 1);
+    assert!(aaaa_hits.load(Ordering::SeqCst) >= 1);
 }

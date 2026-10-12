@@ -223,3 +223,108 @@ fn lru_eviction_removes_both_reverse_maps_without_persistent_cache() {
     let address = store.lookup_address(last, false).unwrap();
     assert_eq!(store.lookup_domain(address).as_deref(), Some(last));
 }
+
+fn octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => a.octets().to_vec(),
+    }
+}
+
+fn test_cache(options: &CacheFileOptions) -> Arc<Mutex<CacheFile>> {
+    Arc::new(Mutex::new(
+        CacheFile::open(options.clone()).unwrap().unwrap(),
+    ))
+}
+
+fn temp_options(tag: &str) -> CacheFileOptions {
+    let path = std::env::temp_dir().join(format!("tachyon-fakeip-{tag}-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    CacheFileOptions {
+        enabled: true,
+        store_fakeip: true,
+        path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+}
+
+/// Issue #135: a forward record on disk whose reverse record was lost lets
+/// `create` answer from disk while `lookup_domain` — the reverse half of the
+/// TPROXY path — finds nothing, and the connection dies as
+/// "missing fakeip record".
+#[test]
+fn disk_only_forward_record_carries_the_whole_pair() {
+    let options = temp_options("fwd-only");
+    let cache = test_cache(&options);
+    let ip = "198.18.0.7".parse::<IpAddr>().unwrap();
+    cache
+        .lock()
+        .unwrap()
+        .put("fakeip_domain4", b"github.com", octets(ip));
+
+    let store = FakeIpStore::new(Some(IpPrefix::parse("198.18.0.0/15").unwrap()), None);
+    store.attach_cache(Some(cache.clone()));
+    assert_eq!(store.create("github.com", false).unwrap(), ip);
+    assert_eq!(store.lookup_domain(ip).as_deref(), Some("github.com"));
+
+    std::fs::remove_file(&options.path).unwrap();
+}
+
+/// A record that lands on disk after attach (a foreign writer, a late flush)
+/// must take the same hydrate-and-heal path in `create`.
+#[test]
+fn create_disk_hit_rehydrates_memory_and_heals_the_reverse_record() {
+    let options = temp_options("create-hydrate");
+    let cache = test_cache(&options);
+    let store = FakeIpStore::new(Some(IpPrefix::parse("198.18.0.0/15").unwrap()), None);
+    store.attach_cache(Some(cache.clone()));
+
+    let ip = "198.18.0.9".parse::<IpAddr>().unwrap();
+    let IpAddr::V4(addr) = ip else {
+        panic!("IPv4 allocation")
+    };
+    cache
+        .lock()
+        .unwrap()
+        .put("fakeip_domain4", b"late.example", addr.octets().to_vec());
+
+    assert_eq!(store.create("late.example", false).unwrap(), ip);
+    // in-memory reverse works immediately…
+    assert_eq!(store.lookup_domain(ip).as_deref(), Some("late.example"));
+    // …and persist healed the missing reverse record on disk
+    cache.lock().unwrap().flush().unwrap();
+    assert_eq!(
+        cache
+            .lock()
+            .unwrap()
+            .get("fakeip_address", &addr.octets())
+            .as_deref(),
+        Some(b"late.example".as_slice())
+    );
+    drop(store);
+    drop(cache);
+
+    std::fs::remove_file(&options.path).unwrap();
+}
+
+/// A disk hit on the reverse path is mirrored into memory, so the next lookup
+/// no longer depends on the record still being readable.
+#[test]
+fn lookup_domain_caches_disk_hits_in_memory() {
+    let options = temp_options("rev-cache");
+    let cache = test_cache(&options);
+    let store = FakeIpStore::new(Some(IpPrefix::parse("198.18.0.0/15").unwrap()), None);
+    store.attach_cache(Some(cache.clone()));
+
+    let ip = "198.18.0.11".parse::<IpAddr>().unwrap();
+    cache
+        .lock()
+        .unwrap()
+        .put("fakeip_address", &octets(ip), b"cached.example".to_vec());
+    assert_eq!(store.lookup_domain(ip).as_deref(), Some("cached.example"));
+
+    cache.lock().unwrap().delete("fakeip_address", &octets(ip));
+    assert_eq!(store.lookup_domain(ip).as_deref(), Some("cached.example"));
+
+    std::fs::remove_file(&options.path).unwrap();
+}

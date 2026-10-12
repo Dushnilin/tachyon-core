@@ -54,7 +54,6 @@ const DEFAULT_MTU: usize = 1408;
 const DEFAULT_PORT: u16 = 51820;
 const EPHEMERAL_BASE: u16 = 49152;
 
-const SOCKET_BUF: usize = 65_536;
 const SCRATCH_BUF: usize = 16_384;
 const CALLER_BUF: usize = 65_536;
 const CMD_QUEUE: usize = 256;
@@ -1109,8 +1108,8 @@ impl Stack {
                 };
                 let port = self.alloc_port();
                 let mut socket = TcpSock::new(
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
+                    TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
+                    TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
                 );
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
@@ -1351,6 +1350,7 @@ impl Stack {
                 self.index_peer.insert(session.local_index, pi);
                 self.peers[pi].session = Some(session);
                 self.peers[pi].session_since = Some(Instant::now());
+                self.peers[pi].last_recv = Some(Instant::now());
                 self.peers[pi].flush = true;
                 self.peers[pi].kick = false;
             }
@@ -1567,6 +1567,13 @@ impl Stack {
                         }
                     }
                 }
+                // The caller is gone: FIN the remote, or `finished` waits for
+                // a remote FIN that can never arrive (we never sent one) and
+                // the socket leaks in the set forever — three cancelled LuCI
+                // pings used to be three leaked sockets and ports.
+                if conn.caller_eof && !remote_closed {
+                    sock.close();
+                }
                 sock.state()
             };
             self.scratch = rbuf;
@@ -1660,7 +1667,11 @@ impl Stack {
                 }
             }
 
-            // AWG 3.x: keychain expiry = reject_after_time.Hi.
+            // AWG 3.x: keychain expiry = reject_after_time.Hi. The lifetime
+            // runs from initiation, like the reference's REJECT_AFTER_TIME:
+            // binding it to last_recv let a fresh handshake inherit a stale
+            // timestamp and be killed on the very next tick, and let
+            // keepalives pin a session past its key lifetime forever.
             let reject_after = self
                 .cfg
                 .awg
@@ -1669,8 +1680,8 @@ impl Stack {
                 .map(|(_, hi)| Duration::from_secs(hi as u64))
                 .unwrap_or(REJECT_AFTER_TIME);
             if self.peers[pi].session.is_some()
-                && let Some(lr) = self.peers[pi].last_recv
-                && now.duration_since(lr) >= reject_after
+                && let Some(since) = self.peers[pi].session_since
+                && now.duration_since(since) >= reject_after
             {
                 self.peers[pi].session = None;
                 self.peers[pi].session_since = None;
@@ -1729,7 +1740,7 @@ impl Stack {
         }
     }
 
-    fn next_deadline(&self) -> tokio::time::Instant {
+    fn next_deadline(&mut self) -> tokio::time::Instant {
         let now = Instant::now();
         let mut best: Option<Instant> = None;
         let mut consider = |t: Instant| {
@@ -1748,9 +1759,7 @@ impl Stack {
             if peer.session.is_some() {
                 if let Some(since) = peer.session_since {
                     consider(since + REKEY_AFTER_TIME);
-                }
-                if let Some(lr) = peer.last_recv {
-                    consider(lr + REJECT_AFTER_TIME);
+                    consider(since + REJECT_AFTER_TIME);
                 }
                 if let Some(range) = peer.endpoint.keepalive {
                     let interval = Duration::from_secs(awg::pick_opt(Some(range), 0) as u64);
@@ -1766,6 +1775,20 @@ impl Stack {
             if conn.resp.is_some() {
                 consider(conn.created + CONNECT_TIMEOUT);
             }
+        }
+        // smoltcp itself may want a poll — data maintain_tcp just pushed into
+        // a socket waits for the next poll to hit the wire, and honouring
+        // poll_at is what the tun inbound does for the same reason (tun.rs).
+        // Without it an interactive reply sat in the socket for up to the 1s
+        // default deadline below.
+        let now_smol = SmolInstant::now();
+        if let Some(at) = self.iface.poll_at(now_smol, &self.sockets) {
+            let due = if at <= now_smol {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_micros((at - now_smol).total_micros()).min(Duration::from_millis(50))
+            };
+            consider(now + due);
         }
         let deadline = match best {
             Some(t) if t <= now => now + Duration::from_millis(50),
@@ -1841,9 +1864,11 @@ async fn run(
         while let Ok(cmd) = rx.try_recv() {
             stack.process_cmd(cmd);
         }
+        // Caller data must reach the sockets before the stack polls, or every
+        // freshly written chunk waits a whole extra wake cycle on the wire.
+        stack.maintain_tcp();
         stack.poll_stack();
         stack.flush_device_tx().await;
-        stack.maintain_tcp();
         stack.maintain_peers().await;
         let deadline = stack.next_deadline();
         let sock = Arc::clone(&stack.sock);

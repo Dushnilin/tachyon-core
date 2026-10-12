@@ -368,6 +368,24 @@ pub fn answer_ips(raw: &[u8]) -> io::Result<Vec<IpAddr>> {
     Ok(out)
 }
 
+/// Sort answers in a DNS response such that the specified fastest IP comes first.
+pub fn reorder_answers_by_fastest_ip(raw: &[u8], fastest: IpAddr) -> io::Result<Vec<u8>> {
+    let mut msg = parse_message(raw)?;
+    let pos = msg.answers.iter().position(|r| match &r.data {
+        RData::A(a) if IpAddr::V4(a.0) == fastest => true,
+        RData::AAAA(a) if IpAddr::V6(a.0) == fastest => true,
+        _ => false,
+    });
+    if let Some(idx) = pos
+        && idx > 0
+    {
+        let winner = msg.answers.remove(idx);
+        msg.answers.insert(0, winner);
+        return encode(&msg);
+    }
+    Ok(raw.to_vec())
+}
+
 /// Response header metadata used for caching decisions.
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseMeta {
@@ -512,5 +530,34 @@ mod tests {
         msg.metadata.id = 0xBEEF;
         assert_eq!(out, encode(&msg).unwrap());
         assert!(set_id(&[0u8], 1).is_err());
+    }
+
+    #[test]
+    fn reorder_answers_puts_fastest_ip_first() {
+        let raw = build_query(1, "speed.test", RecordType::A).unwrap();
+        let (query, _) = parse_query(&raw).unwrap();
+        let ip1: IpAddr = "1.1.1.1".parse().unwrap();
+        let ip2: IpAddr = "1.0.0.1".parse().unwrap();
+        let ip3: IpAddr = "8.8.8.8".parse().unwrap();
+        let resp = synth_addresses(&query, &[ip1, ip2, ip3], 300).unwrap();
+
+        // 1. Move ip2 (middle) to front
+        let reordered = reorder_answers_by_fastest_ip(&resp, ip2).unwrap();
+        let ips = answer_ips(&reordered).unwrap();
+        assert_eq!(ips, vec![ip2, ip1, ip3]);
+
+        // 2. Move ip3 (last) to front
+        let reordered3 = reorder_answers_by_fastest_ip(&resp, ip3).unwrap();
+        let ips3 = answer_ips(&reordered3).unwrap();
+        assert_eq!(ips3, vec![ip3, ip1, ip2]);
+
+        // 3. Already first: should return identical slice
+        let already_first = reorder_answers_by_fastest_ip(&resp, ip1).unwrap();
+        assert_eq!(already_first, resp);
+
+        // 4. Non-existent IP: should return identical slice
+        let missing_ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let not_found = reorder_answers_by_fastest_ip(&resp, missing_ip).unwrap();
+        assert_eq!(not_found, resp);
     }
 }

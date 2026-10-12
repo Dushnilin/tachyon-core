@@ -60,7 +60,6 @@ const TCP_TICK: Duration = Duration::from_millis(50);
 const DEFAULT_MTU: usize = 1500;
 const EPHEMERAL_BASE: u16 = 49152;
 
-const SOCKET_BUF: usize = 65_536;
 const SCRATCH_BUF: usize = 16_384;
 const CALLER_BUF: usize = 65_536;
 const CMD_QUEUE: usize = 256;
@@ -1357,8 +1356,8 @@ impl Stack {
                 };
                 let port = self.alloc_port();
                 let mut socket = TcpSock::new(
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
+                    TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
+                    TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
                 );
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
@@ -1597,6 +1596,12 @@ impl Stack {
                             }
                         }
                     }
+                }
+                // The caller is gone: FIN the remote, or `finished` waits for
+                // a remote FIN that can never arrive (we never sent one) and
+                // the socket leaks in the set forever.
+                if conn.caller_eof && !remote_closed {
+                    sock.close();
                 }
                 sock.state()
             };

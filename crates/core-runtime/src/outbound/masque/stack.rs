@@ -31,7 +31,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const EPHEMERAL_BASE: u16 = 49152;
 
-const SOCKET_BUF: usize = 65_536;
 const SCRATCH_BUF: usize = 16_384;
 const CMD_QUEUE: usize = 256;
 const REPLY_QUEUE: usize = 64;
@@ -317,8 +316,8 @@ impl Stack {
                 };
                 let port = self.alloc_port();
                 let mut socket = TcpSock::new(
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
+                    TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
+                    TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
                 );
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
@@ -529,6 +528,13 @@ impl Stack {
                         }
                     }
                 }
+                // The caller is gone: FIN the remote, or `finished` waits for
+                // a remote FIN that can never arrive (we never sent one) and
+                // the socket leaks in the set forever — three cancelled LuCI
+                // pings used to be three leaked sockets and ports.
+                if conn.caller_eof && !remote_closed {
+                    sock.close();
+                }
                 sock.state()
             };
             self.scratch = rbuf;
@@ -582,7 +588,7 @@ impl Stack {
             .is_some_and(|d| self.last_activity.elapsed() >= d)
     }
 
-    fn next_deadline(&self) -> tokio::time::Instant {
+    fn next_deadline(&mut self) -> tokio::time::Instant {
         let now = Instant::now();
         let mut best: Option<Instant> = None;
         let mut consider = |t: Instant| {
@@ -598,6 +604,18 @@ impl Stack {
         }
         if let Some(idle) = self.cfg.idle_timeout {
             consider(self.last_activity + idle);
+        }
+        // smoltcp itself may want a poll: data maintain_tcp just pushed into
+        // a socket waits for the next poll to hit the wire, and honouring
+        // poll_at is what the tun inbound does for the same reason (tun.rs).
+        let now_smol = SmolInstant::now();
+        if let Some(at) = self.iface.poll_at(now_smol, &self.sockets) {
+            let due = if at <= now_smol {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_micros((at - now_smol).total_micros()).min(Duration::from_millis(50))
+            };
+            consider(now + due);
         }
         let deadline = match best {
             Some(t) if t <= now => now + Duration::from_millis(50),

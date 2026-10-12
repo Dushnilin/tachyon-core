@@ -585,16 +585,26 @@ mod tests {
         let p_str = rule_path.to_str().unwrap().to_string();
 
         // Positional domain with -f binary
-        assert!(cmd_rule_set_match(&[p_str.clone(), "www.youtube.com".into(), "-f".into(), "binary".into()]).is_ok());
+        assert!(
+            cmd_rule_set_match(&[
+                p_str.clone(),
+                "www.youtube.com".into(),
+                "-f".into(),
+                "binary".into()
+            ])
+            .is_ok()
+        );
 
         // Positional IP
         assert!(cmd_rule_set_match(&[p_str.clone(), "192.168.1.50".into()]).is_ok());
 
         // Explicit domain flag
-        assert!(cmd_rule_set_match(&[p_str.clone(), "--domain".into(), "youtube.com".into()]).is_ok());
+        assert!(
+            cmd_rule_set_match(&[p_str.clone(), "--domain".into(), "youtube.com".into()]).is_ok()
+        );
 
         // Missing both domain and ip
-        assert!(cmd_rule_set_match(&[p_str.clone()]).is_err());
+        assert!(cmd_rule_set_match(&[p_str]).is_err());
 
         let _ = std::fs::remove_file(rule_path);
     }

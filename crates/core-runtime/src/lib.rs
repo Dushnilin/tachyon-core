@@ -26,6 +26,28 @@ mod zip;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
+/// rx/tx buffer of one smoltcp TCP socket in the userspace stacks (tun,
+/// wireguard, masque, openvpn).
+///
+/// The buffer size is the TCP window smoltcp can advertise: 64 KiB caps a
+/// single stream at `64 KiB / RTT` (~120 Mbit/s at 4 ms) and pins the
+/// window scale factor at 0. 256 KiB scales to ~500 Mbit/s at the same RTT.
+/// Rounded up to a power of two so the scale factor is exact. `TACHYON_SMOL_TCP_BUF`
+/// overrides it in KiB — every socket pays rx+tx eagerly, so a 64 MiB router
+/// with hundreds of concurrent flows may want to dial it down.
+pub(crate) fn smol_tcp_buf() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let default = 256 * 1024;
+        let kb = std::env::var("TACHYON_SMOL_TCP_BUF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|kb| (64..=4096).contains(kb))
+            .map_or(default, |kb| kb * 1024);
+        kb.next_power_of_two()
+    })
+}
+
 use anyhow::Context;
 use serde_json::Value;
 use tokio::task::JoinHandle;

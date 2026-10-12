@@ -118,3 +118,29 @@ fn a_truncated_certificate_is_refused_not_panicked() {
 fn empty_input_is_an_error() {
     assert!(spki_sha256(&[]).is_err());
 }
+
+#[test]
+fn pin_verifier_accepts_matching_certificate_or_spki_pin() {
+    use core_tls::verify::{CertVerifier, PinVerifier, WebpkiVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName};
+
+    let der = der_of_localhost();
+    let cert_hash = cert_sha256(&der);
+    let spki_hash = spki_sha256(&der).expect("spki");
+    let leaf = CertificateDer::from(der);
+    let server_name = ServerName::try_from("localhost").expect("server name");
+
+    let fallback = WebpkiVerifier::mozilla_roots().expect("roots").into_inner();
+
+    // Matching certificate_sha256
+    let verifier = PinVerifier::new(fallback.clone(), vec![cert_hash], Vec::new());
+    assert!(verifier.verify_chain(&leaf, &[], &server_name).is_ok());
+
+    // Matching public_key_sha256
+    let verifier = PinVerifier::new(fallback.clone(), Vec::new(), vec![spki_hash]);
+    assert!(verifier.verify_chain(&leaf, &[], &server_name).is_ok());
+
+    // Mismatched pin
+    let verifier = PinVerifier::new(fallback, vec![[0u8; 32]], Vec::new());
+    assert!(verifier.verify_chain(&leaf, &[], &server_name).is_err());
+}

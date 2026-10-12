@@ -75,9 +75,9 @@ pub struct Fingerprint {
     pub template: core_tls::hello::Template,
 }
 
-/// Read a pin field: one base64 SHA-256, or a list of them, as the reference
-/// accepts. The value is the same either way - the field says what is hashed,
-/// not how many entries are allowed.
+/// Read a pin field: one SHA-256 (hex or base64), or a list of them, as the reference
+/// accepts. Supports raw 64-char hex strings, optional `sha256:` / `sha256/` prefixes,
+/// and base64 encoded digests.
 fn decode_pin_list(
     tls: &serde_json::Map<String, Value>,
     field: &str,
@@ -110,12 +110,35 @@ fn decode_pin_list(
 
     let mut out = Vec::with_capacity(raw.len());
     for entry in raw {
-        let entry = entry.trim();
+        let mut entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
+        if let Some(rest) = entry
+            .strip_prefix("sha256:")
+            .or_else(|| entry.strip_prefix("sha256/"))
+            .or_else(|| entry.strip_prefix("pin-sha256:"))
+            .or_else(|| entry.strip_prefix("pin-sha256="))
+        {
+            entry = rest.trim();
+        }
+        let entry = entry.trim_matches('"');
+
+        if entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit()) {
+            let mut digest = [0u8; 32];
+            for i in 0..32 {
+                digest[i] = u8::from_str_radix(&entry[i * 2..i * 2 + 2], 16).map_err(|_| {
+                    anyhow::anyhow!("{at}: tls.{field} entry {entry:?} is not valid hex")
+                })?;
+            }
+            out.push(digest);
+            continue;
+        }
+
         let bytes = base64_decode(entry).ok_or_else(|| {
-            anyhow::anyhow!("{at}: tls.{field} entry {entry:?} is not valid base64")
+            anyhow::anyhow!(
+                "{at}: tls.{field} entry {entry:?} is not valid base64 or 64-character hex"
+            )
         })?;
         let len = bytes.len();
         let digest: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -966,5 +989,26 @@ mod tests {
             });
             assert!(options(value).is_err(), "public_key {bad:?} was accepted");
         }
+    }
+
+    #[test]
+    fn pin_list_decodes_hex_base64_and_prefixes() {
+        let hex_pin = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let b64_pin = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "certificate_sha256".to_string(),
+            json!([
+                hex_pin,
+                format!("sha256:{hex_pin}"),
+                b64_pin,
+                format!("sha256/{b64_pin}")
+            ]),
+        );
+        let list = decode_pin_list(&map, "certificate_sha256", "test").expect("decodes");
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0], list[1]);
+        assert_eq!(list[0], list[2]);
+        assert_eq!(list[0], list[3]);
     }
 }

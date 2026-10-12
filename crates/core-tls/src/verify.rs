@@ -538,9 +538,10 @@ impl CertVerifier for WebpkiVerifier {
 /// present before 1.15 and the only one lx accepts. Neither can stand in for
 /// the other: they are different byte strings over the same certificate.
 ///
-/// The chain check still runs. A pin narrows what is trusted, it does not widen
-/// it: presenting a pinned certificate that does not chain to a known root is
-/// exactly the case a pin exists to catch.
+/// When either pin is configured, matching that pin directly trusts the certificate
+/// without requiring it to chain to a public WebPKI root CA, enabling self-signed
+/// certificates (identical to sing-box 1.15). Proof of private key possession is
+/// still enforced by `verify_handshake_signature`.
 pub struct PinVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     /// SHA-256 over the whole DER leaf, when pinned.
@@ -668,28 +669,35 @@ impl CertVerifier for PinVerifier {
         chain: &[CertificateDer<'_>],
         server_name: &ServerName<'_>,
     ) -> io::Result<()> {
-        self.inner
-            .verify_server_cert(leaf, chain, server_name, &[], UnixTime::now())
-            .map_err(|e| bad(format!("certificate chain rejected: {e}")))?;
-
         let der = leaf.as_ref();
+        let mut pin_matched = false;
+
         if !self.certificate_sha256.is_empty() {
             let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(der).into();
-            if !self.certificate_sha256.contains(&digest) {
-                return Err(bad(
-                    "server certificate does not match tls.certificate_sha256",
-                ));
+            if self.certificate_sha256.contains(&digest) {
+                pin_matched = true;
             }
         }
-        if !self.public_key_sha256.is_empty() {
+        if !pin_matched && !self.public_key_sha256.is_empty() {
             let digest = spki_sha256(der)?;
-            if !self.public_key_sha256.contains(&digest) {
-                return Err(bad(
-                    "server public key does not match tls.certificate_public_key_sha256",
-                ));
+            if self.public_key_sha256.contains(&digest) {
+                pin_matched = true;
             }
         }
-        Ok(())
+
+        if !self.certificate_sha256.is_empty() || !self.public_key_sha256.is_empty() {
+            if !pin_matched {
+                return Err(bad(
+                    "server certificate does not match tls.certificate_sha256 or tls.certificate_public_key_sha256",
+                ));
+            }
+            Ok(())
+        } else {
+            self.inner
+                .verify_server_cert(leaf, chain, server_name, &[], UnixTime::now())
+                .map_err(|e| bad(format!("certificate chain rejected: {e}")))?;
+            Ok(())
+        }
     }
 
     fn verify_handshake_signature(

@@ -2083,4 +2083,98 @@ mod tests {
         drop(send_request);
         let _ = accept_task.await;
     }
+
+    /// Flow control has to shut the window on a reader that stopped: the
+    /// server stalls at the advertised 8 MiB and only finishes once we
+    /// drain, which is also the check that `serve` repays capacity — a
+    /// missing release would hang the drain until the timeout.
+    #[tokio::test]
+    async fn h2_window_closes_until_reader_drains() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let obj = serde_json::json!({"transport": {"type": "http", "path": "/tunnel"}});
+        let t = Transport::from_inbound(&obj, "inbounds[0]")
+            .expect("read")
+            .expect("present");
+        const BODY: usize = 9 * 1024 * 1024; // one MiB over the stream window
+        let (client, server) = tokio::io::duplex(1024);
+        let done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let done_task = std::sync::Arc::clone(&done);
+        let accept_task = tokio::spawn(async move {
+            let accepted = t.accept(Box::new(server)).await.unwrap();
+            serve_sessions(accepted, move |mut stream| {
+                let done = std::sync::Arc::clone(&done_task);
+                async move {
+                    let mut buf = [0u8; 5];
+                    stream.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(&buf, b"ping!");
+                    let chunk = vec![0xA5u8; 64 * 1024];
+                    let mut left = BODY;
+                    while left > 0 {
+                        let n = chunk.len().min(left);
+                        stream.write_all(&chunk[..n]).await.unwrap();
+                        left -= n;
+                    }
+                    stream.flush().await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    done.notify_one();
+                }
+            })
+            .await
+            .unwrap();
+        });
+
+        let (send_request, connection) = crate::outbound::transport::h2io::client_builder()
+            .handshake(client)
+            .await
+            .unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut send_request = send_request.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("PUT")
+            .uri("https://example.com/tunnel")
+            .body(())
+            .unwrap();
+        let (response, send) = send_request.send_request(request, false).unwrap();
+        let mut io = crate::outbound::transport::h2io::H2Io {
+            h2: crate::outbound::transport::h2io::H2Stream::new(response, send, conn_task),
+        };
+        io.write_all(b"ping!").await.unwrap();
+
+        // Nobody reads: the window stays shut and the server cannot finish.
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_millis(250), done.notified()).await;
+        assert!(
+            stalled.is_err(),
+            "server finished without its receive window being repaid"
+        );
+
+        // Draining repays capacity as bytes leave `pending`; a missing
+        // release in serve() would hang right here.
+        let mut read = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), io.read(&mut buf))
+                .await
+                .expect("drain stalled: window capacity never repaid")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        assert_eq!(read, BODY);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), done.notified())
+            .await
+            .expect("server did not finish after the drain");
+
+        // Dropping our side ends the connection so the accept loop can exit.
+        drop(io);
+        let _: () = tokio::time::timeout(std::time::Duration::from_secs(10), accept_task)
+            .await
+            .expect("accept loop did not end after the client dropped")
+            .expect("accept loop panicked");
+    }
 }

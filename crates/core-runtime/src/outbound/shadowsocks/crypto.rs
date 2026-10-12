@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use std::io;
 
+use crate::blake3;
 use crate::fastchacha::ChaChaPoly;
 use crate::fastgcm::Gcm;
 use hkdf::Hkdf;

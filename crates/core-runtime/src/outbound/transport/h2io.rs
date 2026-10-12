@@ -15,9 +15,10 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection. Sized to 2 MiB stream / 8 MiB
-/// connection to sustain 10+ Gbps transfers without ballooning client RSS
-/// across concurrent pooled connections.
+/// Receive window per stream and per connection: 8 MiB a stream, 32 MiB a
+/// connection, sized to sustain 10+ Gbps transfers without ballooning
+/// client RSS across concurrent pooled connections. The window is also the
+/// memory ceiling for whatever a fast peer has in flight to a slow reader.
 const STREAM_WINDOW: u32 = 8 << 20;
 const CONN_WINDOW: u32 = 32 << 20;
 /// Largest DATA frame we ask the peer to send.
@@ -154,11 +155,26 @@ impl H2Stream {
                 self.pending.pop_front();
             }
         }
-        want - left
+        let went = want - left;
+        self.release(went);
+        went
+    }
+
+    /// Repay `n` bytes that left `pending`. The window is only repaid when
+    /// bytes actually leave our buffer: advertising buffered-but-unread data
+    /// tells the peer it may keep sending into a reader that stopped, and
+    /// the connection half of the window is shared with the pooled session.
+    pub(crate) fn release(&mut self, n: usize) {
+        if n > 0
+            && let Some(recv) = self.recv.as_mut()
+        {
+            let _ = recv.flow_control().release_capacity(n);
+        }
     }
 
     /// Drop `n` pending bytes without copying them.
     pub(crate) fn skip_pending(&mut self, mut n: usize) {
+        let start = n;
         while n > 0 {
             let Some(front) = self.pending.front_mut() else {
                 break;
@@ -171,6 +187,7 @@ impl H2Stream {
                 self.pending.pop_front();
             }
         }
+        self.release(start - n);
     }
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
@@ -259,8 +276,9 @@ impl H2Stream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(chunk))) => {
                 let len = chunk.len();
-                let _ = recv.flow_control().release_capacity(len);
-                // pushed as it arrived: no join, no copy of either side
+                // pushed as it arrived: no join, no copy of either side.
+                // Capacity is repaid when the bytes leave `pending`, not
+                // while we are still holding them.
                 self.pending.push_back(chunk);
                 self.pending_len += len;
                 Poll::Ready(Ok(true))
@@ -326,8 +344,13 @@ impl H2Stream {
             match recv.poll_data(cx) {
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     let len = chunk.len();
-                    let _ = recv.flow_control().release_capacity(len);
                     let want = out.remaining();
+                    // Only what reaches the caller right now is repaid; the
+                    // tail waits in `pending` and is repaid by `serve`.
+                    let served = want.min(len);
+                    if served > 0 {
+                        let _ = recv.flow_control().release_capacity(served);
+                    }
                     if want >= len {
                         out.put_slice(&chunk);
                     } else if want > 0 {
@@ -373,6 +396,11 @@ impl H2Stream {
 
 impl Drop for H2Stream {
     fn drop(&mut self) {
+        // Whatever is still in `pending` was counted against the shared
+        // connection window: repay it, or a stream dropped with an unread
+        // body shrinks the window the pooled session runs on for good.
+        let unread = self.pending_len;
+        self.release(unread);
         if let Some(mut send) = self.send.take() {
             send.send_reset(h2::Reason::CANCEL);
         }

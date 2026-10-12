@@ -145,12 +145,19 @@ impl AsyncRead for GrpcStream {
                     this.skip -= n;
                     continue;
                 }
-            } else if let Some((data, skip)) =
-                start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?
-            {
-                this.data_left = data;
-                this.skip = skip;
-                continue;
+            } else {
+                let before = this.io.h2.pending_len;
+                if let Some((data, skip)) =
+                    start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?
+                {
+                    // The header parses out of `pending` on a path of its
+                    // own; repay its bytes here or every frame leaks 5..16
+                    // bytes of window until the stream stalls.
+                    this.io.h2.release(before - this.io.h2.pending_len);
+                    this.data_left = data;
+                    this.skip = skip;
+                    continue;
+                }
             }
             if this.io.h2.is_eof() {
                 if !this.io.h2.pending.is_empty() || this.data_left > 0 || this.skip > 0 {

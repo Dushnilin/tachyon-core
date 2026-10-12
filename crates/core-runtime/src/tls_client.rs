@@ -4,7 +4,7 @@
 //! warning, REALITY is rejected because silent fallback would be misleading.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use core_tls::rustls;
 use rustls_pemfile::certs;
@@ -587,6 +587,20 @@ impl TlsOptions {
         self.reality.as_ref()
     }
 
+    pub fn mark_tls12(&self, server: &str, port: u16) {
+        crate::logging::debug(format_args!(
+            "tls: server {server}:{port} (sni: {}) did not negotiate TLS 1.3; falling back to rustls (TLS 1.2)",
+            self.server_name
+        ));
+        mark_tls12_endpoint(&self.server_name);
+        mark_tls12_endpoint(&format!("{server}:{port}"));
+        mark_tls12_endpoint(server);
+    }
+
+    pub fn is_known_tls12(&self) -> bool {
+        is_tls12_endpoint(&self.server_name)
+    }
+
     /// Whose TLS does the handshake and the record layer.
     ///
     /// A fingerprint or REALITY settles it: neither can be presented through
@@ -595,17 +609,26 @@ impl TlsOptions {
     /// moves plaintext between two of its own -- on a busy websocket that was a
     /// third of the client CPU. The one thing ours cannot do is TLS 1.2 on the
     /// client, so a config pinned to 1.2 stays on rustls.
-    fn own_stack(&self) -> bool {
+    pub fn own_stack(&self) -> bool {
+        if self.reality.is_some() {
+            return true;
+        }
+        if self.max_tls12 {
+            return false;
+        }
+        if let Some(stack) = self.stack {
+            return stack;
+        }
+        if self.is_known_tls12() {
+            return false;
+        }
         if self.fragment {
             return true;
         }
         if self.fingerprint().is_some() {
             return true;
         }
-        if let Some(stack) = self.stack {
-            return stack;
-        }
-        !self.max_tls12
+        true
     }
 
     /// Establish the connection, with our own TLS when a fingerprint is
@@ -876,6 +899,40 @@ fn load_pem_key(mut pem: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+static TLS12_ENDPOINTS: OnceLock<Mutex<lru::LruCache<String, ()>>> = OnceLock::new();
+
+pub fn mark_tls12_endpoint(endpoint: &str) {
+    if endpoint.is_empty() {
+        return;
+    }
+    let cache = TLS12_ENDPOINTS.get_or_init(|| {
+        Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(512).expect("nonzero"),
+        ))
+    });
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(endpoint.to_string(), ());
+}
+
+pub fn is_tls12_endpoint(endpoint: &str) -> bool {
+    let Some(cache) = TLS12_ENDPOINTS.get() else {
+        return false;
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(endpoint)
+}
+
+pub fn is_tls13_unsupported(err: &io::Error) -> bool {
+    let s = err.to_string();
+    s.contains("the server did not negotiate TLS 1.3")
+        || s.contains("code 70")
+        || s.contains("wrong legacy version")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,5 +1067,53 @@ mod tests {
         assert_eq!(list[0], list[1]);
         assert_eq!(list[0], list[2]);
         assert_eq!(list[0], list[3]);
+    }
+
+    #[test]
+    fn max_tls12_forces_rustls_even_with_fingerprint() {
+        let tls = options(json!({
+            "server": "example.com",
+            "tls": {
+                "enabled": true,
+                "max_version": "1.2",
+                "utls": {"enabled": true, "fingerprint": "chrome"}
+            }
+        }))
+        .expect("valid")
+        .expect("tls present");
+        assert!(!tls.own_stack());
+    }
+
+    #[test]
+    fn stack_rustls_overrides_fingerprint() {
+        let tls = options(json!({
+            "server": "example.com",
+            "tls": {
+                "enabled": true,
+                "stack": "rustls",
+                "utls": {"enabled": true, "fingerprint": "chrome"}
+            }
+        }))
+        .expect("valid")
+        .expect("tls present");
+        assert!(!tls.own_stack());
+    }
+
+    #[test]
+    fn mark_tls12_falls_back_to_rustls() {
+        let tls = options(json!({
+            "server": "node12.example.com",
+            "tls": {
+                "enabled": true,
+                "server_name": "node12.example.com",
+                "utls": {"enabled": true, "fingerprint": "edge"}
+            }
+        }))
+        .expect("valid")
+        .expect("tls present");
+        assert!(tls.own_stack());
+        tls.mark_tls12("1.2.3.4", 443);
+        assert!(tls.is_known_tls12());
+        assert!(!tls.own_stack());
     }
 }

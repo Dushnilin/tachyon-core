@@ -514,7 +514,21 @@ impl Naive {
         )
         .await
         .map_err(|_| io::Error::other("naive: connect timeout"))??;
-        let stream = self.tls.wrap_with_defaults(tcp, &[b"h2"]).await?;
+        let stream = match self.tls.wrap_with_defaults(tcp, &[b"h2"]).await {
+            Err(e)
+                if crate::tls_client::is_tls13_unsupported(&e) && self.tls.reality().is_none() =>
+            {
+                self.tls.mark_tls12(&self.server, self.port);
+                let tcp = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial),
+                )
+                .await
+                .map_err(|_| io::Error::other("naive: connect timeout"))??;
+                self.tls.wrap_with_defaults(tcp, &[b"h2"]).await?
+            }
+            res => res?,
+        };
         let (send_request, connection) = crate::outbound::transport::h2io::client_builder()
             .handshake(stream)
             .await

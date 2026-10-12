@@ -288,7 +288,19 @@ impl Transport {
         }
 
         let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
-        self.connect(tcp, tls, server, port, early, dial).await
+        match self.connect(tcp, tls, server, port, early, dial).await {
+            Err(e)
+                if crate::tls_client::is_tls13_unsupported(&e)
+                    && tls.is_some_and(|t| t.reality().is_none()) =>
+            {
+                if let Some(t) = tls {
+                    t.mark_tls12(server, port);
+                }
+                let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
+                self.connect(tcp, tls, server, port, early, dial).await
+            }
+            res => res,
+        }
     }
 
     pub(crate) async fn connect(
@@ -363,7 +375,16 @@ impl Transport {
                 let has_reality = tls.and_then(|t| t.reality()).is_some();
                 let dialer = self.dialer(tls, server, port, dial);
                 (
-                    xhttp::connect(stream, tls.is_some(), has_reality, server, port, cfg, dialer).await?,
+                    xhttp::connect(
+                        stream,
+                        tls.is_some(),
+                        has_reality,
+                        server,
+                        port,
+                        cfg,
+                        dialer,
+                    )
+                    .await?,
                     0,
                 )
             }
@@ -391,7 +412,18 @@ impl Transport {
             Box::pin(async move {
                 let tcp = crate::outbound::dial::connect_tcp(&server, port, &dial).await?;
                 let stream: AnyStream = match tls {
-                    Some(tls) => tls.wrap_with_defaults(tcp, alpn).await?,
+                    Some(tls) => match tls.wrap_with_defaults(tcp, alpn).await {
+                        Err(e)
+                            if crate::tls_client::is_tls13_unsupported(&e)
+                                && tls.reality().is_none() =>
+                        {
+                            tls.mark_tls12(&server, port);
+                            let tcp =
+                                crate::outbound::dial::connect_tcp(&server, port, &dial).await?;
+                            tls.wrap_with_defaults(tcp, alpn).await?
+                        }
+                        res => res?,
+                    },
                     None => Box::new(tcp),
                 };
                 Ok(stream)

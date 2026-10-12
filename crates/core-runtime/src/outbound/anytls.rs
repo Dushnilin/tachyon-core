@@ -126,7 +126,19 @@ impl Session {
         )
         .await
         .map_err(|_| io::Error::other("anytls: connect timeout"))??;
-        let stream = tls.wrap_with_defaults(tcp, &[]).await?;
+        let stream = match tls.wrap_with_defaults(tcp, &[]).await {
+            Err(e) if crate::tls_client::is_tls13_unsupported(&e) && tls.reality().is_none() => {
+                tls.mark_tls12(server, port);
+                let tcp = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    crate::outbound::dial::connect_tcp(server, port, dial),
+                )
+                .await
+                .map_err(|_| io::Error::other("anytls: connect timeout"))??;
+                tls.wrap_with_defaults(tcp, &[]).await?
+            }
+            res => res?,
+        };
         Self::establish(stream, password_sha256, client_metadata, tag).await
     }
 

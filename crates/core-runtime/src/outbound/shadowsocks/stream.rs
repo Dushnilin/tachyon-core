@@ -89,7 +89,18 @@ impl Shadowsocks {
     ) -> io::Result<(SsReader<AnyRead>, SsWriter<AnyWrite>)> {
         let tcp = crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial).await?;
         let mut stream: AnyStream = match &self.tls {
-            Some(tls) => tls.wrap_with_defaults(tcp, &[]).await?,
+            Some(tls) => match tls.wrap_with_defaults(tcp, &[]).await {
+                Err(e)
+                    if crate::tls_client::is_tls13_unsupported(&e) && tls.reality().is_none() =>
+                {
+                    tls.mark_tls12(&self.server, self.port);
+                    let tcp =
+                        crate::outbound::dial::connect_tcp(&self.server, self.port, &self.dial)
+                            .await?;
+                    tls.wrap_with_defaults(tcp, &[]).await?
+                }
+                res => res?,
+            },
             None => Box::new(tcp),
         };
         let mut salt = vec![0u8; self.method.salt_len()];

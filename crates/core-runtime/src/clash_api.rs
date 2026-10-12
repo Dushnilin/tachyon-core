@@ -1337,10 +1337,6 @@ async fn handle_proxy_route(
                 return Ok(true);
             };
             let mut url = query_get("url");
-            // Reference quirk: plain-http links fall back to the default probe.
-            if url.starts_with("http://") {
-                url.clear();
-            }
             if url.is_empty() {
                 url = DEFAULT_DELAY_URL.to_string();
             }
@@ -1569,16 +1565,17 @@ fn parse_link(url: &str) -> Option<(bool, String, u16, String, String)> {
     } else {
         tail.to_string()
     };
-    let (host, port) = split_authority(authority)?;
+    let (host, port) = split_authority(authority, tls)?;
     Some((tls, host, port, authority.to_string(), path))
 }
 
-fn split_authority(authority: &str) -> Option<(String, u16)> {
+fn split_authority(authority: &str, tls: bool) -> Option<(String, u16)> {
+    let default_port = if tls { 443 } else { 80 };
     if let Some(rest) = authority.strip_prefix('[') {
         let (host, tail) = rest.split_once(']')?;
         let port = match tail.strip_prefix(':') {
             Some(p) => p.parse().ok()?,
-            None => return Some((host.to_string(), 443)),
+            None => return Some((host.to_string(), default_port)),
         };
         Some((host.to_string(), port))
     } else if let Some((host, port)) = authority.rsplit_once(':') {
@@ -1587,7 +1584,7 @@ fn split_authority(authority: &str) -> Option<(String, u16)> {
         }
         Some((host.to_string(), port.parse().ok()?))
     } else {
-        Some((authority.to_string(), 443))
+        Some((authority.to_string(), default_port))
     }
 }
 
@@ -1939,7 +1936,7 @@ mod tests {
         assert!(!tls);
         assert_eq!(
             (host.as_str(), port, authority.as_str(), path.as_str()),
-            ("example.com", 443, "example.com", "/x")
+            ("example.com", 80, "example.com", "/x")
         );
         let (tls, host, port, authority, path) = parse_link("https://h?x=1").expect("parse");
         assert!(tls);

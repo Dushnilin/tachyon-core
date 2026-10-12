@@ -3,8 +3,9 @@
 
 На каждый протокол: tachyon-клиент + tachyon-сервер, N коннектов по SOCKS
 (половина заливает, половина качает — трафик без остановки), minutes минут.
-Раз в минуту: Гбит/с по направлениям, RSS и CPU обоих ядер, живые коннекты.
-Итог протокола — results/load-<имя>.json (готовый файл пропускается, так что
+Между протоколами — 5 минут отдыха роутеру. Раз в минуту: Гбит/с по
+направлениям, RSS и CPU обоих ядер, живые коннекты. Итог протокола —
+results/load-<имя>.json (готовый файл пропускается, так что
 прогон можно перезапускать и он продолжит с места падения), после всех —
 results/load-summary.json.
 
@@ -30,6 +31,7 @@ OPEN_TIMEOUT = 60       # медленные QUIC-хендшейки на сла
 
 # Второе ядро: сервер + синк/реалити-назначение, первое: клиент + генератор.
 CLIENT_CPUS, SERVER_CPUS = {0}, {1}
+REST_SEC = 300   # отдых роутера между протоколами
 PROXY_PORT, SERVER_PORT = proto.PROXY_PORT_BASE + 1, proto.SERVER_PORT_BASE + 1
 
 
@@ -227,6 +229,10 @@ def main():
             if os.path.exists(out):
                 print(f"({i}/{len(cases)}) {case['name']}: уже есть, пропуск", flush=True)
                 continue
+            if done:
+                # отдых роутера между протоколами: температура и порты
+                print(f"  отдых {REST_SEC // 60} минут", flush=True)
+                time.sleep(REST_SEC)
             print(f"({i}/{len(cases)}) {case['name']}: "
                   f"{args.conns} коннектов, {args.minutes} мин", flush=True)
             t0 = time.time()

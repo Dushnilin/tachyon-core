@@ -548,7 +548,18 @@ impl XhttpConfig {
                 let res = async {
                     let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
                     let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-                    let stream: AnyStream = tls.wrap_with_defaults(tcp, alpn).await?;
+                    let stream: AnyStream = match tls.wrap_with_defaults(tcp, alpn).await {
+                        Err(e)
+                            if crate::tls_client::is_tls13_unsupported(&e)
+                                && tls.reality().is_none() =>
+                        {
+                            tls.mark_tls12(server, port);
+                            let tcp =
+                                crate::outbound::dial::connect_tcp(server, port, dial).await?;
+                            tls.wrap_with_defaults(tcp, alpn).await?
+                        }
+                        res => res?,
+                    };
                     let is_h2 = crate::inbound::stream_alpn(&stream) == Some(b"h2");
                     if !is_h2 {
                         return Err(io::Error::other("xhttp: server did not negotiate h2"));
@@ -729,13 +740,16 @@ pub(crate) async fn connect(
         false,
     )?;
     let mut head_bytes = Vec::with_capacity(256);
-    h1io::write_head(&mut head_bytes, &request, &authority, h1io::Framing::None, true);
+    h1io::write_head(
+        &mut head_bytes,
+        &request,
+        &authority,
+        h1io::Framing::None,
+        true,
+    );
     io.write_all(&head_bytes).await?;
     io.flush().await?;
-    crate::logging::debug(format_args!(
-        "h1: >> GET {} (close=true)",
-        request.uri()
-    ));
+    crate::logging::debug(format_args!("h1: >> GET {} (close=true)", request.uri()));
     this.spawn_download_stream(io);
 
     match mode {
@@ -836,7 +850,9 @@ struct PostWriter {
 impl PostWriter {
     /// A keep-alive connection for one upload POST, out of the pool when there
     /// is a free one and dialled when there is not.
-    async fn connection(&self) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream, bool)> {
+    async fn connection(
+        &self,
+    ) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream, bool)> {
         if let Some(client) = self.cfg.pool.acquire().await {
             if let Some(io) = client.take() {
                 return Ok((client, io, true));
@@ -1037,7 +1053,6 @@ impl SplitConn {
             session_id,
         }
     }
-
 
     /// Feed the download channel from the GET connection without blocking initial dial.
     fn spawn_download_stream(&mut self, mut io: AnyStream) {

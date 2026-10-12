@@ -721,7 +721,7 @@ fn log_entry(requested: &str, level: logging::Level, message: &str) -> String {
     json!({"type": name, "payload": message}).to_string()
 }
 
-/// `GET /traffic`: one JSON object per second with the running totals.
+/// `GET /traffic`: one JSON object per second with the traffic delta (bytes/sec).
 async fn stream_traffic(
     stream: &mut TcpStream,
     cors: &[String],
@@ -730,10 +730,15 @@ async fn stream_traffic(
     let mut out = Live::open(stream, cors, ws_key).await?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.tick().await;
+    let (_, mut prev_up, mut prev_down) = clash_state::snapshot();
     loop {
         ticker.tick().await;
         let (_, up, down) = clash_state::snapshot();
-        out.send(&json!({"up": up, "down": down}).to_string())
+        let delta_up = up.saturating_sub(prev_up);
+        let delta_down = down.saturating_sub(prev_down);
+        prev_up = up;
+        prev_down = down;
+        out.send(&json!({"up": delta_up, "down": delta_down}).to_string())
             .await?;
     }
 }
@@ -746,7 +751,7 @@ fn connections_snapshot() -> Value {
         "downloadTotal": down,
         "uploadTotal": up,
         "connections": connections,
-        "memory": 0,
+        "memory": get_process_rss_bytes(),
     })
 }
 

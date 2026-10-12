@@ -1660,17 +1660,13 @@ impl Stack {
                 }
             }
 
-            // AWG 3.x: keychain expiry = reject_after_time.Hi.
-            let reject_after = self
-                .cfg
-                .awg
-                .as_ref()
-                .and_then(|a| a.reject_after_time)
-                .map(|(_, hi)| Duration::from_secs(hi as u64))
-                .unwrap_or(REJECT_AFTER_TIME);
+            // Key expiry follows this session's birth time. An old receive
+            // timestamp must neither expire a freshly negotiated key nor let
+            // recent traffic extend the lifetime of an already expired key.
+            let reject_after = self.reject_after_time();
             if self.peers[pi].session.is_some()
-                && let Some(lr) = self.peers[pi].last_recv
-                && now.duration_since(lr) >= reject_after
+                && let Some(since) = self.peers[pi].session_since
+                && now.duration_since(since) >= reject_after
             {
                 self.peers[pi].session = None;
                 self.peers[pi].session_since = None;
@@ -1729,6 +1725,16 @@ impl Stack {
         }
     }
 
+    fn reject_after_time(&self) -> Duration {
+        // AWG 3.x: keychain expiry = reject_after_time.Hi.
+        self.cfg
+            .awg
+            .as_ref()
+            .and_then(|a| a.reject_after_time)
+            .map(|(_, hi)| Duration::from_secs(hi as u64))
+            .unwrap_or(REJECT_AFTER_TIME)
+    }
+
     fn next_deadline(&self) -> tokio::time::Instant {
         let now = Instant::now();
         let mut best: Option<Instant> = None;
@@ -1748,9 +1754,7 @@ impl Stack {
             if peer.session.is_some() {
                 if let Some(since) = peer.session_since {
                     consider(since + REKEY_AFTER_TIME);
-                }
-                if let Some(lr) = peer.last_recv {
-                    consider(lr + REJECT_AFTER_TIME);
+                    consider(since + self.reject_after_time());
                 }
                 if let Some(range) = peer.endpoint.keepalive {
                     let interval = Duration::from_secs(awg::pick_opt(Some(range), 0) as u64);
@@ -1841,8 +1845,13 @@ async fn run(
         while let Ok(cmd) = rx.try_recv() {
             stack.process_cmd(cmd);
         }
+        // Feed new caller data before polling smoltcp. Otherwise it can
+        // remain queued until an unrelated ingress packet or keepalive wakes
+        // the loop, stalling short HTTP/TLS latency probes.
+        stack.maintain_tcp();
         stack.poll_stack();
         stack.flush_device_tx().await;
+        // Deliver ingress and connect completions produced by that poll.
         stack.maintain_tcp();
         stack.maintain_peers().await;
         let deadline = stack.next_deadline();
@@ -2086,6 +2095,102 @@ mod tests {
             base.as_object_mut().unwrap().extend(map);
         }
         base.as_object().unwrap().clone()
+    }
+
+    async fn resumed_session_fixture() -> (Stack, Vec<u8>, u32, SocketAddr) {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut wg = WireGuard::build(&wg_obj(json!({})), "endpoints[0]").unwrap();
+        let responder_private = [2u8; 32];
+        let responder_public = PublicKey::from(&StaticSecret::from(responder_private)).to_bytes();
+        wg.cfg.peers[0].public_key = responder_public;
+        let hs = noise::build_initiation(
+            &wg.cfg.private_key,
+            &wg.cfg.public_key,
+            &responder_public,
+            None,
+            &noise::tai64n_now(),
+            1,
+        );
+        let consumed =
+            noise::process_initiation(&responder_private, &responder_public, hs.initiation())
+                .unwrap();
+        let (response, _) = noise::build_response(&consumed, &responder_private, None, 2);
+        let index = hs.sender_index;
+        let now = Instant::now();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = sock.local_addr().unwrap();
+        let cfg = Arc::new(wg.cfg);
+        let mut device = WgDevice::new(cfg.mtu);
+        let iface = Interface::new(
+            IfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            SmolInstant::now(),
+        );
+        let mut peer = PeerRt::new(cfg.peers[0].clone());
+        peer.resolved = Some(address);
+        peer.hs = Some(HsRuntime {
+            attempt: 1,
+            started: now,
+            retry_at: now + REKEY_TIMEOUT,
+            hs,
+        });
+        let stack = Stack {
+            cfg,
+            sock,
+            sock_v6: None,
+            device,
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            peers: vec![peer],
+            index_peer: HashMap::from([(index, 0)]),
+            tcp: HashMap::new(),
+            udp: HashMap::new(),
+            next_port: EPHEMERAL_BASE,
+            scratch: vec![0; SCRATCH_BUF],
+        };
+        (stack, response, index, address)
+    }
+
+    #[tokio::test]
+    async fn new_session_survives_stale_previous_receive_and_flushes_packets() {
+        let (mut stack, response, index, address) = resumed_session_fixture().await;
+        stack.peers[0].last_recv =
+            Some(Instant::now() - REJECT_AFTER_TIME - Duration::from_secs(1));
+        stack.peers[0].pending.push_back(vec![0; 20]);
+        stack.on_response(&response, index, address);
+        assert!(
+            stack.peers[0].session.is_some(),
+            "authenticated handshake installed a key"
+        );
+        stack.maintain_peers().await;
+        assert!(
+            stack.peers[0].session.is_some(),
+            "old receive time must not expire a new key"
+        );
+        assert!(
+            stack.peers[0].hs.is_none(),
+            "new handshake must not restart immediately"
+        );
+        assert!(
+            stack.peers[0].pending.is_empty(),
+            "queued data must leave via the new key"
+        );
+        assert!(stack.next_deadline() > tokio::time::Instant::now() + Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn expired_key_is_rejected_despite_recent_receive() {
+        let (mut stack, response, index, address) = resumed_session_fixture().await;
+        stack.on_response(&response, index, address);
+        stack.peers[0].session_since =
+            Some(Instant::now() - REJECT_AFTER_TIME - Duration::from_secs(1));
+        stack.peers[0].last_recv = Some(Instant::now());
+        stack.maintain_peers().await;
+        assert!(
+            stack.peers[0].session.is_none(),
+            "recent traffic must not extend key lifetime"
+        );
     }
 
     #[test]

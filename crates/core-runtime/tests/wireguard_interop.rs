@@ -194,6 +194,15 @@ async fn socks_roundtrip(proxy: SocketAddr, target: SocketAddr, label: &str) -> 
 
 #[tokio::test]
 async fn interop_wireguard() {
+    interop_wireguard_with_timeout(Duration::from_secs(25)).await;
+}
+
+#[tokio::test]
+async fn interop_tcp_payload_is_not_deferred_until_peer_keepalive() {
+    interop_wireguard_with_timeout(Duration::from_secs(2)).await;
+}
+
+async fn interop_wireguard_with_timeout(deadline: Duration) {
     let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
         return;
     };
@@ -267,11 +276,7 @@ async fn interop_wireguard() {
     let mut ok = false;
     for target in attempts {
         eprintln!("wireguard: roundtrip via {target}");
-        let result = tokio::time::timeout(
-            Duration::from_secs(25),
-            socks_roundtrip(proxy, target, "wg"),
-        )
-        .await;
+        let result = tokio::time::timeout(deadline, socks_roundtrip(proxy, target, "wg")).await;
         match result {
             Ok(Ok(())) => {
                 ok = true;

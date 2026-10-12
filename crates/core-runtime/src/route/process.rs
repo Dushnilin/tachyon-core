@@ -78,20 +78,22 @@ fn is_private(ip: IpAddr) -> bool {
 /// searcher reads it; elsewhere the test below is the only caller.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn addr_hex(ip: IpAddr, port: u16) -> String {
-    let octets = match ip {
-        IpAddr::V4(v4) => v4.octets().to_vec(),
-        IpAddr::V6(v6) => v6.octets().to_vec(),
-    };
-    let mut out = String::new();
-    for word in octets.chunks(4) {
-        out.push_str(&format!(
-            "{:08X}",
-            u32::from_ne_bytes(word.try_into().expect("4 bytes"))
-        ));
+    match ip {
+        IpAddr::V4(v4) => {
+            let w = u32::from_ne_bytes(v4.octets());
+            format!("{w:08X}:{port:04X}")
+        }
+        IpAddr::V6(v6) => {
+            let mut out = String::with_capacity(37);
+            use std::fmt::Write as _;
+            for chunk in v6.octets().chunks_exact(4) {
+                let w = u32::from_ne_bytes(chunk.try_into().expect("4 bytes"));
+                let _ = write!(out, "{w:08X}");
+            }
+            let _ = write!(out, ":{port:04X}");
+            out
+        }
     }
-    out.push(':');
-    out.push_str(&format!("{port:04X}"));
-    out
 }
 
 #[cfg(target_os = "linux")]

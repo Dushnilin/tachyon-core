@@ -22,6 +22,7 @@
 //! Known deviations (deliberate): HTTP keep-alive loop without `Date`
 //! headers; version string reports `tachyon-core`.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -391,6 +392,7 @@ async fn handle_request(
             | Route::Rules
             | Route::Configs
             | Route::Providers
+            | Route::Metrics
     );
     if !mounted && !methods.contains(&method) {
         method_not_allowed(stream, methods, method == "OPTIONS", &cors).await?;
@@ -505,6 +507,20 @@ async fn handle_request(
             };
             respond_json(stream, 200, "OK", &body, &cors).await?;
         }
+        Route::Metrics => {
+            let metrics_body = render_prometheus_metrics();
+            let mut headers = cors;
+            headers.push("Content-Type: text/plain; version=0.0.4; charset=utf-8".to_string());
+            respond_text(
+                stream,
+                200,
+                "OK",
+                &metrics_body,
+                &headers,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
+            .await?;
+        }
         Route::Static(asset) => {
             return serve_static(stream, api, &asset, &cors).await;
         }
@@ -526,6 +542,7 @@ enum Route {
     Rules,
     Configs,
     Providers,
+    Metrics,
     /// `/ui`: the permanent redirect to `/ui/`
     UiRoot,
     /// asset under `/ui/`
@@ -546,6 +563,7 @@ fn classify_with_ui(path: &str, external_ui: bool) -> (Route, &'static [&'static
         "/rules" => (Route::Rules, GET_ONLY),
         "/configs" => (Route::Configs, GET_PUT_PATCH),
         "/providers/proxies" | "/providers/rules" => (Route::Providers, GET_ONLY),
+        "/metrics" => (Route::Metrics, GET_ONLY),
         p => match p.strip_prefix("/connections/") {
             Some(rest) => {
                 let rest = rest.strip_suffix('/').unwrap_or(rest);
@@ -730,6 +748,118 @@ fn connections_snapshot() -> Value {
         "connections": connections,
         "memory": 0,
     })
+}
+
+/// Render live metrics in Prometheus plain text exposition format.
+fn render_prometheus_metrics() -> String {
+    let (views, upload_total, download_total) = clash_state::snapshot();
+    let mut out = String::new();
+
+    // Active connections
+    out.push_str("# HELP tachyon_connections_active Number of currently active connections\n");
+    out.push_str("# TYPE tachyon_connections_active gauge\n");
+    let _ = writeln!(out, "tachyon_connections_active {}", views.len());
+    out.push('\n');
+
+    // Traffic total
+    out.push_str("# HELP tachyon_traffic_upload_bytes_total Total uploaded bytes\n");
+    out.push_str("# TYPE tachyon_traffic_upload_bytes_total counter\n");
+    let _ = writeln!(out, "tachyon_traffic_upload_bytes_total {upload_total}");
+    out.push('\n');
+
+    out.push_str("# HELP tachyon_traffic_download_bytes_total Total downloaded bytes\n");
+    out.push_str("# TYPE tachyon_traffic_download_bytes_total counter\n");
+    let _ = writeln!(out, "tachyon_traffic_download_bytes_total {download_total}");
+    out.push('\n');
+
+    // Process memory RSS
+    let rss = get_process_rss_bytes();
+    if rss > 0 {
+        out.push_str("# HELP tachyon_memory_rss_bytes Process resident memory size in bytes\n");
+        out.push_str("# TYPE tachyon_memory_rss_bytes gauge\n");
+        let _ = writeln!(out, "tachyon_memory_rss_bytes {rss}");
+        out.push('\n');
+    }
+
+    // Per outbound active connections and traffic
+    let mut outbound_conns: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut outbound_up: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut outbound_down: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+
+    for v in &views {
+        let tag = v
+            .meta
+            .chains
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "direct".to_string());
+        *outbound_conns.entry(tag.clone()).or_default() += 1;
+        *outbound_up.entry(tag.clone()).or_default() += v.upload;
+        *outbound_down.entry(tag).or_default() += v.download;
+    }
+
+    if !outbound_conns.is_empty() {
+        out.push_str("# HELP tachyon_outbound_connections_active Number of active connections per outbound\n");
+        out.push_str("# TYPE tachyon_outbound_connections_active gauge\n");
+        let mut tags: Vec<_> = outbound_conns.keys().collect();
+        tags.sort();
+        for tag in &tags {
+            let count = outbound_conns[*tag];
+            let _ = writeln!(
+                out,
+                "tachyon_outbound_connections_active{{outbound=\"{tag}\"}} {count}"
+            );
+        }
+        out.push('\n');
+
+        out.push_str("# HELP tachyon_outbound_traffic_upload_bytes Bytes uploaded per active outbound connection\n");
+        out.push_str("# TYPE tachyon_outbound_traffic_upload_bytes gauge\n");
+        for tag in &tags {
+            let up = outbound_up.get(*tag).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "tachyon_outbound_traffic_upload_bytes{{outbound=\"{tag}\"}} {up}"
+            );
+        }
+        out.push('\n');
+
+        out.push_str("# HELP tachyon_outbound_traffic_download_bytes Bytes downloaded per active outbound connection\n");
+        out.push_str("# TYPE tachyon_outbound_traffic_download_bytes gauge\n");
+        for tag in &tags {
+            let down = outbound_down.get(*tag).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "tachyon_outbound_traffic_download_bytes{{outbound=\"{tag}\"}} {down}"
+            );
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+fn get_process_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            let mut parts = statm.split_whitespace();
+            let _total_pages = parts.next();
+            if let Some(resident_pages_str) = parts.next()
+                && let Ok(pages) = resident_pages_str.parse::<u64>()
+            {
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                let page_size = if page_size > 0 {
+                    page_size as u64
+                } else {
+                    4096
+                };
+                return pages * page_size;
+            }
+        }
+    }
+    0
 }
 
 /// `?interval=` for the websocket stream, in milliseconds (reference default

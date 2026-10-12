@@ -427,18 +427,20 @@ fn reply_code_for_error(err: &io::Error) -> u8 {
 
 /// Clash connection-view metadata for a routed connection: inbound, source,
 /// destination, matched rule and the outbound chain.
+fn clash_host(ctx: &ConnContext) -> String {
+    match (&ctx.domain, &ctx.destination) {
+        (Some(domain), _) if !domain.is_empty() => domain.clone(),
+        (_, Target::Domain(host, _)) => host.clone(),
+        (_, Target::Ip(addr)) => addr.ip().to_string(),
+    }
+}
+
 pub fn clash_meta(
     ctx: &ConnContext,
     router: &Router,
     outbound_index: usize,
 ) -> clash_state::ConnMeta {
-    // reference `TrackerMetadata`: the sniffed domain wins over the
-    // destination's own name, an IP destination has no host at all
-    let host = match (&ctx.domain, &ctx.destination) {
-        (Some(domain), _) if !domain.is_empty() => domain.clone(),
-        (_, Target::Domain(host, _)) => host.clone(),
-        _ => String::new(),
-    };
+    let host = clash_host(ctx);
     let mut chains = Vec::new();
     let mut index = Some(outbound_index);
     let inner = router.inner();
@@ -463,6 +465,10 @@ pub fn clash_meta(
         Some(ty) => format!("{ty}/{tag}"),
         None => tag,
     };
+    let (rule, rule_payload) = ctx
+        .matched_rule
+        .clone()
+        .unwrap_or_else(|| ("final".into(), String::new()));
     clash_state::ConnMeta {
         network: ctx.network,
         inbound,
@@ -470,8 +476,8 @@ pub fn clash_meta(
         host,
         destination: ctx.destination.to_string(),
         chains,
-        rule: ctx.matched_rule.clone().unwrap_or_else(|| "final".into()),
-        rule_payload: String::new(),
+        rule,
+        rule_payload,
         process_path: ctx.process.as_ref().map(process_label).unwrap_or_default(),
     }
 }

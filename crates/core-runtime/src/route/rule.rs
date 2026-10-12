@@ -770,6 +770,129 @@ impl Rule {
         format!("{} => {}", self.description(), self.action().clash_view())
     }
 
+    /// Capture destination and criterion evidence from the rule that actually matched,
+    /// before route actions can change the connection metadata.
+    pub fn clash_match(&self, ctx: &ConnContext) -> (String, String) {
+        let rule = self.clash_primary();
+        let mut evidence = Vec::new();
+        self.matched_destination(ctx, &mut evidence);
+        evidence.dedup();
+        (rule, evidence.join("; "))
+    }
+
+    fn matched_destination(&self, ctx: &ConnContext, evidence: &mut Vec<String>) {
+        if !self.matches(ctx) {
+            return;
+        }
+        match self {
+            Rule::Default(rule) if !rule.invert => {
+                for set in &rule.rule_sets {
+                    if set.matches(ctx) {
+                        for tag in set.tags() {
+                            evidence.push(format!("rule_set={tag}"));
+                        }
+                    }
+                }
+                if let Some(host) = domain_host(ctx) {
+                    for item in &rule.dest_address {
+                        let (kind, values): (&str, Vec<&str>) = match item {
+                            DomainItem::Exact(list) => (
+                                "domain",
+                                list.iter()
+                                    .filter(|value| value.as_str() == host.as_ref())
+                                    .map(String::as_str)
+                                    .collect(),
+                            ),
+                            DomainItem::Suffix(list) => (
+                                "domain_suffix",
+                                list.iter()
+                                    .filter(|value| domain_suffix_match(&host, value))
+                                    .map(String::as_str)
+                                    .collect(),
+                            ),
+                            DomainItem::Keyword(list) => (
+                                "domain_keyword",
+                                list.iter()
+                                    .filter(|value| host.contains(value.as_str()))
+                                    .map(String::as_str)
+                                    .collect(),
+                            ),
+                            DomainItem::Regex(list) => (
+                                "domain_regex",
+                                list.iter()
+                                    .filter(|value| value.is_match(&host))
+                                    .map(Regex::as_str)
+                                    .collect(),
+                            ),
+                        };
+                        evidence.extend(values.into_iter().map(|value| format!("{kind}={value}")));
+                    }
+                }
+                for item in &rule.dest_ip_cidr {
+                    if !item.matches(ctx) {
+                        continue;
+                    }
+                    if item.is_private {
+                        evidence.push("ip_cidr=lan".into());
+                    } else {
+                        for prefix in &item.prefixes {
+                            let matched = match ctx.destination {
+                                super::Target::Ip(addr) => prefix.contains(addr.ip()),
+                                _ => ctx
+                                    .destination_addresses
+                                    .iter()
+                                    .any(|ip| prefix.contains(*ip)),
+                            };
+                            if matched {
+                                evidence.push(format!("ip_cidr={}", prefix.to_cidr()));
+                            }
+                        }
+                    }
+                }
+                for item in &rule.dest_port {
+                    if item.matches(ctx.destination.port()) {
+                        evidence.push(port_description(false, item));
+                    }
+                }
+                for item in &rule.source_port {
+                    if item.matches(ctx.source.port()) {
+                        evidence.push(port_description(true, item));
+                    }
+                }
+                for item in &rule.source_address {
+                    if item.matches_source(ctx) {
+                        match item {
+                            AddressItem::Cidr(list) => {
+                                for prefix in list {
+                                    if prefix.contains(ctx.source.ip()) {
+                                        evidence
+                                            .push(format!("source_ip_cidr={}", prefix.to_cidr()));
+                                    }
+                                }
+                            }
+                            AddressItem::IsPrivate => {
+                                evidence.push("source_ip_is_private=true".into())
+                            }
+                        }
+                    }
+                }
+            }
+            Rule::Logical(rule) if !rule.invert => match rule.mode {
+                LogicalMode::And => {
+                    for child in &rule.rules {
+                        child.matched_destination(ctx, evidence);
+                    }
+                }
+                LogicalMode::Or => {
+                    if let Some(child) = rule.rules.iter().find(|child| child.matches(ctx)) {
+                        child.matched_destination(ctx, evidence);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
     pub fn matches(&self, ctx: &ConnContext) -> bool {
         match self {
             Rule::Default(r) => r.matches(ctx),
@@ -862,7 +985,15 @@ impl DefaultRule {
         }
         parts.extend(tail.into_iter().map(|(_, text)| text));
         // `RuleSetItem.String` brackets every multi-tag list, never truncates
-        match self.rule_set_tags.as_slice() {
+        let tags: Vec<String> = if !self.rule_set_tags.is_empty() {
+            self.rule_set_tags.clone()
+        } else {
+            self.rule_sets
+                .iter()
+                .flat_map(|set| set.tags().iter().cloned())
+                .collect()
+        };
+        match tags.as_slice() {
             [] => {}
             [tag] => parts.push(format!("rule_set={tag}")),
             tags => parts.push(format!("rule_set=[{}]", tags.join(" "))),
@@ -2066,5 +2197,106 @@ mod tests {
         assert_eq!(ctx.udp_disable_domain_unmapping, Some(true));
         assert_eq!(ctx.tls_fragment, Some(true));
         assert_eq!(ctx.tls_record_fragment, Some(false));
+    }
+
+    #[test]
+    fn connection_monitor_captures_exact_suffix_inside_device_guard() {
+        let rule = Rule::build(
+            &json!({
+                "type":"logical", "mode":"and", "outbound":"VPN-out",
+                "rules":[
+                    {"inbound":["in","tproxy6-in"], "domain_suffix":["dell.com","2ip.io","vencord.dev","chatgpt.com"]},
+                    {"source_ip_cidr":["192.168.90.239/32"],"invert":true}
+                ]
+            }),
+            "r",
+            true,
+        )
+        .unwrap();
+        for (host, expected) in [
+            ("ws.chatgpt.com", "chatgpt.com"),
+            ("static.2ip.io", "2ip.io"),
+        ] {
+            let mut ctx = ctx_to(host, 443);
+            let (raw, evidence) = rule.clash_match(&ctx);
+            assert!(raw.contains("domain_suffix="));
+            assert_eq!(evidence, format!("domain_suffix={expected}"));
+            ctx.source.set_ip("192.168.90.239".parse().unwrap());
+            assert!(!rule.matches(&ctx));
+            assert!(rule.clash_match(&ctx).1.is_empty());
+        }
+    }
+
+    #[test]
+    fn connection_monitor_preserves_telegram_rule_set_inside_device_guard() {
+        use super::super::rule_set::{RuleSet, RuleSetRegistry};
+        let mut registry = RuleSetRegistry::new();
+        registry.insert(std::sync::Arc::new(RuleSet::new(
+            vec!["VPN-telegram-community-ruleset".into()],
+            vec![json!({"ip_cidr":"149.154.160.0/20"})],
+        )));
+        let rule = Rule::build_with_rule_sets(
+            &json!({
+                "type":"logical", "mode":"and", "outbound":"VPN-out",
+                "rules":[{"inbound":"in","rule_set":"VPN-telegram-community-ruleset"},
+                         {"source_ip_cidr":"192.168.90.239/32","invert":true}]
+            }),
+            "r",
+            true,
+            &registry,
+        )
+        .unwrap();
+        let mut ctx = ctx_to("unused", 443);
+        ctx.destination = super::super::Target::Ip("149.154.167.50:443".parse().unwrap());
+        assert!(rule.matches(&ctx));
+        let (raw, payload) = rule.clash_match(&ctx);
+        assert!(raw.contains("rule_set=VPN-telegram-community-ruleset"));
+        assert_eq!(payload, "rule_set=VPN-telegram-community-ruleset");
+        ctx.destination = super::super::Target::Ip("203.0.113.5:443".parse().unwrap());
+        assert!(!rule.matches(&ctx));
+        assert!(rule.clash_match(&ctx).1.is_empty());
+    }
+
+    #[test]
+    fn connection_monitor_only_explains_the_selected_or_branch() {
+        let rule = Rule::build(
+            &json!({
+                "type":"logical", "mode":"or", "outbound":"o",
+                "rules":[{"domain_suffix":"other.org"},{"domain_suffix":"chatgpt.com"},{"domain_keyword":"chatgpt"}]
+            }),
+            "r",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.clash_match(&ctx_to("ws.chatgpt.com", 443)).1,
+            "domain_suffix=chatgpt.com"
+        );
+        let inverted = Rule::build(
+            &json!({"domain_suffix":"other.org","invert":true,"outbound":"o"}),
+            "r",
+            true,
+        )
+        .unwrap();
+        assert!(
+            inverted
+                .clash_match(&ctx_to("ws.chatgpt.com", 443))
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn connection_monitor_captures_resolved_subnet_before_metadata_changes() {
+        let rule = Rule::build(
+            &json!({"ip_cidr":["192.0.2.0/24","203.0.113.0/24"],"outbound":"o"}),
+            "r",
+            true,
+        )
+        .unwrap();
+        let mut ctx = ctx_to("example.org", 443);
+        ctx.destination_addresses
+            .push("203.0.113.5".parse().unwrap());
+        assert_eq!(rule.clash_match(&ctx).1, "ip_cidr=203.0.113.0/24");
     }
 }

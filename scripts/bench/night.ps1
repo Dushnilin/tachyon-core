@@ -5,7 +5,7 @@
 а утром забирает json и собирает BENCHMARK.html (матрица, вкладка роутера) и
 NIGHT.html (эндьюранс) в корень репозитория.
 
-    .\scripts\bench\night.ps1                       # до 08:00, 10000 коннектов, 20 мин
+    .\scripts\bench\night.ps1                       # до 08:00, 3000 коннектов, 20 мин
     .\scripts\bench\night.ps1 -StopAt 0930 -Conns 5000 -Minutes 10
 
 ПК за ночь не должен уснуть: спит ПК — спит и опрос, но роутер доделает сам,
@@ -13,7 +13,7 @@ NIGHT.html (эндьюранс) в корень репозитория.
 #>
 param(
     [string]$Router = "root@192.168.1.206",
-    [int]$Conns = 10000,
+    [int]$Conns = 3000,
     [int]$Minutes = 20,
     [string]$StopAt = "0800",
     [string]$LxVer = "1.14.2-lx.12",
@@ -65,7 +65,8 @@ if ((RemoteState "grep -qs '[n]ight_load' /proc/[0-9]*/cmdline && echo RUN || ec
         Start-Sleep -Seconds 120
     }
     Write-Host "==> запуск ночи: $Conns коннектов, $Minutes мин/протокол, стоп в $StopAt"
-    & ssh @sshOpt $Router "cd /tmp/bench && CONNS=$Conns MINUTES=$Minutes setsid nohup sh overnight.sh </dev/null >/dev/null 2>&1 & sleep 2; grep -qs '[n]ight_load' /proc/[0-9]*/cmdline && echo запущено" 2>$null
+    # setsid без nohup: на busybox openwrt бинарника nohup нет
+    & ssh @sshOpt $Router "cd /tmp/bench && CONNS=$Conns MINUTES=$Minutes setsid sh overnight.sh </dev/null >/dev/null 2>&1 & sleep 2; grep -qs '[n]ight_load' /proc/[0-9]*/cmdline && echo запущено" 2>$null
     Start-Sleep -Seconds 180
     Write-Host "    первые шаги прогона:"
     & ssh @sshOpt $Router "tail -5 /tmp/bench/night.log 2>/dev/null" 2>$null

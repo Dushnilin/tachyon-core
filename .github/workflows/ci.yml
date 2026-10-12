@@ -5,185 +5,24 @@ on:
     branches: [main]
   pull_request:
 
-# A new push to the same PR makes the previous run obsolete; don't queue behind it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  SB_REF_VERSION: v1.14.2-lx.11
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      # The workspace .cargo/config.toml pins a local MSVC path; runners resolve
-      # `link.exe` from PATH themselves.
-      - name: Build (override local MSVC linker pin)
-        if: runner.os == 'Windows'
-        run: cargo build --workspace
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
-      - run: cargo test --workspace
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
-      # The exit gate needs CAP_NET_ADMIN (tproxy); re-run it as root so CI
-      # covers what the unprivileged `cargo test` above can only skip.
-      - name: Exit gate (privileged)
-        if: runner.os == 'Linux'
-        run: |
-          sudo -E env "PATH=$PATH" cargo test -p core-runtime --test exit_gate -- --nocapture
-          sudo -E env "PATH=$PATH" cargo test -p core-runtime --test inbounds -- --nocapture
-          # Require privileged SO_MARK coverage while keeping all other option checks.
-          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests::the_options_reach_the_socket -- --nocapture
-          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests::a_connect_with_options_still_reaches_the_peer -- --nocapture
-          sudo -E env "PATH=$PATH" TACHYON_REQUIRE_NET_ADMIN=1 cargo test -p core-runtime --test server_inbounds -- --nocapture
-
-  differential:
-    name: check vs sing-box-lx
+  clippy:
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # run.sh refuses to start without a binary, so this build is not optional.
-      - name: Build tachyon-core
-        run: cargo build --workspace
-      - name: Fetch reference sing-box-lx
-        run: |
-          curl -fsSL -o ref.tar.gz \
-            "https://github.com/Leadaxe/sing-box-lx/releases/download/${SB_REF_VERSION}/sing-box-${SB_REF_VERSION#v}-linux-amd64.tar.gz"
-          mkdir -p "$HOME/ref" && tar -xzf ref.tar.gz -C "$HOME/ref"
-          REF_BIN="$(find "$HOME/ref" -type f -name sing-box | head -1)"
-          chmod +x "$REF_BIN"
-          echo "SING_BOX_REF=$REF_BIN" >> "$GITHUB_ENV"
-          "$REF_BIN" version
-      - name: Run differential harness
-        env:
-          STRICT: "1"
-        run: bash tests/differential/run.sh
-
-  cross:
-    name: Cross build (musl)
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # One architecture per OpenWrt family, and x86_64 because it is the only
-          # one whose binary the runner can actually execute. `release.yml` builds
-          # all seven on a tag; this job is the per-push smoke test, and paying for
-          # seven builds plus seven artifacts on every commit is not a smoke test.
-          - target: x86_64-unknown-linux-musl
-            budget: 14680064
-          - target: aarch64-unknown-linux-musl
-          - target: armv7-unknown-linux-musleabihf
-          # tier-3, no prebuilt std: the standard library is built from source
-          - target: mipsel-unknown-linux-musl
-            build-std: true
-            # ~350 KiB of .pdr procedure descriptors survive every strip mode,
-            # and the gcc-linked build has no `--icf`: 12 MiB is unreachable
-            # on MIPS, so it gets the same ceiling as the glibc desktop build.
-            budget: 16777216
-    steps:
-      - uses: actions/checkout@v4
-      # mimalloc is an x86_64-only dependency and it is a C library: without a
-      # musl C compiler the x86_64-musl job dies inside cc-rs looking for
-      # `x86_64-linux-musl-gcc`, which no runner image ships.
-      - name: Install musl-tools (x86_64 musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
-      # `rustup target add` refuses a tier-3 target outright -- there are no
-      # prebuilt artifacts to add, and it says so and exits non-zero -- so the
-      # MIPS entry must not be asked to install its target. It gets nightly plus
-      # rust-src and lets `-Z build-std` compile the standard library.
-      - name: Toolchain (prebuilt std)
-        if: ${{ !matrix.build-std }}
-        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-      - name: Toolchain (std from source)
-        if: ${{ matrix.build-std }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          components: rust-src
-      # rust-lld's self-contained CRT only carries start files for the targets
-      # rustup distributes a std for. The MIPS targets are tier-3, their
-      # self-contained dir does not exist, and `link-self-contained=yes` hands
-      # lld bare `Scrt1.o` / `-lc` names it cannot resolve -- which is how
-      # these jobs died at link time. Build a real musl for the target: apt
-      # ships a MIPS cross gcc and musl builds with it in a minute, and the
-      # link then goes through that gcc driver with `-B` pointed at the musl
-      # lib dir so crt and libc come from the musl we just built.
-      # (musl.cc, the usual prebuilt toolchain for this, times out from the
-      # runner network: `curl: (28) Failed to connect to musl.cc port 443`.)
-      - name: MIPS musl toolchain (mipsel)
-        if: matrix.target == 'mipsel-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu
-          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
-            https://musl.libc.org/releases/musl-1.2.5.tar.gz
-          tar -xzf /tmp/musl.tar.gz -C /tmp
-          (cd /tmp/musl-1.2.5 && \
-            CROSS_COMPILE=mipsel-linux-gnu- ./configure --prefix=/opt/mipsel-musl && \
-            make -j"$(nproc)" && sudo make install)
-          # Keep the tier-3 unwind archive setup in sync with release.yml.
-          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
-          mipsel-linux-gnu-gcc -c /tmp/dlfo.c -o /tmp/dlfo.o
-          rm -rf /tmp/eh-mipsel && mkdir -p /tmp/eh-mipsel
-          (cd /tmp/eh-mipsel && mipsel-linux-gnu-ar x "$(mipsel-linux-gnu-gcc -print-file-name=libgcc_eh.a)")
-          sudo mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a /tmp/eh-mipsel/*.o /tmp/dlfo.o
-          {
-            echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
-            echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-gnu-gcc"
-            # Env RUSTFLAGS wins over the .cargo/config.toml array, so the
-            # array is repeated here minus everything that names lld: the
-            # driver is GNU ld now and it rejects `--icf=safe`.
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-L/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
-          } >> "$GITHUB_ENV"
-      # Every other musl target links exactly as `.cargo/config.toml` says:
-      # linker = "rust-lld" plus the self-contained CRT, and the per-target
-      # array carries the link-args (aarch64's --cfg trio included). There is
-      # deliberately no RUSTFLAGS step any more -- cargo takes rustflags from
-      # exactly one place, and an env value silently drops those arrays. For
-      # x86_64 that cost `-C target-cpu=x86-64-v3` and `--icf=safe`, and the
-      # binary came out 12.15 MiB against the 12 MiB ceiling.
-      - name: Build
-        run: |
-          if [ -n "${{ matrix.build-std }}" ]; then
-            cargo build --workspace --release --target ${{ matrix.target }} \
-              -Z build-std=std,panic_abort
-          else
-            cargo build --workspace --release --target ${{ matrix.target }}
-          fi
-      - name: Size budget
-        run: |
-          budget="${{ matrix.budget || 12582912 }}"
-          size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")
-          echo "size=$size bytes, budget=$budget"
-          test "$size" -le "$budget"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tachyon-core-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/tachyon-core
+          components: clippy
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

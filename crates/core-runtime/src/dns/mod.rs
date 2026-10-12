@@ -6,6 +6,7 @@
 
 mod cache;
 pub mod codec;
+pub mod fastest_ip;
 pub mod group;
 pub mod mdns;
 mod rules;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use hickory_proto::rr::{RData, RecordType};
 use serde_json::Value;
 
+pub use fastest_ip::{FastestIpCache, FastestIpConfig};
 pub use rules::{Action, QueryMeta, RejectMethod, Rule, WalkOptions};
 pub use transport::{FakeIpStore, Kind, ServerConfig};
 
@@ -34,8 +36,10 @@ const RESOLVE_TIMEOUT_GUARD: Duration = Duration::from_secs(10);
 /// The reference's `mdnsTimeout`: an mDNS answer is either already on the LAN
 /// or it is not coming.
 const MDNS_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long a `domain_resolver` answer for a transport's own address is reused.
-const SERVER_ADDR_TTL: Duration = Duration::from_secs(60);
+/// How long a `domain_resolver` answer for a transport's own address is
+/// reused. A failed refresh falls back to the expired entry (with a warning)
+/// instead of taking the transport down — see `resolve_server_addr`.
+const SERVER_ADDR_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -65,6 +69,15 @@ impl Strategy {
             _ => &[RecordType::A, RecordType::AAAA],
         }
     }
+
+    /// The record type a `prefer_*` strategy is satisfied with alone.
+    fn preferred_family(self) -> Option<RecordType> {
+        match self {
+            Self::PreferIPv4 => Some(RecordType::A),
+            Self::PreferIPv6 => Some(RecordType::AAAA),
+            _ => None,
+        }
+    }
 }
 
 pub struct DnsService {
@@ -74,6 +87,10 @@ pub struct DnsService {
     strategy: Strategy,
     disable_cache: bool,
     disable_expire: bool,
+    serve_stale: bool,
+    serve_stale_duration: Duration,
+    fastest_ip: FastestIpConfig,
+    fastest_ip_cache: FastestIpCache,
     optimistic_timeout: Option<Duration>,
     cache: RwLock<Cache>,
     /// One lock per name that is being looked up right now; the value is a
@@ -258,6 +275,48 @@ impl DnsService {
             anyhow::bail!("`optimistic` is conflict with `disable_expire`");
         }
 
+        let (serve_stale, serve_stale_duration) = match map.get("serve_stale") {
+            None | Some(Value::Null) => (false, Duration::from_secs(7 * 24 * 3600)),
+            Some(Value::Bool(b)) => (*b, Duration::from_secs(7 * 24 * 3600)),
+            Some(obj @ Value::Object(_)) => {
+                let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                let duration = crate::outbound::urltest::parse_duration(
+                    obj.get("timeout").or_else(|| obj.get("max_stale")),
+                    Duration::from_secs(7 * 24 * 3600),
+                    "dns.serve_stale.timeout",
+                )?;
+                (enabled, duration)
+            }
+            Some(_) => anyhow::bail!("dns.serve_stale: must be a bool or object"),
+        };
+
+        let fastest_ip = match map.get("fastest_ip") {
+            None | Some(Value::Null) => FastestIpConfig::default(),
+            Some(Value::Bool(b)) => FastestIpConfig {
+                enabled: *b,
+                ..Default::default()
+            },
+            Some(obj @ Value::Object(_)) => {
+                let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                let timeout = crate::outbound::urltest::parse_duration(
+                    obj.get("timeout"),
+                    Duration::from_millis(200),
+                    "dns.fastest_ip.timeout",
+                )?;
+                let port = obj
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .map(|p| p as u16)
+                    .unwrap_or(443);
+                FastestIpConfig {
+                    enabled,
+                    timeout,
+                    port,
+                }
+            }
+            Some(_) => anyhow::bail!("dns.fastest_ip: must be a bool or object"),
+        };
+
         let cache_capacity = map
             .get("cache_capacity")
             .and_then(Value::as_u64)
@@ -276,6 +335,10 @@ impl DnsService {
             strategy,
             disable_cache,
             disable_expire,
+            serve_stale,
+            serve_stale_duration,
+            fastest_ip,
+            fastest_ip_cache: FastestIpCache::new(cache_capacity, Duration::from_secs(300)),
             optimistic_timeout,
             cache: RwLock::new(Cache::new(cache_capacity)),
             inflight: std::sync::Mutex::new(HashMap::new()),
@@ -294,6 +357,7 @@ impl DnsService {
         if let (Ok(old_cache), Ok(mut new_cache)) = (old.cache.read(), self.cache.write()) {
             old_cache.copy_valid_into(&mut new_cache, now);
         }
+        old.fastest_ip_cache.copy_into(&self.fastest_ip_cache);
         if let (Ok(old_addrs), Ok(mut new_addrs)) =
             (old.server_addrs.lock(), self.server_addrs.lock())
         {
@@ -738,15 +802,26 @@ impl DnsService {
 
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            // write, not read: a hit bumps the entry's place in the eviction
-            // order (see dns::cache)
-            let hit = self.cache.write().expect("dns cache").get(&key, now);
+            let hit = {
+                let mut cache = self.cache.write().expect("dns cache");
+                cache.get(&key, now)
+            };
             match hit {
                 Some((CacheHit::Fresh(raw), received)) => {
+                    let raw = if self.fastest_ip.enabled {
+                        self.apply_fastest_ip(&raw, &info.name, now).await
+                    } else {
+                        raw.to_vec()
+                    };
                     return codec::set_id(&raw, info.id).map(|raw| (raw, received));
                 }
                 Some((CacheHit::Stale(raw), received)) => {
                     self.spawn_refresh(meta.clone(), query.to_vec(), allow_fakeip, key.clone());
+                    let raw = if self.fastest_ip.enabled {
+                        self.apply_fastest_ip(&raw, &info.name, now).await
+                    } else {
+                        raw.to_vec()
+                    };
                     return codec::set_id(&raw, info.id).map(|raw| (raw, received));
                 }
                 None => {}
@@ -768,14 +843,78 @@ impl DnsService {
         let _guard = lock.lock().await;
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            if let Some((CacheHit::Fresh(raw), received)) =
-                self.cache.write().expect("dns cache").get(&key, now)
-            {
+            let hit = {
+                let mut cache = self.cache.write().expect("dns cache");
+                cache.get(&key, now)
+            };
+            if let Some((CacheHit::Fresh(raw), received)) = hit {
+                let raw = if self.fastest_ip.enabled {
+                    self.apply_fastest_ip(&raw, &info.name, now).await
+                } else {
+                    raw.to_vec()
+                };
                 return codec::set_id(&raw, info.id).map(|raw| (raw, received));
             }
         }
 
-        let response = self.exchange_remote(&target, query).await?;
+        let response = match self.exchange_remote(&target, query).await {
+            Ok(resp) => {
+                if self.serve_stale
+                    && use_cache
+                    && let Ok(meta) = codec::response_meta(&resp)
+                    && meta.rcode == hickory_proto::op::ResponseCode::ServFail
+                {
+                    let now = Instant::now();
+                    let stale_hit = {
+                        let mut cache = self.cache.write().expect("dns cache");
+                        cache.get_stale_fallback(&key, now, self.serve_stale_duration)
+                    };
+                    if let Some((stale_raw, rec)) = stale_hit {
+                        crate::logging::debug(format_args!(
+                            "dns: upstream {} returned SERVFAIL, returning stale cached response",
+                            target.tag
+                        ));
+                        let stale_raw = if self.fastest_ip.enabled {
+                            self.apply_fastest_ip(&stale_raw, &info.name, now).await
+                        } else {
+                            stale_raw.to_vec()
+                        };
+                        return codec::set_id(&stale_raw, info.id).map(|raw| (raw, rec));
+                    }
+                }
+                resp
+            }
+            Err(e) => {
+                if self.serve_stale && use_cache {
+                    let now = Instant::now();
+                    let stale_hit = {
+                        let mut cache = self.cache.write().expect("dns cache");
+                        cache.get_stale_fallback(&key, now, self.serve_stale_duration)
+                    };
+                    if let Some((stale_raw, rec)) = stale_hit {
+                        crate::logging::debug(format_args!(
+                            "dns: upstream {} failed ({e}), returning stale cached response",
+                            target.tag
+                        ));
+                        let stale_raw = if self.fastest_ip.enabled {
+                            self.apply_fastest_ip(&stale_raw, &info.name, now).await
+                        } else {
+                            stale_raw.to_vec()
+                        };
+                        return codec::set_id(&stale_raw, info.id).map(|raw| (raw, rec));
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        let now = Instant::now();
+        let response = if self.fastest_ip.enabled {
+            self.apply_fastest_ip(&response, &info.name, now).await
+        } else {
+            response
+        };
+
         let rewritten: Arc<[u8]> = match opts.rewrite_ttl {
             Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
             None => response.into(),
@@ -808,6 +947,35 @@ impl DnsService {
             }
         }
         codec::set_id(&rewritten, info.id).map(|raw| (raw, received))
+    }
+
+    async fn apply_fastest_ip(&self, raw: &[u8], name: &str, now: Instant) -> Vec<u8> {
+        let Ok(ips) = codec::answer_ips(raw) else {
+            return raw.to_vec();
+        };
+        if ips.len() <= 1 {
+            return raw.to_vec();
+        }
+        let winner = match self.fastest_ip_cache.get(name, &ips, now) {
+            Some(cached) => Some(cached),
+            None => {
+                if let Some(best) =
+                    fastest_ip::find_fastest_ip(&ips, self.fastest_ip.port, self.fastest_ip.timeout)
+                        .await
+                {
+                    self.fastest_ip_cache.put(name.to_string(), best, now);
+                    Some(best)
+                } else {
+                    None
+                }
+            }
+        };
+        match winner {
+            Some(w) => {
+                codec::reorder_answers_by_fastest_ip(raw, w).unwrap_or_else(|_| raw.to_vec())
+            }
+            None => raw.to_vec(),
+        }
     }
 
     fn spawn_refresh(
@@ -968,7 +1136,14 @@ impl DnsService {
                     ));
                 }
                 let cache_key = (resolver_tag.clone(), cfg.server.clone());
-                let cached = |this: &Self| {
+                let stale = |this: &Self| {
+                    this.server_addrs
+                        .lock()
+                        .ok()
+                        .and_then(|map| map.get(&cache_key).copied())
+                        .map(|(addr, _)| SocketAddr::new(addr.ip(), cfg.port))
+                };
+                let fresh = |this: &Self| {
                     this.server_addrs
                         .lock()
                         .ok()
@@ -976,7 +1151,7 @@ impl DnsService {
                         .filter(|(_, at)| at.elapsed() < SERVER_ADDR_TTL)
                         .map(|(addr, _)| SocketAddr::new(addr.ip(), cfg.port))
                 };
-                if let Some(addr) = cached(self) {
+                if let Some(addr) = fresh(self) {
                     return Ok(addr);
                 }
                 // only the outermost lookup takes the lock: a chained resolver
@@ -985,9 +1160,26 @@ impl DnsService {
                     0 => Some(self.server_addr_lock.lock().await),
                     _ => None,
                 };
-                if let Some(addr) = cached(self) {
+                if let Some(addr) = fresh(self) {
                     return Ok(addr);
                 }
+                // A resolver that just timed out must not take the transport
+                // down with it: the last known address keeps serving until a
+                // refresh succeeds. One dropped UDP probe used to kill the
+                // whole dns-server transport every TTL window.
+                let stale_or_err = |e: std::io::Error| -> std::io::Result<SocketAddr> {
+                    if let Some(addr) = stale(self) {
+                        crate::logging::warn(format_args!(
+                            "dns: domain_resolver {resolver_tag:?} failed for {:?} ({e}), reusing stale address {addr}",
+                            cfg.server
+                        ));
+                        return Ok(addr);
+                    }
+                    Err(std::io::Error::other(format!(
+                        "dns: domain_resolver {resolver_tag:?} failed for {:?}: {e}",
+                        cfg.server
+                    )))
+                };
                 match self.lookup_via(resolver, &cfg.server, depth + 1).await {
                     Ok(addrs) if !addrs.is_empty() => {
                         let ip = pick_address(addrs, self.strategy)
@@ -999,17 +1191,12 @@ impl DnsService {
                         return Ok(addr);
                     }
                     Ok(_) => {
-                        return Err(std::io::Error::other(format!(
+                        return stale_or_err(std::io::Error::other(format!(
                             "dns: domain_resolver {:?} returned no address for {:?}",
                             resolver_tag, cfg.server
                         )));
                     }
-                    Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "dns: domain_resolver {:?} failed for {:?}: {e}",
-                            resolver_tag, cfg.server
-                        )));
-                    }
+                    Err(e) => return stale_or_err(e),
                 }
             }
             crate::logging::warn(format_args!(
@@ -1108,21 +1295,58 @@ impl DnsService {
             };
             return Ok(addrs);
         }
+        // Both families in flight at once, the way resolve_with already
+        // queries: a sequential A-then-AAAA walk let a v6 probe the uplink
+        // silently drops hold the server_addr_lock for its whole retransmit
+        // schedule, and the bootstrap lookup behind it died at the 5s mark.
+        let qtypes = self.strategy.query_types();
+        let mut handles = Vec::with_capacity(qtypes.len());
+        for &qtype in qtypes {
+            let this = Arc::clone(self);
+            let resolver = Arc::clone(resolver);
+            let host = host.to_string();
+            handles.push(tokio::spawn(async move {
+                let query = codec::build_query(rand_id(), &host, qtype)?;
+                let addr = this.resolve_server_addr(&resolver, depth).await?;
+                let raw = transport::exchange(&resolver, addr, &query, &this.dialer()).await?;
+                codec::answer_ips(&raw)
+            }));
+        }
+        let mut order: Vec<_> = qtypes.iter().copied().zip(handles).collect();
+        if matches!(self.strategy, Strategy::PreferIPv6) {
+            order.reverse();
+        }
         let mut out = Vec::new();
         let mut last_err = None;
-        for qtype in self.strategy.query_types() {
-            // One failing record type (a v6 query on a v4-only uplink, say) must
-            // not sink the other: the server is reachable if any family resolves.
-            let one = async {
-                let query = codec::build_query(rand_id(), host, *qtype)?;
-                let addr = self.resolve_server_addr(resolver, depth).await?;
-                let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
-                codec::answer_ips(&raw)
-            }
-            .await;
-            match one {
-                Ok(ips) => out.extend(ips),
-                Err(e) => last_err = Some(e),
+        for (_qtype, mut handle) in order {
+            // If we already have addresses for one family, don't hang indefinitely
+            // on a second family that the uplink or DNS server drops.
+            if !out.is_empty() {
+                if self.strategy.preferred_family().is_some() {
+                    handle.abort();
+                    break;
+                }
+                // For AsIs, give the other family a short grace period (50ms)
+                // so concurrent replies are not lost, but abort if it's lagging or dropped.
+                match tokio::time::timeout(Duration::from_millis(50), &mut handle).await {
+                    Ok(Ok(Ok(ips))) => out.extend(ips),
+                    Ok(Ok(Err(e))) => last_err = Some(e),
+                    Ok(Err(e)) => {
+                        last_err = Some(std::io::Error::other(format!("dns: resolve task: {e}")))
+                    }
+                    Err(_) => {
+                        handle.abort();
+                        break;
+                    }
+                }
+            } else {
+                match handle.await {
+                    Ok(Ok(ips)) => out.extend(ips),
+                    Ok(Err(e)) => last_err = Some(e),
+                    Err(e) => {
+                        last_err = Some(std::io::Error::other(format!("dns: resolve task: {e}")))
+                    }
+                }
             }
         }
         match (out.is_empty(), last_err) {
@@ -1490,5 +1714,102 @@ mod tests {
             Ok(_) => panic!("optimistic must conflict with disable_cache"),
         };
         assert!(err.contains("optimistic"), "{err}");
+    }
+
+    #[test]
+    fn smart_dns_config_parse() {
+        let root = serde_json::json!({
+            "dns": {
+                "servers": [{"type": "udp", "tag": "u", "server": "127.0.0.1"}],
+                "serve_stale": {
+                    "enabled": true,
+                    "timeout": "3d"
+                },
+                "fastest_ip": {
+                    "enabled": true,
+                    "timeout": "350ms",
+                    "port": 8443
+                }
+            }
+        });
+        let svc = DnsService::build(&root).unwrap().expect("service");
+        assert!(svc.serve_stale);
+        assert_eq!(svc.serve_stale_duration, Duration::from_secs(3 * 24 * 3600));
+        assert!(svc.fastest_ip.enabled);
+        assert_eq!(svc.fastest_ip.timeout, Duration::from_millis(350));
+        assert_eq!(svc.fastest_ip.port, 8443);
+
+        let root_bool = serde_json::json!({
+            "dns": {
+                "servers": [{"type": "udp", "tag": "u", "server": "127.0.0.1"}],
+                "serve_stale": true,
+                "fastest_ip": true
+            }
+        });
+        let svc_bool = DnsService::build(&root_bool).unwrap().expect("service");
+        assert!(svc_bool.serve_stale);
+        assert_eq!(
+            svc_bool.serve_stale_duration,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+        assert!(svc_bool.fastest_ip.enabled);
+        assert_eq!(svc_bool.fastest_ip.timeout, Duration::from_millis(200));
+        assert_eq!(svc_bool.fastest_ip.port, 443);
+    }
+
+    #[tokio::test]
+    async fn serve_stale_recovers_from_upstream_failure() {
+        // Upstream points to a local address with no listener on UDP port 1
+        let root = serde_json::json!({
+            "dns": {
+                "servers": [{"type": "udp", "tag": "dead", "server": "127.0.0.1", "server_port": 1}],
+                "final": "dead",
+                "serve_stale": true,
+                "timeout": "50ms"
+            }
+        });
+        let svc = Arc::new(DnsService::build(&root).unwrap().expect("service"));
+
+        // Synthetic cached answer with 1s TTL
+        let q_raw = codec::build_query(1, "stale.test", RecordType::A).unwrap();
+        let (q_msg, _q_info) = codec::parse_query(&q_raw).unwrap();
+        let test_ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let resp_raw = codec::synth_addresses(&q_msg, &[test_ip], 1).unwrap();
+
+        let key = CacheKey {
+            tag: "dead".into(),
+            name: "stale.test".into(),
+            qtype: 1,
+        };
+        let meta_resp = codec::response_meta(&resp_raw).unwrap();
+        // Insert into cache
+        svc.cache
+            .write()
+            .unwrap()
+            .insert(key.clone(), resp_raw.clone(), &meta_resp, None);
+
+        // Sleep to ensure normal TTL (1s) expires
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // Verify normal cache hit is now expired (None)
+        let now = Instant::now();
+        assert!(svc.cache.write().unwrap().get(&key, now).is_none());
+        assert!(
+            svc.cache
+                .write()
+                .unwrap()
+                .get_stale_fallback(&key, now, Duration::from_secs(60))
+                .is_some()
+        );
+
+        // When exchange is performed, upstream fails because port 1 is dead or times out.
+        // But with serve_stale enabled, it recovers and returns the stale cached response!
+        let meta = QueryMeta::default();
+        let out = svc
+            .exchange(&meta, &q_raw, false)
+            .await
+            .expect("serve_stale fallback");
+        let ips = codec::answer_ips(&out).expect("answer IPs");
+        assert_eq!(ips, vec![test_ip]);
     }
 }

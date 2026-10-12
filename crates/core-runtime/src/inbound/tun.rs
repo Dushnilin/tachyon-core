@@ -607,6 +607,12 @@ impl TunDevice {
     }
 }
 
+/// Cap on the queues between TUN and the userspace stack. A flood the stack
+/// cannot drain must drop (the kernel retransmits TCP) rather than grow until
+/// the OOM killer picks the daemon on a 128 MiB router.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the linux TUN path drains these queues
+const TUN_QUEUE_CAP: usize = 512;
+
 impl Device for TunDevice {
     type RxToken<'a>
         = TunRxToken
@@ -677,7 +683,9 @@ impl PhyTxToken for TunTxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        self.queue.push_back(buffer);
+        if self.queue.len() < TUN_QUEUE_CAP {
+            self.queue.push_back(buffer);
+        }
         result
     }
 }
@@ -690,6 +698,9 @@ struct TunTcpSession {
     dest: SocketAddr,
     to_app: mpsc::Sender<Bytes>,
     from_app: mpsc::Receiver<Bytes>,
+    /// Leftover of a chunk `send_slice` could not fully take; kept until the
+    /// socket drains — dropping the tail would silently corrupt the TCP stream.
+    pending_app: Option<Bytes>,
     created: Instant,
     app_closed: bool,
     established: bool,
@@ -750,7 +761,17 @@ impl AsyncWrite for TunStream {
                 std::task::Poll::Ready(Ok(buf.len()))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
+                // Register on the channel's capacity instead of waking
+                // ourselves: a self-wake spins the worker at 100% CPU until
+                // the reader catches up. The one-shot reserve task drops its
+                // permit before waking, so the writer can take the slot.
+                let tx = self.tx.clone();
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    if tx.reserve().await.is_ok() {
+                        waker.wake();
+                    }
+                });
                 std::task::Poll::Pending
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -818,12 +839,27 @@ async fn drive_tun_stack(
 
             // Drain data from application stream to smoltcp socket
             while sock.can_send() {
-                match session.from_app.try_recv() {
-                    Ok(data) => {
-                        if sock.send_slice(&data).is_err() {
+                // Finish a chunk send_slice could not fully take before
+                // pulling a new one from the channel.
+                if let Some(front) = session.pending_app.take() {
+                    match sock.send_slice(&front) {
+                        Ok(n) if n < front.len() => {
+                            session.pending_app = Some(front.slice(n..));
                             break;
                         }
+                        Ok(_) => continue,
+                        Err(_) => break,
                     }
+                }
+                match session.from_app.try_recv() {
+                    Ok(data) => match sock.send_slice(&data) {
+                        Ok(n) if n < data.len() => {
+                            session.pending_app = Some(data.slice(n..));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         session.app_closed = true;
@@ -949,8 +985,8 @@ fn handle_ipv4_packet(
             let is_syn = (tcp_flags & 0x02) != 0 && (tcp_flags & 0x10) == 0;
 
             if is_syn && !sessions.contains_key(&key) {
-                let rx_buf = TcpSocketBuffer::new(vec![0u8; SOCKET_BUF]);
-                let tx_buf = TcpSocketBuffer::new(vec![0u8; SOCKET_BUF]);
+                let rx_buf = TcpSocketBuffer::new(vec![0u8; crate::smol_tcp_buf()]);
+                let tx_buf = TcpSocketBuffer::new(vec![0u8; crate::smol_tcp_buf()]);
                 let mut sock = TcpSocket::new(rx_buf, tx_buf);
 
                 if sock.listen(dest).is_ok() {
@@ -981,6 +1017,7 @@ fn handle_ipv4_packet(
                             dest,
                             to_app: to_app_tx,
                             from_app: from_app_rx,
+                            pending_app: None,
                             created: Instant::now(),
                             app_closed: false,
                             established: false,
@@ -989,7 +1026,9 @@ fn handle_ipv4_packet(
                 }
             }
 
-            device.rx_queue.push_back(packet.to_vec());
+            if device.rx_queue.len() < TUN_QUEUE_CAP {
+                device.rx_queue.push_back(packet.to_vec());
+            }
         }
         _ => {}
     }
@@ -1084,8 +1123,8 @@ fn handle_ipv6_packet(
             let is_syn = (tcp_flags & 0x02) != 0 && (tcp_flags & 0x10) == 0;
 
             if is_syn && !sessions.contains_key(&key) {
-                let rx_buf = TcpSocketBuffer::new(vec![0u8; SOCKET_BUF]);
-                let tx_buf = TcpSocketBuffer::new(vec![0u8; SOCKET_BUF]);
+                let rx_buf = TcpSocketBuffer::new(vec![0u8; crate::smol_tcp_buf()]);
+                let tx_buf = TcpSocketBuffer::new(vec![0u8; crate::smol_tcp_buf()]);
                 let mut sock = TcpSocket::new(rx_buf, tx_buf);
 
                 if sock.listen(dest).is_ok() {
@@ -1116,6 +1155,7 @@ fn handle_ipv6_packet(
                             dest,
                             to_app: to_app_tx,
                             from_app: from_app_rx,
+                            pending_app: None,
                             created: Instant::now(),
                             app_closed: false,
                             established: false,
@@ -1124,7 +1164,9 @@ fn handle_ipv6_packet(
                 }
             }
 
-            device.rx_queue.push_back(packet.to_vec());
+            if device.rx_queue.len() < TUN_QUEUE_CAP {
+                device.rx_queue.push_back(packet.to_vec());
+            }
         }
         _ => {}
     }

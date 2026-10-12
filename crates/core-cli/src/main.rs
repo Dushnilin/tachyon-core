@@ -575,6 +575,23 @@ mod nofile_tests {
     }
 }
 
+/// `fptn decode <token>` — print a decoded `fptn:`/`fptnb:` token as JSON.
+/// The ucode backend shells out here for `fptnb:`: ucode has no brotli.
+fn cmd_fptn(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("decode") => {
+            let token = args.get(1).ok_or("fptn decode: missing <token>")?;
+            let parsed =
+                core_config::fptn::parse_token(token).map_err(|e| format!("fptn decode: {e}"))?;
+            let json =
+                serde_json::to_string_pretty(&parsed).map_err(|e| format!("fptn decode: {e}"))?;
+            println!("{json}");
+            Ok(())
+        }
+        _ => Err("fptn: expected `fptn decode <token>`".to_string()),
+    }
+}
+
 fn usage() -> String {
     "usage: tachyon-core [options] <command> [command-options]\n\
      \n\
@@ -592,6 +609,7 @@ fn usage() -> String {
        format    -c <path> [-w]            format configuration\n\
        merge     <output-path> -c <path>   merge configurations\n\
        rule-set  <command>                 manage rule-sets\n\
+        fptn      decode <token>            decode an fptn/fptnb token to JSON\n\
        version                             print version\n\
        help                                show this help\n"
         .to_string()
@@ -718,6 +736,7 @@ fn main() -> ExitCode {
         "format" => cmd_format(&cmd_args),
         "merge" => cmd_merge(&cmd_args),
         "rule-set" => rule_set::cmd_rule_set(&cmd_args),
+        "fptn" => cmd_fptn(&cmd_args),
         // the process that holds an `unshare` network namespace open; it does
         // nothing until its stdin closes
         #[cfg(target_os = "linux")]
@@ -754,6 +773,32 @@ mod tests {
         assert!(cmd_generate(&["uuid".to_string()]).is_ok());
         assert!(cmd_generate(&["rand".to_string(), "16".to_string()]).is_ok());
         assert!(cmd_generate(&["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_fptn_decode() {
+        use base64::Engine as _;
+
+        let raw = serde_json::json!({
+            "version": 1,
+            "service_name": "TEST",
+            "username": "user1",
+            "password": "secret1",
+            "servers": [{
+                "name": "a",
+                "host": "1.2.3.4",
+                "port": 443,
+                "md5_fingerprint": "00112233445566778899aabbccddeeff",
+            }],
+        });
+        let token = format!(
+            "fptn:{}",
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&raw).unwrap())
+        );
+        assert!(cmd_fptn(&["decode".to_string(), token]).is_ok());
+        assert!(cmd_fptn(&["decode".to_string()]).is_err());
+        assert!(cmd_fptn(&["decode".to_string(), "garbage".to_string()]).is_err());
+        assert!(cmd_fptn(&["bogus".to_string()]).is_err());
     }
 
     #[test]

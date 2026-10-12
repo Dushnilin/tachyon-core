@@ -7,12 +7,13 @@ use std::collections::HashSet;
 use std::io::Read as _;
 
 use base64::Engine as _;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::validate::DIALER_OUT_FIELDS;
 
 /// One `servers[]` entry of a decoded FPTN token.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct FptnServer {
     pub name: String,
     pub host: String,
@@ -22,7 +23,10 @@ pub struct FptnServer {
 
 /// Decoded FPTN token payload. `censored_zone_servers` follows the official
 /// client: accepted in the token and ignored.
-#[derive(Debug)]
+///
+/// Serialized by `tachyon-core fptn decode`, which the ucode backend calls for
+/// `fptnb:` tokens — ucode has no brotli.
+#[derive(Debug, Serialize)]
 pub struct FptnToken {
     pub service_name: String,
     pub username: String,
@@ -178,9 +182,14 @@ fn is_token_outbound(entry: &Value) -> bool {
 }
 
 /// Replaces every `{"type":"fptn","token":…}` outbound with one outbound per
-/// token server (tag `<tag>/<name>`, dial fields carried over) plus a trailing
-/// `urltest` group that keeps the original tag. Returns `Ok(None)` when the
-/// config has no token outbounds.
+/// token server (tag `<tag>/<name>`, dial fields carried over), a `urltest`
+/// group over them tagged `<tag>-urltest`, and a `selector` that keeps the
+/// original tag with `default` pointing at that group.
+///
+/// The section tag has to end up a selector: the Clash API rejects a group
+/// switch against a urltest group ("Must be a Selector"), which is what the
+/// LuCI dashboard sends for a section tag. Returns `Ok(None)` when the config
+/// has no token outbounds.
 pub fn expand(root: &Value) -> Result<Option<Value>, String> {
     let Some(root_obj) = root.as_object() else {
         return Ok(None);
@@ -245,11 +254,21 @@ pub fn expand(root: &Value) -> Result<Option<Value>, String> {
             members.push(Value::String(member_tag));
             expanded.push(Value::Object(outbound));
         }
-        let mut group = Map::new();
-        group.insert("type".into(), json!("urltest"));
-        group.insert("tag".into(), json!(tag));
-        group.insert("outbounds".into(), Value::Array(members));
-        expanded.push(Value::Object(group));
+        let urltest_tag = format!("{prefix}-urltest");
+        let mut urltest = Map::new();
+        urltest.insert("type".into(), json!("urltest"));
+        urltest.insert("tag".into(), json!(urltest_tag));
+        urltest.insert("outbounds".into(), Value::Array(members.clone()));
+        expanded.push(Value::Object(urltest));
+
+        let mut selector_outbounds = vec![Value::String(urltest_tag.clone())];
+        selector_outbounds.extend(members);
+        let mut selector = Map::new();
+        selector.insert("type".into(), json!("selector"));
+        selector.insert("tag".into(), json!(tag));
+        selector.insert("default".into(), json!(urltest_tag));
+        selector.insert("outbounds".into(), Value::Array(selector_outbounds));
+        expanded.push(Value::Object(selector));
     }
     let mut result = root_obj.clone();
     result.insert("outbounds".into(), Value::Array(expanded));
@@ -407,11 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn expand_builds_members_and_group() {
+    fn expand_builds_members_urltest_and_selector() {
         let root = fptn_config(&token_brotli(two_servers()));
         let expanded = expand(&root).unwrap().expect("fptn entry present");
         let list = expanded["outbounds"].as_array().unwrap();
-        assert_eq!(list.len(), 4);
+        assert_eq!(list.len(), 5);
         assert_eq!(list[0]["type"], "fptn");
         assert_eq!(list[0]["tag"], "vpn/Alpha-1");
         assert_eq!(list[0]["server"], "203.0.113.1");
@@ -425,10 +444,47 @@ mod tests {
         assert_eq!(list[1]["server_port"], 8443);
         assert!(list[1].get("md5_fingerprint").is_none());
         assert_eq!(list[2]["type"], "urltest");
-        assert_eq!(list[2]["tag"], "vpn");
+        assert_eq!(list[2]["tag"], "vpn-urltest");
         assert_eq!(list[2]["outbounds"], json!(["vpn/Alpha-1", "vpn/Beta-2"]));
-        assert_eq!(list[3]["type"], "direct");
+        assert_eq!(list[3]["type"], "selector");
+        assert_eq!(list[3]["tag"], "vpn");
+        assert_eq!(list[3]["default"], "vpn-urltest");
+        assert_eq!(
+            list[3]["outbounds"],
+            json!(["vpn-urltest", "vpn/Alpha-1", "vpn/Beta-2"])
+        );
+        assert_eq!(list[4]["type"], "direct");
         assert_eq!(expanded["route"], root["route"]);
+    }
+
+    #[test]
+    fn expand_selector_defaults_to_urltest_for_untagged_token() {
+        let root = json!({"outbounds": [
+            {"type": "fptn", "token": token_plain(json!([
+                {"name": "solo", "host": "198.51.100.9", "port": 443},
+            ]))},
+        ]});
+        let expanded = expand(&root).unwrap().expect("fptn entry present");
+        let list = expanded["outbounds"].as_array().unwrap();
+        assert_eq!(list[1]["tag"], "fptn-urltest");
+        assert_eq!(list[2]["tag"], "");
+        assert_eq!(list[2]["default"], "fptn-urltest");
+        assert_eq!(list[2]["outbounds"], json!(["fptn-urltest", "fptn/solo"]));
+    }
+
+    #[test]
+    fn token_serializes_for_decode_cli() {
+        let parsed = parse_token(&token_plain(two_servers())).unwrap();
+        let value = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(value["service_name"], "TEST.SERVICE");
+        assert_eq!(value["username"], "user1");
+        assert_eq!(value["password"], "secret1");
+        assert_eq!(value["servers"].as_array().unwrap().len(), 2);
+        assert_eq!(value["servers"][0]["name"], "Alpha-1");
+        assert_eq!(value["servers"][0]["host"], "203.0.113.1");
+        assert_eq!(value["servers"][0]["port"], 443);
+        assert_eq!(value["servers"][0]["md5_fingerprint"], FP);
+        assert_eq!(value["servers"][1]["md5_fingerprint"], "");
     }
 
     #[test]

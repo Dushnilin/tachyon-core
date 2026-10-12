@@ -87,6 +87,25 @@ impl Cache {
         None
     }
 
+    /// RFC 8767: Retrieve a stale entry for fallback when upstream fails.
+    /// Returns the raw response and the original insertion instant if the entry
+    /// was inserted within `max_stale` duration from `now`.
+    pub fn get_stale_fallback(
+        &mut self,
+        key: &CacheKey,
+        now: Instant,
+        max_stale: Duration,
+    ) -> Option<(Arc<[u8]>, Instant)> {
+        let entry = self.entries.get(key)?;
+        let received = entry.inserted;
+        let age = now.duration_since(entry.inserted);
+        if age <= entry.ttl + max_stale {
+            Some((Arc::clone(&entry.raw), received))
+        } else {
+            None
+        }
+    }
+
     pub fn insert(
         &mut self,
         key: CacheKey,
@@ -238,5 +257,29 @@ mod tests {
             cache.get(&probe("h1.test"), Instant::now()).is_none(),
             "the untouched one took the eviction"
         );
+    }
+
+    #[test]
+    fn stale_fallback_window() {
+        let mut cache = Cache::new(16);
+        let k = key();
+        cache.insert(k.clone(), b"stale_resp".to_vec(), &meta(Some(10)), None);
+        let now = Instant::now();
+
+        // 1. Within normal TTL: get_stale_fallback returns response
+        let res = cache.get_stale_fallback(&k, now, Duration::from_secs(60));
+        assert!(res.is_some());
+        assert_eq!(&*res.unwrap().0, b"stale_resp");
+
+        // 2. Beyond TTL (15s elapsed), but within max_stale (60s): get_stale_fallback returns response
+        let later = now + Duration::from_secs(15);
+        let res2 = cache.get_stale_fallback(&k, later, Duration::from_secs(60));
+        assert!(res2.is_some());
+        assert_eq!(&*res2.unwrap().0, b"stale_resp");
+
+        // 3. Beyond TTL + max_stale (80s elapsed): get_stale_fallback returns None
+        let much_later = now + Duration::from_secs(80);
+        let res3 = cache.get_stale_fallback(&k, much_later, Duration::from_secs(60));
+        assert!(res3.is_none());
     }
 }

@@ -133,8 +133,9 @@ async fn skip_vless_head(from: &TcpStream) -> io::Result<()> {
     if head[0] != 0x00 {
         return Err(io::Error::other("bad vless response version"));
     }
-    let mut addons = vec![0u8; usize::from(head[1])];
-    fill(from, &mut addons).await
+    let len = usize::from(head[1]);
+    let mut addons = [0u8; 255];
+    fill(from, &mut addons[..len]).await
 }
 
 /// Move bytes `from` -> `to` until `from` reaches EOF, then half-close `to`.

@@ -1,4 +1,4 @@
-<#
+﻿<#
 Ночь на роутере 192.168.1.206 с ПК: кладёт файлы на устройство, дожидается
 конца идущей матрицы, запускает ночную нагрузку (только tachyon-core, каждый
 протокол подряд, N коннектов и трафик minutes минут), раз в 10 минут поглядывает,
@@ -19,7 +19,7 @@ param(
     [string]$LxVer = "1.14.2-lx.12",
     [string]$Note = "Виртуальный роутер на Proxmox (хост — NanoPi R3S LTS 2GB): 2 vCPU aarch64 (Cortex-A55, aes/pmull), 727 МиБ RAM, OpenWrt 25.12.5; tachyon-core aarch64-unknown-linux-musl против sing-box-lx, клиент и сервер по одному ядру."
 )
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"   # Stop в PS 5.1 роняет скрипт на чужом stderr
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $bench = Join-Path $root "target\bench"
 $sshOpt = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=8")
@@ -54,8 +54,8 @@ if (-not (Test-Path $sbArm)) {
 & scp -O @sshOpt "$bench\tachyon-core-arm64" "${Router}:/tmp/bench/tachyon-core" | Out-Null
 & scp -O @sshOpt $sbArm "${Router}:/tmp/bench/sing-box" | Out-Null
 & scp -O @sshOpt "$root\scripts\bench\proto.py" "$root\scripts\bench\bench.py" `
-    "$root\scripts\bench\night_load.py" "$bench\router-overnight.sh" "${Router}:/tmp/bench/" | Out-Null
-& ssh @sshOpt $Router "chmod +x /tmp/bench/tachyon-core /tmp/bench/sing-box; mv -f /tmp/bench/router-overnight.sh /tmp/bench/overnight.sh; chmod +x /tmp/bench/overnight.sh" 2>$null
+    "$root\scripts\bench\night_load.py" "$root\scripts\bench\overnight.sh" "${Router}:/tmp/bench/" | Out-Null
+& ssh @sshOpt $Router "chmod +x /tmp/bench/tachyon-core /tmp/bench/sing-box /tmp/bench/overnight.sh" 2>$null
 
 if ((RemoteState "grep -qs night_load /proc/[0-9]*/cmdline && echo RUN || echo IDLE") -ne "RUN") {
     # если ещё идёт полный прогон матрицы — не мешаем, дождаться его конца
@@ -66,6 +66,9 @@ if ((RemoteState "grep -qs night_load /proc/[0-9]*/cmdline && echo RUN || echo I
     }
     Write-Host "==> запуск ночи: $Conns коннектов, $Minutes мин/протокол, стоп в $StopAt"
     & ssh @sshOpt $Router "cd /tmp/bench && CONNS=$Conns MINUTES=$Minutes setsid nohup sh overnight.sh </dev/null >/dev/null 2>&1 & sleep 2; grep -qs night_load /proc/[0-9]*/cmdline && echo запущено" 2>$null
+    Start-Sleep -Seconds 180
+    Write-Host "    первые шаги прогона:"
+    & ssh @sshOpt $Router "tail -5 /tmp/bench/night.log 2>/dev/null" 2>$null
 }
 else { Write-Host "==> ночь уже идёт, перехожу к опросу" }
 
@@ -77,7 +80,7 @@ while ($true) {
     }
     if ((Get-Date) -ge $stopTime) {
         Write-Host "    $StopAt — снимаю ночной прогон (SIGTERM, ядра остановятся сами)"
-        & ssh @sshOpt $Router "for p in /proc/[0-9]*/cmdline; do grep -qs night_load `$p 2>/dev/null && kill -TERM (echo `$p | tr -dc 0-9); done" 2>$null
+        & ssh @sshOpt $Router "pgrep -f night_load | while read p; do kill -TERM `$p; done" 2>$null
         Start-Sleep -Seconds 30
         break
     }

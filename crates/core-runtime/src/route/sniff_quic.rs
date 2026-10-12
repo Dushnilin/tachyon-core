@@ -151,27 +151,32 @@ fn open_initial(packet: &[u8], initial: &Initial, dcid: &[u8], crypto: &mut Cryp
     let pn_at = initial.pn_at;
     // RFC 9001 5.4.2: the sample starts 4 bytes into the packet number field
     let sample = packet.get(pn_at + 4..pn_at + 4 + keys.remote.header.sample_len())?;
-    let mut header = packet.get(..pn_at + 4)?.to_vec();
-    let (first, rest) = header.split_at_mut(1);
+    let hdr_len = pn_at + 4;
+    if hdr_len > 64 {
+        return None;
+    }
+    let mut header_buf = [0u8; 64];
+    header_buf[..hdr_len].copy_from_slice(packet.get(..hdr_len)?);
+    let (first, rest) = header_buf[..hdr_len].split_at_mut(1);
     keys.remote
         .header
         .decrypt_in_place(sample, &mut first[0], &mut rest[pn_at - 1..])
         .ok()?;
-    if header[0] & 0x0c != 0 {
+    if header_buf[0] & 0x0c != 0 {
         return None; // reserved bits must be zero once unmasked
     }
-    let pn_len = usize::from(header[0] & 3) + 1;
+    let pn_len = usize::from(header_buf[0] & 3) + 1;
     // nothing has been received in this space yet, so the truncated packet
     // number decodes to itself (RFC 9000 A.3 with an expected number of 0)
-    let pn = header[pn_at..pn_at + pn_len]
+    let pn = header_buf[pn_at..pn_at + pn_len]
         .iter()
         .fold(0u64, |n, b| (n << 8) | u64::from(*b));
-    header.truncate(pn_at + pn_len);
+    let header = &header_buf[..pn_at + pn_len];
     let mut payload = packet.get(header.len()..)?.to_vec();
     let plain = keys
         .remote
         .packet
-        .decrypt_in_place(pn, &header, &mut payload)
+        .decrypt_in_place(pn, header, &mut payload)
         .ok()?;
     frames(plain, crypto)
 }

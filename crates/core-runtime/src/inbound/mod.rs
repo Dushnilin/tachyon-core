@@ -444,9 +444,9 @@ pub fn clash_meta(
     let mut chains = Vec::new();
     let mut index = Some(outbound_index);
     let inner = router.inner();
-    // expand selector groups into their selected member (one level, like the
-    // reference chain display for group proxies)
-    for _ in 0..8 {
+    // expand selector groups and detour chains into their members (like the
+    // reference chain display for cascaded proxies)
+    for _ in 0..16 {
         let Some(current) = index else { break };
         let Some((_, tag, outbound)) = inner.outbound_table().find(|(i, _, _)| *i == current)
         else {
@@ -456,7 +456,35 @@ pub fn clash_meta(
         index = match outbound {
             crate::route::Outbound::Selector(selector) => router.index_of(selector.now()),
             crate::route::Outbound::Urltest(urltest) => router.index_of(urltest.now()),
-            _ => None,
+            crate::route::Outbound::Chain(chain) => chain.members().last().copied(),
+            _ => {
+                if let Some(detour) = outbound.detour() {
+                    let d = detour.trim();
+                    if d.is_empty()
+                        || d.eq_ignore_ascii_case("direct")
+                        || d.eq_ignore_ascii_case("bypass")
+                        || d.eq_ignore_ascii_case("skip")
+                        || d.eq_ignore_ascii_case("none")
+                        || d.eq_ignore_ascii_case("default")
+                    {
+                        None
+                    } else if let Some(target_idx) = router.index_of(d) {
+                        if let Some(target) = inner.outbounds.get(target_idx) {
+                            if target.is_direct() {
+                                None
+                            } else {
+                                Some(target_idx)
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
         };
     }
     let tag = ctx.inbound.clone().unwrap_or_default();

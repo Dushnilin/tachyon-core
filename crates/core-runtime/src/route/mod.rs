@@ -290,6 +290,28 @@ impl Outbound {
         }
     }
 
+    pub fn detour(&self) -> Option<&str> {
+        match self {
+            Outbound::Direct(d) => d.dial.detour.as_deref(),
+            Outbound::Desync(d) => d.dial.detour.as_deref(),
+            Outbound::Vless(v) => v.dial.detour.as_deref(),
+            Outbound::Trojan(t) => t.dial.detour.as_deref(),
+            Outbound::Shadowsocks(s) => s.dial.detour.as_deref(),
+            Outbound::Vmess(m) => m.dial.detour.as_deref(),
+            Outbound::Socks(s) => s.dial.detour.as_deref(),
+            Outbound::Http(h) => h.dial.detour.as_deref(),
+            Outbound::ShadowTls(s) => s.dial.detour.as_deref(),
+            Outbound::Naive(n) => n.dial.detour.as_deref(),
+            Outbound::Snell(s) => s.dial.detour.as_deref(),
+            Outbound::Mieru(m) => m.dial.detour.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Outbound::Direct(_) | Outbound::Block(_))
+    }
+
     fn build(obj: &Value, at: &str) -> anyhow::Result<Outbound> {
         let ty = obj
             .get("type")
@@ -1014,6 +1036,79 @@ impl RouterInner {
             .unwrap_or("")
     }
 
+    pub fn tag_of(&self, index: usize) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|(_, idx)| **idx == index)
+            .map(|(t, _)| t.as_str())
+    }
+}
+
+fn is_direct_or_skip(tag: &str) -> bool {
+    let t = tag.trim();
+    t.is_empty()
+        || t.eq_ignore_ascii_case("direct")
+        || t.eq_ignore_ascii_case("bypass")
+        || t.eq_ignore_ascii_case("skip")
+        || t.eq_ignore_ascii_case("none")
+        || t.eq_ignore_ascii_case("default")
+}
+
+impl RouterInner {
+    /// Traverse a detour/cascade chain until it reaches the exit hop (terminating
+    /// on a direct/skip hop or end of chain), with cycle detection.
+    pub fn resolve_detour_chain(&self, mut index: usize) -> io::Result<usize> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(index);
+        for _ in 0..64 {
+            let Some(outbound) = self.outbounds.get(index) else {
+                return Err(io::Error::other("outbound index out of range"));
+            };
+            let next = match outbound {
+                Outbound::Selector(selector) => {
+                    let member = selector.now();
+                    self.index_of(member)
+                }
+                Outbound::Urltest(urltest) => {
+                    let member = urltest.now();
+                    self.index_of(member)
+                }
+                Outbound::Chain(chain) => chain.members().last().copied(),
+                _ => {
+                    if let Some(detour) = outbound.detour() {
+                        if is_direct_or_skip(detour) {
+                            None
+                        } else if let Some(target_idx) = self.index_of(detour) {
+                            if let Some(target) = self.outbounds.get(target_idx) {
+                                if target.is_direct() {
+                                    None
+                                } else {
+                                    Some(target_idx)
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+            match next {
+                Some(next_idx) => {
+                    if !visited.insert(next_idx) {
+                        return Err(io::Error::other("detour cycle detected"));
+                    }
+                    index = next_idx;
+                }
+                None => return Ok(index),
+            }
+        }
+        Err(io::Error::other("detour chain exceeded max depth 64"))
+    }
+
     /// Switch a `selector` group to one of its members (clash `PUT /proxies`).
     pub fn select_member(&self, group_tag: &str, member: &str) -> Result<bool, SelectError> {
         let index = self.index_of(group_tag).ok_or(SelectError::NotFound)?;
@@ -1022,7 +1117,22 @@ impl RouterInner {
         };
         match outbound {
             Outbound::Selector(selector) => {
+                let old_member = selector.now().to_string();
                 if selector.select(member) {
+                    if selector.interrupt_exist_connections() && old_member != member {
+                        let old_last_hop = if let Some(old_idx) = self.index_of(&old_member) {
+                            self.resolve_detour_chain(old_idx)
+                                .ok()
+                                .and_then(|idx| self.tag_of(idx))
+                                .unwrap_or(&old_member)
+                                .to_string()
+                        } else {
+                            old_member.clone()
+                        };
+                        crate::clash_state::close_by_tag(&old_last_hop);
+                        crate::clash_state::close_by_tag(&old_member);
+                        crate::clash_state::close_by_tag(group_tag);
+                    }
                     Ok(true)
                 } else {
                     Err(SelectError::NotMember)
@@ -1199,6 +1309,10 @@ impl Router {
         self.connect_index(self.default_index(), target)
     }
 
+    pub fn resolve_detour_chain(&self, index: usize) -> io::Result<usize> {
+        self.inner().resolve_detour_chain(index)
+    }
+
     pub fn connect_index<'a>(
         &'a self,
         index: usize,
@@ -1206,7 +1320,8 @@ impl Router {
     ) -> Pin<Box<dyn Future<Output = io::Result<Conn>> + Send + 'a>> {
         let inner = self.inner();
         Box::pin(async move {
-            let Some(outbound) = inner.outbounds.get(index) else {
+            let exit_idx = inner.resolve_detour_chain(index)?;
+            let Some(outbound) = inner.outbounds.get(exit_idx) else {
                 return Err(io::Error::other("outbound index out of range"));
             };
             outbound.connect(self, target).await
@@ -1220,7 +1335,8 @@ impl Router {
     ) -> Pin<Box<dyn Future<Output = io::Result<tokio::net::UdpSocket>> + Send + 'a>> {
         let inner = self.inner();
         Box::pin(async move {
-            let Some(outbound) = inner.outbounds.get(index) else {
+            let exit_idx = inner.resolve_detour_chain(index)?;
+            let Some(outbound) = inner.outbounds.get(exit_idx) else {
                 return Err(io::Error::other("outbound index out of range"));
             };
             outbound.connect_udp(self, target).await
@@ -2134,5 +2250,103 @@ mod tests {
         }
 
         crate::dns::set_service(None);
+    }
+
+    #[test]
+    fn resolve_detour_chain_cascades_and_detects_cycles() {
+        // 1. Cascade detour: first -> second -> direct
+        let root = json!({
+            "outbounds": [
+                {"type": "socks", "tag": "first", "server": "1.1.1.1", "server_port": 1080, "detour": "second"},
+                {"type": "socks", "tag": "second", "server": "2.2.2.2", "server_port": 1080, "detour": "direct"},
+                {"type": "direct", "tag": "direct"}
+            ],
+            "route": {"final": "first"}
+        });
+        let router = Router::new(&root).unwrap();
+        let first_idx = router.index_of("first").unwrap();
+        let second_idx = router.index_of("second").unwrap();
+        let resolved = router.resolve_detour_chain(first_idx).unwrap();
+        assert_eq!(
+            resolved, second_idx,
+            "first detours through second as last hop"
+        );
+
+        // 2. Cycle detection: loop1 -> loop2 -> loop1
+        let loop_root = json!({
+            "outbounds": [
+                {"type": "socks", "tag": "loop1", "server": "1.1.1.1", "server_port": 1080, "detour": "loop2"},
+                {"type": "socks", "tag": "loop2", "server": "2.2.2.2", "server_port": 1080, "detour": "loop1"}
+            ],
+            "route": {"final": "loop1"}
+        });
+        let loop_router = Router::new(&loop_root).unwrap();
+        let l1 = loop_router.index_of("loop1").unwrap();
+        let err = loop_router.resolve_detour_chain(l1).unwrap_err();
+        assert!(err.to_string().contains("cycle"), "cycle detected: {err}");
+
+        // 3. Skip/bypass termination:
+        let skip_root = json!({
+            "outbounds": [
+                {"type": "socks", "tag": "hop", "server": "1.1.1.1", "server_port": 1080, "detour": "bypass"},
+                {"type": "direct", "tag": "bypass"}
+            ],
+            "route": {"final": "hop"}
+        });
+        let skip_router = Router::new(&skip_root).unwrap();
+        let hop_idx = skip_router.index_of("hop").unwrap();
+        assert_eq!(skip_router.resolve_detour_chain(hop_idx).unwrap(), hop_idx);
+    }
+
+    #[tokio::test]
+    async fn selector_interrupt_exist_connections_closes_last_hop() {
+        let root = json!({
+            "outbounds": [
+                {
+                    "type": "selector",
+                    "tag": "sel",
+                    "outbounds": ["chain_a", "chain_b"],
+                    "interrupt_exist_connections": true
+                },
+                {"type": "socks", "tag": "chain_a", "server": "1.1.1.1", "server_port": 1080, "detour": "exit_a"},
+                {"type": "socks", "tag": "exit_a", "server": "2.2.2.2", "server_port": 1080, "detour": "direct"},
+                {"type": "socks", "tag": "chain_b", "server": "3.3.3.3", "server_port": 1080, "detour": "exit_b"},
+                {"type": "socks", "tag": "exit_b", "server": "4.4.4.4", "server_port": 1080, "detour": "direct"},
+                {"type": "direct", "tag": "direct"}
+            ],
+            "route": {"final": "sel"}
+        });
+        let router = Router::new(&root).unwrap();
+
+        // Register a connection whose chain terminates at exit_a:
+        let meta_a = crate::clash_state::ConnMeta {
+            network: "tcp",
+            inbound: "mixed-in".into(),
+            source: "192.168.1.10:5000".into(),
+            host: "target.example".into(),
+            destination: "target.example:443".into(),
+            chains: vec![
+                "inbound".into(),
+                "sel".into(),
+                "chain_a".into(),
+                "exit_a".into(),
+            ],
+            rule: "final".into(),
+            rule_payload: String::new(),
+            process_path: String::new(),
+        };
+        let handle_a = crate::clash_state::ConnHandle::open(meta_a);
+        let signal_a = handle_a.close_signal();
+
+        // Switch member of selector to chain_b:
+        router.select_member("sel", "chain_b").unwrap();
+
+        // Verify connection on exit_a was closed:
+        tokio::select! {
+            _ = signal_a.wait() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                panic!("close signal not delivered to exit_a connection")
+            }
+        }
     }
 }

@@ -428,6 +428,7 @@ pub struct Selector {
     default: Option<String>,
     resolved: Vec<usize>,
     current: AtomicUsize,
+    interrupt_exist_connections: bool,
 }
 
 impl Selector {
@@ -450,11 +451,16 @@ impl Selector {
             .get("default")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let interrupt_exist_connections = obj
+            .get("interrupt_exist_connections")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Ok(Self {
             raw_members,
             default,
             resolved: Vec::new(),
             current: AtomicUsize::new(0),
+            interrupt_exist_connections,
         })
     }
 
@@ -511,6 +517,10 @@ impl Selector {
             .get(self.current.load(Ordering::Relaxed))
             .map(String::as_str)
             .unwrap_or_default()
+    }
+
+    pub fn interrupt_exist_connections(&self) -> bool {
+        self.interrupt_exist_connections
     }
 
     pub async fn connect_udp(

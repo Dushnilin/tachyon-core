@@ -87,9 +87,9 @@ pub struct ConnContext {
     pub sniff_timeout: Option<Duration>,
     pub ip_version: Option<u8>,
     pub route_original_destination: Option<Target>,
-    /// Clash connection view: `<rule> => <action>` of the rule that produced
+    /// Clash connection view: `(<rule> => <action>, <evidence>)` of the rule that produced
     /// the decision.
-    pub matched_rule: Option<String>,
+    pub matched_rule: Option<(String, String)>,
     /// `route.find_neighbor`: the client's hardware address, when the
     /// neighbour tables know it.
     pub source_mac: Option<neighbor::MacAddr>,
@@ -1060,7 +1060,7 @@ impl RouterInner {
                 continue;
             }
             let action = rule.action();
-            ctx.matched_rule = Some(rule.clash_primary());
+            ctx.matched_rule = Some(rule.clash_match(ctx));
             logging::debug(format_args!(
                 "route: match[{i}] {} => {}",
                 ctx.destination,

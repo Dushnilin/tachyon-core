@@ -91,6 +91,9 @@ def ensure_steer_env(bin_path):
 # ---------------------------------------------------------------- sink server
 def run_sink(cpus):
     os.sched_setaffinity(0, cpus)
+    # один буфер на все коннекты-источники: своя копия на коннект (1 МиБ)
+    # при 750 источниках съедала 750 МиБ и питон уходил в OOM
+    src_buf = b"\0" * CHUNK
 
     async def handle(r, w):
         try:
@@ -103,7 +106,7 @@ def run_sink(cpus):
                     w.write(await r.readexactly(64))
                     await w.drain()
             elif mode == MODE_SOURCE:
-                buf = b"\0" * CHUNK
+                buf = src_buf
                 while True:
                     w.write(buf)
                     await w.drain()
@@ -147,7 +150,9 @@ def recvn(s, n):
 
 async def async_socks_connect(proxy, mode):
     host, port = "127.0.0.1", PROXY_PORT if proxy else SINK_PORT
-    r, w = await asyncio.open_connection(host, port)
+    # limit — потолок внутреннего буфера StreamReader на коннект (дефолт 64 КиБ,
+    # при тысяче коннектов это сотни мегабайт на стороне питона)
+    r, w = await asyncio.open_connection(host, port, limit=32768)
     if proxy:
         w.write(b"\x05\x01\x00")
         assert await r.readexactly(2) == b"\x05\x00"

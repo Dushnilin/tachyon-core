@@ -25,7 +25,7 @@ import bench  # noqa: E402
 import proto  # noqa: E402
 
 CHUNK = 16384
-WRITE_CAP = 65536       # per-conn буфер заливки, дальше drain
+WRITE_CAP = 32768       # per-conn буфер заливки, дальше drain
 OPEN_BATCH = 250
 OPEN_TIMEOUT = 60       # медленные QUIC-хендшейки на слабом ядре
 
@@ -152,6 +152,16 @@ async def run_case(case, args, work):
                   f"{res['gbit_per_min'][-1]:.2f} Гбит/с, живых {alive}, "
                   f"RSS c/s {bench.proc_status(client.p.pid).get('VmRSS', 0):.0f}/"
                   f"{bench.proc_status(server.p.pid).get('VmRSS', 0):.0f} МиБ", flush=True)
+            # ядро умерло — коннекты повиснут полумёртвыми и alive не сойдёт
+            # в ноль; ловим сразу, с хвостом ядра в логе
+            for who, proc in (("server", server), ("client", client)):
+                if proc.p.poll() is not None:
+                    res.update(status="FAIL", why=f"{who} умер на минуте "
+                               f"{minute + 1}: {proc.tail()[-300:]}")
+                    print(f"  !! {res['why']}", flush=True)
+                    break
+            if res["status"] != "OK":
+                break
             if alive == 0:
                 res.update(status="DIED", why=f"все коннекты умерли на минуте {minute + 1}")
                 break
@@ -223,6 +233,9 @@ def main():
              if not only or any(s in c["name"] for s in only)]
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     done = []
+    # ядра упавшего прошлого прогона (OOM, kill) держат 21101/21201 —
+    # без этой уборки первый же протокол упал бы с «server port still held»
+    proto.kill_cell_proxies(args.work)
     try:
         for i, case in enumerate(cases, 1):
             out = os.path.join(args.out_dir, f"load-{case['name']}.json")

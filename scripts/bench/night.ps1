@@ -5,7 +5,7 @@
 а утром забирает json и собирает BENCHMARK.html (матрица, вкладка роутера) и
 NIGHT.html (эндьюранс) в корень репозитория.
 
-    .\scripts\bench\night.ps1                       # до 08:00, 3000 коннектов, 20 мин
+    .\scripts\bench\night.ps1                       # до 08:00, 400 коннектов, 20 мин
     .\scripts\bench\night.ps1 -StopAt 0930 -Conns 5000 -Minutes 10
 
 ПК за ночь не должен уснуть: спит ПК — спит и опрос, но роутер доделает сам,
@@ -13,7 +13,7 @@ NIGHT.html (эндьюранс) в корень репозитория.
 #>
 param(
     [string]$Router = "root@192.168.1.206",
-    [int]$Conns = 3000,
+    [int]$Conns = 400,
     [int]$Minutes = 20,
     [string]$StopAt = "0800",
     [string]$LxVer = "1.14.2-lx.12",

@@ -225,9 +225,16 @@ impl Client {
         self.left_requests.fetch_sub(1, Ordering::SeqCst);
     }
 
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
     fn evict_cause(&self) -> Option<&'static str> {
         if self.closed.load(Ordering::SeqCst) {
             return Some("closed");
+        }
+        if !self.has_io() && self.open_usage.load(Ordering::SeqCst) == 0 {
+            return Some("no_io");
         }
         if self.left_usage.load(Ordering::SeqCst) == 0 {
             return Some("reuse");

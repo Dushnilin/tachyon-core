@@ -27,7 +27,7 @@ use std::task::{Context, Poll, ready};
 use bytes::{Bytes, BytesMut};
 use portable_atomic::AtomicU64;
 use serde_json::{Map, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -506,7 +506,8 @@ impl XhttpConfig {
         let Some(tls) = tls else {
             return Ok(None);
         };
-        let mode = self.resolved_mode(true, true);
+        let has_reality = tls.reality().is_some();
+        let mode = self.resolved_mode(true, true, has_reality);
         if mode != Mode::StreamOne {
             return Ok(None);
         }
@@ -596,13 +597,13 @@ impl XhttpConfig {
         }
     }
 
-    fn resolved_mode(&self, tls: bool, is_h2: bool) -> Mode {
+    fn resolved_mode(&self, secure: bool, is_h2: bool, has_reality: bool) -> Mode {
         match self.mode {
-            // In reference sing-box (scratch/dialer.go:333), auto resolves to packet-up
-            // (stream-one is only for REALITY).
+            // Reference sing-box: REALITY or H2 in auto resolves to stream-one; otherwise packet-up.
+            Mode::Auto if has_reality || is_h2 => Mode::StreamOne,
             Mode::Auto => Mode::PacketUp,
             other => {
-                let _ = (tls, is_h2);
+                let _ = (secure, is_h2, has_reality);
                 other
             }
         }
@@ -612,8 +613,12 @@ impl XhttpConfig {
     /// but stream-one goes through `h1io`, so the connection must not negotiate
     /// h2 even when `tls.alpn` asks for it — a server that picks `h2` closes
     /// on our plaintext HTTP/1.1 request instead of answering it.
-    pub(crate) fn h1_only(&self, secure: bool) -> bool {
-        self.resolved_mode(secure, true) != Mode::StreamOne
+    pub(crate) fn h1_only(&self, tls: Option<&crate::tls_client::TlsOptions>) -> bool {
+        let Some(tls) = tls else {
+            return true;
+        };
+        let has_reality = tls.reality().is_some();
+        self.resolved_mode(true, true, has_reality) != Mode::StreamOne
     }
 }
 
@@ -626,6 +631,7 @@ pub(crate) struct XhttpConn {
 pub(crate) async fn connect(
     stream: AnyStream,
     secure: bool,
+    has_reality: bool,
     server: &str,
     port: u16,
     cfg: &XhttpConfig,
@@ -640,7 +646,7 @@ pub(crate) async fn connect(
         }
     });
     let scheme = if secure { "https" } else { "http" };
-    let mode = cfg.resolved_mode(secure, is_h2);
+    let mode = cfg.resolved_mode(secure, is_h2, has_reality);
     crate::logging::debug(format_args!(
         "xhttp: connect {server}:{port} secure={secure} is_h2={is_h2} mode={mode:?}"
     ));
@@ -722,11 +728,15 @@ pub(crate) async fn connect(
         None,
         false,
     )?;
-    let (head, pending) = h1io::send(&mut io, &request, &authority, b"", true)
-        .await
-        .map_err(|e| io::Error::other(format!("xhttp: download: {e}")))?;
-    h1io::expect_ok(&head, "download")?;
-    this.spawn_pump(h1io::Body::new(io, &head, pending));
+    let mut head_bytes = Vec::with_capacity(256);
+    h1io::write_head(&mut head_bytes, &request, &authority, h1io::Framing::None, true);
+    io.write_all(&head_bytes).await?;
+    io.flush().await?;
+    crate::logging::debug(format_args!(
+        "h1: >> GET {} (close=true)",
+        request.uri()
+    ));
+    this.spawn_download_stream(io);
 
     match mode {
         Mode::StreamUp => {
@@ -826,10 +836,10 @@ struct PostWriter {
 impl PostWriter {
     /// A keep-alive connection for one upload POST, out of the pool when there
     /// is a free one and dialled when there is not.
-    async fn connection(&self) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream)> {
+    async fn connection(&self) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream, bool)> {
         if let Some(client) = self.cfg.pool.acquire().await {
             if let Some(io) = client.take() {
-                return Ok((client, io));
+                return Ok((client, io, true));
             }
             self.cfg.pool.release(&client).await;
         }
@@ -840,7 +850,7 @@ impl PostWriter {
         let io = client
             .take()
             .ok_or_else(|| io::Error::other("xhttp: pooled connection unavailable"))?;
-        Ok((client, io))
+        Ok((client, io, false))
     }
 
     /// Send one upload chunk as a single sequenced POST (reference
@@ -919,20 +929,41 @@ impl PostWriter {
         }
         let payload = payload.unwrap_or_default();
 
-        let (client, io) = self.connection().await?;
+        let (client, io, reused) = self.connection().await?;
         // one HTTP request against the pool's h_max_request_times: a packet-up
         // stream issues one POST per write, and a connection that ignored those
         // would outlive the limit the server was told about
         client.take_request();
-        let mut body = match Self::post(io, &req, &self.authority, &payload).await {
+        let res = Self::post(io, &req, &self.authority, &payload).await;
+        let (client, mut body) = match res {
             Ok((head, body)) => {
                 if let Err(e) = h1io::expect_ok(&head, "upload") {
+                    client.close();
                     self.cfg.pool.release(&client).await;
                     return Err(e);
                 }
-                body
+                (client, body)
+            }
+            Err(e) if reused => {
+                client.close();
+                self.cfg.pool.release(&client).await;
+                crate::logging::debug(format_args!(
+                    "xhttp: pooled connection failed ({e}), retrying with fresh connection"
+                ));
+                let (client, io, _) = self.connection().await?;
+                client.take_request();
+                let (head, body) = Self::post(io, &req, &self.authority, &payload)
+                    .await
+                    .inspect_err(|_| client.close())?;
+                if let Err(e) = h1io::expect_ok(&head, "upload") {
+                    client.close();
+                    self.cfg.pool.release(&client).await;
+                    return Err(e);
+                }
+                (client, body)
             }
             Err(e) => {
+                client.close();
                 self.cfg.pool.release(&client).await;
                 return Err(e);
             }
@@ -944,6 +975,8 @@ impl PostWriter {
             && let Some(io) = body.into_inner()
         {
             client.give(io);
+        } else {
+            client.close();
         }
         self.cfg.pool.release(&client).await;
         drained
@@ -1005,12 +1038,27 @@ impl SplitConn {
         }
     }
 
-    /// Feed the download channel from a response body, until it ends or the
-    /// reader goes away.
-    fn spawn_pump(&mut self, body: h1io::Body) {
-        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+
+    /// Feed the download channel from the GET connection without blocking initial dial.
+    fn spawn_download_stream(&mut self, mut io: AnyStream) {
+        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(16);
         self.dl = rx;
-        self.dl_task = tokio::spawn(pump(body, tx));
+        self.dl_task = tokio::spawn(async move {
+            let (head, pending) = match h1io::read_head(&mut io).await {
+                Ok(res) => res,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(io::Error::other(format!("xhttp: download head: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+            if let Err(e) = h1io::expect_ok(&head, "download") {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+            pump(h1io::Body::new(io, &head, pending), tx).await;
+        });
     }
 
     /// The upload request's response when it *is* the download stream, which is
@@ -1744,7 +1792,7 @@ mod tests {
 
         let mut conn = tokio::time::timeout(
             timeout,
-            super::connect(stream, false, "srv", 443, &c, dialer),
+            super::connect(stream, false, false, "srv", 443, &c, dialer),
         )
         .await
         .expect("connect timed out")
@@ -1826,7 +1874,7 @@ mod tests {
 
         let mut conn = tokio::time::timeout(
             timeout,
-            super::connect(stream, false, "srv", 443, &c, dialer),
+            super::connect(stream, false, false, "srv", 443, &c, dialer),
         )
         .await
         .expect("connect timed out")

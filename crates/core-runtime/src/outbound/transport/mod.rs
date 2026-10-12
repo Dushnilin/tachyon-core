@@ -251,7 +251,7 @@ impl Transport {
     /// narrowed copy, or `None` when the config can be used as-is.
     fn h1_forced_tls(&self, tls: Option<&TlsOptions>) -> Option<TlsOptions> {
         match &self.kind {
-            Kind::Xhttp(cfg) if cfg.h1_only(tls.is_some()) => {
+            Kind::Xhttp(cfg) if cfg.h1_only(tls) => {
                 let mut t = tls?.clone();
                 t.set_alpn(&[b"http/1.1"]);
                 Some(t)
@@ -360,9 +360,10 @@ impl Transport {
                 0,
             ),
             Kind::Xhttp(cfg) => {
+                let has_reality = tls.and_then(|t| t.reality()).is_some();
                 let dialer = self.dialer(tls, server, port, dial);
                 (
-                    xhttp::connect(stream, tls.is_some(), server, port, cfg, dialer).await?,
+                    xhttp::connect(stream, tls.is_some(), has_reality, server, port, cfg, dialer).await?,
                     0,
                 )
             }

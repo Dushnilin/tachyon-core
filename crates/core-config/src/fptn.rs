@@ -151,8 +151,7 @@ pub fn parse_token(token: &str) -> Result<FptnToken, String> {
         let md5_fingerprint = match item.get("md5_fingerprint") {
             None | Some(Value::Null) => String::new(),
             Some(Value::String(fp)) => {
-                if !fp.is_empty() && !(fp.len() == 32 && fp.chars().all(|c| c.is_ascii_hexdigit()))
-                {
+                if !(fp.is_empty() || fp.len() == 32 && fp.chars().all(|c| c.is_ascii_hexdigit())) {
                     return Err(format!("{ctx}.md5_fingerprint: expected 32 hex characters"));
                 }
                 fp.clone()

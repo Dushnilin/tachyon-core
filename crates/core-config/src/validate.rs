@@ -7780,8 +7780,8 @@ fn validate_outbound(
                 // collapse to an absent balancer pointer; any other key means
                 // the balancer is present.
                 let bm = bal.as_object().expect("decode checked above");
-                let present = !bm.is_empty()
-                    && !(bm.len() == 1
+                let present = !(bm.is_empty()
+                    || bm.len() == 1
                         && matches!(bm.get("sticky_hash"), Some(Value::Array(a)) if a.is_empty()));
                 if mode != "round_robin" {
                     if present {

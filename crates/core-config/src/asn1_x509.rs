@@ -339,9 +339,7 @@ fn parse_field(
         Kind::Oid => (6, false, false),
         Kind::Struct(_) | Kind::SeqOf(_) => (16, true, false),
     };
-    if (!match_any && (t.class != 0 || t.tag != expected))
-        || (!match_any && t.compound != compound_type)
-    {
+    if !match_any && (t.class != 0 || t.tag != expected || t.compound != compound_type) {
         if field.optional {
             return Ok((init, None));
         }

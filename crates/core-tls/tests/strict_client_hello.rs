@@ -100,10 +100,7 @@ fn unmarshal(hello: &[u8]) -> Result<Vec<u16>, String> {
     s.take(4)?; // type and the uint24 length
     s.u16()?; // legacy_version
     s.take(32)?; // random
-    let session_id = s.u8_prefixed()?;
-    if session_id.empty() && false {
-        // the fork allows a zero-length session id; nothing to check
-    }
+    s.u8_prefixed()?; // session_id: the fork allows a zero-length value
     s.list_of_u16()?; // cipher_suites
     s.u8_prefixed()?; // compression_methods
     if s.empty() {

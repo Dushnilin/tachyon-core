@@ -32,6 +32,3 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
 libc.workspace = true
-
-[target.'cfg(all(target_os = "linux", not(target_env = "msvc"), target_arch = "x86_64"))'.dependencies]
-mimalloc = { version = "0.1", default-features = false }

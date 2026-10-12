@@ -1,25 +1,9 @@
-// The router build runs on musl/aarch64 where the system allocator is the
-// one thing every packet allocation goes through.
-#[cfg(all(
-    target_os = "linux",
-    not(target_env = "msvc"),
-    not(feature = "allocstat"),
-    target_arch = "x86_64"
-))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
 #[global_allocator]
 static GLOBAL: allocstat::Counting = allocstat::Counting;
 
 #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
 mod allocstat;
-
-#[cfg(all(target_os = "linux", not(target_env = "msvc"), target_arch = "x86_64"))]
-unsafe extern "C" {
-    fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
-}
 
 // On soft-float targets (armv6/mips, no FPU) LLVM lowers `f64::max` to a
 // libcall named `fmaximum_num`, the C23 spelling of the IEEE maxNum helper.
@@ -616,25 +600,8 @@ fn usage() -> String {
 }
 
 fn main() -> ExitCode {
-    // mimalloc options RSS lives or dies by, set here because the defaults
-    // are desktop defaults, not proxy defaults:
-    //   15 purge_delay -- freed pages stay dirty for a whole second by
-    //       default; after a burst that is tens of MiB of RSS nobody asked
-    //       for.
-    //   43 allow_thp -- mimalloc marks its arena MADV_HUGEPAGE, khugepaged
-    //       merges it into 2MiB pages, and RSS then grows in 2MiB
-    //       granules: AnonHugePages alone reached 33 MiB and VmHWM swung
-    //       ±20 MiB from run to run. Small pages cost nothing measurable.
-    // Indices are `mi_option_t` of mimalloc v3 (== v2 up to use_numa_nodes).
-    // The same-named env vars are read once at the option's first access,
-    // which the runtime does before main -- these two calls are what stands.
     #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
     unsafe {
-        #[cfg(target_arch = "x86_64")]
-        {
-            mi_option_set(15, 0);
-            mi_option_set(43, 0);
-        }
         raise_rlimit_nofile();
     }
     let raw_args: Vec<String> = std::env::args().skip(1).collect();

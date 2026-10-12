@@ -1,8 +1,8 @@
-//! Feature `allocstat`: a counting allocator wrapped around mimalloc, dumping
-//! one line per second to `/tmp/tachyon-allocstat.txt` while `TACHYON_ALLOCSTAT`
-//! is set. The bench needs to know where the heap actually sits -- live bytes
-//! and objects by size class, plus allocation churn -- which no amount of
-//! reading `/proc` says, because mimalloc keeps the whole heap in one mapping.
+//! Feature `allocstat`: a counting allocator wrapped around the system
+//! allocator, dumping one line per second to `/tmp/tachyon-allocstat.txt`
+//! while `TACHYON_ALLOCSTAT` is set. The bench needs to know where the heap
+//! actually sits -- live bytes and objects by size class, plus allocation
+//! churn -- which no amount of reading `/proc` says.
 //! Counters are plain relaxed atomics on the alloc/free path and are compiled
 //! in only under the feature, so the shipped binary pays nothing.
 
@@ -84,7 +84,7 @@ pub struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
             add(layout.size());
         }
@@ -92,12 +92,12 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) };
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
         sub(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
             sub(layout.size());
             add(new_size);

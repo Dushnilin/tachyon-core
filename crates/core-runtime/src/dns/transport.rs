@@ -313,41 +313,107 @@ impl FakeIpStore {
         if let Some(cache) = &cache {
             let mut cache = cache.lock().expect("cache");
             let mut state = self.state.lock().expect("fakeip state");
+            let mut changes = Vec::new();
+
             for (bucket, v6) in [("fakeip_domain4", false), ("fakeip_domain6", true)] {
                 for domain in cache.keys(bucket) {
-                    if let Some(ip) = cache
+                    let Some(ip) = cache
                         .get(bucket, domain.as_bytes())
                         .and_then(|raw| cached_ip(&raw))
-                        && self.contains(ip)
-                    {
-                        // Restore the maps, not just the cursors. An address
-                        // served from a forward record the memory maps never
-                        // saw dies on the reverse path as "missing fakeip
-                        // record" — a TPROXY connection reset.
-                        Self::remember(&mut state, ip, &domain);
-                        match ip {
-                            IpAddr::V4(ip) if !v6 => {
-                                state.cur4 = Some(state.cur4.map_or(ip, |cur| cur.max(ip)))
-                            }
-                            IpAddr::V6(ip) if v6 => {
-                                state.cur6 = Some(state.cur6.map_or(ip, |cur| cur.max(ip)))
-                            }
-                            _ => {}
+                        .filter(|ip| self.contains(*ip))
+                    else {
+                        // Purge invalid/out-of-subnet forward record
+                        changes.push((bucket, domain.into_bytes(), None));
+                        continue;
+                    };
+
+                    let rev = cache
+                        .get("fakeip_address", &ip_bytes(ip))
+                        .and_then(|raw| String::from_utf8(raw).ok());
+                    if let Some(rev_domain) = rev {
+                        if rev_domain != domain {
+                            // Asymmetry on disk: IP claimed by another domain. Prune stale forward record.
+                            changes.push((bucket, domain.into_bytes(), None));
+                            continue;
                         }
+                    } else {
+                        // Reverse record is missing on disk: heal it guaranteed!
+                        changes.push((
+                            "fakeip_address",
+                            ip_bytes(ip),
+                            Some(domain.as_bytes().to_vec()),
+                        ));
+                    }
+
+                    let (evicted, superseded) = Self::remember(&mut state, ip, &domain);
+                    if let Some((ev_d, ev_ip)) = evicted {
+                        let ev_bucket = if ev_ip.is_ipv4() {
+                            "fakeip_domain4"
+                        } else {
+                            "fakeip_domain6"
+                        };
+                        changes.push((ev_bucket, ev_d.into_bytes(), None));
+                        changes.push(("fakeip_address", ip_bytes(ev_ip), None));
+                    }
+                    if let Some(prev) = superseded {
+                        changes.push((bucket, prev.into_bytes(), None));
+                    }
+                    match ip {
+                        IpAddr::V4(ip) if !v6 => {
+                            state.cur4 = Some(state.cur4.map_or(ip, |cur| cur.max(ip)))
+                        }
+                        IpAddr::V6(ip) if v6 => {
+                            state.cur6 = Some(state.cur6.map_or(ip, |cur| cur.max(ip)))
+                        }
+                        _ => {}
                     }
                 }
             }
+
+            // Prune orphaned reverse records on disk
+            for addr_bytes in cache.raw_keys("fakeip_address") {
+                if addr_bytes == b"fakeip_metadata" {
+                    continue;
+                }
+                if let Some(ip) = cached_ip(&addr_bytes) {
+                    if !self.contains(ip) {
+                        changes.push(("fakeip_address", addr_bytes, None));
+                        continue;
+                    }
+                    let bucket = if ip.is_ipv4() {
+                        "fakeip_domain4"
+                    } else {
+                        "fakeip_domain6"
+                    };
+                    let dom = cache
+                        .get("fakeip_address", &addr_bytes)
+                        .and_then(|raw| String::from_utf8(raw).ok());
+                    let valid_fwd = dom.as_ref().is_some_and(|d| {
+                        cache
+                            .get(bucket, d.as_bytes())
+                            .and_then(|raw| cached_ip(&raw))
+                            == Some(ip)
+                    });
+                    if !valid_fwd {
+                        changes.push(("fakeip_address", addr_bytes, None));
+                    }
+                }
+            }
+
             if let Some(raw) = cache.get("fakeip_address", b"fakeip_metadata")
                 && let Some((cur4, cur6)) = self.decode_metadata(&raw)
             {
                 state.cur4 = cur4;
                 state.cur6 = cur6;
             }
-            cache.put(
-                "fakeip_address",
-                b"fakeip_metadata",
-                self.encode_metadata(&state),
-            );
+            if !changes.is_empty() {
+                changes.push((
+                    "fakeip_address",
+                    b"fakeip_metadata".to_vec(),
+                    Some(self.encode_metadata(&state)),
+                ));
+                cache.apply_changes(changes);
+            }
         }
         *self.cache.write().expect("fakeip cache") = cache;
     }
@@ -355,21 +421,26 @@ impl FakeIpStore {
     /// One paired insert into both maps: the LRU recency push, the reverse
     /// record, and the cleanup on whichever side the insert evicts. What a
     /// fresh allocation in `create` does, replayed for records found on disk.
-    fn remember(state: &mut FakeIpState, ip: IpAddr, domain: &str) {
+    /// Returns (evicted_pair, superseded_domain).
+    fn remember(
+        state: &mut FakeIpState,
+        ip: IpAddr,
+        domain: &str,
+    ) -> (Option<(String, IpAddr)>, Option<String>) {
         let evicted = match ip {
             IpAddr::V4(addr) => state
                 .domain_to_v4
                 .push(domain.to_string(), addr)
-                .map(|(_, addr)| IpAddr::V4(addr)),
+                .map(|(d, a)| (d, IpAddr::V4(a))),
             IpAddr::V6(addr) => state
                 .domain_to_v6
                 .push(domain.to_string(), addr)
-                .map(|(_, addr)| IpAddr::V6(addr)),
+                .map(|(d, a)| (d, IpAddr::V6(a))),
         };
-        if let Some(evicted) = evicted {
-            state.addr_to_domain.remove(&evicted);
+        if let Some((_, evicted_addr)) = &evicted {
+            state.addr_to_domain.remove(evicted_addr);
         }
-        if let Some(previous) = state.addr_to_domain.insert(ip, domain.to_string())
+        let superseded = if let Some(previous) = state.addr_to_domain.insert(ip, domain.to_string())
             && previous != domain
         {
             // a pool wrap reissues an address an earlier domain still claims;
@@ -382,10 +453,21 @@ impl FakeIpStore {
                     state.domain_to_v6.pop(&previous);
                 }
             }
-        }
+            Some(previous)
+        } else {
+            None
+        };
+        (evicted, superseded)
     }
 
-    fn persist(&self, state: &FakeIpState, ip: IpAddr, domain: &str) {
+    fn persist(
+        &self,
+        state: &FakeIpState,
+        ip: IpAddr,
+        domain: &str,
+        evicted: Option<(String, IpAddr)>,
+        superseded: Option<String>,
+    ) {
         let cache = self.cache.read().expect("fakeip cache").clone();
         let Some(cache) = cache else { return };
         let mut cache = cache.lock().expect("cache");
@@ -395,16 +477,136 @@ impl FakeIpStore {
         } else {
             "fakeip_domain6"
         };
+        // Router flash protection: if the exact pair already lives on disk and nothing was evicted, skip!
+        let already_fwd = cache.get(bucket, domain.as_bytes()).as_deref() == Some(&address);
+        let already_rev =
+            cache.get("fakeip_address", &address).as_deref() == Some(domain.as_bytes());
+        if already_fwd && already_rev && evicted.is_none() && superseded.is_none() {
+            return;
+        }
+
         let mut changes = Vec::new();
-        if let Some(previous) = cache.get("fakeip_address", &address) {
+        // 1. Evicted pair must be atomically deleted from both maps on disk:
+        if let Some((ev_domain, ev_ip)) = evicted {
+            let ev_bucket = if ev_ip.is_ipv4() {
+                "fakeip_domain4"
+            } else {
+                "fakeip_domain6"
+            };
+            changes.push((ev_bucket, ev_domain.into_bytes(), None));
+            changes.push(("fakeip_address", ip_bytes(ev_ip), None));
+        }
+        // 2. Superseded domain previously had this IP address:
+        if let Some(prev) = superseded {
+            changes.push((bucket, prev.into_bytes(), None));
+        }
+        // 3. Any previous domain associated with this IP on disk:
+        if let Some(previous) = cache.get("fakeip_address", &address)
+            && previous != domain.as_bytes()
+        {
             changes.push((bucket, previous, None));
+        }
+        // 4. Any previous IP associated with this domain on disk:
+        if let Some(old_ip_bytes) = cache.get(bucket, domain.as_bytes())
+            && old_ip_bytes != address
+        {
+            changes.push(("fakeip_address", old_ip_bytes, None));
+        }
+        // 5. Store both forward and reverse atomically:
+        if !already_rev {
+            changes.push((
+                "fakeip_address",
+                address.clone(),
+                Some(domain.as_bytes().to_vec()),
+            ));
+        }
+        if !already_fwd {
+            changes.push((bucket, domain.as_bytes().to_vec(), Some(address)));
         }
         changes.push((
             "fakeip_address",
-            address.clone(),
-            Some(domain.as_bytes().to_vec()),
+            b"fakeip_metadata".to_vec(),
+            Some(self.encode_metadata(state)),
         ));
-        changes.push((bucket, domain.as_bytes().to_vec(), Some(address)));
+        cache.apply_changes(changes);
+    }
+
+    fn heal_disk_hit_if_needed(
+        &self,
+        state: &FakeIpState,
+        ip: IpAddr,
+        domain: &str,
+        evicted: Option<(String, IpAddr)>,
+        superseded: Option<String>,
+    ) {
+        let cache = self.cache.read().expect("fakeip cache").clone();
+        let Some(cache) = cache else { return };
+        let mut cache = cache.lock().expect("cache");
+        let address = ip_bytes(ip);
+        let has_rev = cache
+            .get("fakeip_address", &address)
+            .is_some_and(|d| d == domain.as_bytes());
+
+        // Router flash protection: if reverse record exists and nothing was evicted, skip!
+        if has_rev && evicted.is_none() && superseded.is_none() {
+            return;
+        }
+
+        let mut changes = Vec::new();
+        if let Some((ev_domain, ev_ip)) = evicted {
+            let ev_bucket = if ev_ip.is_ipv4() {
+                "fakeip_domain4"
+            } else {
+                "fakeip_domain6"
+            };
+            changes.push((ev_bucket, ev_domain.into_bytes(), None));
+            changes.push(("fakeip_address", ip_bytes(ev_ip), None));
+        }
+        if let Some(prev) = superseded {
+            let bucket = if ip.is_ipv4() {
+                "fakeip_domain4"
+            } else {
+                "fakeip_domain6"
+            };
+            changes.push((bucket, prev.into_bytes(), None));
+        }
+        if !has_rev {
+            changes.push(("fakeip_address", address, Some(domain.as_bytes().to_vec())));
+        }
+        changes.push((
+            "fakeip_address",
+            b"fakeip_metadata".to_vec(),
+            Some(self.encode_metadata(state)),
+        ));
+        cache.apply_changes(changes);
+    }
+
+    fn persist_evictions(
+        &self,
+        state: &FakeIpState,
+        evicted: Option<(String, IpAddr)>,
+        superseded: Option<String>,
+    ) {
+        if evicted.is_none() && superseded.is_none() {
+            return;
+        }
+        let cache = self.cache.read().expect("fakeip cache").clone();
+        let Some(cache) = cache else { return };
+        let mut cache = cache.lock().expect("cache");
+        let mut changes = Vec::new();
+        if let Some((ev_domain, ev_ip)) = evicted {
+            let ev_bucket = if ev_ip.is_ipv4() {
+                "fakeip_domain4"
+            } else {
+                "fakeip_domain6"
+            };
+            changes.push((ev_bucket, ev_domain.into_bytes(), None));
+            changes.push(("fakeip_address", ip_bytes(ev_ip), None));
+        }
+        if let Some(prev) = superseded {
+            changes.push(("fakeip_domain4", prev.clone().into_bytes(), None));
+            changes.push(("fakeip_domain6", prev.into_bytes(), None));
+        }
         changes.push((
             "fakeip_address",
             b"fakeip_metadata".to_vec(),
@@ -524,9 +726,12 @@ impl FakeIpStore {
             .ok()
             .filter(|domain| !domain.is_empty())?;
         // A record that only lives on disk is one flush failure away from a
-        // TPROXY connection reset; mirror it into memory while we are here.
+        // TPROXY connection reset; mirror it into memory and heal persistence while we are here.
         let mut state = self.state.lock().expect("fakeip state");
-        Self::remember(&mut state, ip, &domain);
+        let (evicted, superseded) = Self::remember(&mut state, ip, &domain);
+        if evicted.is_some() || superseded.is_some() {
+            self.persist_evictions(&state, evicted, superseded);
+        }
         Some(domain)
     }
 
@@ -537,43 +742,56 @@ impl FakeIpStore {
         } else {
             state.domain_to_v4.get(domain).map(|a| IpAddr::V4(*a))
         };
+        if let Some(ip) = memory {
+            if state.addr_to_domain.get(&ip).is_some_and(|d| d == domain) {
+                return Some(ip);
+            }
+            state.addr_to_domain.insert(ip, domain.to_string());
+            return Some(ip);
+        }
         drop(state);
-        memory.or_else(|| {
-            let cache = self.cache.read().expect("fakeip cache").clone()?;
-            let bucket = if v6 {
-                "fakeip_domain6"
-            } else {
-                "fakeip_domain4"
-            };
-            let value = cache
-                .lock()
-                .expect("cache")
-                .get(bucket, domain.as_bytes())?;
-            cached_ip(&value).filter(|ip| ip.is_ipv6() == v6 && self.contains(*ip))
-        })
+        let cache = self.cache.read().expect("fakeip cache").clone()?;
+        let bucket = if v6 {
+            "fakeip_domain6"
+        } else {
+            "fakeip_domain4"
+        };
+        let value = cache
+            .lock()
+            .expect("cache")
+            .get(bucket, domain.as_bytes())?;
+        let ip = cached_ip(&value).filter(|ip| ip.is_ipv6() == v6 && self.contains(*ip))?;
+        // Check if reciprocal reverse entry on disk belongs to another domain:
+        let cache_guard = cache.lock().expect("cache");
+        let rev = cache_guard.get("fakeip_address", &ip_bytes(ip));
+        if let Some(rev) = rev
+            && rev != domain.as_bytes()
+        {
+            return None;
+        }
+        Some(ip)
     }
 
     pub fn create(&self, domain: &str, v6: bool) -> io::Result<IpAddr> {
         if let Some(ip) = self.lookup_address(domain, v6) {
-            // A disk hit returns the address without the in-memory maps ever
-            // having seen the pair, so the reverse lookup the TPROXY path runs
-            // would only be as durable as the flush queue. Rehydrate, and
-            // re-persist so a forward record whose reverse was lost heals.
             let mut state = self.state.lock().expect("fakeip state");
-            if !state
+            let in_memory_ok = state
                 .addr_to_domain
                 .get(&ip)
-                .is_some_and(|known| known == domain)
-            {
-                Self::remember(&mut state, ip, domain);
-                self.persist(&state, ip, domain);
+                .is_some_and(|known| known == domain);
+            if !in_memory_ok {
+                let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+                self.heal_disk_hit_if_needed(&state, ip, domain, evicted, superseded);
             }
             return Ok(ip);
         }
         let mut state = self.state.lock().expect("fakeip state");
         if v6 {
-            if let Some(existing) = state.domain_to_v6.get(domain) {
-                return Ok(IpAddr::V6(*existing));
+            if let Some(existing) = state.domain_to_v6.get(domain).copied() {
+                let ip = IpAddr::V6(existing);
+                let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+                self.persist(&state, ip, domain, evicted, superseded);
+                return Ok(ip);
             }
             let prefix = self
                 .v6
@@ -583,12 +801,16 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet6 range"))?;
             let next = next_v6(cur, prefix);
             state.cur6 = Some(next);
-            Self::remember(&mut state, IpAddr::V6(next), domain);
-            self.persist(&state, IpAddr::V6(next), domain);
-            Ok(IpAddr::V6(next))
+            let ip = IpAddr::V6(next);
+            let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+            self.persist(&state, ip, domain, evicted, superseded);
+            Ok(ip)
         } else {
-            if let Some(existing) = state.domain_to_v4.get(domain) {
-                return Ok(IpAddr::V4(*existing));
+            if let Some(existing) = state.domain_to_v4.get(domain).copied() {
+                let ip = IpAddr::V4(existing);
+                let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+                self.persist(&state, ip, domain, evicted, superseded);
+                return Ok(ip);
             }
             let prefix = self
                 .v4
@@ -598,9 +820,10 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet4 range"))?;
             let next = next_v4(cur, prefix);
             state.cur4 = Some(next);
-            Self::remember(&mut state, IpAddr::V4(next), domain);
-            self.persist(&state, IpAddr::V4(next), domain);
-            Ok(IpAddr::V4(next))
+            let ip = IpAddr::V4(next);
+            let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+            self.persist(&state, ip, domain, evicted, superseded);
+            Ok(ip)
         }
     }
 }

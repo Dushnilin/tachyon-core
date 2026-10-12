@@ -267,7 +267,7 @@ fn disk_only_forward_record_carries_the_whole_pair() {
     assert_eq!(store.create("github.com", false).unwrap(), ip);
     assert_eq!(store.lookup_domain(ip).as_deref(), Some("github.com"));
 
-    std::fs::remove_file(&options.path).unwrap();
+    let _ = std::fs::remove_file(&options.path);
 }
 
 /// A record that lands on disk after attach (a foreign writer, a late flush)
@@ -326,5 +326,95 @@ fn lookup_domain_caches_disk_hits_in_memory() {
     cache.lock().unwrap().delete("fakeip_address", &octets(ip));
     assert_eq!(store.lookup_domain(ip).as_deref(), Some("cached.example"));
 
-    std::fs::remove_file(&options.path).unwrap();
+    let _ = std::fs::remove_file(&options.path);
+}
+
+#[test]
+fn eviction_removes_both_forward_and_reverse_from_persistent_cache_atomically() {
+    let mut options = temp_options("evict-atomic");
+    options.flush_interval = std::time::Duration::from_secs(60);
+    let cache = test_cache(&options);
+    let store = FakeIpStore::new(Some(IpPrefix::parse("198.18.0.0/15").unwrap()), None);
+    store.attach_cache(Some(cache.clone()));
+
+    let first_ip = store.create("first.example", false).unwrap();
+    cache.lock().unwrap().flush().unwrap();
+    assert!(
+        cache
+            .lock()
+            .unwrap()
+            .get("fakeip_domain4", b"first.example")
+            .is_some()
+    );
+    assert_eq!(
+        cache
+            .lock()
+            .unwrap()
+            .get("fakeip_address", &octets(first_ip))
+            .as_deref(),
+        Some(b"first.example".as_slice())
+    );
+
+    // Evict `first.example` by filling LRU capacity (16384):
+    for i in 0..16384 {
+        let domain = format!("item-{i}.example");
+        store.create(&domain, false).unwrap();
+    }
+    cache.lock().unwrap().flush().unwrap();
+
+    // Verify both forward and reverse records are deleted atomically from persistent cache:
+    assert_eq!(
+        cache
+            .lock()
+            .unwrap()
+            .get("fakeip_domain4", b"first.example"),
+        None,
+        "forward record must be deleted on LRU eviction"
+    );
+    assert_eq!(
+        cache
+            .lock()
+            .unwrap()
+            .get("fakeip_address", &octets(first_ip)),
+        None,
+        "reverse record must be deleted on LRU eviction"
+    );
+
+    let _ = std::fs::remove_file(&options.path);
+}
+
+#[test]
+fn memory_and_disk_hits_do_not_dirty_the_cache_or_write_to_flash() {
+    let options = temp_options("flash-protect");
+    let cache = test_cache(&options);
+    let store = pool();
+    store.attach_cache(Some(cache.clone()));
+
+    // Create a domain:
+    let ip = store.create("saved.example", false).unwrap();
+    cache.lock().unwrap().flush().unwrap();
+
+    // Repeated create for the same domain (LAN DNS queries):
+    let ip2 = store.create("saved.example", false).unwrap();
+    assert_eq!(ip, ip2);
+
+    // Repeated lookup_domain (incoming TPROXY streams):
+    let dom = store.lookup_domain(ip).unwrap();
+    assert_eq!(dom, "saved.example");
+
+    // Close and reopen cache to simulate router reboot:
+    drop((store, cache));
+    let cache = Arc::new(Mutex::new(
+        CacheFile::open(options.clone()).unwrap().unwrap(),
+    ));
+    let reopened = pool();
+    reopened.attach_cache(Some(cache.clone()));
+
+    // Cold lookup from disk promotes to memory:
+    assert_eq!(reopened.lookup_domain(ip).as_deref(), Some("saved.example"));
+
+    // Repeated create for saved.example:
+    assert_eq!(reopened.create("saved.example", false).unwrap(), ip);
+
+    let _ = std::fs::remove_file(options.path);
 }

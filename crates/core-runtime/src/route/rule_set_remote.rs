@@ -138,9 +138,13 @@ impl RemoteRuleSet {
         if let Some(parent) = cache_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let tmp_path = cache_path.with_extension("tmp");
-        std::fs::write(&tmp_path, &bytes)?;
-        std::fs::rename(&tmp_path, cache_path)?;
+        let already_identical = cache_path.exists()
+            && std::fs::read(cache_path).is_ok_and(|existing| existing == bytes);
+        if !already_identical {
+            let tmp_path = cache_path.with_extension("tmp");
+            std::fs::write(&tmp_path, &bytes)?;
+            std::fs::rename(&tmp_path, cache_path)?;
+        }
         crate::route::mmap_set::MmapRuleSet::open_with_mode(cache_path, self.spec.mode)
             .map_err(|e| io::Error::other(format!("open tsrs: {e}")))
     }
@@ -347,12 +351,20 @@ impl RemoteRuleSet {
                             match crate::route::mmap_set::apply_delta(&base_bytes, &delta_resp.body)
                             {
                                 Ok(new_bytes) => {
-                                    let tmp_path = tsrs_path.with_extension("tmp");
-                                    if let Some(parent) = tsrs_path.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    let _ = std::fs::write(&tmp_path, &new_bytes);
-                                    if std::fs::rename(&tmp_path, &tsrs_path).is_ok() {
+                                    let already_identical = tsrs_path.exists()
+                                        && std::fs::read(&tsrs_path)
+                                            .is_ok_and(|existing| existing == new_bytes);
+                                    let write_ok = if !already_identical {
+                                        let tmp_path = tsrs_path.with_extension("tmp");
+                                        if let Some(parent) = tsrs_path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let _ = std::fs::write(&tmp_path, &new_bytes);
+                                        std::fs::rename(&tmp_path, &tsrs_path).is_ok()
+                                    } else {
+                                        true
+                                    };
+                                    if write_ok {
                                         match crate::route::mmap_set::MmapRuleSet::open_with_mode(
                                             &tsrs_path,
                                             self.spec.mode,
@@ -418,12 +430,16 @@ impl RemoteRuleSet {
         let _ = is_start;
 
         if response.body.starts_with(b"TSRS") {
-            if let Some(parent) = tsrs_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            let already_identical = tsrs_path.exists()
+                && std::fs::read(&tsrs_path).is_ok_and(|existing| existing == response.body);
+            if !already_identical {
+                if let Some(parent) = tsrs_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp_path = tsrs_path.with_extension("tmp");
+                std::fs::write(&tmp_path, &response.body)?;
+                std::fs::rename(&tmp_path, &tsrs_path)?;
             }
-            let tmp_path = tsrs_path.with_extension("tmp");
-            std::fs::write(&tmp_path, &response.body)?;
-            std::fs::rename(&tmp_path, &tsrs_path)?;
             let mmap_set =
                 crate::route::mmap_set::MmapRuleSet::open_with_mode(&tsrs_path, self.spec.mode)
                     .map_err(|e| io::Error::other(format!("open downloaded tsrs: {e}")))?;
@@ -488,9 +504,6 @@ impl RemoteRuleSet {
             self.tag().as_bytes(),
             saved_binary::marshal(&saved),
         );
-        if let Err(error) = guard.flush() {
-            logging::error(format_args!("save rule-set updated time: {error}"));
-        }
     }
 }
 

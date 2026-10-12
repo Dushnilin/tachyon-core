@@ -63,6 +63,9 @@ pub fn set(name: &str) -> bool {
     };
     match MODE.write() {
         Ok(mut guard) => {
+            if *guard == next {
+                return true;
+            }
             *guard = next;
         }
         Err(_) => return false,

@@ -404,7 +404,11 @@ pub(crate) fn build_rule_sets(
                     if let Some(parent) = target_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    std::fs::write(&target_path, &tsrs_bytes)?;
+                    let already_identical = target_path.exists()
+                        && std::fs::read(&target_path).is_ok_and(|existing| existing == tsrs_bytes);
+                    if !already_identical {
+                        std::fs::write(&target_path, &tsrs_bytes)?;
+                    }
                     let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
                         &target_path,
                         mode,
@@ -453,7 +457,12 @@ pub(crate) fn build_rule_sets(
                         if let Some(parent) = target_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        std::fs::write(&target_path, &tsrs_bytes)?;
+                        let already_identical = target_path.exists()
+                            && std::fs::read(&target_path)
+                                .is_ok_and(|existing| existing == tsrs_bytes);
+                        if !already_identical {
+                            std::fs::write(&target_path, &tsrs_bytes)?;
+                        }
                         let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
                             &target_path,
                             mode,

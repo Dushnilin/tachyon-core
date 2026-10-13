@@ -182,12 +182,12 @@ async fn vision_frames_the_payload_behind_the_uuid() {
     let payload = b"GET / HTTP/1.1\r\n\r\n";
     let start = head.len();
     let frame = &seen[start..];
-    // the first frame of the padding phase is Continue: End means "the framing
-    // stops here", so a client would read this header as payload
-    assert_eq!(frame[0], 0, "commandPaddingContinue");
-    let content = u16::from_be_bytes([frame[1], frame[2]]) as usize;
+    // the first frame carries user UUID prefix on the wire (reference XtlsPadding)
+    assert_eq!(&frame[..16], &UUID, "first frame starts with user UUID");
+    assert_eq!(frame[16], 0, "commandPaddingContinue");
+    let content = u16::from_be_bytes([frame[17], frame[18]]) as usize;
     assert_eq!(content, payload.len(), "the whole write is one block");
-    assert_eq!(&frame[5..5 + content], &payload[..]);
+    assert_eq!(&frame[21..21 + content], &payload[..]);
 }
 
 #[test]

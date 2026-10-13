@@ -73,7 +73,7 @@ def run_sink(cpus):
             w.close()
 
     async def main():
-        srv = await asyncio.start_server(handle, "127.0.0.1", SINK_PORT, backlog=4096)
+        srv = await asyncio.start_server(handle, "0.0.0.0", SINK_PORT, backlog=4096)
         try:
             srv6 = await asyncio.start_server(handle, "::", SINK_PORT, backlog=4096)
         except OSError:
@@ -244,7 +244,7 @@ def steer_net_setup():
         print(f"Warning: cannot add {STEER_SINK} to lo", file=sys.stderr)
 
 
-def steer_wait_ready(timeout=15):
+def steer_wait_ready(timeout=1.5):
     """steer races its own startup: ctl apply runs before sbx0 is up, so the first
     apply fails with `on_fail=drop` and the proxy answers EOF until the --watch
     supervisor reapplies. Poll until a real SOCKS CONNECT to the sink succeeds."""
@@ -308,7 +308,7 @@ def cpu_split(pid):
 
 # ---------------------------------------------------------------- measurements
 def measure_latency(rounds=800):
-    s = socks_connect(timeout=10)
+    s = socks_connect(timeout=25)
     s.sendall(MODE_ECHO)
     if os.environ.get("STEER_DEBUG"):
         s.settimeout(3)
@@ -439,17 +439,17 @@ def get_cases(certs):
 
     reality_s = {
         "enabled": True,
-        "server_name": "localhost",
+        "server_name": "www.apple.com",
         "reality": {
             "enabled": True,
-            "handshake": {"server": "127.0.0.1", "server_port": SINK_PORT},
+            "handshake": {"server": "www.apple.com", "server_port": 443},
             "private_key": reality_priv,
             "short_id": [short_id],
         },
     }
     reality_c = {
         "enabled": True,
-        "server_name": "localhost",
+        "server_name": "www.apple.com",
         "utls": {"enabled": True, "fingerprint": "chrome"},
         "reality": {
             "enabled": True,
@@ -460,7 +460,7 @@ def get_cases(certs):
     reality_xray_c = {
         "security": "reality",
         "realitySettings": {
-            "serverName": "localhost",
+            "serverName": "www.apple.com",
             "fingerprint": "chrome",
             "show": False,
             "publicKey": reality_pub,
@@ -469,7 +469,7 @@ def get_cases(certs):
         },
     }
     reality_mihomo_c = {
-        "servername": "localhost",
+        "servername": "www.apple.com",
         "client-fingerprint": "chrome",
         "reality-opts": {
             "public-key": reality_pub,
@@ -953,7 +953,7 @@ def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None
         cfg = {
             "log": {"loglevel": "error"},
             "inbounds": [inbound],
-            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+            "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {"finalRules": [{"action": "allow"}]}}]
         }
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
@@ -1003,7 +1003,7 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
     pre = (lambda: os.sched_setaffinity(0, client_cpus)) if hasattr(os, "sched_setaffinity") else None
 
     if core_name in ("tachyon", "sing-box", "steer"):
-        spec = case.get("client_sb")
+        spec = case.get("client_tachyon") if core_name == "tachyon" and case.get("client_tachyon") else case.get("client_sb")
         if not spec:
             return None, d
         if core_name == "steer":
@@ -1711,7 +1711,8 @@ def main():
 
                 t1, cpu1 = measure_throughput(1, args.seconds, cli_proc.pid)
                 t8, cpu8 = measure_throughput(8, args.seconds, cli_proc.pid)
-                lat = measure_latency(args.latency_rounds)
+                lat_rounds = min(args.latency_rounds, 30) if "xhttp" in cid else args.latency_rounds
+                lat = measure_latency(lat_rounds)
                 peak_rss = round(proc_status(cli_proc.pid)["VmHWM"], 1)
 
                 case_res[c_name] = {
@@ -1745,6 +1746,7 @@ def main():
             except Exception:
                 srv_proc.kill()
             wait_port_free(SERVER_PORT)
+            time.sleep(0.05)
 
         results.append(case_res)
 

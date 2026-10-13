@@ -74,6 +74,10 @@ pub struct VisionStream {
     framed_at: usize,
     /// bytes of the caller's buffer the frame in flight stands for
     pending: usize,
+    /// user UUID sent on the very first frame (reference XtlsPadding)
+    uuid: Option<[u8; 16]>,
+    /// expected user UUID on the first incoming frame (reference XtlsUnpadding)
+    expected_uuid: Option<[u8; 16]>,
     // inbound framing state, straight from the reference field names
     remaining_content: i64,
     remaining_padding: i64,
@@ -87,7 +91,7 @@ pub struct VisionStream {
 }
 
 impl VisionStream {
-    pub fn new(inner: AnyStream, _uuid: [u8; 16]) -> Self {
+    pub fn new(inner: AnyStream, uuid: [u8; 16]) -> Self {
         Self {
             inner,
             padding: true,
@@ -96,6 +100,8 @@ impl VisionStream {
             framed: Vec::new(),
             framed_at: 0,
             pending: 0,
+            uuid: Some(uuid),
+            expected_uuid: Some(uuid),
             remaining_content: 0,
             remaining_padding: 0,
             current_command: PADDING_CONTINUE,
@@ -124,7 +130,11 @@ impl VisionStream {
             Self::random_below(PLAIN_PADDING_SPREAD)
         };
         self.framed.clear();
-        self.framed.reserve(5 + content.len() + padding_len);
+        let uuid_len = if self.uuid.is_some() { 16 } else { 0 };
+        self.framed.reserve(uuid_len + 5 + content.len() + padding_len);
+        if let Some(uuid) = self.uuid.take() {
+            self.framed.extend_from_slice(&uuid);
+        }
         self.framed.push(command);
         self.framed
             .extend_from_slice(&(content.len() as u16).to_be_bytes());
@@ -183,6 +193,29 @@ impl VisionStream {
         let mut index = 0usize;
         while index < self.raw.len() {
             if self.remaining_content <= 0 && self.remaining_padding <= 0 {
+                if let Some(expected) = self.expected_uuid {
+                    if self.raw.len() < index + 21 {
+                        if self.eof {
+                            self.payload.extend_from_slice(&self.raw[index..]);
+                            index = self.raw.len();
+                        }
+                        break;
+                    }
+                    if self.raw[index..index + 16] == expected {
+                        index += 16;
+                        self.expected_uuid = None;
+                    } else if self.raw[index] <= PADDING_DIRECT {
+                        // Peer omitted UUID (e.g. tests or older peer)
+                        self.expected_uuid = None;
+                    } else {
+                        // Peer is not framing vision; fallback to raw stream
+                        self.expected_uuid = None;
+                        self.current_command = 0xFF;
+                        self.payload.extend_from_slice(&self.raw[index..]);
+                        index = self.raw.len();
+                        break;
+                    }
+                }
                 // any command but Continue ends the framing, and whatever
                 // follows it is payload
                 if self.current_command != PADDING_CONTINUE {
@@ -378,7 +411,10 @@ mod tests {
     fn pair() -> (VisionStream, tokio::io::DuplexStream) {
         let (client, server) = tokio::io::duplex(8192);
         let boxed: AnyStream = Box::new(client);
-        (VisionStream::new(boxed, uuid()), server)
+        let mut v = VisionStream::new(boxed, uuid());
+        v.uuid = None;
+        v.expected_uuid = None;
+        (v, server)
     }
 
     /// A frame built by hand, the way the reference puts it on the wire.
@@ -583,19 +619,20 @@ mod tests {
         .expect("read back");
         writer.await.expect("writer");
 
-        assert_eq!(got[0], PADDING_CONTINUE, "command");
+        assert_eq!(&got[..16], &uuid(), "uuid prefix");
+        assert_eq!(got[16], PADDING_CONTINUE, "command");
         assert_eq!(
-            usize::from(u16::from_be_bytes([got[1], got[2]])),
+            usize::from(u16::from_be_bytes([got[17], got[18]])),
             want,
             "content length"
         );
-        let padding = usize::from(u16::from_be_bytes([got[3], got[4]]));
+        let padding = usize::from(u16::from_be_bytes([got[19], got[20]]));
         assert_eq!(
             got.len(),
-            5 + want + padding,
+            16 + 5 + want + padding,
             "the frame went out whole, padding and all"
         );
-        assert!(got[5..5 + want].iter().all(|byte| *byte == 0x5A));
+        assert!(got[21..21 + want].iter().all(|byte| *byte == 0x5A));
     }
 
     #[test]

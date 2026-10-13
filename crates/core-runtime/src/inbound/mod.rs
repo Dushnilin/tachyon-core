@@ -37,6 +37,11 @@ pub mod vmess;
 #[cfg(target_os = "linux")]
 mod relay;
 
+/// Maximum time to wait for the remaining direction after one direction closes.
+/// Prevents TCP sockets from lingering in CLOSE_WAIT indefinitely when client
+/// or upstream does not close cleanly.
+const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// A TCP listener on `addr`, with `SO_REUSEADDR`.
 ///
 /// The reference's Go runtime sets it on every listener, and without it a
@@ -674,10 +679,29 @@ where
                     }
                 }
             };
+            let relay = async {
+                let mut up = std::pin::pin!(up);
+                let mut down = std::pin::pin!(down);
+                tokio::select! {
+                    res = &mut up => {
+                        res?;
+                        if let Ok(Err(err)) = tokio::time::timeout(HALF_CLOSE_TIMEOUT, down).await {
+                            return Err(err);
+                        }
+                        Ok(())
+                    }
+                    res = &mut down => {
+                        res?;
+                        if let Ok(Err(err)) = tokio::time::timeout(HALF_CLOSE_TIMEOUT, up).await {
+                            return Err(err);
+                        }
+                        Ok(())
+                    }
+                }
+            };
             let result = match tracker {
                 Some(tracker) => {
                     let signal = tracker.close_signal();
-                    let relay = async { tokio::try_join!(up, down).map(|_| ()) };
                     tokio::pin!(relay);
                     tokio::select! {
                         biased;
@@ -685,7 +709,7 @@ where
                         _ = signal.wait() => Err(closed_by_api()),
                     }
                 }
-                None => tokio::try_join!(up, down).map(|_| ()),
+                None => relay.await,
             };
             give_buf(up_buf);
             give_buf(down_buf);
@@ -1008,12 +1032,40 @@ where
 {
     let mut a_to_b = TransferState::Running(PooledBuffer::new(take_buf()));
     let mut b_to_a = TransferState::Running(PooledBuffer::new(take_buf()));
+    let mut sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     std::future::poll_fn(|cx| {
         let res_a = transfer_one_direction(cx, &mut a_to_b, a, b)?;
         let res_b = transfer_one_direction(cx, &mut b_to_a, b, a)?;
-        let amt_a = ready!(res_a);
-        let amt_b = ready!(res_b);
-        Poll::Ready(Ok((amt_a, amt_b)))
+        match (res_a, res_b) {
+            (Poll::Ready(amt_a), Poll::Ready(amt_b)) => Poll::Ready(Ok((amt_a, amt_b))),
+            (Poll::Ready(amt_a), Poll::Pending) => {
+                let s =
+                    sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(HALF_CLOSE_TIMEOUT)));
+                if s.as_mut().poll(cx).is_ready() {
+                    let amt_b = match &b_to_a {
+                        TransferState::Done(c) | TransferState::ShuttingDown(c) => *c,
+                        TransferState::Running(buf) => buf.amt,
+                    };
+                    Poll::Ready(Ok((amt_a, amt_b)))
+                } else {
+                    Poll::Pending
+                }
+            }
+            (Poll::Pending, Poll::Ready(amt_b)) => {
+                let s =
+                    sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(HALF_CLOSE_TIMEOUT)));
+                if s.as_mut().poll(cx).is_ready() {
+                    let amt_a = match &a_to_b {
+                        TransferState::Done(c) | TransferState::ShuttingDown(c) => *c,
+                        TransferState::Running(buf) => buf.amt,
+                    };
+                    Poll::Ready(Ok((amt_a, amt_b)))
+                } else {
+                    Poll::Pending
+                }
+            }
+            (Poll::Pending, Poll::Pending) => Poll::Pending,
+        }
     })
     .await
 }

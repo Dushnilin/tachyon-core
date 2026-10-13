@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;

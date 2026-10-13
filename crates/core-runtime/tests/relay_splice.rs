@@ -326,3 +326,31 @@ async fn splice_survives_a_peer_that_vanishes_mid_transfer() {
         .await
         .expect("relay must not hang after the peer is gone");
 }
+
+#[tokio::test]
+async fn splice_terminates_after_half_close_when_peer_is_silent() {
+    let (relay_client, mut caller) = pair().await;
+    let (relay_upstream, _server) = pair().await;
+    let tracker = clash_state::ConnHandle::open(meta("splice-hang.example.com:443"));
+
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(
+            relay_client,
+            Conn::Plain(Box::new(relay_upstream)),
+            &[],
+            Some(&tracker),
+        )
+        .await
+    });
+
+    // Caller sends request and shuts down write (FIN).
+    // Server stays completely silent and never closes.
+    // The relay must not hang forever: it must terminate within HALF_CLOSE_TIMEOUT + 5s.
+    caller.write_all(b"request").await.expect("write");
+    caller.shutdown().await.expect("shutdown");
+
+    let result = tokio::time::timeout(Duration::from_secs(20), relay)
+        .await
+        .expect("relay must terminate within half-close timeout instead of hanging in CLOSE_WAIT");
+    assert!(result.is_ok(), "task completed successfully");
+}

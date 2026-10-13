@@ -20,16 +20,18 @@ use tokio::net::TcpStream;
 
 use crate::clash_state::ConnHandle;
 
-/// Largest bytes asked from one splice, and the size a busy pipe grows to. One
-/// stream needs this much in flight to keep both sockets fed: 256 KiB measured
-/// 15-21 Gbit/s on a single stream, 1 MiB measured 51.
-const CHUNK: usize = 1024 * 1024;
-/// What a fresh pipe asks for: starts at 1 MiB so single-stream and short
-/// transfers immediately hit line rate without a 4-splice ramp.
-const PIPE_START: usize = 1024 * 1024;
+/// Largest bytes asked from one splice, matching the pipe capacity.
+const CHUNK: usize = 64 * 1024;
+/// What a fresh pipe asks for: 64 KiB (standard Linux pipe capacity, 16 pages).
+/// Heavy 1 MiB pipes exhaust kernel memory on routers with 512 MiB RAM under load.
+const PIPE_START: usize = 64 * 1024;
 /// Chunk of the buffered fallback, deliberately small: it only runs when fds
 /// are scarce, and so is memory.
 const FALLBACK_CHUNK: usize = 16 * 1024;
+/// Maximum time to wait for the remaining direction after one direction closes.
+/// Prevents TCP sockets from lingering in CLOSE_WAIT indefinitely when client
+/// or upstream does not close cleanly.
+const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// A non-blocking pipe pair that closes with its owner.
 struct Pipe {
@@ -228,20 +230,39 @@ pub(crate) async fn relay(
             tracker.add_upload(prefix.len() as u64);
         }
     }
+    let client_to_up = one_way(client, upstream, false, |n| {
+        if let Some(tracker) = tracker {
+            tracker.add_upload(n);
+        }
+    });
+    let up_to_client = one_way(upstream, client, vless_head, |n| {
+        if let Some(tracker) = tracker {
+            tracker.add_download(n);
+        }
+    });
     let both = async {
-        tokio::try_join!(
-            one_way(client, upstream, false, |n| {
-                if let Some(tracker) = tracker {
-                    tracker.add_upload(n)
+        let mut client_to_up = std::pin::pin!(client_to_up);
+        let mut up_to_client = std::pin::pin!(up_to_client);
+        tokio::select! {
+            res = &mut client_to_up => {
+                res?;
+                // Client closed write (sent FIN). Upstream write is shut down.
+                // Allow upstream to finish sending its reply within HALF_CLOSE_TIMEOUT.
+                if let Ok(Err(err)) = tokio::time::timeout(HALF_CLOSE_TIMEOUT, up_to_client).await {
+                    return Err(err);
                 }
-            }),
-            one_way(upstream, client, vless_head, |n| {
-                if let Some(tracker) = tracker {
-                    tracker.add_download(n)
+                Ok(())
+            }
+            res = &mut up_to_client => {
+                res?;
+                // Upstream closed write (sent FIN). Client write is shut down.
+                // Allow client to finish sending its tail within HALF_CLOSE_TIMEOUT.
+                if let Ok(Err(err)) = tokio::time::timeout(HALF_CLOSE_TIMEOUT, client_to_up).await {
+                    return Err(err);
                 }
-            }),
-        )
-        .map(|_| ())
+                Ok(())
+            }
+        }
     };
     let Some(tracker) = tracker else {
         return both.await;

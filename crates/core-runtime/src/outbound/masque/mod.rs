@@ -780,7 +780,7 @@ impl Masque {
         let cmd_tx = shared.cmd_tx.clone();
         let udp_timeout = self.cfg.udp_timeout;
 
-        let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(
+        let last_activity = Arc::new(portable_atomic::AtomicU64::new(
             crate::inbound::udp::now_ms(),
         ));
         let last_act_rx = Arc::clone(&last_activity);

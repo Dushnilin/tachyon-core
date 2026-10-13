@@ -56,17 +56,12 @@ const CIPHER_OVERHEAD: usize = 16;
 const MAX_PADDING: u16 = 64;
 
 /// Read-ahead the frame buffer aims for: enough that one read brings in several
-/// chunks rather than the two bytes of a length block.
-const READ_CHUNK: usize = 64 * 1024;
-/// Hard ceiling on the frame buffer: one whole chunk (a `u16` of ciphertext plus
-/// its tag) behind the length block, plus the read-ahead.
-///
-/// The buffer used to be grown with `Vec::reserve` every time it filled, and
-/// `reserve` rounds up to twice the capacity -- so a connection that carried a
-/// gigabyte ended up holding a buffer to match, hundreds of megabytes of pages
-/// that had to be faulted in and copied. It is now sized in one step, to what
-/// the read needs and never past this.
-const FRAME_ROOM: usize = 2 + CIPHER_OVERHEAD + u16::MAX as usize + READ_CHUNK;
+/// chunks rather than the two bytes of a length block. Sized to match `relay_buf()`
+/// so bulk transfers drain in full multi-chunk batches.
+const READ_CHUNK: usize = 128 * 1024;
+/// Hard ceiling on the frame buffer: sized to hold at least READ_CHUNK free headroom
+/// above one max chunk (u16::MAX + tag) to prevent TLS deframer starvation.
+const FRAME_ROOM: usize = 256 * 1024;
 
 /// Only these two securities seal the body; `none` frames it in the clear.
 fn has_aead(security: u8) -> bool {
@@ -376,7 +371,7 @@ impl FrameAssembler {
             cfb,
             checksum: legacy,
             state: AssembleState::Len,
-            frame: Vec::new(),
+            frame: Vec::with_capacity(FRAME_ROOM),
             start: 0,
             pos: 0,
             end: 0,
@@ -608,17 +603,22 @@ fn fill(
             *at = 0;
         }
         let needed = need - (frame.len() - *at);
-        if frame.capacity().saturating_sub(frame.len()) < needed {
-            if *at > 0 {
-                let len = frame.len();
-                frame.copy_within(*at..len, 0);
-                frame.truncate(len - *at);
-                *at = 0;
-            }
-            let want = need.saturating_add(READ_CHUNK).min(FRAME_ROOM).max(need);
-            if frame.capacity() < want {
-                frame.reserve_exact(want - frame.len());
-            }
+        if *at > 0
+            && (frame.capacity().saturating_sub(frame.len()) < 16 * 1024
+                || frame.capacity().saturating_sub(frame.len()) < needed)
+        {
+            let len = frame.len();
+            frame.copy_within(*at..len, 0);
+            frame.truncate(len - *at);
+            *at = 0;
+        }
+        let unconsumed = frame.len() - *at;
+        let want = unconsumed
+            .saturating_add(READ_CHUNK)
+            .min(FRAME_ROOM)
+            .max(need);
+        if frame.capacity() < want {
+            frame.reserve_exact(want - frame.len());
         }
         let len = frame.len();
         let got = {

@@ -9,6 +9,13 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+
+/// Serialize box instances: the dns service is process-global.
+async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::const_new(());
+    LOCK.lock().await
+}
 
 const CERT_PEM: &str = include_str!("../../../tests/golden/certs/localhost.crt");
 const KEY_PEM: &str = include_str!("../../../tests/golden/certs/localhost.key");
@@ -135,6 +142,7 @@ async fn assert_outbound(
     make_ref_inbound: impl Fn(u16) -> Value,
     make_outbound: impl Fn(u16) -> Value,
 ) {
+    let _guard = test_guard().await;
     eprintln!("{label}: starting ref");
     let ref_port = free_port();
     let echo = spawn_echo().await;

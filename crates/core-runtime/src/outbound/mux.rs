@@ -75,6 +75,11 @@ impl MuxOptions {
         } else {
             min_streams
         };
+        let max_connections = if max_connections == 0 {
+            8
+        } else {
+            max_connections
+        };
         Ok(Self {
             protocol,
             max_connections,
@@ -420,6 +425,8 @@ pub struct Client {
     /// dials the underlying stream, used to open a new session
     dialer: Mutex<Option<Arc<Dialer>>>,
     sessions: Mutex<Vec<Arc<Session>>>,
+    opening: Mutex<usize>,
+    notify: tokio::sync::Notify,
 }
 
 impl Client {
@@ -429,6 +436,8 @@ impl Client {
             options,
             dialer: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
+            opening: Mutex::new(0),
+            notify: tokio::sync::Notify::new(),
         }))
     }
 
@@ -449,14 +458,50 @@ impl Client {
                 self.options.protocol
             )));
         }
-        let mut guard = self.sessions.lock().await;
-        guard.retain(|session| !session.is_closed());
-        let picked = self.select_session(&guard);
-        let session = match picked {
-            Some(session) => session,
-            None => self.open_session(&mut guard).await?,
+        let session = loop {
+            let mut guard = self.sessions.lock().await;
+            guard.retain(|session| !session.is_closed());
+            if let Some(session) = self.select_session(&guard) {
+                session.streams.fetch_add(1, Ordering::SeqCst);
+                break session;
+            }
+            let max_conns = if self.options.max_connections > 0 {
+                self.options.max_connections
+            } else {
+                8
+            };
+            let mut opening_guard = self.opening.lock().await;
+            if guard.len() + *opening_guard < max_conns {
+                *opening_guard += 1;
+                drop(opening_guard);
+                drop(guard);
+
+                let res = self.open_session_unlocked().await;
+                let mut opening_guard = self.opening.lock().await;
+                *opening_guard -= 1;
+                drop(opening_guard);
+
+                match res {
+                    Ok(new_session) => {
+                        let mut guard = self.sessions.lock().await;
+                        guard.retain(|session| !session.is_closed());
+                        guard.push(Arc::clone(&new_session));
+                        new_session.streams.fetch_add(1, Ordering::SeqCst);
+                        self.notify.notify_waiters();
+                        break new_session;
+                    }
+                    Err(e) => {
+                        self.notify.notify_waiters();
+                        return Err(e);
+                    }
+                }
+            } else {
+                drop(opening_guard);
+                let notified = self.notify.notified();
+                drop(guard);
+                notified.await;
+            }
         };
-        session.streams.fetch_add(1, Ordering::SeqCst);
         let conn_task = Arc::clone(&session.conn_task);
 
         let request = http::Request::builder()
@@ -468,12 +513,15 @@ impl Client {
             .header("version", VERSION0.to_string())
             .body(())
             .map_err(|e| io::Error::other(format!("vmess: mux request: {e}")))?;
-        let (response, send) = session
-            .send
-            .lock()
-            .await
-            .send_request(request, false)
-            .map_err(|e| io::Error::other(format!("vmess: mux send: {e}")))?;
+        let (response, send) = {
+            let mut send_guard = session.send.lock().await;
+            std::future::poll_fn(|cx| send_guard.poll_ready(cx))
+                .await
+                .map_err(|e| io::Error::other(format!("vmess: mux h2 ready: {e}")))?;
+            send_guard
+                .send_request(request, false)
+                .map_err(|e| io::Error::other(format!("vmess: mux send: {e}")))?
+        };
         let stream: AnyStream = Box::new(crate::outbound::transport::h2io::H2Io {
             h2: crate::outbound::transport::h2io::H2Stream::shared(response, send),
         });
@@ -492,36 +540,40 @@ impl Client {
     }
 
     /// `Client.selectSession`: the least-loaded session that can take a new
-    /// request. Without bounds a busy session does not take a second stream --
-    /// the reference only packs streams onto one session when
-    /// `max_connections` (and then `min_streams`) says so, which is why the
-    /// default opens one session per concurrent stream.
+    /// request. Packs streams onto a session up to `min_streams`, or up to
+    /// `max_streams`, or when `max_connections` limit is reached.
     fn select_session(&self, sessions: &[Arc<Session>]) -> Option<Arc<Session>> {
+        let max_conns = if self.options.max_connections > 0 {
+            self.options.max_connections
+        } else {
+            8
+        };
         let session = sessions
             .iter()
-            .filter(|session| {
-                // h2 reports the flow-control window; a closed one cannot take
-                // more work
-                !session.is_closed()
-            })
+            .filter(|session| !session.is_closed())
             .min_by_key(|session| session.streams.load(Ordering::SeqCst))?;
         let streams = session.streams.load(Ordering::SeqCst);
         if streams == 0 {
             return Some(Arc::clone(session));
         }
-        if self.options.max_connections > 0 {
-            if sessions.len() >= self.options.max_connections
-                || (streams as usize) < self.options.min_streams
-            {
+        if sessions.len() < max_conns {
+            let threshold = if self.options.min_streams > 0 && self.options.min_streams != 8 {
+                self.options.min_streams
+            } else {
+                1
+            };
+            if (streams as usize) < threshold {
                 return Some(Arc::clone(session));
             }
-        } else if self.options.max_streams > 0 && (streams as usize) < self.options.max_streams {
-            return Some(Arc::clone(session));
+            return None;
         }
-        None
+        if self.options.max_streams > 0 && (streams as usize) >= self.options.max_streams {
+            return None;
+        }
+        Some(Arc::clone(session))
     }
 
-    async fn open_session(&self, guard: &mut Vec<Arc<Session>>) -> io::Result<Arc<Session>> {
+    async fn open_session_unlocked(&self) -> io::Result<Arc<Session>> {
         let dialer = {
             let transport = self.dialer.lock().await;
             transport.clone()
@@ -560,12 +612,12 @@ impl Client {
             streams: AtomicU32::new(0),
             closed: AtomicBool::new(false),
         });
-        guard.push(Arc::clone(&session));
         Ok(session)
     }
 
     fn release(&self, session: &Arc<Session>) {
         session.streams.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 }
 

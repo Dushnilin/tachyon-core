@@ -46,9 +46,12 @@ def main():
                     help="count syscalls of the target for the first run instead of sampling")
     ap.add_argument("--sched", action="store_true",
                     help="off-cpu view for the first run: per-thread sleep/run and wakeup pairs")
+    ap.add_argument("--cpus", default="0-1,2-3",
+                    help="client,server core sets; --cpus 0-3,4-7 matches the bench desktop profile")
     args = ap.parse_args()
 
-    cpus = {"client": proto.parse_cpus("0-1"), "server": proto.parse_cpus("2-3")}
+    client_cpus, server_cpus = args.cpus.split(",")
+    cpus = {"client": proto.parse_cpus(client_cpus), "server": proto.parse_cpus(server_cpus)}
     load = set(range(os.cpu_count())) - cpus["client"] - cpus["server"] or cpus["client"]
     os.sched_setaffinity(0, load)
     work = tempfile.mkdtemp()
@@ -97,7 +100,8 @@ def main():
                        "syscalls:sys_enter_epoll_pwait,syscalls:sys_enter_write,"
                        "syscalls:sys_enter_read,syscalls:sys_enter_futex,"
                        "syscalls:sys_enter_writev,syscalls:sys_enter_sendmsg,"
-                       "syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg"],
+                       "syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,"
+                       "page-faults,minor-faults,context-switches,cpu-migrations"],
                 stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             time.sleep(0.5)
             r = real(proxy, streams, seconds, pid)
@@ -295,7 +299,7 @@ def main():
     ports = (proto.PROXY_PORT_BASE + 1, proto.SERVER_PORT_BASE + 1)
     bins = {"tachyon": args.tachyon, "ref": args.ref}
     cell = ctx.Process(target=proto.run_cell,
-                       args=(role, case, bins, cpus, 1, args.seconds, 1500, ports, work, tx))
+                       args=(role, case, bins, cpus, 1, args.seconds, 1500, ports, work, tx, 0))
     cell.start()
     tx.close()
     cell.join(180)

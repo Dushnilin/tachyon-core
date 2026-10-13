@@ -731,7 +731,16 @@ fn relay_buf() -> usize {
 static BUF_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 const POOL_CAP: usize = 64;
 
+thread_local! {
+    static LOCAL_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+const LOCAL_CAP: usize = 4;
+
 fn take_buf() -> Vec<u8> {
+    if let Ok(Some(mut buf)) = LOCAL_BUF_POOL.try_with(|p| p.borrow_mut().pop()) {
+        buf.resize(relay_buf(), 0);
+        return buf;
+    }
     let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
     match pool.pop() {
         Some(mut buf) => {
@@ -748,6 +757,19 @@ fn give_buf(buf: Vec<u8>) {
     }
     // Retain initialized length: reusing a drained buffer does not need another
     // zero-fill. Only the bytes actually filled by AsyncRead are forwarded.
+    let buf = match LOCAL_BUF_POOL.try_with(|p| {
+        let mut local = p.borrow_mut();
+        if local.len() < LOCAL_CAP {
+            local.push(buf);
+            None
+        } else {
+            Some(buf)
+        }
+    }) {
+        Ok(None) => return,
+        Ok(Some(buf)) => buf,
+        Err(_) => return,
+    };
     let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
     if pool.len() < POOL_CAP {
         pool.push(buf);

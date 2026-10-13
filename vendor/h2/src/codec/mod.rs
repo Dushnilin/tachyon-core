@@ -1,6 +1,7 @@
 mod error;
 mod framed_read;
 mod framed_write;
+mod recycle;
 
 pub use self::error::{SendError, UserError};
 

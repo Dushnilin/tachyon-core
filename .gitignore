@@ -21,6 +21,11 @@ to_improve.md
 scripts/bench/__pycache__/
 proto-result.json
 proto-result.md
+proto-result.html
+BENCHMARK.html
+BENCHMARK.md
+INBOUND_BENCHMARK.html
+NIGHT.html
 PONYTAIL_AUDIT.md
 scratch/
 

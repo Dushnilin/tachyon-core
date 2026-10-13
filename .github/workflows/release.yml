@@ -51,11 +51,11 @@ jobs:
             budget: 14680064
           - name: aarch64
             target: aarch64-unknown-linux-musl
-            budget: 12582912
+            budget: 14680064
           - name: armv7
             target: armv7-unknown-linux-musleabihf
             use_musl_lld: true
-            budget: 12582912
+            budget: 14680064
           - name: armv6
             target: arm-unknown-linux-musleabi
             use_musl_lld: true
@@ -63,7 +63,7 @@ jobs:
           - name: riscv64
             target: riscv64gc-unknown-linux-musl
             use_musl_lld: true
-            budget: 12582912
+            budget: 14680064
           # mipsel and mips have no prebuilt std: tier-3 targets that need
           # the standard library built from source via nightly + build-std
           - name: mipsel

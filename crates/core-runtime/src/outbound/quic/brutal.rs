@@ -123,7 +123,13 @@ impl Controller for Brutal {
         Some(self.byte_rate())
     }
     fn window(&self) -> u64 {
-        ((self.byte_rate() as f64 * self.rtt.as_secs_f64() * 2.0) as u64).max(self.mtu)
+        // A sub-millisecond RTT (loopback, same-host relays) would collapse the
+        // BDP window below one packet, and quinn's `in_flight + bytes >= window`
+        // check then blocks transmission forever. Floor the window at a few MTUs;
+        // the explicit pacing rate still caps the actual sending rate.
+        const MIN_WINDOW_MTUS: u64 = 8;
+        ((self.byte_rate() as f64 * self.rtt.as_secs_f64() * 2.0) as u64)
+            .max(self.mtu * MIN_WINDOW_MTUS)
     }
     fn initial_window(&self) -> u64 {
         self.window()
@@ -184,6 +190,22 @@ mod tests {
         assert_eq!(c.byte_rate(), 12_500_000);
     }
     #[test]
+    fn low_rtt_window_keeps_a_multi_packet_floor() {
+        let mut c = controller();
+        for rtt in [
+            Duration::from_micros(0),
+            Duration::from_micros(300),
+            Duration::from_micros(600),
+            Duration::from_millis(1),
+        ] {
+            c.rtt = rtt;
+            assert!(
+                c.window() >= c.mtu * 8,
+                "rtt {rtt:?} must not collapse the window below the floor"
+            );
+        }
+    }
+    #[test]
     fn undersampled_loss_and_ecn_do_not_change_rate() {
         let mut c = controller();
         let now = c.epoch;
@@ -194,6 +216,7 @@ mod tests {
         assert_eq!(c.byte_rate(), 12_500_000);
         c.on_mtu_update(9000);
         c.rtt = Duration::ZERO;
-        assert_eq!(c.window(), 9000);
+        // zero RTT floors the window at MIN_WINDOW_MTUS, not at one packet
+        assert_eq!(c.window(), 9000 * 8);
     }
 }

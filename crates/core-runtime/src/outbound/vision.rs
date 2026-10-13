@@ -131,7 +131,8 @@ impl VisionStream {
         };
         self.framed.clear();
         let uuid_len = if self.uuid.is_some() { 16 } else { 0 };
-        self.framed.reserve(uuid_len + 5 + content.len() + padding_len);
+        self.framed
+            .reserve(uuid_len + 5 + content.len() + padding_len);
         if let Some(uuid) = self.uuid.take() {
             self.framed.extend_from_slice(&uuid);
         }

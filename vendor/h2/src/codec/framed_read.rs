@@ -6,6 +6,8 @@ use crate::proto::Error;
 
 use crate::hpack;
 
+use super::recycle;
+
 use futures_core::Stream;
 
 use bytes::{Buf, BytesMut};
@@ -234,7 +236,9 @@ fn decode_frame(
         }
         Kind::Data => {
             bytes.advance(frame::HEADER_LEN);
-            let res = frame::Data::load(head, bytes.freeze());
+            // Not `bytes.freeze()`: the payload would alias the codec read
+            // buffer and force a fresh allocation per frame. See `recycle`.
+            let res = frame::Data::load(head, recycle::recycle(bytes));
 
             // TODO: Should this always be connection level? Probably not...
             res.map_err(|e| {

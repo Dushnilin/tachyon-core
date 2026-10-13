@@ -15,12 +15,12 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection: 8 MiB a stream, 32 MiB a
-/// connection, sized to sustain 10+ Gbps transfers without ballooning
+/// Receive window per stream and per connection: 16 MiB a stream, 64 MiB a
+/// connection, sized to sustain 20+ Gbps transfers without ballooning
 /// client RSS across concurrent pooled connections. The window is also the
 /// memory ceiling for whatever a fast peer has in flight to a slow reader.
-const STREAM_WINDOW: u32 = 8 << 20;
-const CONN_WINDOW: u32 = 32 << 20;
+const STREAM_WINDOW: u32 = 16 << 20;
+const CONN_WINDOW: u32 = 64 << 20;
 /// Largest DATA frame we ask the peer to send.
 const MAX_FRAME: u32 = 256 * 1024;
 
@@ -31,7 +31,8 @@ pub(crate) fn client_builder() -> h2::client::Builder {
     builder
         .initial_window_size(STREAM_WINDOW)
         .initial_connection_window_size(CONN_WINDOW)
-        .max_frame_size(MAX_FRAME);
+        .max_frame_size(MAX_FRAME)
+        .max_send_buffer_size(16 << 20);
     builder
 }
 
@@ -42,7 +43,8 @@ pub(crate) fn server_builder() -> h2::server::Builder {
     builder
         .initial_window_size(STREAM_WINDOW)
         .initial_connection_window_size(CONN_WINDOW)
-        .max_frame_size(MAX_FRAME);
+        .max_frame_size(MAX_FRAME)
+        .max_send_buffer_size(4 << 20);
     builder
 }
 
@@ -204,12 +206,6 @@ impl H2Stream {
     pub(crate) fn stage(&mut self, frame: Vec<u8>, report: usize) {
         debug_assert!(!self.has_out());
         self.out = Bytes::from(frame);
-        self.report = report;
-    }
-
-    pub(crate) fn stage_bytes(&mut self, frame: Bytes, report: usize) {
-        debug_assert!(!self.has_out());
-        self.out = frame;
         self.report = report;
     }
 
@@ -432,14 +428,38 @@ impl AsyncWrite for H2Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if !self.h2.has_out() {
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
-            }
-            self.h2.stage_bytes(Bytes::copy_from_slice(buf), buf.len());
+        if self.h2.has_out() {
+            ready!(self.h2.poll_flush_out(cx))?;
+            return Poll::Ready(Ok(self.h2.take_report()));
         }
-        ready!(self.h2.poll_flush_out(cx))?;
-        Poll::Ready(Ok(self.h2.take_report()))
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let Some(send) = self.h2.send.as_mut() else {
+            return Poll::Ready(Err(io::Error::other("h2: stream send side closed")));
+        };
+        let cur = send.capacity();
+        if cur < buf.len() {
+            send.reserve_capacity(buf.len() - cur);
+        }
+        let cap = match send.poll_capacity(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(Ok(cap))) => cap,
+            Poll::Ready(Some(Err(e))) => {
+                return Poll::Ready(Err(io::Error::other(format!("h2: capacity: {e}"))));
+            }
+            Poll::Ready(None) => {
+                return Poll::Ready(Err(io::Error::other("h2: stream closed for writing")));
+            }
+        };
+        if cap == 0 {
+            return Poll::Pending;
+        }
+        let n = cap.min(buf.len());
+        let chunk = Bytes::copy_from_slice(&buf[..n]);
+        send.send_data(chunk, false)
+            .map_err(|e| io::Error::other(format!("h2: send_data: {e}")))?;
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(

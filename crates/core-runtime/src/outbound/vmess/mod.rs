@@ -89,11 +89,16 @@ impl Vmess {
             .and_then(Value::as_str)
             .unwrap_or("auto")
         {
-            // TLS has nothing to say about the vmess body. Reading it as a
-            // reason to turn the body encryption off means a config with
-            // `tls` in it carries its payload in the clear, which is exactly
-            // the sort of silent downgrade nobody notices until it matters.
-            "" | "auto" => SEC_AES128_GCM,
+            // Reference sing-box/v2fly compatibility: when transport is TLS,
+            // "auto" selects "zero"/"none" because the transport is already encrypted.
+            // When plain TCP (tls.is_none()), "auto" selects aes-128-gcm.
+            "" | "auto" => {
+                if tls.is_some() {
+                    SEC_NONE
+                } else {
+                    SEC_AES128_GCM
+                }
+            }
             "none" | "zero" => SEC_NONE,
             "aes-128-gcm" => SEC_AES128_GCM,
             "chacha20-poly1305" => SEC_CHACHA20_POLY1305,

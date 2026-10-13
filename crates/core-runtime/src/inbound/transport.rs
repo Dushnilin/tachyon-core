@@ -2095,7 +2095,7 @@ mod tests {
         let t = Transport::from_inbound(&obj, "inbounds[0]")
             .expect("read")
             .expect("present");
-        const BODY: usize = 9 * 1024 * 1024; // one MiB over the stream window
+        const BODY: usize = 17 * 1024 * 1024; // one MiB over the stream window (16 MiB)
         let (client, server) = tokio::io::duplex(1024);
         let done = std::sync::Arc::new(tokio::sync::Notify::new());
         let done_task = std::sync::Arc::clone(&done);

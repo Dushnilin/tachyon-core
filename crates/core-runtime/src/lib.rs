@@ -57,6 +57,7 @@ use crate::route::Router;
 
 /// A started box instance: running inbound listeners plus their tasks.
 pub struct BoxInstance {
+    root: Value,
     router: Arc<Router>,
     tasks: Vec<JoinHandle<()>>,
     quic_endpoints: Vec<(quinn::Endpoint, Weak<dyn quinn::AsyncUdpSocket>)>,
@@ -81,10 +82,6 @@ struct TaskGuard(Vec<JoinHandle<()>>);
 impl TaskGuard {
     fn push(&mut self, task: JoinHandle<()>) {
         self.0.push(task);
-    }
-
-    fn extend(&mut self, tasks: impl IntoIterator<Item = JoinHandle<()>>) {
-        self.0.extend(tasks);
     }
 
     /// The box is up: its tasks belong to it now, and this guard must not
@@ -205,8 +202,11 @@ impl BoxInstance {
     }
 
     /// Perform in-place hot reload without stopping inbounds or dropping connections.
-    /// Perform in-place hot reload without stopping inbounds or dropping connections.
     pub async fn reload_in_place(&mut self, new_root: &Value) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            can_reload_in_place(&self.root, new_root),
+            "cannot reload in-place: inbounds, clash_api, netns or ntp configuration changed"
+        );
         warn_unhonored_options(new_root);
 
         // 1. Build and validate new router inner BEFORE mutating anything running
@@ -251,12 +251,16 @@ impl BoxInstance {
         }
         logging::set_enabled(!disabled);
 
+        self.root = new_root.clone();
         Ok(())
     }
 
     /// Abort all listeners and connection tasks.
     pub fn shutdown(&self) {
         self.abort_listeners();
+        for task in self.router.take_probe_tasks() {
+            task.abort();
+        }
         let inner = self.router.inner();
         for (_, _, outbound) in inner.outbound_table() {
             if let crate::route::Outbound::Tailscale(endpoint) = outbound {
@@ -414,7 +418,6 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
 
     let mut quic_endpoints = Vec::new();
     let mut udp_sockets = Vec::new();
-    guard.extend(router.take_probe_tasks());
     #[allow(unused_mut)]
     let mut clash_api = None;
     #[cfg(feature = "clash-api")]
@@ -597,6 +600,7 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
     }
 
     Ok(BoxInstance {
+        root: root.clone(),
         router,
         quic_endpoints,
         udp_sockets,
@@ -683,7 +687,7 @@ where
 }
 
 pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
-    if old_root.get("inbounds") != new_root.get("inbounds") {
+    if !inbounds_equal(old_root.get("inbounds"), new_root.get("inbounds")) {
         return false;
     }
     let old_clash = old_root
@@ -701,6 +705,46 @@ pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
     }
     if old_root.get("ntp") != new_root.get("ntp") {
         return false;
+    }
+    true
+}
+
+fn inbounds_equal(old_val: Option<&Value>, new_val: Option<&Value>) -> bool {
+    if old_val == new_val {
+        return true;
+    }
+    let (Some(Value::Array(old_arr)), Some(Value::Array(new_arr))) = (old_val, new_val) else {
+        return false;
+    };
+    if old_arr.len() != new_arr.len() {
+        return false;
+    }
+    for (old_item, new_item) in old_arr.iter().zip(new_arr.iter()) {
+        if old_item == new_item {
+            continue;
+        }
+        let (Some(old_obj), Some(new_obj)) = (old_item.as_object(), new_item.as_object()) else {
+            return false;
+        };
+        let old_port = old_obj
+            .get("listen_port")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let new_port = new_obj
+            .get("listen_port")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if old_port == 0 || new_port == 0 {
+            let mut o = old_obj.clone();
+            let mut n = new_obj.clone();
+            o.remove("listen_port");
+            n.remove("listen_port");
+            if o != n {
+                return false;
+            }
+        } else {
+            return false;
+        }
     }
     true
 }

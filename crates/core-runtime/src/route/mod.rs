@@ -782,6 +782,15 @@ impl RouterInner {
         std::mem::take(&mut *self.probe_tasks.lock().expect("probe tasks"))
     }
 
+    /// Track a background task (probe, updater, recovery) so it is aborted on reload/shutdown.
+    pub fn track_background_task(&self, handle: tokio::task::JoinHandle<()>) {
+        self.probe_tasks.lock().expect("probe tasks").push(handle);
+    }
+
+    pub fn background_tasks_count(&self) -> usize {
+        self.probe_tasks.lock().expect("probe tasks").len()
+    }
+
     /// Clash `DelayHistory`: record a successful probe against `index`.
     pub fn record_delay(&self, index: usize, delay: u32) {
         let index = self.delay_provenance_index(index);
@@ -1274,6 +1283,14 @@ impl Router {
 
     pub fn take_probe_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         self.inner().take_probe_tasks()
+    }
+
+    pub fn track_background_task(&self, handle: tokio::task::JoinHandle<()>) {
+        self.inner().track_background_task(handle);
+    }
+
+    pub fn background_tasks_count(&self) -> usize {
+        self.inner().background_tasks_count()
     }
 
     pub fn record_delay(&self, index: usize, delay: u32) {

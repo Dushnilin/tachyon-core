@@ -551,17 +551,18 @@ impl RemoteRegistry {
                 logging::warn(format_args!(
                     "{error}: starting with an empty rule-set, retrying in the background"
                 ));
-                spawn_recovery(Arc::clone(set), Arc::clone(router), cache.cloned());
+                let handle = spawn_recovery(Arc::clone(set), Arc::clone(router), cache.cloned());
+                router.track_background_task(handle);
             }
         }
         Ok(())
     }
 
-    /// Periodic refresh; the task ends with the process.
+    /// Periodic refresh; the task ends with the process or when aborted on reload.
     pub fn spawn_updaters(&self, router: Arc<Router>, cache: Option<SharedCacheFile>) {
         for set in &self.sets {
             let state = Arc::clone(set);
-            let router = Arc::clone(&router);
+            let router_c = Arc::clone(&router);
             let cache = cache.clone();
             let interval = {
                 let guard = set.try_lock().expect("rule-set mutex");
@@ -573,17 +574,18 @@ impl RemoteRegistry {
                     DEFAULT_UPDATE_INTERVAL
                 }
             };
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
                     let mut guard = state.lock().await;
-                    if let Err(error) = guard.fetch(&router, false, cache.as_ref()).await {
+                    if let Err(error) = guard.fetch(&router_c, false, cache.as_ref()).await {
                         logging::error(format_args!("fetch rule-set {}: {error}", guard.tag()));
                     }
                 }
             });
+            router.track_background_task(handle);
         }
     }
 }
@@ -594,7 +596,7 @@ fn spawn_recovery(
     set: Arc<Mutex<RemoteRuleSet>>,
     router: Arc<Router>,
     cache: Option<SharedCacheFile>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         for delay in RECOVERY_LADDER {
             tokio::time::sleep(delay).await;
@@ -616,7 +618,7 @@ fn spawn_recovery(
             "rule-set {} is still empty, the periodic updater will keep trying",
             set.lock().await.tag()
         ));
-    });
+    })
 }
 
 /// `ruleSet.Read` for a downloaded payload: the pinned `format` wins, then the

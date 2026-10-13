@@ -780,11 +780,21 @@ impl Masque {
         let cmd_tx = shared.cmd_tx.clone();
         let udp_timeout = self.cfg.udp_timeout;
 
+        let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::inbound::udp::now_ms(),
+        ));
+        let last_act_rx = Arc::clone(&last_activity);
+        let last_act_tx = Arc::clone(&last_activity);
+
         // replies: stack → session channel → loopback peer socket.
         {
             let peer = Arc::clone(&peer);
             tokio::spawn(async move {
                 while let Some(bytes) = replies.recv().await {
+                    last_act_rx.store(
+                        crate::inbound::udp::now_ms(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if peer.send(&bytes).await.is_err() {
                         break;
                     }
@@ -795,16 +805,33 @@ impl Masque {
         // sends: loopback peer socket → stack (mirrors the hysteria2 bridge).
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
-            while let Ok(Ok(n)) = tokio::time::timeout(udp_timeout, peer.recv(&mut buf)).await {
-                if cmd_tx
-                    .send(Cmd::UdpSend {
-                        port,
-                        bytes: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
+            let check_interval = udp_timeout.min(Duration::from_secs(5));
+            loop {
+                match tokio::time::timeout(check_interval, peer.recv(&mut buf)).await {
+                    Ok(Ok(n)) => {
+                        last_act_tx.store(
+                            crate::inbound::udp::now_ms(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if cmd_tx
+                            .send(Cmd::UdpSend {
+                                port,
+                                bytes: buf[..n].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        let elapsed = crate::inbound::udp::now_ms()
+                            .saturating_sub(last_act_tx.load(std::sync::atomic::Ordering::Relaxed));
+                        if elapsed >= udp_timeout.as_millis() as u64 {
+                            break;
+                        }
+                    }
                 }
             }
             let _ = cmd_tx.send(Cmd::UdpClose { port }).await;

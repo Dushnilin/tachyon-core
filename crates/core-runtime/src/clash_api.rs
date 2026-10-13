@@ -1463,7 +1463,7 @@ fn udp_capable(outbound: &Outbound) -> bool {
 }
 
 /// Reference `urltest.URLTest`: HEAD through the outbound, any HTTP response
-/// counts, delay measured from the dial (reset before the TLS handshake).
+/// counts, delay measured from the dial (reset after the TLS handshake).
 async fn delay_test(
     stream: &mut TcpStream,
     router: &Router,

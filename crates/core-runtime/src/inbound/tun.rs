@@ -347,6 +347,7 @@ impl Tun {
                 self.udp_timeout,
                 DatagramFrame::Raw,
             );
+            let _stop_hub = crate::inbound::udp::StopHub(Arc::clone(&hub));
             let reply = Reply::Tun { sender: tun_tx };
 
             let async_fd = Arc::clone(&self.async_fd);

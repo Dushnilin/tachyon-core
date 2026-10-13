@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -423,6 +423,7 @@ impl Hysteria2 {
             sock: Arc::clone(&peer),
             defragger: std::sync::Mutex::new(Defragger::new()),
             packet_id: AtomicU32::new(0),
+            last_activity: AtomicU64::new(crate::inbound::udp::now_ms()),
         });
         shared
             .sessions
@@ -437,9 +438,13 @@ impl Hysteria2 {
         let handle = tokio::spawn(async move {
             let _lease = lease;
             let mut buf = vec![0u8; 65_535];
+            let check_interval = DEFAULT_UDP_TIMEOUT.min(Duration::from_secs(5));
             loop {
-                match tokio::time::timeout(DEFAULT_UDP_TIMEOUT, peer_f.recv(&mut buf)).await {
+                match tokio::time::timeout(check_interval, peer_f.recv(&mut buf)).await {
                     Ok(Ok(n)) => {
+                        sess_f
+                            .last_activity
+                            .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
                         if let Err(e) =
                             send_hy2_datagram(&shared_f.conn, sid, &dest_f, &buf[..n], &sess_f)
                         {
@@ -451,7 +456,13 @@ impl Hysteria2 {
                         logging::debug(format_args!("hysteria2 udp recv {sid}: {e}"));
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        let elapsed = crate::inbound::udp::now_ms()
+                            .saturating_sub(sess_f.last_activity.load(Ordering::Relaxed));
+                        if elapsed >= DEFAULT_UDP_TIMEOUT.as_millis() as u64 {
+                            break;
+                        }
+                    }
                 }
             }
             shared_f
@@ -507,6 +518,9 @@ impl Hy2Shared {
                 let Some(session) = session else {
                     continue;
                 };
+                session
+                    .last_activity
+                    .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
                 // share the datagram instead of copying the payload out of it
                 let payload = data.slice(payload.as_ptr() as usize - data.as_ptr() as usize..);
                 let complete = {
@@ -540,6 +554,7 @@ struct UdpSession {
     sock: Arc<tokio::net::UdpSocket>,
     defragger: std::sync::Mutex<Defragger>,
     packet_id: AtomicU32,
+    last_activity: AtomicU64,
 }
 
 fn go_parse_bool(s: &str) -> bool {

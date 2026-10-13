@@ -48,7 +48,7 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 | `log` | partial | level/output/timestamp/disabled live; `time` (unix epoch format) ignored |
 | `dns` | partial | udp/tcp/tls/https/fakeip + rule walk live; predefined rules, groups (lx) planned; `evaluate`/`respond` warn+inert |
 | `ntp` | partial | SNTP client + write_to_system; no interval edge cases yet |
-| `certificate` | planned | |
+| `certificate` | partial | `probe_connector` implemented (`tls_client.rs`) |
 | `endpoints` | planned | sing-box 1.12+, incl. AWG fields |
 | `inbounds` | partial | tproxy/direct/mixed/redirect data plane live (F1); server half planned |
 | `outbounds` | planned | see protocol table |

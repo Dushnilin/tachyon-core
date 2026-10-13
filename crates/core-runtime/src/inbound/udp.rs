@@ -96,14 +96,17 @@ impl Flow {
     /// once so a push that raced the release cannot be stranded with no
     /// writer looking at it.
     async fn drain_backlog(self: Arc<Self>) {
-        loop {
+        'drain: loop {
             loop {
                 let next = self.backlog.lock().expect("backlog").pop_front();
                 let Some(pkt) = next else {
                     break;
                 };
                 if let FlowKind::Outbound { sock } = &self.kind {
-                    let _ = sock.send(&pkt).await;
+                    match tokio::time::timeout(self.timeout, sock.send(&pkt)).await {
+                        Ok(Ok(_)) => {}
+                        _ => break 'drain,
+                    }
                 }
             }
             self.writing.store(false, Ordering::Release);
@@ -116,12 +119,13 @@ impl Flow {
             }
             // we reclaimed the racing push ourselves
         }
+        self.writing.store(false, Ordering::Release);
     }
 }
 
 static START_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     let epoch = START_EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -632,7 +636,9 @@ impl UdpHub {
                     &ctx.destination
                 };
                 let timeout = ctx.udp_timeout.unwrap_or(self.timeout);
-                let sock = self.router.connect_udp_index(idx, target).await?;
+                let sock = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
+                    .scope(timeout, self.router.connect_udp_index(idx, target))
+                    .await?;
                 let sock = Arc::new(sock);
                 let task = spawn_reverse(
                     Arc::clone(&sock),
@@ -737,6 +743,14 @@ impl UdpHub {
     }
 }
 
+pub(crate) struct StopHub(pub(crate) Arc<UdpHub>);
+
+impl Drop for StopHub {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// The UDP command of a proxy-protocol server inbound: `[len:u16][payload]` in
 /// both directions over the connection the client already opened, with every
 /// datagram going to the destination its request head named.
@@ -761,6 +775,7 @@ where
         Duration::ZERO,
         DatagramFrame::LengthPrefixed,
     );
+    let _stop_hub = StopHub(Arc::clone(&hub));
     let reply = Reply::Stream(writer);
     let mut len = [0u8; 2];
     loop {
@@ -1145,5 +1160,72 @@ mod tests {
             crate::outbound::packet::take_addr_port(&framed[2..]).expect("take addr port");
         assert_eq!(got_target, Target::Ip(dest));
         assert_eq!(got_payload, payload);
+    }
+
+    #[tokio::test]
+    async fn hub_applies_udp_timeout_to_outbound_bridge() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let router = Router::new(&serde_json::json!({
+            "outbounds": [{
+                "type": "vless",
+                "tag": "out",
+                "server": "127.0.0.1",
+                "server_port": proxy_addr.port(),
+                "uuid": "00000000-0000-0000-0000-000000000001",
+                "packet_encoding": "xudp"
+            }],
+            "route": {"final": "out"}
+        }))
+        .unwrap();
+
+        let hub = UdpHub::new(router, Duration::from_millis(50), DatagramFrame::Raw);
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let src: SocketAddr = "127.0.0.1:39123".parse().unwrap();
+        let dst: SocketAddr = "192.0.2.1:53".parse().unwrap();
+
+        hub.handle(
+            Reply::Socket(Arc::downgrade(&reply)),
+            src,
+            dst,
+            b"test-datagram",
+            "test",
+        )
+        .await
+        .unwrap();
+
+        let bridge_peer_addr = {
+            let flows = hub.flows.read().unwrap();
+            let flow = flows.get(&(src, dst)).expect("flow opened");
+            let FlowKind::Outbound { sock } = &flow.kind else {
+                panic!("expected Outbound flow");
+            };
+            sock.peer_addr().expect("peer_addr")
+        };
+
+        // Without UDP_BRIDGE_TIMEOUT scope, the bridge lives for the 120s default timeout.
+        // With the 50ms scope, it stops within ~100ms and drops its peer socket.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            tokio::net::UdpSocket::bind(bridge_peer_addr).await.is_ok(),
+            "outbound bridge failed to release socket within 50ms udp_timeout"
+        );
+
+        hub.stop();
+        server.abort();
     }
 }

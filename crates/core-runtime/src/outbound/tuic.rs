@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -276,6 +276,7 @@ impl Tuic {
             sock: Arc::clone(&peer),
             defragger: std::sync::Mutex::new(Defragger::new()),
             packet_id: AtomicU32::new(0),
+            last_activity: AtomicU64::new(crate::inbound::udp::now_ms()),
         });
         shared
             .sessions
@@ -290,9 +291,13 @@ impl Tuic {
         let handle = tokio::spawn(async move {
             let _lease = lease;
             let mut buf = vec![0u8; 65_535];
+            let check_interval = DEFAULT_UDP_TIMEOUT.min(Duration::from_secs(5));
             loop {
-                match tokio::time::timeout(DEFAULT_UDP_TIMEOUT, peer_f.recv(&mut buf)).await {
+                match tokio::time::timeout(check_interval, peer_f.recv(&mut buf)).await {
                     Ok(Ok(n)) => {
+                        sess_f
+                            .last_activity
+                            .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
                         if let Err(e) =
                             send_tuic_datagram(&shared_f, sid, &target_f, &buf[..n], &sess_f).await
                         {
@@ -304,7 +309,13 @@ impl Tuic {
                         logging::debug(format_args!("tuic udp recv {sid}: {e}"));
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        let elapsed = crate::inbound::udp::now_ms()
+                            .saturating_sub(sess_f.last_activity.load(Ordering::Relaxed));
+                        if elapsed >= DEFAULT_UDP_TIMEOUT.as_millis() as u64 {
+                            break;
+                        }
+                    }
                 }
             }
             shared_f
@@ -415,6 +426,7 @@ struct TuicUdpSession {
     sock: Arc<tokio::net::UdpSocket>,
     defragger: std::sync::Mutex<Defragger>,
     packet_id: AtomicU32,
+    last_activity: AtomicU64,
 }
 
 async fn tuic_auth(conn: &quinn::Connection, uuid: &[u8; 16], password: &str) -> io::Result<()> {
@@ -484,6 +496,9 @@ async fn handle_tuic_packet_body(shared: &Arc<TuicShared>, body: bytes::Bytes) {
     let Some(session) = session else {
         return;
     };
+    session
+        .last_activity
+        .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
     // share the message instead of copying the payload out of it — bounded
     // by the parsed length: a datagram may carry trailing bytes the parser
     // does not consider part of the fragment

@@ -160,6 +160,7 @@ pub async fn serve_mux(
                     crate::inbound::udp::DEFAULT_UDP_TIMEOUT,
                     frame,
                 );
+                let _stop_hub = crate::inbound::udp::StopHub(Arc::clone(&hub));
                 let reply = crate::inbound::udp::Reply::Stream(writer);
                 let mut len_buf = [0u8; 2];
                 loop {

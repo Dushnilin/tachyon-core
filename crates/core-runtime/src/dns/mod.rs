@@ -80,6 +80,8 @@ impl Strategy {
     }
 }
 
+type ServerAddrLockMap = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
+
 pub struct DnsService {
     servers: HashMap<String, Arc<ServerConfig>>,
     rules: Vec<Rule>,
@@ -103,7 +105,7 @@ pub struct DnsService {
     /// dozens of identical bootstrap queries at the same instant get dropped
     /// upstream and every one of them sat out the full timeout.
     server_addrs: std::sync::Mutex<HashMap<(String, String), (SocketAddr, Instant)>>,
-    server_addr_lock: tokio::sync::Mutex<()>,
+    server_addr_locks: std::sync::Mutex<ServerAddrLockMap>,
     /// Installed after the router exists, so `detour` can dial through it.
     router: RwLock<Option<Arc<crate::route::Router>>>,
     /// `dns.reverse_mapping`: ip → domain learned from A/AAAA answers, present
@@ -344,7 +346,7 @@ impl DnsService {
             inflight: std::sync::Mutex::new(HashMap::new()),
             refreshing: std::sync::Mutex::new(HashSet::new()),
             server_addrs: std::sync::Mutex::new(HashMap::new()),
-            server_addr_lock: tokio::sync::Mutex::new(()),
+            server_addr_locks: std::sync::Mutex::new(HashMap::new()),
             router: RwLock::new(None),
             reverse: reverse_mapping.then(|| RwLock::new(HashMap::new())),
             client_subnet,
@@ -1157,7 +1159,22 @@ impl DnsService {
                 // only the outermost lookup takes the lock: a chained resolver
                 // resolving its own address would otherwise wait on itself
                 let _once = match depth {
-                    0 => Some(self.server_addr_lock.lock().await),
+                    0 => {
+                        let lock = {
+                            let mut locks =
+                                self.server_addr_locks.lock().expect("server addr locks");
+                            locks.retain(|_, weak| weak.strong_count() > 0);
+                            match locks.get(&cache_key).and_then(Weak::upgrade) {
+                                Some(lock) => lock,
+                                None => {
+                                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                                    locks.insert(cache_key.clone(), Arc::downgrade(&lock));
+                                    lock
+                                }
+                            }
+                        };
+                        Some(lock.lock_owned().await)
+                    }
                     _ => None,
                 };
                 if let Some(addr) = fresh(self) {

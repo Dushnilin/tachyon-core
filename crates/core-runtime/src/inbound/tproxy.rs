@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
+use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, StopHub, UdpHub};
 use crate::inbound::{Target, drive_transparent, network_includes_udp, parse_listen};
 use crate::logging;
 use crate::outbound::urltest::parse_duration;
@@ -260,14 +260,6 @@ impl Tproxy {
             _ = tcp => {}
             _ = udp_loop => {}
         }
-    }
-}
-
-struct StopHub(Arc<UdpHub>);
-
-impl Drop for StopHub {
-    fn drop(&mut self) {
-        self.0.stop();
     }
 }
 

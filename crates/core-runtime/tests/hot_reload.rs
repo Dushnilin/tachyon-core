@@ -58,8 +58,14 @@ async fn socks5_handshake(stream: &mut TcpStream, target: SocketAddr) {
     assert_eq!(reply[1], 0, "status succeeded");
 }
 
+async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
+
 #[tokio::test]
 async fn hot_reload_preserves_live_tcp_connections() {
+    let _guard = test_guard().await;
     let echo = spawn_echo().await;
 
     // 1. Initial config with mixed inbound
@@ -148,6 +154,7 @@ async fn hot_reload_preserves_live_tcp_connections() {
 
 #[tokio::test]
 async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
+    let _guard = test_guard().await;
     let _echo = spawn_echo().await;
 
     let root1 = json!({
@@ -237,6 +244,7 @@ async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
 
 #[tokio::test]
 async fn hot_reload_failure_keeps_running_instance_untouched() {
+    let _guard = test_guard().await;
     let echo = spawn_echo().await;
 
     let root1 = json!({
@@ -306,4 +314,133 @@ async fn hot_reload_failure_keeps_running_instance_untouched() {
     assert_eq!(&buf2, b"still_working_after_failure");
 
     instance.shutdown();
+}
+
+#[tokio::test]
+async fn reload_in_place_rejects_inbound_changes() {
+    let _guard = test_guard().await;
+    let root1 = json!({
+        "log": {"level": "error"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": 0
+        }],
+        "outbounds": [
+            {"type": "direct", "tag": "direct-out"}
+        ],
+        "route": {"final": "direct-out"}
+    });
+
+    let mut instance = core_runtime::start(&root1).await.expect("start box");
+
+    // Modify inbounds in new configuration
+    let root2 = json!({
+        "log": {"level": "error"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "different-tag",
+            "listen": "127.0.0.1",
+            "listen_port": 12345
+        }],
+        "outbounds": [
+            {"type": "direct", "tag": "direct-out"}
+        ],
+        "route": {"final": "direct-out"}
+    });
+
+    let err = instance.reload_in_place(&root2).await.unwrap_err();
+    assert!(
+        err.to_string().contains("cannot reload in-place"),
+        "expected in-place reload rejection error, got: {err}"
+    );
+
+    instance.shutdown();
+}
+
+#[tokio::test]
+async fn reload_in_place_does_not_leak_rule_set_tasks() {
+    let _guard = test_guard().await;
+
+    let payload = json!({
+        "version": 1,
+        "rules": [
+            {"domain_suffix": "example.com"}
+        ]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let server = tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let p = payload_bytes.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    p.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(&p).await;
+                let _ = s.flush().await;
+            });
+        }
+    });
+
+    let root = json!({
+        "log": {"level": "error"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "in",
+            "listen": "127.0.0.1",
+            "listen_port": 0
+        }],
+        "route": {
+            "rule_set": [
+                {
+                    "type": "remote",
+                    "tag": "remote-rules",
+                    "format": "source",
+                    "url": format!("http://{addr}/rules.json"),
+                    "download_detour": "direct-out",
+                    "update_interval": "1h"
+                }
+            ],
+            "rules": [
+                {
+                    "rule_set": "remote-rules",
+                    "outbound": "direct-out"
+                }
+            ],
+            "final": "direct-out"
+        },
+        "outbounds": [
+            {"type": "direct", "tag": "direct-out"}
+        ]
+    });
+
+    let mut instance = core_runtime::start(&root).await.expect("start box");
+    let initial_tasks = instance.router().background_tasks_count();
+    assert!(
+        initial_tasks >= 1,
+        "expected at least 1 updater task spawned"
+    );
+
+    for _ in 0..5 {
+        instance
+            .reload_in_place(&root)
+            .await
+            .expect("reload in place");
+    }
+
+    let final_tasks = instance.router().background_tasks_count();
+    assert_eq!(
+        final_tasks, initial_tasks,
+        "tasks leaked! initial={initial_tasks}, final={final_tasks}"
+    );
+
+    instance.shutdown();
+    server.abort();
 }

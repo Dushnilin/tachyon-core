@@ -347,11 +347,8 @@ async fn handle_websocket_tunnel(
     let assign_payload = encode_ip_assignment(&client_ipv4, &client_ipv6);
     send_ws_frame(&mut stream, OP_BINARY, &assign_payload).await?;
 
-    let hub = Arc::new(UdpHub::new(
-        Arc::clone(router),
-        DEFAULT_UDP_TIMEOUT,
-        DatagramFrame::Raw,
-    ));
+    let hub = UdpHub::new(Arc::clone(router), DEFAULT_UDP_TIMEOUT, DatagramFrame::Raw);
+    let _stop_hub = crate::inbound::udp::StopHub(Arc::clone(&hub));
 
     let stream = Arc::new(Mutex::new(stream));
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<crate::inbound::udp::TunReply>(256);

@@ -978,7 +978,9 @@ async fn predefined_noerror_and_ruleset_matching() {
 
 #[tokio::test]
 async fn domain_resolver_v4_only_uplink_does_not_timeout_on_dropped_aaaa() {
-    let (addr, a_hits, aaaa_hits) = spawn_udp_dns_v4_only(Ipv4Addr::new(93, 184, 216, 34)).await;
+    // Resolve the upstream to the fixture itself, not an external host that
+    // does not serve DNS. Both bootstrap and the final exchange stay local.
+    let (addr, a_hits, aaaa_hits) = spawn_udp_dns_v4_only(Ipv4Addr::LOCALHOST).await;
     let root = json!({
         "dns": {
             "servers": [
@@ -993,7 +995,7 @@ async fn domain_resolver_v4_only_uplink_does_not_timeout_on_dropped_aaaa() {
                     "tag": "upstream",
                     "server": "example.com",
                     "domain_resolver": "bootstrap",
-                    "server_port": 53
+                    "server_port": addr.port()
                 }
             ],
             "final": "upstream",
@@ -1011,6 +1013,6 @@ async fn domain_resolver_v4_only_uplink_does_not_timeout_on_dropped_aaaa() {
         resp.is_ok(),
         "timed out waiting for domain_resolver on dropped AAAA"
     );
-    assert!(a_hits.load(Ordering::SeqCst) >= 1);
+    assert!(a_hits.load(Ordering::SeqCst) >= 2);
     assert!(aaaa_hits.load(Ordering::SeqCst) >= 1);
 }

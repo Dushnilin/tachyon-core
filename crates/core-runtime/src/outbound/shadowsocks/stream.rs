@@ -7,33 +7,42 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::crypto::{AEAD_TAG, Cipher, Method, derive_subkey, master_key, random_bytes};
 use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 
-/// Read buffer floor, several records deep: `need` reads as much as the buffer
-/// has room for in one syscall, so a bigger buffer means fewer syscalls per GiB.
-const READ_BUF: usize = 256 * 1024;
+/// Read buffer floor: on single-worker router runtimes, 48 KiB easily fits
+/// several records while staying cache-resident on in-order Cortex-A55 cores.
+/// Multi-core hosts use 256 KiB for maximum syscall amortization.
+fn default_read_buf() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let workers = std::env::var("TACHYON_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        if workers == 1 { 48 * 1024 } else { 256 * 1024 }
+    })
+}
 
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
 /// block, the tag on that block and the tag on the payload.
 const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
-/// Largest frame a connection keeps between writes. The relay hands over 128 KiB
-/// at a time, which seals to a little more than that, so the steady state stays
-/// well under this and the buffer is never dropped.
-const WRITE_BUF_KEEP: usize = 256 * 1024;
+
+/// Largest frame a connection keeps between writes.
+fn write_buf_keep() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let workers = std::env::var("TACHYON_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        if workers == 1 { 64 * 1024 } else { 256 * 1024 }
+    })
+}
 
 /// Read buffer floor for `method`: enough for one whole record of `method`
-/// plus the length block of the next one, and at least `READ_START`.
-///
-/// The reader asks for a *payload* (`payload_len + AEAD_TAG`), but what it needs
-/// is room for the record that payload belongs to. Sizing to the payload leaves a
-/// 2022 buffer one length block short of its own record: `need(18)` consumes the
-/// header, `need(65551)` then finds 18 bytes missing and moves the whole 65533-byte
-/// payload to the front before it can read them -- a full copy of every byte, every
-/// record, plus a syscall and a wakeup it would not have needed. Legacy records are
-/// small enough that two of them fit, which is why only 2022 paid it.
-///
-/// Read buffer floor for `method`: enough for one whole record of `method`
-/// plus the length block of the next one, and at least `READ_BUF`.
+/// plus the length block of the next one, and at least `default_read_buf()`.
 fn read_buf(method: Method) -> usize {
-    (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
+    (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(default_read_buf())
 }
 
 /// shadowsocks outbound: AEAD (2017) and AEAD-2022 ciphers over TCP.
@@ -216,7 +225,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> SsWriter<W> {
         }
         self.inner.write_all(&self.buf).await?;
         // a one-off big write must not pin its buffer for the connection's life
-        if self.buf.capacity() > WRITE_BUF_KEEP {
+        if self.buf.capacity() > write_buf_keep() {
             self.buf = Vec::new();
         }
         Ok(())

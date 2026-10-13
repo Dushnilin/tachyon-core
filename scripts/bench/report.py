@@ -38,8 +38,18 @@ REF_NAME = "sing-box"
 HOST_RU = {"desktop": "десктоп", "router": "роутер"}
 
 
-def host_of(path):
-    return "router" if os.path.basename(path).endswith("-router.json") else "desktop"
+def host_of(path, run=None):
+    if run:
+        cores = run.get("cores")
+        cpu = str(run.get("cpu", ""))
+        if cores == 1 or run.get("kernel") == "6.12.94":
+            return "router"
+        if cores and cores > 1 and ("Ryzen" in cpu or "Intel" in cpu):
+            return "desktop"
+    parts = os.path.normpath(path).split(os.sep)
+    if "router" in parts or os.path.basename(path).endswith("-router.json"):
+        return "router"
+    return "desktop"
 
 
 def load(path):
@@ -741,7 +751,7 @@ def tabs_html(by_host, by_entries):
 def render(entries, live_path, strict, note=""):
     by_host, order = {}, []
     for e in entries:
-        h = host_of(e[0])
+        h = host_of(e[0], e[1])
         if h not in by_host:
             by_host[h] = []
             order.append(h)

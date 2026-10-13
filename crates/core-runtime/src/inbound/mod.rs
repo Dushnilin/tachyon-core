@@ -714,16 +714,22 @@ fn relay_buf() -> usize {
         {
             return n;
         }
-        2 * 65535
+        let workers = std::env::var("TACHYON_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        if workers == 1 { 32 * 1024 } else { 2 * 65535 }
     })
 }
 
 /// Relay buffers waiting for the next connection. A connection takes two and
 /// gives them back on close: at 128 KiB each is an mmap/munmap pair on glibc,
-/// and a steady connection rate pays that per connection. Capped so a burst
-/// cannot pin memory (16 x 128 KiB = 2 MiB).
+/// and a steady connection rate pays that per connection. Sized to 64 buffers
+/// (2 MiB on single-core 32 KiB, 8 MiB on multi-core 128 KiB) so concurrent
+/// multi-stream runs do not drop buffers to munmap.
 static BUF_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
-const POOL_CAP: usize = 16;
+const POOL_CAP: usize = 64;
 
 fn take_buf() -> Vec<u8> {
     let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());

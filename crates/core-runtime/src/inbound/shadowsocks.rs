@@ -515,47 +515,49 @@ struct ChunkReader {
     read_buf: usize,
 }
 
-/// Read buffer floor, several records deep: `poll_fill` reads as much as the
-/// buffer has room for in one syscall, so a bigger buffer means fewer syscalls
-/// per GiB -- with 33 KiB the steady state was one record per `recvfrom` while
-/// a peer with a large buffer drained four or five records per `read`. Grown
-/// to only when the first chunk is waited for.
-const READ_BUF: usize = 256 * 1024;
+/// Read buffer floor: on single-worker router runtimes, 48 KiB easily fits
+/// several records while staying cache-resident on in-order Cortex-A55 cores.
+/// Multi-core hosts use 256 KiB for maximum syscall amortization.
+fn default_read_buf() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let workers = std::env::var("TACHYON_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        if workers == 1 { 48 * 1024 } else { 256 * 1024 }
+    })
+}
+
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
 /// block, the tag on that block and the tag on the payload.
 const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
 
 /// Read buffer big enough for one whole record of `method` plus the length block
 /// of the next one.
-///
-/// `poll_fill` is asked for a *payload* (`payload_len + AEAD_TAG`), but what it
-/// needs is room for the record that payload belongs to. Sizing to the payload
-/// leaves a 2022 buffer one length block short of its own record, so every record
-/// costs a full copy of its payload on the way to the front of the buffer plus a
-/// syscall and a wakeup. Legacy records are small enough that two of them fit,
-/// which is why only 2022 paid it.
 fn read_buf(method: Method) -> usize {
-    (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(READ_BUF)
+    (usize::from(method.max_chunk()) + BLOCK_OVERHEAD).max(default_read_buf())
 }
+
 /// Most plaintext one write turns into a frame, sized to the relay's read so a
-/// frame of several records leaves as one syscall: at 64 KiB a 2022 frame was
-/// one record no matter how much the relay had read.
-const WRITE_FRAME: usize = 128 * 1024;
+/// frame of several records leaves as one syscall.
+fn write_frame_limit() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let workers = std::env::var("TACHYON_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        if workers == 1 { 32 * 1024 } else { 128 * 1024 }
+    })
+}
 
 /// How much of `avail` one frame takes: whole chunks, and as much of
-/// [`WRITE_FRAME`] as fits in them.
-///
-/// `WRITE_FRAME` is a multiple of neither chunk size -- it is 128 KiB against
-/// `0x3FFF` and against `0xFFFF` -- so cutting a frame at it left a tail that
-/// went out as a record of its own. That is two more AEAD invocations for
-/// nothing, a few bytes of wire, and a peer that has to open a second record
-/// where it expected one. Cutting on a chunk boundary instead
-/// leaves the remainder with the caller, and the relay -- which keeps what a
-/// partial write did not take -- coalesces it with the next read into a full
-/// chunk. A write that genuinely holds less than one chunk still goes out whole:
-/// holding it back would stall anything that waits for an answer.
+/// [`write_frame_limit()`] as fits in them.
 fn frame_take(avail: usize, max_chunk: usize) -> usize {
-    let room = WRITE_FRAME.max(max_chunk);
+    let room = write_frame_limit().max(max_chunk);
     let whole = avail.min(room) / max_chunk * max_chunk;
     whole.max(max_chunk).min(avail)
 }

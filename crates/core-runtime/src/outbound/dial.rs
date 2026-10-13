@@ -788,8 +788,11 @@ where
 /// No `setsockopt` to reach for here: `parse` already refused the options this
 /// platform cannot carry, so the socket is the plain one.
 #[cfg(not(unix))]
-async fn dial_tcp(addr: SocketAddr, _options: &DialOptions) -> io::Result<TcpStream> {
-    TcpStream::connect(addr).await
+async fn dial_tcp(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpStream> {
+    match tokio::time::timeout(options.connect_timeout(), TcpStream::connect(addr)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+    }
 }
 
 #[cfg(not(unix))]

@@ -178,10 +178,12 @@ async fn vision_frames_the_payload_behind_the_uuid() {
     let head = vision_request_head();
     assert_eq!(&seen[..head.len()], &head[..], "the request head");
 
-    // the payload arrives as [command][content_len][pad_len][content][pad]
+    // The first Vision frame carries its own UUID after the VLESS header:
+    // [uuid][command][content_len][pad_len][content][pad].
     let payload = b"GET / HTTP/1.1\r\n\r\n";
     let start = head.len();
-    let frame = &seen[start..];
+    assert_eq!(&seen[start..start + 16], &UUID, "the Vision UUID prefix");
+    let frame = &seen[start + 16..];
     // the first frame of the padding phase is Continue: End means "the framing
     // stops here", so a client would read this header as payload
     assert_eq!(frame[0], 0, "commandPaddingContinue");

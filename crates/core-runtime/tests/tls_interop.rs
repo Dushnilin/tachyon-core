@@ -127,10 +127,16 @@ async fn assert_outbound(
     let echo = spawn_echo().await;
     let users = match inbound_type {
         "vless" => json!([{"uuid": VLESS_UUID}]),
+        "vless-vision" => json!([{"uuid": VLESS_UUID, "flow": "xtls-rprx-vision"}]),
         "trojan" => json!([{"password": "trojan-secret"}]),
         "anytls" => json!([{"password": "anytls-secret"}]),
         "naive" => json!([{"username": "naive-user", "password": "naive-secret"}]),
         other => panic!("unsupported inbound type {other}"),
+    };
+    let inbound_type = if inbound_type == "vless-vision" {
+        "vless"
+    } else {
+        inbound_type
     };
     let _server = start_ref(
         ref_bin,
@@ -180,6 +186,28 @@ async fn interop_vless_tls() {
             "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
         })
     })
+    .await;
+}
+
+/// An independent Vision peer catches a missing first-frame UUID that a
+/// round trip between two copies of our own codec cannot detect.
+#[tokio::test]
+async fn interop_vless_vision_tls() {
+    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
+        return;
+    };
+    assert_outbound(
+        &ref_bin.to_string_lossy(),
+        "vless-vision",
+        "vless+vision+tls",
+        |port| {
+            json!({
+                "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+                "uuid": VLESS_UUID, "flow": "xtls-rprx-vision",
+                "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
+            })
+        },
+    )
     .await;
 }
 

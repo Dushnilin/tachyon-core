@@ -4,8 +4,8 @@
 //! `[command:u8, content_len:u16, padding_len:u16, content, padding]`, and strips
 //! the same framing on the way back. Padding keeps the small writes of a TLS
 //! handshake looking like record traffic, which is the point of the flow.
-//! Note that the user UUID belongs strictly to the VLESS protocol request header,
-//! not the Vision stream framing.
+//! Each direction prefixes its first frame with the 16-byte user UUID, in
+//! addition to the UUID in the VLESS request header. Subsequent frames omit it.
 //!
 //! The framing is *transient*, and getting that wrong breaks the flow in both
 //! directions. `CommandPaddingEnd` does not mean "this frame is the last one",
@@ -61,6 +61,9 @@ const TLS_APP_DATA: [u8; 3] = [0x17, 0x03, 0x03];
 
 pub struct VisionStream {
     inner: AnyStream,
+    uuid: [u8; 16],
+    write_uuid: bool,
+    read_uuid: bool,
     /// the reference's `isPadding`: framing covers the first packets only, and
     /// every write after the transition is the payload itself
     padding: bool,
@@ -87,9 +90,12 @@ pub struct VisionStream {
 }
 
 impl VisionStream {
-    pub fn new(inner: AnyStream, _uuid: [u8; 16]) -> Self {
+    pub fn new(inner: AnyStream, uuid: [u8; 16]) -> Self {
         Self {
             inner,
+            uuid,
+            write_uuid: true,
+            read_uuid: true,
             padding: true,
             saw_tls: false,
             packets_to_filter: PACKETS_TO_FILTER,
@@ -124,7 +130,13 @@ impl VisionStream {
             Self::random_below(PLAIN_PADDING_SPREAD)
         };
         self.framed.clear();
-        self.framed.reserve(5 + content.len() + padding_len);
+        let prefix_len = if self.write_uuid { self.uuid.len() } else { 0 };
+        self.framed
+            .reserve(prefix_len + 5 + content.len() + padding_len);
+        if self.write_uuid {
+            self.framed.extend_from_slice(&self.uuid);
+            self.write_uuid = false;
+        }
         self.framed.push(command);
         self.framed
             .extend_from_slice(&(content.len() as u16).to_be_bytes());
@@ -181,6 +193,23 @@ impl VisionStream {
     /// `VisionConn.unPadding` over `raw`, moving payload into `self.payload`.
     fn unpad(&mut self) {
         let mut index = 0usize;
+        if self.read_uuid {
+            let prefix_len = self.raw.len().min(self.uuid.len());
+            let matches = self.raw[..prefix_len] == self.uuid[..prefix_len];
+            // TCP may split both the UUID and the first five-byte header.
+            // Keep a matching partial prefix until it is complete or EOF.
+            if matches && self.raw.len() < self.uuid.len() + 5 && !self.eof {
+                return;
+            }
+            self.read_uuid = false;
+            if matches && self.raw.len() >= self.uuid.len() + 5 {
+                index = self.uuid.len();
+            } else {
+                // As in the reference, a response without our UUID is raw.
+                // Do not mistake its first bytes for a Vision frame header.
+                self.current_command = 0xFF;
+            }
+        }
         while index < self.raw.len() {
             if self.remaining_content <= 0 && self.remaining_padding <= 0 {
                 // any command but Continue ends the framing, and whatever
@@ -392,6 +421,56 @@ mod tests {
         BytesMut::from(out.as_slice())
     }
 
+    /// sing-vmess VisionConn.padding writes the UUID once before its header.
+    fn first_wire_frame(command: u8, content: &[u8], padding: usize) -> BytesMut {
+        let mut out = BytesMut::from(&uuid()[..]);
+        out.extend_from_slice(&wire_frame(command, content, padding));
+        out
+    }
+
+    #[test]
+    fn uuid_and_first_header_can_be_fragmented_at_every_boundary() {
+        let wire = first_wire_frame(PADDING_CONTINUE, b"payload", 3);
+        for split in 1..wire.len() {
+            let (mut sink, _) = pair();
+            sink.raw.extend_from_slice(&wire[..split]);
+            sink.unpad();
+            sink.raw.extend_from_slice(&wire[split..]);
+            sink.unpad();
+            assert_eq!(&sink.payload[..], b"payload", "split at {split}");
+            assert!(sink.raw.is_empty(), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn non_matching_uuid_is_raw_even_if_it_starts_with_a_valid_command() {
+        let (mut sink, _) = pair();
+        let mut raw = vec![0, 0, 3, 0, 1];
+        raw.extend_from_slice(b"unframed response beyond the header");
+        sink.raw.extend_from_slice(&raw);
+        sink.unpad();
+        sink.raw.extend_from_slice(b"tail");
+        sink.unpad();
+        raw.extend_from_slice(b"tail");
+        assert_eq!(&sink.payload[..], &raw);
+        assert!(sink.raw.is_empty());
+    }
+
+    #[test]
+    fn truncated_uuid_or_header_at_eof_is_not_discarded() {
+        let wire = first_wire_frame(PADDING_CONTINUE, b"payload", 1);
+        for len in 1..21 {
+            let (mut sink, _) = pair();
+            sink.raw.extend_from_slice(&wire[..len]);
+            sink.unpad();
+            assert!(sink.payload.is_empty(), "wait for prefix at {len}");
+            sink.eof = true;
+            sink.unpad();
+            assert_eq!(&sink.payload[..], &wire[..len]);
+            assert!(sink.raw.is_empty());
+        }
+    }
+
     /// A frame as it goes on the wire.
     fn frame_of(stream: &mut VisionStream, content: &[u8]) -> Vec<u8> {
         stream.build_frame(content, PADDING_CONTINUE);
@@ -399,13 +478,16 @@ mod tests {
     }
 
     fn padding_of(frame: &[u8]) -> usize {
+        let frame = frame.strip_prefix(&uuid()).unwrap_or(frame);
         usize::from(u16::from_be_bytes([frame[3], frame[4]]))
     }
 
     #[test]
-    fn first_frame_carries_the_five_byte_header() {
+    fn first_frame_carries_uuid_then_the_five_byte_header() {
         let (mut vision, _) = pair();
-        let frame = frame_of(&mut vision, b"hello");
+        let wire = frame_of(&mut vision, b"hello");
+        assert_eq!(&wire[..16], &uuid());
+        let frame = &wire[16..];
         assert_eq!(frame[0], PADDING_CONTINUE, "command");
         assert_eq!(u16::from_be_bytes([frame[1], frame[2]]), 5);
         let padding = u16::from_be_bytes([frame[3], frame[4]]) as usize;
@@ -418,15 +500,19 @@ mod tests {
     }
 
     #[test]
-    fn frames_start_with_five_byte_header() {
+    fn uuid_is_written_only_before_the_first_frame() {
         let (mut vision, _) = pair();
         vision.build_frame(b"one", PADDING_CONTINUE);
-        let first = vision.framed.clone();
+        let wire = vision.framed.clone();
+        assert_eq!(&wire[..16], &uuid());
+        let first = &wire[16..];
         vision.build_frame(b"two", PADDING_CONTINUE);
         let second = vision.framed.clone();
         assert_eq!(first[0], PADDING_CONTINUE);
         assert_eq!(u16::from_be_bytes([first[1], first[2]]), 3);
         assert_eq!(second[0], PADDING_CONTINUE);
+        let padding = padding_of(&second);
+        assert_eq!(second.len(), 5 + 3 + padding);
         assert_eq!(u16::from_be_bytes([second[1], second[2]]), 3);
     }
 
@@ -497,7 +583,7 @@ mod tests {
     #[test]
     fn any_command_but_continue_hands_the_rest_through() {
         for command in [PADDING_END, 0x02] {
-            let mut wire = wire_frame(PADDING_CONTINUE, b"framed", 4);
+            let mut wire = first_wire_frame(PADDING_CONTINUE, b"framed", 4);
             wire.extend_from_slice(&wire_frame(command, b"last", 2));
             wire.extend_from_slice(b"raw tail");
             let (mut sink, _) = pair();
@@ -583,6 +669,8 @@ mod tests {
         .expect("read back");
         writer.await.expect("writer");
 
+        assert_eq!(&got[..16], &uuid());
+        let got = &got[16..];
         assert_eq!(got[0], PADDING_CONTINUE, "command");
         assert_eq!(
             usize::from(u16::from_be_bytes([got[1], got[2]])),
@@ -600,7 +688,7 @@ mod tests {
 
     #[test]
     fn unpadding_strips_headers_and_padding() {
-        let mut bytes = wire_frame(PADDING_CONTINUE, b"first", 3);
+        let mut bytes = first_wire_frame(PADDING_CONTINUE, b"first", 3);
         bytes.extend_from_slice(&wire_frame(PADDING_CONTINUE, b"second", 5));
 
         let (mut sink, _) = pair();
@@ -612,7 +700,7 @@ mod tests {
 
     #[test]
     fn first_inbound_frame_unpads_cleanly() {
-        let framed = wire_frame(PADDING_CONTINUE, b"payload", 1);
+        let framed = first_wire_frame(PADDING_CONTINUE, b"payload", 1);
         let (mut sink, _) = pair();
         sink.raw = framed;
         sink.unpad();
@@ -642,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn reads_back_what_the_peer_wrote() {
         // two frames, delivered in pieces
-        let mut framed = wire_frame(PADDING_CONTINUE, b"alpha", 2);
+        let mut framed = first_wire_frame(PADDING_CONTINUE, b"alpha", 2);
         framed.extend_from_slice(&wire_frame(PADDING_CONTINUE, b"beta", 7));
         let (client, server) = tokio::io::duplex(4096);
         let mut sink = VisionStream::new(Box::new(client), uuid());

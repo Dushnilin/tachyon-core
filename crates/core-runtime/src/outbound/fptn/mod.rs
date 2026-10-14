@@ -11,7 +11,7 @@
 //!    already land on the stack's `local_cidr`.
 
 mod http;
-mod obfs;
+pub(crate) mod obfs;
 pub(crate) mod proto;
 mod reality;
 mod tls;
@@ -540,6 +540,10 @@ impl FptnConn {
             self.pending.extend(packets);
             return Ok(first);
         }
+    }
+
+    pub(crate) fn try_read_packet(&mut self) -> Option<Vec<u8>> {
+        self.pending.pop_front()
     }
 
     /// Serialize a whole batch into one binary WebSocket message (the

@@ -34,7 +34,7 @@ const EPHEMERAL_BASE: u16 = 49152;
 const SCRATCH_BUF: usize = 16_384;
 const CMD_QUEUE: usize = 256;
 const REPLY_QUEUE: usize = 64;
-const EGRESS_BUF_MAX: usize = 1 << 20;
+const EGRESS_BUF_MAX: usize = 16 << 20;
 
 /// One tunnel write carries at most this many IP packets — the reference
 /// FPTN client's `kMaxBatchSize` in `wsclient.cpp::RunSender`.
@@ -69,6 +69,14 @@ impl Leg {
             Leg::H3(conn) => conn.read_packet().await,
             Leg::H2(conn) => conn.read_packet().await,
             Leg::Fptn(conn) => conn.read_packet().await,
+        }
+    }
+
+    fn try_read_packet(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Leg::H3(conn) => conn.try_read_packet(),
+            Leg::H2(conn) => conn.try_read_packet(),
+            Leg::Fptn(conn) => conn.try_read_packet(),
         }
     }
 
@@ -716,13 +724,19 @@ pub(crate) async fn run(
     let mut ping_sent: Option<Instant> = None;
 
     loop {
+        while let Some(pkt) = leg.try_read_packet() {
+            stack.on_tunnel_packet(pkt);
+            stack.last_activity = Instant::now();
+        }
         while let Ok(cmd) = rx.try_recv() {
             stack.process_cmd(cmd);
             stack.last_activity = Instant::now();
         }
+        stack.maintain_tcp();
+        stack.poll_stack();
+        stack.maintain_tcp();
         stack.poll_stack();
         stack.flush_leg(&mut leg).await?;
-        stack.maintain_tcp();
         if let (Some(interval), Some(activity)) = (ka_interval, leg.last_activity()) {
             match keepalive_tick(interval, activity, &mut ping_sent, Instant::now()) {
                 Keepalive::Wait => {}

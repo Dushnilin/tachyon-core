@@ -837,8 +837,11 @@ fn build_tcp_stream(addr: &SocketAddr, options: &DialOptions) -> io::Result<std:
             return Err(err);
         }
     }
-    if let Some(path) = &options.protect_path {
-        crate::protect::protect(path, fd)?;
+    if let Some(path) = &options.protect_path
+        && let Err(err) = crate::protect::protect(path, fd)
+    {
+        unsafe { libc::close(fd) };
+        return Err(err);
     }
     // SAFETY: the socket is a fresh, owned fd
     let stream = unsafe { <std::net::TcpStream as FromRawFd>::from_raw_fd(fd) };
@@ -887,8 +890,11 @@ fn build_udp_socket(addr: &SocketAddr, options: &DialOptions) -> io::Result<std:
         unsafe { libc::close(fd) };
         return Err(err);
     }
-    if let Some(path) = &options.protect_path {
-        crate::protect::protect(path, fd)?;
+    if let Some(path) = &options.protect_path
+        && let Err(err) = crate::protect::protect(path, fd)
+    {
+        unsafe { libc::close(fd) };
+        return Err(err);
     }
     finish(fd)
 }

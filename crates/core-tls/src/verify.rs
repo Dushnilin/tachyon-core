@@ -225,6 +225,80 @@ mod tests {
         );
         assert_ne!(hmac_sha512(&auth, &public), hmac_sha512(&auth, &[4u8; 32]));
     }
+
+    /// Go's `x509.CreateCertificate(rand.Reader, &x509.Certificate{}, ...)` emits
+    /// an X.509 v1 certificate (no `[0] EXPLICIT` version tag) because `Version`
+    /// is left at 0 with no v3 extensions. `rustls-webpki` rejects it with
+    /// `UnsupportedCertVersion`, yet every Xray/sing-box REALITY server presents
+    /// one and signs `CertificateVerify` with its Ed25519 key.
+    #[test]
+    fn an_x509_v1_reality_certificate_verifies_chain_and_handshake_signature() {
+        use rustls::sign::SigningKey;
+
+        let (signing_key, pub_key) = core_crypto::sign::Ed25519SigningKey::generate();
+        let auth = [0x5au8; 32];
+        let cert_sig = hmac_sha512(&auth, &pub_key);
+
+        // X.509 v1 tbsCertificate: no 0xA0 version tag; starts directly at serialNumber.
+        let mut tbs = Vec::with_capacity(92);
+        tbs.extend_from_slice(&[0x30, 0x5A]); // SEQUENCE, 90 bytes
+        tbs.extend_from_slice(&[0x02, 0x01, 0x01]); // serial 1
+        tbs.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]); // alg Ed25519
+        tbs.extend_from_slice(&[0x30, 0x00]); // issuer
+        tbs.extend_from_slice(&[
+            0x30, 0x1E, // validity SEQUENCE
+            0x17, 0x0D, b'2', b'0', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0',
+            b'Z', 0x17, 0x0D, b'4', b'9', b'1', b'2', b'3', b'1', b'2', b'3', b'5', b'9', b'5',
+            b'9', b'Z',
+        ]);
+        tbs.extend_from_slice(&[0x30, 0x00]); // subject
+        tbs.extend_from_slice(&[0x30, 0x2A]); // SPKI SEQUENCE, 42 bytes
+        tbs.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]); // alg Ed25519
+        tbs.extend_from_slice(&[0x03, 0x21, 0x00]); // BIT STRING, 33 bytes, 0 unused
+        tbs.extend_from_slice(&pub_key);
+
+        let sig_alg = [0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70];
+        let mut sig_val = Vec::with_capacity(67);
+        sig_val.extend_from_slice(&[0x03, 0x41, 0x00]);
+        sig_val.extend_from_slice(&cert_sig);
+
+        let total_len = tbs.len() + sig_alg.len() + sig_val.len();
+        let mut cert_der = Vec::with_capacity(3 + total_len);
+        cert_der.extend_from_slice(&[0x30, 0x81, total_len as u8]);
+        cert_der.extend_from_slice(&tbs);
+        cert_der.extend_from_slice(&sig_alg);
+        cert_der.extend_from_slice(&sig_val);
+
+        let leaf = CertificateDer::from(cert_der);
+        assert!(
+            webpki::EndEntityCert::try_from(&leaf).is_err(),
+            "sanity: webpki rejects X.509 v1 certificates with UnsupportedCertVersion"
+        );
+
+        let fallback = WebpkiVerifier::mozilla_roots().expect("mozilla roots");
+        let verifier = RealityVerifier::new(Box::new(fallback));
+        verifier.set_reality_auth_key(&auth);
+
+        let name = ServerName::try_from("example.com").expect("server name");
+        verifier
+            .verify_chain(&leaf, &[], &name)
+            .expect("X.509 v1 REALITY leaf should pass verify_chain");
+        assert_eq!(verifier.verdict(), "the borrowed certificate checks out");
+
+        let transcript = b"TLS 1.3, server CertificateVerify\x00transcript-hash";
+        let signer = signing_key
+            .choose_scheme(&[rustls::SignatureScheme::ED25519])
+            .expect("Ed25519 scheme");
+        let hs_sig = signer.sign(transcript).expect("Ed25519 sign");
+        verifier
+            .verify_handshake_signature(
+                transcript,
+                &leaf,
+                u16::from(rustls::SignatureScheme::ED25519),
+                &hs_sig,
+            )
+            .expect("X.509 v1 REALITY leaf should pass verify_handshake_signature");
+    }
 }
 
 /// The verification algorithm for a TLS signature scheme, or `None` for one we do
@@ -296,10 +370,9 @@ impl CertVerifier for RealityVerifier {
         let auth_key = self.auth_key.lock().ok().and_then(|slot| *slot);
         match auth_key {
             Some(key) => {
-                let der = webpki::EndEntityCert::try_from(leaf)
-                    .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?
-                    .subject_public_key_info();
-                let Some(public) = ed25519_public_key(&der) else {
+                let der = spki_element(leaf.as_ref())
+                    .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?;
+                let Some(public) = ed25519_public_key(der) else {
                     self.set_verdict("the certificate carries no Ed25519 key");
                     return self.fallback.verify_chain(leaf, chain, server_name);
                 };
@@ -457,6 +530,7 @@ fn der_length(data: &[u8]) -> io::Result<(usize, usize)> {
 /// `rustls-webpki`. The chain check goes through rustls' verifier; the handshake
 /// signature is checked here, because rustls keeps the constructor of the
 /// structure that carries it private and there is no other way in.
+#[derive(Clone)]
 pub struct WebpkiVerifier {
     chain: Arc<dyn ServerCertVerifier>,
 }
@@ -474,13 +548,22 @@ impl WebpkiVerifier {
 
     /// The Mozilla root store, which is what the reference ships with.
     pub fn mozilla_store() -> RootCertStore {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        roots
+        static STORE: std::sync::OnceLock<RootCertStore> = std::sync::OnceLock::new();
+        STORE
+            .get_or_init(|| {
+                let mut roots = RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                roots
+            })
+            .clone()
     }
 
     /// The Mozilla root store, which is what the reference ships with.
     pub fn mozilla_roots() -> io::Result<Self> {
+        static VERIFIER: std::sync::OnceLock<Option<WebpkiVerifier>> = std::sync::OnceLock::new();
+        if let Some(v) = VERIFIER.get_or_init(|| Self::new(Arc::new(Self::mozilla_store())).ok()) {
+            return Ok(v.clone());
+        }
         Self::new(Arc::new(Self::mozilla_store()))
     }
 
@@ -516,16 +599,57 @@ impl CertVerifier for WebpkiVerifier {
         scheme: u16,
         signature: &[u8],
     ) -> io::Result<()> {
-        let algorithm = algorithm_for(scheme).ok_or_else(|| {
-            bad(format!(
-                "signature scheme {scheme:#06x} is not one we accept"
-            ))
-        })?;
-        let cert = webpki::EndEntityCert::try_from(leaf)
-            .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?;
-        cert.verify_signature(algorithm, signed, signature)
-            .map_err(|e| bad(format!("CertificateVerify signature rejected: {e}")))
+        verify_leaf_signature(signed, leaf, scheme, signature)
     }
+}
+
+/// Verify a TLS handshake `CertificateVerify` signature against `leaf`.
+///
+/// Ordinary X.509 v3 certificates go through `webpki::EndEntityCert`, while
+/// X.509 v1 certificates — notably the temporary Ed25519 leaf that Go's
+/// `x509.CreateCertificate(rand.Reader, &x509.Certificate{}, ...)` emits for
+/// REALITY when no extensions or explicit version are set — are rejected by
+/// `webpki` with `UnsupportedCertVersion`. For those, we extract the SPKI
+/// directly from `tbsCertificate` and check that its `AlgorithmIdentifier`
+/// matches `algorithm.public_key_alg_id()` before verifying the signature.
+fn verify_leaf_signature(
+    signed: &[u8],
+    leaf: &CertificateDer<'_>,
+    scheme: u16,
+    signature: &[u8],
+) -> io::Result<()> {
+    let algorithm = algorithm_for(scheme).ok_or_else(|| {
+        bad(format!(
+            "signature scheme {scheme:#06x} is not one we accept"
+        ))
+    })?;
+    if let Ok(cert) = webpki::EndEntityCert::try_from(leaf) {
+        return cert
+            .verify_signature(algorithm, signed, signature)
+            .map_err(|e| bad(format!("CertificateVerify signature rejected: {e}")));
+    }
+    let spki = spki_element(leaf.as_ref())
+        .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?;
+    let mut outer = Der::new(spki);
+    let mut body = Der::new(outer.take(0x30)?);
+    let alg_id = body.take(0x30)?;
+    let bits = body.take(0x03)?;
+    let key = bits
+        .strip_prefix(&[0x00])
+        .ok_or_else(|| bad("a public key with unused bits is not a public key"))?;
+    let expected = algorithm.public_key_alg_id();
+    let expected = expected.as_ref();
+    let alg_matches = alg_id == expected
+        || alg_id.strip_suffix(&[0x05, 0x00]) == Some(expected)
+        || expected.strip_suffix(&[0x05, 0x00]) == Some(alg_id);
+    if !alg_matches {
+        return Err(bad(
+            "CertificateVerify signature scheme does not match the leaf key algorithm",
+        ));
+    }
+    algorithm
+        .verify_signature(key, signed, signature)
+        .map_err(|e| bad(format!("CertificateVerify signature rejected: {e:?}")))
 }
 
 /// Trust by certificate fingerprint rather than by chain.
@@ -586,6 +710,16 @@ impl Debug for PinVerifier {
 /// reference hashes too - hashing a stripped inner slice would produce a
 /// different digest and never match a value written by anything else.
 pub fn spki_sha256(der: &[u8]) -> io::Result<[u8; 32]> {
+    let element = spki_element(der)?;
+    Ok(<sha2::Sha256 as sha2::Digest>::digest(element).into())
+}
+
+/// The certificate's `SubjectPublicKeyInfo` DER element, tag and length included.
+///
+/// Handles both X.509 v3 (`[0] EXPLICIT` version present) and X.509 v1 (version
+/// omitted, as Go's `x509.CreateCertificate` emits when `Version` is left at 0
+/// with no extensions — the exact shape of a REALITY temporary certificate).
+fn spki_element(der: &[u8]) -> io::Result<&[u8]> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
     let (cert, _) = der_element(der, 0).ok_or_else(|| bad("certificate does not parse"))?;
     // Walk into the Certificate's value first: its length covers the whole
@@ -612,8 +746,7 @@ pub fn spki_sha256(der: &[u8]) -> io::Result<[u8; 32]> {
             bad("certificate pin: tbsCertificate ends before subjectPublicKeyInfo")
         })?;
         if index == want {
-            let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(element).into();
-            return Ok(digest);
+            return Ok(element);
         }
         rest = next;
     }
@@ -707,14 +840,47 @@ impl CertVerifier for PinVerifier {
         scheme: u16,
         signature: &[u8],
     ) -> io::Result<()> {
-        let algorithm = algorithm_for(scheme).ok_or_else(|| {
-            bad(format!(
-                "signature scheme {scheme:#06x} is not one we accept"
-            ))
-        })?;
-        let cert = webpki::EndEntityCert::try_from(leaf)
-            .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?;
-        cert.verify_signature(algorithm, signed, signature)
-            .map_err(|e| bad(format!("CertificateVerify signature rejected: {e}")))
+        verify_leaf_signature(signed, leaf, scheme, signature)
+    }
+}
+
+impl ServerCertVerifier for PinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.verify_chain(end_entity, intermediates, server_name)
+            .map(|_| rustls::client::danger::ServerCertVerified::assertion())
+            .map_err(|e| rustls::Error::General(e.to_string()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_handshake_signature(message, cert, u16::from(dss.scheme), dss.signature())
+            .map(|_| rustls::client::danger::HandshakeSignatureValid::assertion())
+            .map_err(|e| rustls::Error::General(e.to_string()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_handshake_signature(message, cert, u16::from(dss.scheme), dss.signature())
+            .map(|_| rustls::client::danger::HandshakeSignatureValid::assertion())
+            .map_err(|e| rustls::Error::General(e.to_string()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }

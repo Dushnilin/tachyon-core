@@ -21,7 +21,7 @@ h2 = { path = "vendor/h2" }
 quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Dushnilin/tachyon-core"
@@ -88,7 +88,7 @@ debug = "line-tables-only"
 debug = false
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
@@ -99,6 +99,8 @@ overflow-checks = false
 # wrong one for the loops that touch every byte of every packet: AEAD, GHASH,
 # ChaCha, the hashes, the stream ciphers. Those crates get speed instead; the
 # binary grows by a few hundred KiB, not by a multiple.
+[profile.release.package.core-crypto]
+opt-level = 3
 [profile.release.package.aes]
 opt-level = 3
 [profile.release.package.aes-gcm]

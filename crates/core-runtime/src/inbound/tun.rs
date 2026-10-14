@@ -591,15 +591,15 @@ impl Drop for Tun {
 
 /// A smoltcp Virtual Device feeding IP packets between TUN and user-space TCP stack.
 #[allow(dead_code)]
-struct TunDevice {
-    mtu: usize,
-    rx_queue: VecDeque<Vec<u8>>,
-    tx_queue: VecDeque<Vec<u8>>,
+pub(crate) struct TunDevice {
+    pub(crate) mtu: usize,
+    pub(crate) rx_queue: VecDeque<Vec<u8>>,
+    pub(crate) tx_queue: VecDeque<Vec<u8>>,
 }
 
 impl TunDevice {
     #[allow(dead_code)]
-    fn new(mtu: usize) -> Self {
+    pub(crate) fn new(mtu: usize) -> Self {
         Self {
             mtu,
             rx_queue: VecDeque::new(),
@@ -611,8 +611,7 @@ impl TunDevice {
 /// Cap on the queues between TUN and the userspace stack. A flood the stack
 /// cannot drain must drop (the kernel retransmits TCP) rather than grow until
 /// the OOM killer picks the daemon on a 128 MiB router.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the linux TUN path drains these queues
-const TUN_QUEUE_CAP: usize = 512;
+pub(crate) const TUN_QUEUE_CAP: usize = 512;
 
 impl Device for TunDevice {
     type RxToken<'a>
@@ -640,6 +639,9 @@ impl Device for TunDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        if self.tx_queue.len() >= TUN_QUEUE_CAP {
+            return None;
+        }
         Some(TunTxToken {
             queue: &mut self.tx_queue,
         })
@@ -659,7 +661,7 @@ impl Device for TunDevice {
 }
 
 #[allow(dead_code)]
-struct TunRxToken {
+pub(crate) struct TunRxToken {
     packet: Vec<u8>,
 }
 
@@ -673,7 +675,7 @@ impl PhyRxToken for TunRxToken {
 }
 
 #[allow(dead_code)]
-struct TunTxToken<'a> {
+pub(crate) struct TunTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
 }
 
@@ -693,27 +695,27 @@ impl PhyTxToken for TunTxToken<'_> {
 
 /// An active transparent TCP session bridged between `smoltcp` and Tachyon router.
 #[allow(dead_code)]
-struct TunTcpSession {
-    handle: SocketHandle,
-    source: SocketAddr,
-    dest: SocketAddr,
-    to_app: mpsc::Sender<Bytes>,
-    from_app: mpsc::Receiver<Bytes>,
+pub(crate) struct TunTcpSession {
+    pub(crate) handle: SocketHandle,
+    pub(crate) source: SocketAddr,
+    pub(crate) dest: SocketAddr,
+    pub(crate) to_app: mpsc::Sender<Bytes>,
+    pub(crate) from_app: mpsc::Receiver<Bytes>,
     /// Leftover of a chunk `send_slice` could not fully take; kept until the
     /// socket drains — dropping the tail would silently corrupt the TCP stream.
-    pending_app: Option<Bytes>,
-    created: Instant,
-    app_closed: bool,
-    established: bool,
+    pub(crate) pending_app: Option<Bytes>,
+    pub(crate) created: Instant,
+    pub(crate) app_closed: bool,
+    pub(crate) established: bool,
 }
 
 /// AsyncRead + AsyncWrite stream adapter bridging mpsc channels to `ClientConn`.
 #[allow(dead_code)]
-struct TunStream {
-    rx: mpsc::Receiver<Bytes>,
-    tx: mpsc::Sender<Bytes>,
-    notify: Arc<Notify>,
-    current: Option<(Bytes, usize)>,
+pub(crate) struct TunStream {
+    pub(crate) rx: mpsc::Receiver<Bytes>,
+    pub(crate) tx: mpsc::Sender<Bytes>,
+    pub(crate) notify: Arc<Notify>,
+    pub(crate) current: Option<(Bytes, usize)>,
 }
 
 impl AsyncRead for TunStream {
@@ -722,6 +724,7 @@ impl AsyncRead for TunStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        let mut copied_any = false;
         loop {
             if let Some((chunk, offset)) = &mut self.current {
                 let available = chunk.len() - *offset;
@@ -729,22 +732,41 @@ impl AsyncRead for TunStream {
                     let to_copy = available.min(buf.remaining());
                     buf.put_slice(&chunk[*offset..*offset + to_copy]);
                     *offset += to_copy;
+                    copied_any = true;
                     if *offset >= chunk.len() {
                         self.current = None;
                     }
-                    return std::task::Poll::Ready(Ok(()));
+                    if buf.remaining() == 0 {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                } else {
+                    self.current = None;
                 }
-                self.current = None;
             }
 
-            match self.rx.poll_recv(cx) {
-                std::task::Poll::Ready(Some(chunk)) => {
-                    self.current = Some((chunk, 0));
+            if copied_any {
+                match self.rx.try_recv() {
+                    Ok(chunk) => {
+                        if self.rx.len() >= 16 {
+                            self.notify.notify_one();
+                        }
+                        self.current = Some((chunk, 0));
+                    }
+                    Err(_) => return std::task::Poll::Ready(Ok(())),
                 }
-                std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(Ok(())); // EOF
+            } else {
+                match self.rx.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(chunk)) => {
+                        if self.rx.len() >= 16 {
+                            self.notify.notify_one();
+                        }
+                        self.current = Some((chunk, 0));
+                    }
+                    std::task::Poll::Ready(None) => {
+                        return std::task::Poll::Ready(Ok(())); // EOF
+                    }
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
                 }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }
     }
@@ -798,21 +820,113 @@ impl AsyncWrite for TunStream {
     }
 }
 
-/// Drive smoltcp stack polling, I/O pumping and egress transmission to TUN.
-#[cfg(target_os = "linux")]
-async fn drive_tun_stack(
-    iface: &mut Interface,
+/// Create a catch-all any-IP `smoltcp::iface::Interface` for virtual L3 tunnels (TUN, FPTN, MASQUE).
+pub(crate) fn new_virtual_ip_iface(device: &mut TunDevice) -> Interface {
+    let mut iconfig = IfaceConfig::new(HardwareAddress::Ip);
+    let mut seed = [0u8; 8];
+    crate::outbound::shadowsocks::crypto::random_bytes(&mut seed)
+        .unwrap_or_else(|_| seed = [1, 2, 3, 4, 5, 6, 7, 8]);
+    iconfig.random_seed = u64::from_le_bytes(seed);
+    let mut iface = Interface::new(iconfig, device, SmolInstant::now());
+    iface.set_any_ip(true);
+    iface.update_ip_addrs(|list| {
+        let _ = list.push(smoltcp::wire::IpCidr::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+            0,
+        ));
+        let _ = list.push(smoltcp::wire::IpCidr::new(
+            smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+            0,
+        ));
+    });
+    iface
+}
+
+/// Ensure a listening virtual `smoltcp` `TcpSocket` and `drive_framed` task exist on a new SYN.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_virtual_tcp_session(
+    source: SocketAddr,
+    dest: SocketAddr,
+    is_syn: bool,
+    tag: &str,
+    router: &Arc<Router>,
+    sockets: &mut SocketSet<'static>,
+    sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
+    notify: &Arc<Notify>,
+) {
+    let key = (source, dest);
+    if is_syn && !sessions.contains_key(&key) {
+        let rx_buf = TcpSocketBuffer::new(vec![0u8; crate::smol_tcp_buf()]);
+        let tx_buf = TcpSocketBuffer::new(vec![0u8; crate::smol_tcp_buf()]);
+        let mut sock = TcpSocket::new(rx_buf, tx_buf);
+        sock.set_nagle_enabled(false);
+        sock.set_ack_delay(None);
+
+        if sock.listen(dest).is_ok() {
+            let handle = sockets.add(sock);
+            let (to_app_tx, to_app_rx) = mpsc::channel(256);
+            let (from_app_tx, from_app_rx) = mpsc::channel(256);
+
+            let tun_stream = TunStream {
+                rx: to_app_rx,
+                tx: from_app_tx,
+                notify: Arc::clone(notify),
+                current: None,
+            };
+
+            let client = ClientConn::framed(Box::new(tun_stream), source);
+            let router = Arc::clone(router);
+            let tag = tag.to_string();
+
+            tokio::spawn(async move {
+                let _ = drive_framed(client, source, Target::Ip(dest), &tag, &router).await;
+            });
+
+            sessions.insert(
+                key,
+                TunTcpSession {
+                    handle,
+                    source,
+                    dest,
+                    to_app: to_app_tx,
+                    from_app: from_app_rx,
+                    pending_app: None,
+                    created: Instant::now(),
+                    app_closed: false,
+                    established: false,
+                },
+            );
+        }
+    }
+}
+
+/// Accept a raw IPv4/IPv6 TCP packet into the virtual `smoltcp` TCP stack, spawning a `drive_framed` task on new SYNs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accept_virtual_tcp_packet(
+    packet: &[u8],
+    source: SocketAddr,
+    dest: SocketAddr,
+    is_syn: bool,
+    tag: &str,
+    router: &Arc<Router>,
     device: &mut TunDevice,
     sockets: &mut SocketSet<'static>,
     sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
-    async_fd: &Arc<tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>>,
-    vnet_hdr: bool,
+    notify: &Arc<Notify>,
+) {
+    if device.rx_queue.len() >= TUN_QUEUE_CAP {
+        return;
+    }
+    ensure_virtual_tcp_session(source, dest, is_syn, tag, router, sockets, sessions, notify);
+    device.rx_queue.push_back(packet.to_vec());
+}
+
+/// Pump data between virtual `smoltcp` TCP sockets and application streams.
+pub(crate) fn pump_virtual_tcp_sockets(
+    sockets: &mut SocketSet<'static>,
+    sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
     scratch: &mut [u8],
 ) {
-    let now = SmolInstant::now();
-    let _ = iface.poll(now, device, sockets);
-
-    // Pump data between smoltcp TCP sockets and application streams
     let mut finished = Vec::new();
 
     for (&key, session) in sessions.iter_mut() {
@@ -824,24 +938,29 @@ async fn drive_tun_stack(
                 session.established = true;
             }
 
-            // Drain data from smoltcp socket to application stream
-            while sock.can_recv() {
-                match sock.recv_slice(scratch) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = Bytes::copy_from_slice(&scratch[..n]);
-                        if session.to_app.try_send(chunk).is_err() {
-                            break;
-                        }
+            // Drain data from smoltcp socket to application stream only when
+            // the channel has capacity, so recv_slice never consumes TCP bytes
+            // that would be dropped on a full channel.
+            while session.to_app.capacity() > 0 && sock.can_recv() {
+                let mut filled = 0;
+                while filled < scratch.len() && sock.can_recv() {
+                    match sock.recv_slice(&mut scratch[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(_) => break,
                     }
-                    Err(_) => break,
+                }
+                if filled == 0 {
+                    break;
+                }
+                let chunk = Bytes::copy_from_slice(&scratch[..filled]);
+                if session.to_app.try_send(chunk).is_err() {
+                    break;
                 }
             }
 
             // Drain data from application stream to smoltcp socket
             while sock.can_send() {
-                // Finish a chunk send_slice could not fully take before
-                // pulling a new one from the channel.
                 if let Some(front) = session.pending_app.take() {
                     match sock.send_slice(&front) {
                         Ok(n) if n < front.len() => {
@@ -874,6 +993,7 @@ async fn drive_tun_stack(
         if state == TcpState::Closed
             || state == TcpState::TimeWait
             || (session.app_closed && !sock.can_recv())
+            || (!session.established && session.created.elapsed() >= Duration::from_secs(30))
         {
             finished.push(key);
         }
@@ -884,6 +1004,51 @@ async fn drive_tun_stack(
             sockets.remove(session.handle);
         }
     }
+}
+
+/// Poll `smoltcp` and pump data between virtual TCP sockets and application streams.
+/// Outbound IP packets remain in `device.tx_queue` for the caller to flush.
+pub(crate) fn pump_virtual_tcp_sessions(
+    iface: &mut Interface,
+    device: &mut TunDevice,
+    sockets: &mut SocketSet<'static>,
+    sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
+    scratch: &mut [u8],
+) {
+    for _ in 0..16 {
+        let now = SmolInstant::now();
+        iface.poll_maintenance(now);
+        while device.tx_queue.len() < TUN_QUEUE_CAP
+            && iface.poll_ingress_single(now, device, sockets)
+                != smoltcp::iface::PollIngressSingleResult::None
+        {}
+        pump_virtual_tcp_sockets(sockets, sessions, scratch);
+        let now = SmolInstant::now();
+        let mut progressed = false;
+        while device.tx_queue.len() < TUN_QUEUE_CAP
+            && iface.poll_egress(now, device, sockets)
+                == smoltcp::iface::PollResult::SocketStateChanged
+        {
+            progressed = true;
+        }
+        if !progressed && device.rx_queue.is_empty() {
+            break;
+        }
+    }
+}
+
+/// Drive smoltcp stack polling, I/O pumping and egress transmission to TUN.
+#[cfg(target_os = "linux")]
+async fn drive_tun_stack(
+    iface: &mut Interface,
+    device: &mut TunDevice,
+    sockets: &mut SocketSet<'static>,
+    sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
+    async_fd: &Arc<tokio::io::unix::AsyncFd<std::os::unix::io::RawFd>>,
+    vnet_hdr: bool,
+    scratch: &mut [u8],
+) {
+    pump_virtual_tcp_sessions(iface, device, sockets, sessions, scratch);
 
     // Flush any outbound TCP packets generated by smoltcp to the TUN interface
     while let Some(out_pkt) = device.tx_queue.pop_front() {
@@ -976,6 +1141,9 @@ fn handle_ipv4_packet(
         }
         // TCP
         6 if packet.len() >= ihl + 20 => {
+            if device.rx_queue.len() >= TUN_QUEUE_CAP {
+                return;
+            }
             let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
             let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
             let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
@@ -1027,9 +1195,7 @@ fn handle_ipv4_packet(
                 }
             }
 
-            if device.rx_queue.len() < TUN_QUEUE_CAP {
-                device.rx_queue.push_back(packet.to_vec());
-            }
+            device.rx_queue.push_back(packet.to_vec());
         }
         _ => {}
     }
@@ -1114,6 +1280,9 @@ fn handle_ipv6_packet(
         }
         // TCP
         6 if payload.len() >= 20 => {
+            if device.rx_queue.len() >= TUN_QUEUE_CAP {
+                return;
+            }
             let src_port = u16::from_be_bytes([payload[0], payload[1]]);
             let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
             let source = SocketAddr::new(IpAddr::V6(src_ip), src_port);
@@ -1165,9 +1334,7 @@ fn handle_ipv6_packet(
                 }
             }
 
-            if device.rx_queue.len() < TUN_QUEUE_CAP {
-                device.rx_queue.push_back(packet.to_vec());
-            }
+            device.rx_queue.push_back(packet.to_vec());
         }
         _ => {}
     }

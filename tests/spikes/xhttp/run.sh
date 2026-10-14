@@ -194,7 +194,7 @@ cat > "$WORK/server.json" <<JSON
     "settings": {"clients": [{"id": "$UUID"}], "decryption": "none"},
     "streamSettings": {
       "network": "xhttp",
-      "xhttpSettings": {"path": "$PATH_X", "mode": "packet-up", "host": "$SNI"$XMUX_SERVER},
+      "xhttpSettings": {"path": "$PATH_X", "mode": "${MODE_SERVER:-${MODE:-packet-up}}", "host": "$SNI"$XMUX_SERVER},
       "security": "$SECURITY",
       $TLS_BLOCK
     }
@@ -241,7 +241,7 @@ cat > "$WORK/client.json" <<JSON
     "server": "127.0.0.1", "server_port": $CLIENT_PORT,
     "uuid": "$UUID",
     "tls": $CLIENT_TLS,
-    "transport": {"type": "xhttp", "path": "$PATH_X", "host": "$SNI", "mode": "packet-up"$XMUX_CLIENT}
+    "transport": {"type": "xhttp", "path": "$PATH_X", "host": "$SNI", "mode": "${MODE_CLIENT:-${MODE:-packet-up}}"$XMUX_CLIENT}
   }],
   "route": {"final": "out"}
 }

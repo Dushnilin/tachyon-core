@@ -43,16 +43,15 @@ const STREAM_QPACK_ENCODER: u8 = 0x02;
 const STREAM_QPACK_DECODER: u8 = 0x03;
 
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x07;
+const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 // The official WARP client still advertises the deprecated
 // SETTINGS_H3_DATAGRAM_00; WARP expects it (reference masque.go).
 const SETTINGS_H3_DATAGRAM_00: u64 = 0x276;
 
-const INITIAL_MTU: u16 = 1242;
-/// Memory quinn keeps for its datagram queue, not a read buffer, so it is a
-/// round 64 KiB rather than the 65_535-byte datagram maximum.
-const DATAGRAM_BUFFER: usize = 65_536;
+const INITIAL_MTU: u16 = 1400;
+/// Memory quinn keeps for its datagram queue.
+const DATAGRAM_BUFFER: usize = 2 * 1024 * 1024;
 const STREAM_WINDOW: u64 = 8 << 20;
 const CONNECTION_WINDOW: u64 = 16 << 20;
 /// Bound for a single buffered frame payload (stream windows cap this).
@@ -65,6 +64,9 @@ pub(crate) struct H3Conn {
     conn: quinn::Connection,
     endpoint: quinn::Endpoint,
     send: AsyncMutex<quinn::SendStream>,
+    _control: quinn::SendStream,
+    _qpack_enc: quinn::SendStream,
+    _qpack_dec: quinn::SendStream,
     rx: mpsc::Receiver<Vec<u8>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -118,7 +120,9 @@ impl H3Conn {
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(keep_alive);
+        transport.min_mtu(1350);
         transport.initial_mtu(INITIAL_MTU);
+        transport.mtu_discovery_config(None);
         transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
         transport.datagram_send_buffer_size(DATAGRAM_BUFFER);
         transport.stream_receive_window(quinn::VarInt::from_u64(STREAM_WINDOW).unwrap());
@@ -187,9 +191,6 @@ impl H3Conn {
             .write_all(&[STREAM_QPACK_ENCODER])
             .await
             .map_err(|e| io::Error::other(format!("masque h3: write qpack stream: {e}")))?;
-        qpack_enc
-            .finish()
-            .map_err(|e| io::Error::other(format!("masque h3: finish qpack stream: {e}")))?;
         let mut qpack_dec = conn
             .open_uni()
             .await
@@ -198,9 +199,6 @@ impl H3Conn {
             .write_all(&[STREAM_QPACK_DECODER])
             .await
             .map_err(|e| io::Error::other(format!("masque h3: write qpack stream: {e}")))?;
-        qpack_dec
-            .finish()
-            .map_err(|e| io::Error::other(format!("masque h3: finish qpack stream: {e}")))?;
 
         // Accept the server's unidirectional streams; the control stream
         // yields the SETTINGS that gate the request. Everything up to the
@@ -336,7 +334,11 @@ impl H3Conn {
         // the h2 shim does no route advertisement, the h3 path requires it
         // before the endpoint routes anything our way.
         let capsule = encode_route_advertisement(&default_routes);
-        if let Err(e) = send.write_all(&capsule).await {
+        let mut data_frame = Vec::with_capacity(capsule.len() + 4);
+        put_varint(&mut data_frame, FRAME_DATA);
+        put_varint(&mut data_frame, capsule.len() as u64);
+        data_frame.extend_from_slice(&capsule);
+        if let Err(e) = send.write_all(&data_frame).await {
             for task in &tasks {
                 task.abort();
             }
@@ -351,6 +353,9 @@ impl H3Conn {
             conn,
             endpoint,
             send: AsyncMutex::new(send),
+            _control: control,
+            _qpack_enc: qpack_enc,
+            _qpack_dec: qpack_dec,
             rx,
             tasks,
         })
@@ -362,6 +367,10 @@ impl H3Conn {
             .recv()
             .await
             .ok_or_else(|| io::Error::other("masque h3: tunnel closed"))
+    }
+
+    pub(crate) fn try_read_packet(&mut self) -> Option<Vec<u8>> {
+        self.rx.try_recv().ok()
     }
 
     /// Send one outbound IP packet as an HTTP datagram. Returns an ICMP

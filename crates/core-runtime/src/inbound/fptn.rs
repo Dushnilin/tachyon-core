@@ -8,20 +8,28 @@
 //!    carrying client IP datagrams, answers ICMP echo requests, and forwards UDP/TCP
 //!    into the Tachyon Router data plane.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use smoltcp::iface::SocketSet;
+use smoltcp::time::Instant as SmolInstant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Notify, mpsc};
 
+use crate::inbound::parse_listen;
 use crate::inbound::tls::ServerTls;
+use crate::inbound::tun::{
+    TunDevice, TunTcpSession, accept_virtual_tcp_packet, new_virtual_ip_iface,
+    pump_virtual_tcp_sessions,
+};
 use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
-use crate::inbound::{ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::fptn::proto::{decode_batch, encode_batch, encode_ip_assignment};
 use crate::outbound::proxy::base64_std;
@@ -59,9 +67,12 @@ impl Fptn {
         let mut users = Vec::new();
         if let Some(user_list) = object.get("users").and_then(Value::as_array) {
             for user in user_list {
-                if let Some(u) = user.get("username").and_then(Value::as_str)
-                    && let Some(p) = user.get("password").and_then(Value::as_str)
-                {
+                let u = user
+                    .get("username")
+                    .or_else(|| user.get("name"))
+                    .and_then(Value::as_str);
+                let p = user.get("password").and_then(Value::as_str);
+                if let (Some(u), Some(p)) = (u, p) {
                     users.push((u.to_string(), p.to_string()));
                 }
             }
@@ -130,15 +141,39 @@ impl Fptn {
 
                     tokio::spawn(async move {
                         let stream: Box<dyn AsyncStream> = match tls {
-                            Some(tls) => match tls.accept(stream).await {
-                                Ok(tls_stream) => Box::new(tls_stream),
-                                Err(err) => {
-                                    logging::debug(format_args!(
-                                        "fptn[{tag}] TLS accept {peer}: {err}"
-                                    ));
-                                    return;
+                            Some(tls) => {
+                                let mut first = [0u8; 1];
+                                let is_obfs = stream
+                                    .peek(&mut first)
+                                    .await
+                                    .is_ok_and(|n| n > 0 && first[0] == 0x17);
+                                if is_obfs {
+                                    let (obfs_stream, plain_flag) =
+                                        crate::outbound::fptn::obfs::ObfsStream::new(stream);
+                                    match tls.accept(obfs_stream).await {
+                                        Ok(tls_stream) => {
+                                            plain_flag.store(true, Ordering::Relaxed);
+                                            Box::new(tls_stream)
+                                        }
+                                        Err(err) => {
+                                            logging::debug(format_args!(
+                                                "fptn[{tag}] obfs TLS accept {peer}: {err}"
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    match tls.accept(stream).await {
+                                        Ok(tls_stream) => Box::new(tls_stream),
+                                        Err(err) => {
+                                            logging::debug(format_args!(
+                                                "fptn[{tag}] TLS accept {peer}: {err}"
+                                            ));
+                                            return;
+                                        }
+                                    }
                                 }
-                            },
+                            }
                             None => Box::new(stream),
                         };
 
@@ -347,12 +382,24 @@ async fn handle_websocket_tunnel(
     let assign_payload = encode_ip_assignment(&client_ipv4, &client_ipv6);
     send_ws_frame(&mut stream, OP_BINARY, &assign_payload).await?;
 
+    let (mut ws_reader, mut ws_writer) = tokio::io::split(stream);
+    let (ws_tx, mut ws_rx) = mpsc::channel::<(u8, Vec<u8>)>(512);
+    tokio::spawn(async move {
+        while let Some((opcode, payload)) = ws_rx.recv().await {
+            if send_ws_frame(&mut ws_writer, opcode, &payload)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     let hub = UdpHub::new(Arc::clone(router), DEFAULT_UDP_TIMEOUT, DatagramFrame::Raw);
     let _stop_hub = crate::inbound::udp::StopHub(Arc::clone(&hub));
 
-    let stream = Arc::new(Mutex::new(stream));
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<crate::inbound::udp::TunReply>(256);
-    let ws_writer = Arc::clone(&stream);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<crate::inbound::udp::TunReply>(256);
+    let ws_tx_udp = ws_tx.clone();
     let client_v4: Ipv4Addr = client_ipv4.parse().unwrap_or(Ipv4Addr::new(10, 88, 0, 2));
     tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
@@ -367,45 +414,107 @@ async fn handle_websocket_tunnel(
                 reply.dest.port(),
                 &reply.payload,
             );
-            if let Ok(batch) = encode_batch(&[pkt]) {
-                let mut s = ws_writer.lock().await;
-                let _ = send_ws_frame(&mut *s, OP_BINARY, &batch).await;
+            if let Ok(batch) = encode_batch(&[pkt])
+                && ws_tx_udp.send((OP_BINARY, batch)).await.is_err()
+            {
+                break;
             }
         }
     });
 
-    // WebSocket read loop
+    // Virtual smoltcp stack for TCP over FPTN
+    let mut device = TunDevice::new(1280);
+    let mut iface = new_virtual_ip_iface(&mut device);
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut tcp_sessions: HashMap<(SocketAddr, SocketAddr), TunTcpSession> = HashMap::new();
+    let mut scratch_buf = vec![0u8; 65_536];
+    let notify = Arc::new(Notify::new());
+
     loop {
-        let (opcode, payload) = match read_ws_message(&stream).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => break,
-            Err(e) => {
-                logging::debug(format_args!("fptn[{tag}] {peer} read error: {e}"));
-                break;
+        let now = SmolInstant::now();
+        let delay = match iface.poll_at(now, &sockets) {
+            Some(at) if at <= now => Duration::from_millis(1),
+            Some(at) => {
+                Duration::from_micros((at - now).total_micros()).min(Duration::from_millis(50))
             }
+            None => Duration::from_millis(50),
         };
 
-        match opcode {
-            OP_BINARY => {
-                let packets = match decode_batch(&payload) {
-                    Ok(pkts) => pkts,
-                    Err(_) => continue,
+        tokio::select! {
+            msg_res = read_ws_message(&mut ws_reader) => {
+                let (opcode, payload) = match msg_res {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => break,
+                    Err(e) => {
+                        logging::debug(format_args!("fptn[{tag}] {peer} read error: {e}"));
+                        break;
+                    }
                 };
 
-                for pkt in packets {
-                    process_client_packet(pkt, tag, router, &hub, &reply_tx, &stream).await;
+                match opcode {
+                    OP_BINARY => {
+                        let packets = match decode_batch(&payload) {
+                            Ok(pkts) => pkts,
+                            Err(_) => continue,
+                        };
+
+                        for pkt in packets {
+                            process_client_packet(
+                                pkt,
+                                tag,
+                                router,
+                                &hub,
+                                &reply_tx,
+                                &ws_tx,
+                                &mut device,
+                                &mut sockets,
+                                &mut tcp_sessions,
+                                &notify,
+                            )
+                            .await;
+                        }
+                        flush_fptn_tcp_stack(
+                            &mut iface,
+                            &mut device,
+                            &mut sockets,
+                            &mut tcp_sessions,
+                            &mut scratch_buf,
+                            &ws_tx,
+                        )
+                        .await;
+                    }
+                    OP_PING => {
+                        let _ = ws_tx.send((OP_PONG, payload)).await;
+                    }
+                    OP_CLOSE => {
+                        let _ = ws_tx.send((OP_CLOSE, Vec::new())).await;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            OP_PING => {
-                let mut s = stream.lock().await;
-                let _ = send_ws_frame(&mut *s, OP_PONG, &payload).await;
+            _ = notify.notified() => {
+                flush_fptn_tcp_stack(
+                    &mut iface,
+                    &mut device,
+                    &mut sockets,
+                    &mut tcp_sessions,
+                    &mut scratch_buf,
+                    &ws_tx,
+                )
+                .await;
             }
-            OP_CLOSE => {
-                let mut s = stream.lock().await;
-                let _ = send_ws_frame(&mut *s, OP_CLOSE, &[]).await;
-                break;
+            _ = tokio::time::sleep(delay) => {
+                flush_fptn_tcp_stack(
+                    &mut iface,
+                    &mut device,
+                    &mut sockets,
+                    &mut tcp_sessions,
+                    &mut scratch_buf,
+                    &ws_tx,
+                )
+                .await;
             }
-            _ => {}
         }
     }
 
@@ -413,18 +522,47 @@ async fn handle_websocket_tunnel(
     Ok(())
 }
 
+async fn flush_fptn_tcp_stack(
+    iface: &mut smoltcp::iface::Interface,
+    device: &mut TunDevice,
+    sockets: &mut SocketSet<'static>,
+    tcp_sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
+    scratch_buf: &mut [u8],
+    ws_tx: &mpsc::Sender<(u8, Vec<u8>)>,
+) {
+    pump_virtual_tcp_sessions(iface, device, sockets, tcp_sessions, scratch_buf);
+    while !device.tx_queue.is_empty() {
+        let mut batch_pkts = Vec::with_capacity(32);
+        while batch_pkts.len() < 32 {
+            let Some(pkt) = device.tx_queue.pop_front() else {
+                break;
+            };
+            batch_pkts.push(pkt);
+        }
+        if let Ok(batch) = encode_batch(&batch_pkts)
+            && ws_tx.send((OP_BINARY, batch)).await.is_err()
+        {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn process_client_packet(
     packet: Vec<u8>,
     tag: &str,
     router: &Arc<Router>,
     hub: &Arc<UdpHub>,
-    reply_tx: &tokio::sync::mpsc::Sender<crate::inbound::udp::TunReply>,
-    stream: &Arc<Mutex<Box<dyn AsyncStream>>>,
+    reply_tx: &mpsc::Sender<crate::inbound::udp::TunReply>,
+    ws_tx: &mpsc::Sender<(u8, Vec<u8>)>,
+    device: &mut TunDevice,
+    sockets: &mut SocketSet<'static>,
+    tcp_sessions: &mut HashMap<(SocketAddr, SocketAddr), TunTcpSession>,
+    notify: &Arc<Notify>,
 ) {
     if packet.len() < 20 {
         return;
     }
-    // Only IPv4 packets currently
     if packet[0] >> 4 != 4 {
         return;
     }
@@ -461,8 +599,7 @@ async fn process_client_packet(
                     reply_pkt[ihl + 3] = icmp_csum as u8;
 
                     if let Ok(batch) = encode_batch(&[reply_pkt]) {
-                        let mut s = stream.lock().await;
-                        let _ = send_ws_frame(&mut *s, OP_BINARY, &batch).await;
+                        let _ = ws_tx.send((OP_BINARY, batch)).await;
                     }
                 }
             }
@@ -477,10 +614,17 @@ async fn process_client_packet(
                     let payload = &packet[ihl + 8..ihl + udp_len];
                     let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
                     let dest = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
-                    let reply = Reply::Tun {
-                        sender: reply_tx.clone(),
-                    };
-                    let _ = hub.handle(reply, source, dest, payload, tag).await;
+                    if !hub.try_existing(source, dest, payload) {
+                        let payload = payload.to_vec();
+                        let hub = Arc::clone(hub);
+                        let reply = Reply::Tun {
+                            sender: reply_tx.clone(),
+                        };
+                        let tag = tag.to_string();
+                        tokio::spawn(async move {
+                            let _ = hub.handle(reply, source, dest, &payload, &tag).await;
+                        });
+                    }
                 }
             }
         }
@@ -490,17 +634,21 @@ async fn process_client_packet(
             let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
             let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
             let dest = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
+            let tcp_flags = packet[ihl + 13];
+            let is_syn = (tcp_flags & 0x02) != 0 && (tcp_flags & 0x10) == 0;
 
-            let is_syn = (packet[ihl + 13] & 0x02) != 0;
-            if is_syn {
-                let (client_stream, _server_stream) = tokio::io::duplex(65_536);
-                let router = Arc::clone(router);
-                let tag = tag.to_string();
-                tokio::spawn(async move {
-                    let client = ClientConn::framed(Box::new(client_stream), source);
-                    let _ = drive_framed(client, source, Target::Ip(dest), &tag, &router).await;
-                });
-            }
+            accept_virtual_tcp_packet(
+                &packet,
+                source,
+                dest,
+                is_syn,
+                tag,
+                router,
+                device,
+                sockets,
+                tcp_sessions,
+                notify,
+            );
         }
         _ => {}
     }
@@ -528,10 +676,7 @@ async fn send_ws_frame<S: AsyncWrite + Unpin>(
     stream.flush().await
 }
 
-async fn read_ws_message(
-    stream: &Arc<Mutex<Box<dyn AsyncStream>>>,
-) -> io::Result<Option<(u8, Vec<u8>)>> {
-    let mut s = stream.lock().await;
+async fn read_ws_message<R: AsyncRead + Unpin>(s: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut header = [0u8; 2];
     let n = s.read(&mut header).await?;
     if n == 0 {

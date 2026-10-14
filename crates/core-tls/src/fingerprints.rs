@@ -26,6 +26,16 @@ pub const MODERN_CAPTURED_FROM: &str = "1.14.2-x-1.0.3";
 /// reference (common/tls/utls_client.go). Random policies are resolved once per
 /// process by `random_fingerprints`, separately from the captured tables.
 pub fn by_name(name: &str) -> Option<Template> {
+    use std::sync::OnceLock;
+    static CHROME: OnceLock<Template> = OnceLock::new();
+    static FIREFOX: OnceLock<Template> = OnceLock::new();
+    static EDGE: OnceLock<Template> = OnceLock::new();
+    static SAFARI: OnceLock<Template> = OnceLock::new();
+    static R360: OnceLock<Template> = OnceLock::new();
+    static QQ: OnceLock<Template> = OnceLock::new();
+    static IOS: OnceLock<Template> = OnceLock::new();
+    static ANDROID: OnceLock<Template> = OnceLock::new();
+
     Some(match name {
         ""
         | "chrome"
@@ -33,14 +43,14 @@ pub fn by_name(name: &str) -> Option<Template> {
         | "chrome_psk_shuffle"
         | "chrome_padding_psk_shuffle"
         | "chrome_pq"
-        | "chrome_pq_psk" => chrome(),
-        "firefox" => firefox(),
-        "edge" => edge(),
-        "safari" => safari(),
-        "360" => r360(),
-        "qq" => qq(),
-        "ios" => ios(),
-        "android" => android(),
+        | "chrome_pq_psk" => CHROME.get_or_init(chrome).clone(),
+        "firefox" => FIREFOX.get_or_init(firefox).clone(),
+        "edge" => EDGE.get_or_init(edge).clone(),
+        "safari" => SAFARI.get_or_init(safari).clone(),
+        "360" => R360.get_or_init(r360).clone(),
+        "qq" => QQ.get_or_init(qq).clone(),
+        "ios" => IOS.get_or_init(ios).clone(),
+        "android" => ANDROID.get_or_init(android).clone(),
         "random" => super::random_fingerprints::random(),
         "randomized" => super::random_fingerprints::randomized(),
         _ => return None,

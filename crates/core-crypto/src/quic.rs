@@ -65,6 +65,7 @@ pub struct HeaderProtectionKey {
 /// An AES key for the one block header protection encrypts.
 enum HeaderAes {
     Aes128(Box<Aes128>),
+    Aes256(Box<Aes256>),
 }
 
 impl HeaderProtectionKey {
@@ -75,6 +76,11 @@ impl HeaderProtectionKey {
                 let kb = key.as_ref();
                 kb.get(..16)
                     .map(|k| HeaderAes::Aes128(Box::new(Aes128::new(GenericArray::from_slice(k)))))
+            }
+            HeaderCipher::Aes256 => {
+                let kb = key.as_ref();
+                kb.get(..32)
+                    .map(|k| HeaderAes::Aes256(Box::new(Aes256::new(GenericArray::from_slice(k)))))
             }
             _ => None,
         };
@@ -115,13 +121,11 @@ impl HeaderProtectionKey {
 
             HeaderCipher::Aes256 => {
                 // RFC 9001 §5.4.3 — AES-256-ECB
-                let key_bytes = self.key.as_ref();
-                if key_bytes.len() < 32 {
+                let Some(HeaderAes::Aes256(cipher)) = &self.aes else {
                     return Err(Error::General(
                         "QUIC header protection: AES-256 key must be 32 bytes".into(),
                     ));
-                }
-                let cipher = Aes256::new(GenericArray::from_slice(&key_bytes[..32]));
+                };
                 let mut block: GenericArray<u8, _> = GenericArray::clone_from_slice(sample);
                 cipher.encrypt_block(&mut block);
                 let mask: [u8; MASK_LEN] = block[..MASK_LEN]

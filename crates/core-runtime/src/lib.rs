@@ -7,6 +7,7 @@ pub mod clash_state;
 pub mod dns;
 pub(crate) use core_tls::fastchacha;
 pub(crate) use core_tls::fastgcm;
+pub mod hardware;
 pub mod http_client;
 pub mod inbound;
 pub mod logging;
@@ -37,16 +38,7 @@ use std::sync::{Arc, Weak};
 /// overrides it in KiB — every socket pays rx+tx eagerly, so a 64 MiB router
 /// with hundreds of concurrent flows may want to dial it down.
 pub(crate) fn smol_tcp_buf() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let default = 256 * 1024;
-        let kb = std::env::var("TACHYON_SMOL_TCP_BUF")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|kb| (64..=4096).contains(kb))
-            .map_or(default, |kb| kb * 1024);
-        kb.next_power_of_two()
-    })
+    hardware::HardwareProfile::detect().smol_tcp_buf
 }
 
 use anyhow::Context;
@@ -567,6 +559,15 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
                 inbounds.push((tag.clone(), addr));
                 guard.push(serve_forever(ty, &tag, inbound.serve()));
             }
+            "masque" => {
+                let inbound = inbound::masque::Masque::bind(obj, Arc::clone(&router))
+                    .await
+                    .with_context(|| format!("inbounds[{i}]: masque"))?;
+                let addr = inbound.local_addr()?;
+                quic_endpoints.push(inbound.shutdown_endpoint());
+                inbounds.push((tag.clone(), addr));
+                guard.push(serve_forever(ty, &tag, inbound.serve()));
+            }
             "hysteria2" => {
                 let inbound = inbound::hysteria2::Hysteria2::bind(obj, Arc::clone(&router))
                     .await
@@ -587,6 +588,31 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
             other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
         }
     }
+
+    {
+        static LOGGED_HW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_HW.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let hw = hardware::HardwareProfile::detect();
+            logging::info(format_args!(
+                "hardware profile: {} (RAM {} MiB, {} workers, relay buf {} KiB, h2 window {} KiB)",
+                hw.mem_tier.as_str(),
+                hw.total_ram_mb,
+                hw.workers,
+                hw.relay_buf_size / 1024,
+                hw.h2_stream_window / 1024,
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    guard.push(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            hardware::refresh_memory_pressure();
+        }
+    }));
 
     if let Some(cache) = &cache_file {
         let cache = Arc::clone(cache);

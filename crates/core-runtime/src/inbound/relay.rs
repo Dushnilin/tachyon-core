@@ -21,10 +21,10 @@ use tokio::net::TcpStream;
 use crate::clash_state::ConnHandle;
 
 /// Largest bytes asked from one splice, matching the pipe capacity.
-const CHUNK: usize = 64 * 1024;
-/// What a fresh pipe asks for: 64 KiB (standard Linux pipe capacity, 16 pages).
-/// Heavy 1 MiB pipes exhaust kernel memory on routers with 512 MiB RAM under load.
-const PIPE_START: usize = 64 * 1024;
+#[inline]
+fn pipe_size() -> usize {
+    crate::hardware::HardwareProfile::detect().splice_pipe_size
+}
 /// Chunk of the buffered fallback, deliberately small: it only runs when fds
 /// are scarce, and so is memory.
 const FALLBACK_CHUNK: usize = 16 * 1024;
@@ -49,7 +49,7 @@ impl Pipe {
             read: fds[0],
             write: fds[1],
         };
-        let _ = unsafe { libc::fcntl(pipe.write, libc::F_SETPIPE_SZ, PIPE_START as libc::c_int) };
+        let _ = unsafe { libc::fcntl(pipe.write, libc::F_SETPIPE_SZ, pipe_size() as libc::c_int) };
         Ok(pipe)
     }
 }
@@ -157,11 +157,12 @@ async fn one_way(
         return one_way_buffered(from, to, count).await;
     };
     let (from_fd, to_fd) = (from.as_raw_fd(), to.as_raw_fd());
+    let chunk = pipe_size();
     loop {
-        let n = match splice(from_fd, pipe.write, CHUNK) {
+        let n = match splice(from_fd, pipe.write, chunk) {
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                from.async_io(Interest::READABLE, || splice(from_fd, pipe.write, CHUNK))
+                from.async_io(Interest::READABLE, || splice(from_fd, pipe.write, chunk))
                     .await?
             }
             Err(e) => return Err(e),

@@ -102,6 +102,7 @@ struct Session {
     streams: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
     /// stream ids start at 1 (`session.OpenStream`)
     next_sid: AtomicU32,
+    reserved: std::sync::atomic::AtomicUsize,
     alive: AtomicBool,
     peer_version: AtomicU8,
     /// recycled payload buffers: frames are handed to streams from here and
@@ -162,6 +163,7 @@ impl Session {
             writer: AsyncMutex::new(writer),
             streams: Mutex::new(HashMap::new()),
             next_sid: AtomicU32::new(0),
+            reserved: std::sync::atomic::AtomicUsize::new(0),
             alive: AtomicBool::new(true),
             peer_version: AtomicU8::new(0),
             free: Mutex::new(Vec::new()),
@@ -174,27 +176,84 @@ impl Session {
         self.alive.load(Ordering::Acquire)
     }
 
-    /// An empty buffer for the next frame payload: recycled when a reader
-    /// has one to spare, fresh otherwise.
-    fn take_buf(&self) -> Vec<u8> {
-        self.free.lock().expect("free").pop().unwrap_or_default()
+    fn unreserve(&self) {
+        let mut cur = self.reserved.load(Ordering::Acquire);
+        while cur > 0 {
+            match self.reserved.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
-    /// Hand a fully-read payload buffer back for reuse.
-    fn give_buf(&self, mut buf: Vec<u8>) {
-        buf.clear();
-        self.free.lock().expect("free").push(buf);
+    /// A buffer pre-sized to at least `min_len` for the next frame payload:
+    /// recycled buffers retain their initialized length so `give_buf` + reuse
+    /// never zeroes 32-64 KiB of memory before `read_exact` overwrites it.
+    fn take_buf_sized(&self, min_len: usize) -> Vec<u8> {
+        let mut buf = self.free.lock().expect("free").pop().unwrap_or_default();
+        if buf.len() < min_len {
+            buf.resize(min_len, 0);
+        }
+        buf
+    }
+
+    /// Hand a fully-read payload buffer back for reuse without clearing its
+    /// initialized length.
+    fn give_buf(&self, buf: Vec<u8>) {
+        let mut free = self.free.lock().expect("free");
+        if free.len() < 128 {
+            free.push(buf);
+        }
     }
 
     /// `SYN` a new stream and register its receive queue.
+    #[allow(dead_code)]
     async fn open_stream(&self) -> io::Result<(u32, mpsc::Receiver<Vec<u8>>)> {
+        self.open_stream_with_payload(&[]).await
+    }
+
+    /// `SYN` a new stream and optionally coalesce its initial `PSH` target
+    /// frame into the same TLS write and flush.
+    async fn open_stream_with_payload(
+        &self,
+        payload: &[u8],
+    ) -> io::Result<(u32, mpsc::Receiver<Vec<u8>>)> {
         if !self.is_alive() {
             return Err(io::Error::other("anytls: session is closed"));
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
         self.streams.lock().expect("streams").insert(sid, tx);
-        if let Err(e) = self.write_frame(CMD_SYN, sid, &[]).await {
+        let mut buf = Vec::with_capacity(
+            FRAME_HEADER
+                + if payload.is_empty() {
+                    0
+                } else {
+                    FRAME_HEADER + payload.len()
+                },
+        );
+        buf.push(CMD_SYN);
+        buf.extend_from_slice(&sid.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        if !payload.is_empty() {
+            buf.push(CMD_PSH);
+            buf.extend_from_slice(&sid.to_be_bytes());
+            buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            buf.extend_from_slice(payload);
+        }
+        let res = {
+            let mut writer = self.writer.lock().await;
+            match writer.write_all(&buf).await {
+                Ok(()) => writer.flush().await,
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = res {
             self.streams.lock().expect("streams").remove(&sid);
             return Err(e);
         }
@@ -213,8 +272,12 @@ impl Session {
     async fn send_data(&self, sid: u32, data: &[u8]) -> io::Result<()> {
         let mut writer = self.writer.lock().await;
         for chunk in data.chunks(MAX_FRAME_PAYLOAD) {
-            let frame = encode_frame(CMD_PSH, sid, chunk);
-            writer.write_all(&frame).await?;
+            let mut hdr = [0u8; FRAME_HEADER];
+            hdr[0] = CMD_PSH;
+            hdr[1..5].copy_from_slice(&sid.to_be_bytes());
+            hdr[5..7].copy_from_slice(&(chunk.len() as u16).to_be_bytes());
+            writer.write_all(&hdr).await?;
+            writer.write_all(chunk).await?;
         }
         writer.flush().await
     }
@@ -226,6 +289,7 @@ impl Session {
     /// Unregister a stream, without touching the wire.
     fn unregister(self: &Arc<Self>, sid: u32) {
         self.streams.lock().expect("streams").remove(&sid);
+        self.unreserve();
     }
 
     /// Teardown from `Drop`, where awaiting is not possible: hand the `FIN`
@@ -242,30 +306,99 @@ impl Session {
     }
 }
 
+/// Non-blocking poll to check if the next frame header is already buffered in
+/// the TLS reader without waiting on the socket.
+fn try_read_immediate(
+    reader: &mut tokio::io::ReadHalf<AnyStream>,
+    dst: &mut [u8],
+) -> io::Result<usize> {
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut filled = 0;
+    while filled < dst.len() {
+        let mut rb = ReadBuf::new(&mut dst[filled..]);
+        match Pin::new(&mut *reader).poll_read(&mut cx, &mut rb) {
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            Poll::Ready(Err(e)) => return Err(e),
+            Poll::Pending => break,
+        }
+    }
+    Ok(filled)
+}
+
 /// Frame dispatch loop; exits when the TLS connection breaks.
 async fn read_loop(mut reader: tokio::io::ReadHalf<AnyStream>, session: Arc<Session>, tag: String) {
     let mut header = [0u8; FRAME_HEADER];
+    let mut hdr_filled = 0usize;
     let mut payload: Vec<u8> = vec![0u8; MAX_FRAME_PAYLOAD];
-    loop {
-        if let Err(e) = reader.read_exact(&mut header).await {
+    let mut cached_stream: Option<(u32, mpsc::Sender<Vec<u8>>)> = None;
+    'session: loop {
+        if hdr_filled < FRAME_HEADER
+            && let Err(e) = reader.read_exact(&mut header[hdr_filled..]).await
+        {
             logging::debug(format_args!("anytls[{tag}]: session read: {e}"));
             break;
         }
+        hdr_filled = 0;
         let (cmd, sid, len) = parse_header(&header);
         // a payload bound for a live stream reads straight into its recycled
         // buffer: the scratch copy below is only for frames nobody takes
         if cmd == CMD_PSH && len > 0 {
-            let sender = session.streams.lock().expect("streams").get(&sid).cloned();
+            let sender = match &cached_stream {
+                Some((cached_sid, tx)) if *cached_sid == sid && !tx.is_closed() => Some(tx.clone()),
+                _ => {
+                    let tx = session.streams.lock().expect("streams").get(&sid).cloned();
+                    if let Some(ref tx) = tx {
+                        cached_stream = Some((sid, tx.clone()));
+                    }
+                    tx
+                }
+            };
             if let Some(sender) = sender {
-                let mut buf = session.take_buf();
-                buf.resize(len, 0);
+                let mut buf = session.take_buf_sized(len.max(65536));
                 if let Err(e) = reader.read_exact(&mut buf[..len]).await {
                     logging::debug(format_args!("anytls[{tag}]: session payload: {e}"));
                     break;
                 }
+                let mut filled_len = len;
+                while filled_len <= 49152 {
+                    let n = match try_read_immediate(&mut reader, &mut header) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            logging::debug(format_args!("anytls[{tag}]: session read: {e}"));
+                            break 'session;
+                        }
+                    };
+                    if n < FRAME_HEADER {
+                        hdr_filled = n;
+                        break;
+                    }
+                    let (cmd2, sid2, len2) = parse_header(&header);
+                    if cmd2 != CMD_PSH || sid2 != sid || len2 == 0 || filled_len + len2 > 65536 {
+                        hdr_filled = FRAME_HEADER;
+                        break;
+                    }
+                    if buf.len() < filled_len + len2 {
+                        buf.resize(filled_len + len2, 0);
+                    }
+                    if let Err(e) = reader
+                        .read_exact(&mut buf[filled_len..filled_len + len2])
+                        .await
+                    {
+                        logging::debug(format_args!("anytls[{tag}]: session payload: {e}"));
+                        break 'session;
+                    }
+                    filled_len += len2;
+                }
+                buf.truncate(filled_len);
                 if sender.send(buf).await.is_err() {
-                    // the stream is gone: the frame is dropped like an
-                    // unclaimed one
+                    cached_stream = None;
                 }
                 continue;
             }
@@ -286,12 +419,16 @@ async fn read_loop(mut reader: tokio::io::ReadHalf<AnyStream>, session: Arc<Sess
                 }
                 let sender = session.streams.lock().expect("streams").get(&sid).cloned();
                 if let Some(sender) = sender {
-                    let mut buf = session.take_buf();
-                    buf.extend_from_slice(&payload[..len]);
+                    let mut buf = session.take_buf_sized(len);
+                    buf[..len].copy_from_slice(&payload[..len]);
+                    buf.truncate(len);
                     let _ = sender.send(buf).await;
                 }
             }
             CMD_FIN => {
+                if cached_stream.as_ref().is_some_and(|(id, _)| *id == sid) {
+                    cached_stream = None;
+                }
                 session.unregister(sid);
             }
             // the server confirms (or rejects) stream setup for protocol v2
@@ -301,6 +438,9 @@ async fn read_loop(mut reader: tokio::io::ReadHalf<AnyStream>, session: Arc<Sess
                     logging::warn(format_args!(
                         "anytls[{tag}]: remote rejected stream: {message}"
                     ));
+                    if cached_stream.as_ref().is_some_and(|(id, _)| *id == sid) {
+                        cached_stream = None;
+                    }
                     session.streams.lock().expect("streams").remove(&sid);
                 }
             }
@@ -413,10 +553,26 @@ impl AsyncRead for Stream {
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
             }
         }
-        let available = self.pending.len() - self.pos;
-        let n = out.remaining().min(available);
-        out.put_slice(&self.pending[self.pos..self.pos + n]);
-        self.pos += n;
+        loop {
+            let available = self.pending.len() - self.pos;
+            let n = out.remaining().min(available);
+            out.put_slice(&self.pending[self.pos..self.pos + n]);
+            self.pos += n;
+            if self.pos < self.pending.len() || out.remaining() == 0 {
+                break;
+            }
+            let spent = std::mem::take(&mut self.pending);
+            if !spent.is_empty() {
+                self.session.give_buf(spent);
+            }
+            self.pos = 0;
+            match self.rx.try_recv() {
+                Ok(chunk) => {
+                    self.pending = chunk;
+                }
+                Err(_) => break,
+            }
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -436,9 +592,9 @@ impl AsyncWrite for Stream {
         }
         // the same pool the read side uses: one alloc per connection, not
         // per write
-        let mut owned = self.session.take_buf();
-        owned.clear();
-        owned.extend_from_slice(buf);
+        let mut owned = self.session.take_buf_sized(buf.len());
+        owned[..buf.len()].copy_from_slice(buf);
+        owned.truncate(buf.len());
         self.poll_frame_write(cx, Some(owned))
     }
 
@@ -564,17 +720,29 @@ impl AnyTls {
         })
     }
 
-    /// A session for the next stream: below the cap every stream gets its own
-    /// session for parallel TCP flows, at the cap the least-loaded live one
-    /// takes it. Dead sessions are pruned on the way.
+    /// A session for the next stream: reuse any idle session first, open a
+    /// dedicated session while below `MAX_SESSIONS`, and share the
+    /// least-loaded live session once at the cap.
     async fn session(&self) -> io::Result<Arc<Session>> {
         let shared = {
             let mut pool = self.sessions.lock().expect("sessions");
             pool.retain(|s| s.is_alive());
-            if pool.len() >= MAX_SESSIONS {
-                pool.iter()
-                    .min_by_key(|s| s.streams.lock().expect("streams").len())
-                    .cloned()
+            if let Some(idle) = pool
+                .iter()
+                .find(|s| s.reserved.load(Ordering::Acquire) == 0)
+                .cloned()
+            {
+                idle.reserved.fetch_add(1, Ordering::AcqRel);
+                Some(idle)
+            } else if pool.len() >= MAX_SESSIONS {
+                let best = pool
+                    .iter()
+                    .min_by_key(|s| s.reserved.load(Ordering::Acquire))
+                    .cloned();
+                if let Some(s) = &best {
+                    s.reserved.fetch_add(1, Ordering::AcqRel);
+                }
+                best
             } else {
                 None
             }
@@ -592,6 +760,7 @@ impl AnyTls {
             &self.dial,
         )
         .await?;
+        session.reserved.store(1, Ordering::Release);
         let mut pool = self.sessions.lock().expect("sessions");
         pool.retain(|s| s.is_alive());
         pool.push(Arc::clone(&session));
@@ -608,11 +777,21 @@ impl AnyTls {
 
     /// One multiplexed stream carrying `address` as its first payload.
     async fn open_stream(&self, session: &Arc<Session>, address: &Target) -> io::Result<AnyStream> {
-        let (sid, rx) = session.open_stream().await?;
-        let mut stream = Stream::new(Arc::clone(session), sid, rx);
-        stream.write_all(&encode_target(address)?).await?;
-        stream.flush().await?;
-        Ok(Box::new(stream))
+        let target_bytes = match encode_target(address) {
+            Ok(b) => b,
+            Err(e) => {
+                session.unreserve();
+                return Err(e);
+            }
+        };
+        let (sid, rx) = match session.open_stream_with_payload(&target_bytes).await {
+            Ok(v) => v,
+            Err(e) => {
+                session.unreserve();
+                return Err(e);
+            }
+        };
+        Ok(Box::new(Stream::new(Arc::clone(session), sid, rx)))
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
@@ -639,11 +818,28 @@ impl AnyTls {
         // uot: the stream targets the reserved magic address, the real
         // destination travels in the request header
         let magic = Target::Domain(UOT_MAGIC.to_string(), 0);
-        let (sid, rx) = session.open_stream().await?;
-        let mut stream = Stream::new(Arc::clone(&session), sid, rx);
-        stream.write_all(&encode_target(&magic)?).await?;
-        stream.write_all(&request_header(true, target)?).await?;
-        stream.flush().await?;
+        let mut init_payload = match encode_target(&magic) {
+            Ok(b) => b,
+            Err(e) => {
+                session.unreserve();
+                return Err(e);
+            }
+        };
+        match request_header(true, target) {
+            Ok(hdr) => init_payload.extend_from_slice(&hdr),
+            Err(e) => {
+                session.unreserve();
+                return Err(e);
+            }
+        }
+        let (sid, rx) = match session.open_stream_with_payload(&init_payload).await {
+            Ok(v) => v,
+            Err(e) => {
+                session.unreserve();
+                return Err(e);
+            }
+        };
+        let stream = Stream::new(Arc::clone(&session), sid, rx);
         spawn_bridge(Box::new(stream), peer);
         Ok(local)
     }

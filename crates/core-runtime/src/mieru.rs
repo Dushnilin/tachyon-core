@@ -22,14 +22,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{
-    AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf,
-};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::mpsc;
+
+use crate::fastchacha::ChaChaPoly;
 
 pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
@@ -97,8 +95,23 @@ fn pbkdf2_block(password: &[u8], salt: &[u8]) -> [u8; 32] {
 
 /// Key for the salt window starting at `window` (unix seconds, multiple of 120).
 pub fn key_for_window(hashed: &[u8; 32], window: i64) -> [u8; 32] {
+    type KeyCacheEntry = ([u8; 32], i64, [u8; 32]);
+    static CACHE: std::sync::Mutex<[KeyCacheEntry; 8]> =
+        std::sync::Mutex::new([([0u8; 32], i64::MIN, [0u8; 32]); 8]);
+    if let Ok(guard) = CACHE.lock() {
+        for (h, w, k) in guard.iter() {
+            if *w == window && h == hashed {
+                return *k;
+            }
+        }
+    }
     let salt: [u8; 32] = Sha256::digest((window as u64).to_be_bytes()).into();
-    pbkdf2_block(hashed, &salt)
+    let key = pbkdf2_block(hashed, &salt);
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.rotate_right(1);
+        guard[0] = (*hashed, window, key);
+    }
+    key
 }
 
 /// The window a client uses now: unix time rounded to the nearest two
@@ -129,18 +142,54 @@ fn nonce_hint(user: &str, nonce: &[u8]) -> [u8; 4] {
 
 /// One direction of a connection: key plus the running nonce.
 struct Dir {
-    aead: XChaCha20Poly1305,
+    key: [u8; 32],
+    fast: Option<([u8; 16], ChaChaPoly)>,
     user: String,
     nonce: Option<[u8; NONCE_LEN]>,
+    rng: u64,
 }
 
 impl Dir {
     fn new(key: &[u8; 32], user: &str) -> Self {
+        let mut seed = [0u8; 8];
+        let _ = getrandom::fill(&mut seed);
+        let rng = u64::from_le_bytes(seed).max(1);
         Self {
-            aead: XChaCha20Poly1305::new(Key::from_slice(key)),
+            key: *key,
+            fast: None,
             user: user.to_string(),
             nonce: None,
+            rng,
         }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Generate `0..=max` printable ASCII padding bytes on the stack without
+    /// per-segment `getrandom` syscalls or heap allocations.
+    fn next_padding(&mut self, max: u8) -> ([u8; 64], usize) {
+        let len = (self.next_u64() as usize) % (max as usize + 1);
+        let mut p = [0u8; 64];
+        let mut i = 0;
+        while i < len {
+            let mut w = self.next_u64();
+            for _ in 0..8 {
+                if i >= len {
+                    break;
+                }
+                p[i] = 0x20 + ((w as u8) % 0x5f);
+                w >>= 8;
+                i += 1;
+            }
+        }
+        (p, len)
     }
 
     fn step(nonce: &mut [u8; NONCE_LEN]) {
@@ -150,6 +199,21 @@ impl Dir {
                 break;
             }
         }
+    }
+
+    fn cipher(&mut self, nonce: &[u8; NONCE_LEN]) -> (&ChaChaPoly, [u8; 12]) {
+        let prefix: [u8; 16] = nonce[..16].try_into().expect("16 bytes");
+        let need_rekey = self.fast.as_ref().is_none_or(|(p, _)| *p != prefix);
+        if need_rekey {
+            let subkey = chacha20::hchacha::<chacha20::cipher::consts::U10>(
+                chacha20::Key::from_slice(&self.key),
+                (&prefix).into(),
+            );
+            self.fast = Some((prefix, ChaChaPoly::new(subkey.as_slice())));
+        }
+        let mut n12 = [0u8; 12];
+        n12[4..].copy_from_slice(&nonce[16..]);
+        (&self.fast.as_ref().expect("set above").1, n12)
     }
 
     /// Seal `plain` onto `out`, nonce first when this is the first seal.
@@ -173,16 +237,17 @@ impl Dir {
         };
         let start = out.len();
         out.extend_from_slice(plain);
-        let tag = self
-            .aead
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce), b"", &mut out[start..])
-            .expect("a segment is far below the AEAD size limit");
+        let (cipher, n12) = self.cipher(&nonce);
+        let tag = cipher.seal(&n12, &[], &mut out[start..]);
         out.extend_from_slice(&tag);
     }
 
-    /// Open `ct` (ciphertext + tag). `first_nonce` is the clear nonce that
-    /// leads the first segment of the direction, `None` afterwards.
-    fn open(&mut self, first_nonce: Option<&[u8]>, ct: &[u8]) -> io::Result<Vec<u8>> {
+    /// Open `ct` (ciphertext + tag) in place and return the plaintext slice.
+    fn open_in_place<'a>(
+        &mut self,
+        first_nonce: Option<&[u8]>,
+        ct: &'a mut [u8],
+    ) -> io::Result<&'a [u8]> {
         let nonce = if let Some(n) = self.nonce.as_mut() {
             Self::step(n);
             *n
@@ -196,16 +261,22 @@ impl Dir {
         if ct.len() < TAG_LEN {
             return Err(bad("short ciphertext"));
         }
-        let (body, tag) = ct.split_at(ct.len() - TAG_LEN);
-        let mut buf = body.to_vec();
-        self.aead
-            .decrypt_in_place_detached(
-                XNonce::from_slice(&nonce),
-                b"",
-                &mut buf,
-                Tag::from_slice(tag),
-            )
-            .map_err(|_| bad("authentication failed"))?;
+        let split = ct.len() - TAG_LEN;
+        let (body, tag_slice) = ct.split_at_mut(split);
+        let tag: [u8; TAG_LEN] = (&*tag_slice).try_into().expect("16 bytes");
+        let (cipher, n12) = self.cipher(&nonce);
+        if !cipher.open(&n12, &[], body, &tag) {
+            return Err(bad("authentication failed"));
+        }
+        Ok(body)
+    }
+
+    /// Open `ct` (ciphertext + tag). `first_nonce` is the clear nonce that
+    /// leads the first segment of the direction, `None` afterwards.
+    fn open(&mut self, first_nonce: Option<&[u8]>, ct: &[u8]) -> io::Result<Vec<u8>> {
+        let mut buf = ct.to_vec();
+        let len = self.open_in_place(first_nonce, &mut buf)?.len();
+        buf.truncate(len);
         Ok(buf)
     }
 }
@@ -375,24 +446,6 @@ impl Meta {
     }
 }
 
-fn rand_byte() -> u8 {
-    let mut b = [0u8; 1];
-    let _ = getrandom::fill(&mut b);
-    b[0]
-}
-
-/// Printable padding of random length `0..=max`; the receiver skips it by the
-/// length in the metadata.
-fn padding(max: u8) -> Vec<u8> {
-    let len = rand_byte() as usize % (max as usize + 1);
-    let mut p = vec![0u8; len];
-    let _ = getrandom::fill(&mut p);
-    for b in &mut p {
-        *b = 0x20 + *b % 0x5f;
-    }
-    p
-}
-
 // ----------------------------------------------------- segment coding
 
 /// Seal a session segment (open/close) onto `out`.
@@ -405,20 +458,20 @@ fn put_session(
     status: u8,
     payload: &[u8],
 ) {
-    let suffix = padding(63);
+    let (suffix, suffix_len) = send.next_padding(63);
     let meta = Meta::Session {
         proto,
         session_id,
         seq,
         status,
         payload_len: payload.len() as u16,
-        suffix_len: suffix.len() as u8,
+        suffix_len: suffix_len as u8,
     };
     send.seal(&meta.marshal(), out);
     if !payload.is_empty() {
         send.seal(payload, out);
     }
-    out.extend_from_slice(&suffix);
+    out.extend_from_slice(&suffix[..suffix_len]);
 }
 
 /// Seal a data segment onto `out`.
@@ -431,8 +484,8 @@ fn put_data(
     un_ack: u32,
     payload: &[u8],
 ) {
-    let prefix = padding(31);
-    let suffix = padding(31);
+    let (prefix, prefix_len) = send.next_padding(31);
+    let (suffix, suffix_len) = send.next_padding(31);
     let meta = Meta::Data {
         proto,
         session_id,
@@ -440,44 +493,85 @@ fn put_data(
         un_ack,
         window: WINDOW_SLOTS,
         fragment: 0,
-        prefix_len: prefix.len() as u8,
+        prefix_len: prefix_len as u8,
         payload_len: payload.len() as u16,
-        suffix_len: suffix.len() as u8,
+        suffix_len: suffix_len as u8,
     };
     send.seal(&meta.marshal(), out);
-    out.extend_from_slice(&prefix);
+    out.extend_from_slice(&prefix[..prefix_len]);
     if !payload.is_empty() {
         send.seal(payload, out);
     }
-    out.extend_from_slice(&suffix);
+    out.extend_from_slice(&suffix[..suffix_len]);
 }
+
+const DEC_BUF_CAP: usize = 256 * 1024;
+const DEC_MIN_SPACE: usize = 96 * 1024;
 
 /// Receive side of one direction: buffers bytes, yields whole segments.
 struct Decoder {
     recv: Dir,
     rbuf: Vec<u8>,
     rstart: usize,
+    rend: usize,
     pending: Option<Meta>,
     check_time: bool,
 }
 
 impl Decoder {
     fn new(key: &[u8; 32], user: &str, head: Vec<u8>, check_time: bool) -> Self {
+        let rend = head.len();
+        let mut rbuf = head;
+        if rbuf.len() < DEC_BUF_CAP {
+            rbuf.resize(DEC_BUF_CAP, 0);
+        }
         Self {
             recv: Dir::new(key, user),
-            rbuf: head,
+            rbuf,
             rstart: 0,
+            rend,
             pending: None,
             check_time,
         }
     }
 
+    fn read_slice(&mut self) -> &mut [u8] {
+        if self.rstart == self.rend {
+            self.rstart = 0;
+            self.rend = 0;
+        } else if self.rbuf.len() - self.rend < DEC_MIN_SPACE && self.rstart > 0 {
+            self.rbuf.copy_within(self.rstart..self.rend, 0);
+            self.rend -= self.rstart;
+            self.rstart = 0;
+        }
+        if self.rbuf.len() - self.rend < DEC_MIN_SPACE {
+            self.rbuf.resize(self.rend + DEC_MIN_SPACE, 0);
+        }
+        &mut self.rbuf[self.rend..]
+    }
+
+    fn advance_read(&mut self, n: usize) {
+        self.rend += n;
+    }
+
+    #[cfg(test)]
     fn push(&mut self, bytes: &[u8]) {
-        self.rbuf.extend_from_slice(bytes);
+        let dst = self.read_slice();
+        if dst.len() >= bytes.len() {
+            dst[..bytes.len()].copy_from_slice(bytes);
+            self.rend += bytes.len();
+        } else {
+            let need = self.rend + bytes.len();
+            if self.rbuf.len() < need {
+                self.rbuf.resize(need, 0);
+            }
+            self.rbuf[self.rend..need].copy_from_slice(bytes);
+            self.rend = need;
+        }
     }
 
     fn avail(&self) -> &[u8] {
-        &self.rbuf[self.rstart..]
+        &self.rbuf[self.rstart..self.rend]
     }
 
     /// Nothing buffered and no half-read segment.
@@ -487,17 +581,14 @@ impl Decoder {
 
     fn consume(&mut self, n: usize) {
         self.rstart += n;
-        if self.rstart == self.rbuf.len() {
-            self.rbuf.clear();
+        if self.rstart == self.rend {
             self.rstart = 0;
-        } else if self.rstart > 64 * 1024 {
-            self.rbuf.drain(..self.rstart);
-            self.rstart = 0;
+            self.rend = 0;
         }
     }
 
-    /// One whole segment, or `None` when more bytes are needed.
-    fn next(&mut self) -> io::Result<Option<(Meta, Vec<u8>)>> {
+    /// Decode one whole segment in place and return its metadata + plaintext slice.
+    fn next_slice(&mut self) -> io::Result<Option<(Meta, &[u8])>> {
         if self.pending.is_none() {
             let lead = if self.recv.nonce.is_none() {
                 NONCE_LEN
@@ -508,16 +599,22 @@ impl Decoder {
             if self.avail().len() < need {
                 return Ok(None);
             }
-            let (first, ct) = {
-                let a = self.avail();
-                (
-                    (lead > 0).then(|| a[..NONCE_LEN].to_vec()),
-                    a[lead..need].to_vec(),
+            let first_nonce: Option<[u8; NONCE_LEN]> = if lead > 0 {
+                Some(
+                    self.rbuf[self.rstart..self.rstart + NONCE_LEN]
+                        .try_into()
+                        .expect("24 bytes"),
                 )
+            } else {
+                None
             };
-            let plain = self.recv.open(first.as_deref(), &ct)?;
+            let ct_slice = &mut self.rbuf[self.rstart + lead..self.rstart + need];
+            let plain = self
+                .recv
+                .open_in_place(first_nonce.as_ref().map(|n| &n[..]), ct_slice)?;
+            let meta = Meta::parse(plain, self.check_time)?;
             self.consume(need);
-            self.pending = Some(Meta::parse(&plain, self.check_time)?);
+            self.pending = Some(meta);
         }
         let meta = self.pending.clone().expect("set just above");
         let body = meta.body_len();
@@ -532,15 +629,26 @@ impl Decoder {
                 ..
             } => (prefix_len as usize, payload_len as usize),
         };
-        let payload = if payload_len > 0 {
-            let ct = self.avail()[prefix..prefix + payload_len + TAG_LEN].to_vec();
-            self.recv.open(None, &ct)?
-        } else {
-            Vec::new()
-        };
+        let p_start = self.rstart + prefix;
+        let p_end = p_start + payload_len;
+        if payload_len > 0 {
+            let end = p_end + TAG_LEN;
+            let _ = self
+                .recv
+                .open_in_place(None, &mut self.rbuf[p_start..end])?;
+        }
         self.consume(body);
         self.pending = None;
-        Ok(Some((meta, payload)))
+        Ok(Some((meta, &self.rbuf[p_start..p_end])))
+    }
+
+    /// One whole segment, or `None` when more bytes are needed.
+    #[cfg(test)]
+    fn next(&mut self) -> io::Result<Option<(Meta, Vec<u8>)>> {
+        match self.next_slice()? {
+            Some((meta, slice)) => Ok(Some((meta, slice.to_vec()))),
+            None => Ok(None),
+        }
     }
 }
 
@@ -556,13 +664,167 @@ struct Live {
     seq: u32,
 }
 
-fn emit(o: Out, live: &mut HashMap<u32, Live>, send: &mut Dir, wbuf: &mut Vec<u8>) {
+fn take_pool_buf(free: &std::sync::Mutex<Vec<Vec<u8>>>, data: &[u8]) -> Vec<u8> {
+    let mut buf = free.lock().expect("free").pop().unwrap_or_default();
+    if buf.len() < data.len() {
+        buf.resize(data.len(), 0);
+    } else {
+        buf.truncate(data.len());
+    }
+    buf[..data.len()].copy_from_slice(data);
+    buf
+}
+
+fn give_pool_buf(free: &std::sync::Mutex<Vec<Vec<u8>>>, buf: Vec<u8>) {
+    let mut guard = free.lock().expect("free");
+    if guard.len() < 128 {
+        guard.push(buf);
+    }
+}
+
+pub struct MieruServerStream {
+    sid: u32,
+    rx: mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    pos: usize,
+    out_tx: mpsc::Sender<Out>,
+    free: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    closed: bool,
+}
+
+impl AsyncRead for MieruServerStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos >= self.pending.len() {
+            let spent = std::mem::take(&mut self.pending);
+            if !spent.is_empty() {
+                give_pool_buf(&self.free, spent);
+            }
+            self.pos = 0;
+            match self.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(chunk)) => self.pending = chunk,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+            }
+        }
+        loop {
+            let avail = self.pending.len() - self.pos;
+            let n = out.remaining().min(avail);
+            out.put_slice(&self.pending[self.pos..self.pos + n]);
+            self.pos += n;
+            if self.pos < self.pending.len() || out.remaining() == 0 {
+                break;
+            }
+            let spent = std::mem::take(&mut self.pending);
+            if !spent.is_empty() {
+                give_pool_buf(&self.free, spent);
+            }
+            self.pos = 0;
+            match self.rx.try_recv() {
+                Ok(chunk) => self.pending = chunk,
+                Err(_) => break,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for MieruServerStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let n = buf.len().min(2 * MAX_PDU);
+        match self.out_tx.try_reserve() {
+            Ok(permit) => {
+                let owned = take_pool_buf(&self.free, &buf[..n]);
+                permit.send(Out::Data(self.sid, owned));
+                Poll::Ready(Ok(n))
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let tx = self.out_tx.clone();
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    if tx.reserve().await.is_ok() {
+                        waker.wake();
+                    }
+                });
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.closed {
+            self.closed = true;
+            let sid = self.sid;
+            let tx = self.out_tx.clone();
+            if tx.try_send(Out::Close(sid)).is_err()
+                && tokio::runtime::Handle::try_current().is_ok()
+            {
+                tokio::spawn(async move {
+                    let _ = tx.send(Out::Close(sid)).await;
+                });
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for MieruServerStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            let sid = self.sid;
+            let tx = self.out_tx.clone();
+            if tx.try_send(Out::Close(sid)).is_err()
+                && tokio::runtime::Handle::try_current().is_ok()
+            {
+                tokio::spawn(async move {
+                    let _ = tx.send(Out::Close(sid)).await;
+                });
+            }
+        }
+        let spent = std::mem::take(&mut self.pending);
+        if !spent.is_empty() {
+            give_pool_buf(&self.free, spent);
+        }
+    }
+}
+
+fn emit(
+    o: Out,
+    live: &mut HashMap<u32, Live>,
+    send: &mut Dir,
+    wbuf: &mut Vec<u8>,
+    free: &std::sync::Mutex<Vec<Vec<u8>>>,
+) {
     match o {
         Out::Data(sid, bytes) => {
             if let Some(l) = live.get_mut(&sid) {
-                put_data(send, wbuf, DATA_SERVER_TO_CLIENT, sid, l.seq, 0, &bytes);
-                l.seq = l.seq.wrapping_add(1);
+                for chunk in bytes.chunks(MAX_PDU) {
+                    put_data(send, wbuf, DATA_SERVER_TO_CLIENT, sid, l.seq, 0, chunk);
+                    l.seq = l.seq.wrapping_add(1);
+                }
             }
+            give_pool_buf(free, bytes);
         }
         Out::Close(sid) => {
             if let Some(l) = live.remove(&sid) {
@@ -574,7 +836,7 @@ fn emit(o: Out, live: &mut HashMap<u32, Live>, send: &mut Dir, wbuf: &mut Vec<u8
 
 /// Serve one client connection that may carry many sessions (the reference
 /// client reuses an underlay). Every session the client opens is handed to
-/// `accept` as a plain duplex stream. Returns when the connection ends.
+/// `accept` as a stream. Returns when the connection ends.
 pub async fn serve_underlay<S, F>(
     stream: S,
     key: &[u8; 32],
@@ -584,17 +846,17 @@ pub async fn serve_underlay<S, F>(
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnMut(DuplexStream),
+    F: FnMut(MieruServerStream),
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut dec = Decoder::new(key, user, head, true);
     let mut send = Dir::new(key, user);
-    let (out_tx, mut out_rx) = mpsc::channel::<Out>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<Out>(128);
     let mut live: HashMap<u32, Live> = HashMap::new();
-    let mut wbuf = Vec::new();
-    let mut tmp = vec![0u8; 16 * 1024];
+    let mut wbuf = Vec::with_capacity(128 * 1024);
+    let free = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     loop {
-        while let Some((meta, payload)) = dec.next()? {
+        while let Some((meta, payload)) = dec.next_slice()? {
             match meta {
                 Meta::Session {
                     proto,
@@ -606,36 +868,16 @@ where
                             return Err(bad("session id 0"));
                         }
                         if let Entry::Vacant(e) = live.entry(sid) {
-                            let (app, bridge) = tokio::io::duplex(256 * 1024);
-                            let (mut br_r, mut br_w) = tokio::io::split(bridge);
-                            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
-                            tokio::spawn(async move {
-                                while let Some(b) = rx.recv().await {
-                                    if br_w.write_all(&b).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                let _ = br_w.shutdown().await;
-                            });
-                            let up = out_tx.clone();
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; MAX_PDU];
-                                loop {
-                                    match br_r.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            if up
-                                                .send(Out::Data(sid, buf[..n].to_vec()))
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                                let _ = up.send(Out::Close(sid)).await;
-                            });
+                            let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+                            let app = MieruServerStream {
+                                sid,
+                                rx,
+                                pending: Vec::new(),
+                                pos: 0,
+                                out_tx: out_tx.clone(),
+                                free: std::sync::Arc::clone(&free),
+                                closed: false,
+                            };
                             accept(app);
                             put_session(&mut send, &mut wbuf, OPEN_RESPONSE, sid, 0, 0, &[]);
                             e.insert(Live { tx, seq: 1 });
@@ -643,7 +885,8 @@ where
                         if !payload.is_empty()
                             && let Some(l) = live.get(&sid)
                         {
-                            let _ = l.tx.send(payload).await;
+                            let buf = take_pool_buf(&free, payload);
+                            let _ = l.tx.send(buf).await;
                         }
                     }
                     CLOSE_REQUEST => {
@@ -664,7 +907,8 @@ where
                         && !payload.is_empty()
                         && let Some(l) = live.get(&sid)
                     {
-                        let _ = l.tx.send(payload).await;
+                        let buf = take_pool_buf(&free, payload);
+                        let _ = l.tx.send(buf).await;
                     }
                 }
             }
@@ -675,17 +919,20 @@ where
             wbuf.clear();
         }
         tokio::select! {
-            n = rd.read(&mut tmp) => {
+            n = rd.read(dec.read_slice()) => {
                 let n = n?;
                 if n == 0 {
                     return Ok(());
                 }
-                dec.push(&tmp[..n]);
+                dec.advance_read(n);
             }
             Some(o) = out_rx.recv() => {
-                emit(o, &mut live, &mut send, &mut wbuf);
-                while let Ok(o) = out_rx.try_recv() {
-                    emit(o, &mut live, &mut send, &mut wbuf);
+                emit(o, &mut live, &mut send, &mut wbuf, &free);
+                while wbuf.len() < 256 * 1024 {
+                    let Ok(o) = out_rx.try_recv() else {
+                        break;
+                    };
+                    emit(o, &mut live, &mut send, &mut wbuf, &free);
                 }
             }
         }
@@ -736,9 +983,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> MieruStream<S> {
             session_id,
             next_seq: 0,
             received: 0,
-            plain: Vec::new(),
+            plain: Vec::with_capacity(64 * 1024),
             pstart: 0,
-            wbuf: Vec::new(),
+            wbuf: Vec::with_capacity(128 * 1024),
             wstart: 0,
             open_sent: false,
             closed_by_peer: false,
@@ -754,6 +1001,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> MieruStream<S> {
             user,
             Vec::new(),
         )
+    }
+
+    pub fn client_with_hash(inner: S, user: &str, hashed: &[u8; 32]) -> Self {
+        let key = key_for_window(hashed, current_window());
+        Self::new(inner, Role::Client, &key, user, Vec::new())
     }
 
     /// `head` is what `discover` already read off the socket.
@@ -793,20 +1045,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> MieruStream<S> {
         );
     }
 
-    /// Decode one whole segment. `Ok(false)`: need more bytes.
-    fn parse_segment(&mut self) -> io::Result<bool> {
-        match self.dec.next()? {
-            Some((meta, payload)) => {
-                self.received = self.received.wrapping_add(1);
-                self.handle(meta, payload)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    fn handle(&mut self, meta: Meta, payload: Vec<u8>) -> io::Result<()> {
-        match meta {
+    /// Decode one whole segment directly into `out` when possible, spilling any
+    /// remainder into `self.plain`. `Ok(false)`: need more bytes.
+    fn parse_segment_into(&mut self, out: &mut ReadBuf<'_>) -> io::Result<bool> {
+        let Some((meta, payload)) = self.dec.next_slice()? else {
+            return Ok(false);
+        };
+        self.received = self.received.wrapping_add(1);
+        let mut reply_proto: Option<u8> = None;
+        let keep = match meta {
             Meta::Session {
                 proto, session_id, ..
             } => match proto {
@@ -816,32 +1063,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin> MieruStream<S> {
                     }
                     if self.session_id == 0 {
                         self.session_id = session_id;
-                        self.queue_session(OPEN_RESPONSE, &[], 0);
+                        reply_proto = Some(OPEN_RESPONSE);
                     }
-                    self.plain.extend_from_slice(&payload);
+                    true
                 }
                 OPEN_RESPONSE => {
                     if self.role != Role::Client {
                         return Err(bad("unexpected open response"));
                     }
-                    self.plain.extend_from_slice(&payload);
+                    true
                 }
                 CLOSE_REQUEST => {
                     if !self.close_sent {
-                        self.queue_session(CLOSE_RESPONSE, &[], 0);
+                        reply_proto = Some(CLOSE_RESPONSE);
                     }
                     self.closed_by_peer = true;
+                    false
                 }
-                _ => self.closed_by_peer = true,
-            },
-            Meta::Data { proto, .. } => match proto {
-                DATA_CLIENT_TO_SERVER | DATA_SERVER_TO_CLIENT => {
-                    self.plain.extend_from_slice(&payload);
+                _ => {
+                    self.closed_by_peer = true;
+                    false
                 }
-                _ => {}
             },
+            Meta::Data { proto, .. } => {
+                matches!(proto, DATA_CLIENT_TO_SERVER | DATA_SERVER_TO_CLIENT)
+            }
+        };
+        if keep && !payload.is_empty() {
+            if self.pstart == self.plain.len() {
+                let n = out.remaining().min(payload.len());
+                out.put_slice(&payload[..n]);
+                if n < payload.len() {
+                    self.plain.clear();
+                    self.pstart = 0;
+                    self.plain.extend_from_slice(&payload[n..]);
+                }
+            } else {
+                self.plain.extend_from_slice(payload);
+            }
         }
-        Ok(())
+        if let Some(proto) = reply_proto {
+            self.queue_session(proto, &[], 0);
+        }
+        Ok(true)
     }
 
     fn poll_flush_wbuf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -866,6 +1130,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MieruStream<S> {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let initial_rem = out.remaining();
         loop {
             if this.pstart < this.plain.len() {
                 let n = out.remaining().min(this.plain.len() - this.pstart);
@@ -875,31 +1140,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MieruStream<S> {
                     this.plain.clear();
                     this.pstart = 0;
                 }
-                return Poll::Ready(Ok(()));
+                if out.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
             }
-            if this.closed_by_peer {
-                return Poll::Ready(Ok(()));
-            }
-            if this.parse_segment()? {
-                // A close reply or open response may have been queued.
+            while !this.closed_by_peer && out.remaining() > 0 && this.pstart == this.plain.len() {
+                if !this.parse_segment_into(out)? {
+                    break;
+                }
                 let _ = this.poll_flush_wbuf(cx);
-                continue;
             }
-            let mut tmp = [0u8; 16 * 1024];
-            let mut rb = ReadBuf::new(&mut tmp);
+            if out.remaining() < initial_rem || this.closed_by_peer {
+                return Poll::Ready(Ok(()));
+            }
+            let mut rb = ReadBuf::new(this.dec.read_slice());
             match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {
-                    let got = rb.filled();
-                    if got.is_empty() {
+                    let got = rb.filled().len();
+                    if got == 0 {
                         if this.dec.idle() {
                             this.closed_by_peer = true;
                             return Poll::Ready(Ok(()));
                         }
                         return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
                     }
-                    this.dec.push(got);
+                    this.dec.advance_read(got);
                 }
             }
         }
@@ -933,8 +1200,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MieruStream<S> {
             this.queue_session(OPEN_REQUEST, &buf[..n], 0);
             n
         } else {
-            let n = buf.len().min(MAX_PDU);
-            this.queue_data(&buf[..n]);
+            let n = buf.len().min(2 * MAX_PDU);
+            for chunk in buf[..n].chunks(MAX_PDU) {
+                this.queue_data(chunk);
+            }
             n
         };
         match this.poll_flush_wbuf(cx) {

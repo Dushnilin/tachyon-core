@@ -253,7 +253,9 @@ impl Transport {
         match &self.kind {
             Kind::Xhttp(cfg) if cfg.h1_only(tls) => {
                 let mut t = tls?.clone();
-                t.set_alpn(&[b"http/1.1"]);
+                if t.reality().is_none() {
+                    t.set_alpn(&[b"http/1.1"]);
+                }
                 Some(t)
             }
             _ => None,
@@ -281,10 +283,26 @@ impl Transport {
         early: &[u8],
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<(AnyStream, usize)> {
-        if let Kind::Xhttp(cfg) = &self.kind
-            && let Some(stream) = cfg.connect_h2_stream(tls, server, port, dial).await?
-        {
-            return Ok((stream, 0));
+        if let Kind::Xhttp(cfg) = &self.kind {
+            match cfg.connect_h2_stream(tls, server, port, dial).await? {
+                xhttp::H2Connect::Stream(stream) => return Ok((stream, 0)),
+                xhttp::H2Connect::Fallback(stream) => {
+                    let has_reality = tls.and_then(|t| t.reality()).is_some();
+                    let dialer = self.dialer(tls, server, port, dial);
+                    let stream = xhttp::connect(
+                        stream,
+                        tls.is_some(),
+                        has_reality,
+                        server,
+                        port,
+                        cfg,
+                        dialer,
+                    )
+                    .await?;
+                    return Ok((stream, 0));
+                }
+                xhttp::H2Connect::Skip => {}
+            }
         }
 
         let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
@@ -393,7 +411,8 @@ impl Transport {
     }
 
     /// A closure that opens one more connection to the same server with the same
-    /// TCP options, the same TLS and the same ALPN as the first one.
+    /// TCP options, the same TLS and HTTP/1.1 ALPN (since `dialer` is only used
+    /// by XHTTP's HTTP/1.1 `packet-up` and `stream-up` paths).
     fn dialer(
         &self,
         tls: Option<&TlsOptions>,
@@ -403,7 +422,13 @@ impl Transport {
     ) -> Arc<xhttp::Dialer> {
         let server = server.to_string();
         let dial = dial.clone();
-        let tls = self.h1_forced_tls(tls).or_else(|| tls.cloned());
+        let tls = tls.map(|t| {
+            let mut t = t.clone();
+            if t.reality().is_none() {
+                t.set_alpn(&[b"http/1.1"]);
+            }
+            t
+        });
         let alpn = self.default_alpn(tls.is_some());
         Arc::new(move || {
             let server = server.clone();
@@ -700,7 +725,7 @@ impl WsStream {
         Self {
             mask_out,
             inner,
-            rbuf: Vec::with_capacity(WS_READ),
+            rbuf: Vec::new(),
             rpos: 0,
             left: 0,
             mask: None,

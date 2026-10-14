@@ -361,12 +361,9 @@ async fn handle_hy2_connection(
                 Hy2UdpSession::new(Arc::clone(&router_dg), sid, reply_tx.clone())
             });
             session.last_activity = Instant::now();
-            let complete = session.defragger.feed(
-                pid,
-                frag_id,
-                frag_total,
-                bytes::Bytes::copy_from_slice(payload),
-            );
+            let complete = session
+                .defragger
+                .feed(pid, frag_id, frag_total, data.slice_ref(payload));
             if let Some(pkt) = complete {
                 let target = match parse_target_str(dest) {
                     Some(t) => t,

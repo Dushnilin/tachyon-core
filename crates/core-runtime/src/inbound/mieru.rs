@@ -53,7 +53,11 @@ impl Mieru {
             .map(Vec::as_slice)
             .unwrap_or_default()
         {
-            let name = u.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = u
+                .get("name")
+                .or_else(|| u.get("username"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let pass = u
                 .get("password")
                 .and_then(Value::as_str)
@@ -134,7 +138,7 @@ async fn handle(
 }
 
 async fn handle_session(
-    mut session: tokio::io::DuplexStream,
+    mut session: mieru::MieruServerStream,
     local: SocketAddr,
     peer: SocketAddr,
     tag: &str,

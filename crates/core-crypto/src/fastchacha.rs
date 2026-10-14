@@ -558,14 +558,18 @@ mod avx2 {
     }
 
     /// A MAC over `key`, from the first 32 bytes of block 0.
-    fn new_mac(key: &[u8]) -> Poly1305 {
+    #[target_feature(enable = "avx2,bmi2")]
+    #[inline]
+    unsafe fn new_mac(key: &[u8]) -> Poly1305 {
         let k = poly1305::universal_hash::generic_array::GenericArray::clone_from_slice(key);
         Poly1305::new(&k)
     }
 
     /// `aad.len() || buf.len()` as the two little-endian u64s the construction
     /// appends to the MAC input.
-    fn lengths(aad_len: usize, ct_len: usize) -> [u8; 16] {
+    #[target_feature(enable = "avx2,bmi2")]
+    #[inline]
+    unsafe fn lengths(aad_len: usize, ct_len: usize) -> [u8; 16] {
         let mut l = [0u8; 16];
         l[..8].copy_from_slice(&(aad_len as u64).to_le_bytes());
         l[8..].copy_from_slice(&(ct_len as u64).to_le_bytes());
@@ -574,6 +578,7 @@ mod avx2 {
 
     /// Keystream blocks `counter..counter + 8`.
     #[target_feature(enable = "avx2,bmi2")]
+    #[inline]
     pub(super) unsafe fn keystream(key: &[u32; 8], nonce: &[u8; 12], counter: u32) -> [u8; 512] {
         let init = setup(key, nonce, counter);
         let x = rounds::<false>(&init, None, core::ptr::null());
@@ -582,9 +587,30 @@ mod avx2 {
         ks
     }
 
-    fn xor_into(dst: &mut [u8], ks: &[u8]) {
-        for (d, k) in dst.iter_mut().zip(ks) {
-            *d ^= k;
+    #[target_feature(enable = "avx2,bmi2")]
+    #[inline]
+    unsafe fn xor_into(dst: &mut [u8], ks: &[u8]) {
+        let len = dst.len();
+        let d_ptr = dst.as_mut_ptr();
+        let k_ptr = ks.as_ptr();
+        let mut i = 0usize;
+        while i + 32 <= len {
+            let v = _mm256_xor_si256(
+                _mm256_loadu_si256(d_ptr.add(i) as *const __m256i),
+                _mm256_loadu_si256(k_ptr.add(i) as *const __m256i),
+            );
+            _mm256_storeu_si256(d_ptr.add(i) as *mut __m256i, v);
+            i += 32;
+        }
+        while i + 8 <= len {
+            let a = core::ptr::read_unaligned(d_ptr.add(i) as *const u64);
+            let b = core::ptr::read_unaligned(k_ptr.add(i) as *const u64);
+            core::ptr::write_unaligned(d_ptr.add(i) as *mut u64, a ^ b);
+            i += 8;
+        }
+        while i < len {
+            *d_ptr.add(i) ^= *k_ptr.add(i);
+            i += 1;
         }
     }
 

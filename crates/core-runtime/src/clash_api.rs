@@ -341,10 +341,11 @@ async fn handle_request(
     };
     let mut parts = request_line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (percent_decode(p), parse_query(q)),
-        None => (percent_decode(target), Vec::new()),
+    let (raw_path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, parse_query(q)),
+        None => (target, Vec::new()),
     };
+    let path = percent_decode(raw_path);
     let origin = header_get(&headers, "origin").map(str::to_string);
     let cors = cors_base(api, origin.as_deref());
 
@@ -359,7 +360,7 @@ async fn handle_request(
         return Ok(true);
     }
 
-    let (route, methods) = classify_with_ui(&path, api.external_ui.is_some());
+    let (route, methods) = classify_with_ui(raw_path, api.external_ui.is_some());
 
     // Unknown paths answer 404 outside the authenticated group (chi layout).
     if matches!(route, Route::Unknown) {
@@ -589,10 +590,10 @@ fn classify_proxies(path: &str, external_ui: bool) -> (Route, &'static [&'static
             let rest = rest.strip_suffix('/').unwrap_or(rest);
             match rest.rsplit_once('/') {
                 Some((base, "delay")) if !base.is_empty() && !base.contains('/') => {
-                    (Route::Delay(base.to_string()), GET_ONLY)
+                    (Route::Delay(percent_decode(base)), GET_ONLY)
                 }
                 Some(_) => (Route::Unknown, GET_ONLY),
-                None if !rest.is_empty() => (Route::Proxy(rest.to_string()), GET_PUT),
+                None if !rest.is_empty() => (Route::Proxy(percent_decode(rest)), GET_PUT),
                 None => (Route::Unknown, GET_ONLY),
             }
         }
@@ -607,7 +608,7 @@ fn classify_group(rest: &str) -> (Route, &'static [&'static str]) {
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     match rest.rsplit_once('/') {
         Some((base, "delay")) if !base.is_empty() && !base.contains('/') => {
-            (Route::Delay(base.to_string()), GET_ONLY)
+            (Route::Delay(percent_decode(base)), GET_ONLY)
         }
         _ => (Route::Unknown, GET_ONLY),
     }
@@ -616,10 +617,11 @@ fn classify_group(rest: &str) -> (Route, &'static [&'static str]) {
 /// `external_ui` is mounted where the reference mounts it: only under `/ui`,
 /// with `/ui` itself redirected to `/ui/`.
 fn classify_ui(path: &str) -> (Route, &'static [&'static str]) {
-    if path.contains("..") {
+    let decoded = percent_decode(path);
+    if decoded.contains("..") {
         return (Route::Unknown, GET_ONLY);
     }
-    match path.strip_prefix("/ui") {
+    match decoded.strip_prefix("/ui") {
         Some("") => (Route::UiRoot, GET_ONLY),
         Some(rest) => match rest.strip_prefix('/') {
             Some(asset) => (Route::Static(asset.to_string()), GET_ONLY),
@@ -2148,6 +2150,33 @@ mod tests {
             classify_with_ui("/../etc/passwd", true).0,
             Route::Unknown
         ));
+        assert!(matches!(
+            classify_with_ui("/ui/%2e%2e/etc/passwd", true).0,
+            Route::Unknown
+        ));
+        // proxy and group names containing `/` (encoded as `%2F`) must route
+        // before decoding the segment
+        match classify_with_ui("/proxies/Fast%20%7C%2010%20Gbit%2Fs/delay", false) {
+            (Route::Delay(name), methods) => {
+                assert_eq!(name, "Fast | 10 Gbit/s");
+                assert_eq!(methods, GET_ONLY);
+            }
+            _ => panic!("expected Route::Delay"),
+        }
+        match classify_with_ui("/proxies/Fast%20%7C%2010%20Gbit%2Fs", false) {
+            (Route::Proxy(name), methods) => {
+                assert_eq!(name, "Fast | 10 Gbit/s");
+                assert_eq!(methods, GET_PUT);
+            }
+            _ => panic!("expected Route::Proxy"),
+        }
+        match classify_with_ui("/group/Group%2FA/delay", false) {
+            (Route::Delay(name), methods) => {
+                assert_eq!(name, "Group/A");
+                assert_eq!(methods, GET_ONLY);
+            }
+            _ => panic!("expected Route::Delay"),
+        }
     }
 
     #[test]

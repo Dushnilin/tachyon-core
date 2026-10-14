@@ -18,6 +18,7 @@ pub mod anytls;
 pub mod direct;
 pub mod fptn;
 pub mod hysteria2;
+pub mod masque;
 pub mod mieru;
 pub mod mixed;
 pub mod mux;
@@ -723,60 +724,51 @@ fn closed_by_api() -> io::Error {
     io::Error::other("connection closed by clash api")
 }
 
-/// Each direction of a userspace relay moves up to this much per read. Sized
-/// to two whole shadowsocks 2022 chunks (2 * 65535 ~ 128 KiB) so a steady transfer
-/// costs one write per two chunks or eight TLS records, halving syscalls on routers.
-///
-/// Buffers are recycled through `BUF_POOL`, so active connections allocate zero heap
-/// slices and peak memory is bounded to `POOL_CAP * relay_buf()` (2 MiB).
+/// Each direction of a userspace relay moves up to this much per read.
+/// Scaled automatically by `HardwareProfile` (16 KiB on Constrained up to
+/// 128 KiB on DesktopServer), with `TACHYON_RELAY_BUF` as manual override.
 fn relay_buf() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        if let Ok(val) = std::env::var("TACHYON_RELAY_BUF")
-            && let Ok(n) = val.parse::<usize>()
-            && n > 0
-        {
-            return n;
-        }
-        let workers = std::env::var("TACHYON_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        if workers == 1 { 32 * 1024 } else { 2 * 65535 }
-    })
+    crate::hardware::HardwareProfile::detect().relay_buf_size
 }
 
-/// Relay buffers waiting for the next connection. A connection takes two and
-/// gives them back on close: at 128 KiB each is an mmap/munmap pair on glibc,
-/// and a steady connection rate pays that per connection. Sized to 64 buffers
-/// (2 MiB on single-core 32 KiB, 8 MiB on multi-core 128 KiB) so concurrent
-/// multi-stream runs do not drop buffers to munmap.
+const SMALL_RELAY_BUF: usize = 8 * 1024;
+const BULK_PROMOTE_BYTES: u64 = 32 * 1024;
+
 static BUF_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
-const POOL_CAP: usize = 64;
 
 thread_local! {
     static LOCAL_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 const LOCAL_CAP: usize = 4;
 
-fn take_buf() -> Vec<u8> {
+pub(crate) fn clear_global_buf_pool() {
+    let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.clear();
+    pool.shrink_to_fit();
+}
+
+fn try_take_pooled_buf() -> Option<Vec<u8>> {
     if let Ok(Some(mut buf)) = LOCAL_BUF_POOL.try_with(|p| p.borrow_mut().pop()) {
         buf.resize(relay_buf(), 0);
-        return buf;
+        return Some(buf);
     }
     let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    match pool.pop() {
-        Some(mut buf) => {
-            buf.resize(relay_buf(), 0);
-            buf
-        }
-        None => vec![0u8; relay_buf()],
-    }
+    pool.pop().map(|mut buf| {
+        buf.resize(relay_buf(), 0);
+        buf
+    })
+}
+
+fn take_buf() -> Vec<u8> {
+    try_take_pooled_buf().unwrap_or_else(|| vec![0u8; relay_buf()])
 }
 
 fn give_buf(buf: Vec<u8>) {
-    if buf.capacity() < relay_buf() / 2 || buf.capacity() > relay_buf() * 2 {
+    if crate::hardware::is_memory_pressured() {
+        return;
+    }
+    let target = relay_buf();
+    if buf.capacity() < target / 2 || buf.capacity() > target * 2 {
         return;
     }
     // Retain initialized length: reusing a drained buffer does not need another
@@ -794,8 +786,9 @@ fn give_buf(buf: Vec<u8>) {
         Ok(Some(buf)) => buf,
         Err(_) => return,
     };
+    let cap = crate::hardware::HardwareProfile::detect().buf_pool_capacity;
     let mut pool = BUF_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    if pool.len() < POOL_CAP {
+    if pool.len() < cap {
         pool.push(buf);
     }
 }
@@ -861,9 +854,9 @@ struct PooledBuffer {
 }
 
 impl PooledBuffer {
-    fn new(buf: Vec<u8>) -> Self {
+    fn new() -> Self {
         Self {
-            buf: Some(buf),
+            buf: None,
             read_done: false,
             need_flush: false,
             pos: 0,
@@ -874,7 +867,26 @@ impl PooledBuffer {
 
     #[inline]
     fn buffer(&mut self) -> &mut [u8] {
-        self.buf.get_or_insert_with(take_buf)
+        let amt = self.amt;
+        self.buf.get_or_insert_with(|| {
+            if amt >= BULK_PROMOTE_BYTES {
+                take_buf()
+            } else if let Some(pooled) = try_take_pooled_buf() {
+                pooled
+            } else {
+                vec![0u8; SMALL_RELAY_BUF.min(relay_buf())]
+            }
+        })
+    }
+
+    fn maybe_promote_buffer(&mut self) {
+        if self.pos == self.cap
+            && self.amt >= BULK_PROMOTE_BYTES
+            && let Some(cur) = &self.buf
+            && cur.len() < relay_buf()
+        {
+            self.buf = Some(take_buf());
+        }
     }
 
     fn release_buffer(&mut self) {
@@ -891,6 +903,7 @@ impl PooledBuffer {
     where
         R: AsyncRead + ?Sized,
     {
+        self.maybe_promote_buffer();
         let cap = self.cap;
         let mut read_buf = ReadBuf::new(self.buffer());
         read_buf.set_filled(cap);
@@ -938,7 +951,7 @@ impl PooledBuffer {
         W: AsyncWrite + ?Sized,
     {
         loop {
-            let buf_len = self.buffer().len();
+            let buf_len = self.buf.as_ref().map_or(SMALL_RELAY_BUF, Vec::len);
             if self.cap < buf_len && !self.read_done {
                 match self.poll_fill_buf(cx, reader.as_mut()) {
                     Poll::Ready(Ok(())) => {}
@@ -1030,8 +1043,8 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let mut a_to_b = TransferState::Running(PooledBuffer::new(take_buf()));
-    let mut b_to_a = TransferState::Running(PooledBuffer::new(take_buf()));
+    let mut a_to_b = TransferState::Running(PooledBuffer::new());
+    let mut b_to_a = TransferState::Running(PooledBuffer::new());
     let mut sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     std::future::poll_fn(|cx| {
         let res_a = transfer_one_direction(cx, &mut a_to_b, a, b)?;
@@ -1246,7 +1259,7 @@ mod relay_buffer_tests {
         let payload = vec![0x5a; relay_buf() * 2 + 17];
         let (mut source, mut reader) = tokio::io::duplex(payload.len());
         let (mut writer, mut destination) = tokio::io::duplex(payload.len());
-        let mut buffer = PooledBuffer::new(take_buf());
+        let mut buffer = PooledBuffer::new();
         let mut cx = Context::from_waker(std::task::Waker::noop());
 
         assert!(
@@ -1278,7 +1291,7 @@ mod relay_buffer_tests {
         let payload: Vec<u8> = (0..96).collect();
         let (mut source, mut reader) = tokio::io::duplex(96);
         let (mut writer, mut destination) = tokio::io::duplex(64);
-        let mut buffer = PooledBuffer::new(take_buf());
+        let mut buffer = PooledBuffer::new();
         source.write_all(&payload).await.unwrap();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(
@@ -1326,7 +1339,7 @@ mod relay_buffer_tests {
             if eof {
                 source.shutdown().await.unwrap();
             }
-            let mut buffer = PooledBuffer::new(take_buf());
+            let mut buffer = PooledBuffer::new();
             let mut writer = PendingFlush;
             let mut cx = Context::from_waker(std::task::Waker::noop());
             assert!(

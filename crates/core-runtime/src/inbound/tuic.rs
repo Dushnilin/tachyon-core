@@ -235,7 +235,8 @@ async fn handle_tuic_connection(
             }
             match data[1] {
                 CMD_HEARTBEAT => {
-                    let _ = conn_dg.send_datagram(vec![TUIC_VERSION, CMD_HEARTBEAT].into());
+                    let _ = conn_dg
+                        .send_datagram(bytes::Bytes::from_static(&[TUIC_VERSION, CMD_HEARTBEAT]));
                 }
                 CMD_PACKET => {
                     let body = &data[2..];
@@ -246,12 +247,7 @@ async fn handle_tuic_connection(
                     };
                     let complete = {
                         let mut defrag = defragger.lock().expect("defragger");
-                        defrag.feed(
-                            pid,
-                            frag_id,
-                            frag_total,
-                            bytes::Bytes::copy_from_slice(payload),
-                        )
+                        defrag.feed(pid, frag_id, frag_total, data.slice_ref(payload))
                     };
                     if let (Some(pkt), Some(target)) = (complete, target_opt) {
                         let dest_addr = match target {

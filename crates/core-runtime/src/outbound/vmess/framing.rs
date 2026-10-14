@@ -49,7 +49,11 @@ pub(crate) fn write_batch() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v >= 4096)
-            .unwrap_or(WRITE_BATCH)
+            .unwrap_or_else(|| {
+                crate::hardware::HardwareProfile::detect()
+                    .relay_buf_size
+                    .min(WRITE_BATCH)
+            })
     })
 }
 const CIPHER_OVERHEAD: usize = 16;
@@ -58,10 +62,18 @@ const MAX_PADDING: u16 = 64;
 /// Read-ahead the frame buffer aims for: enough that one read brings in several
 /// chunks rather than the two bytes of a length block. Sized to match `relay_buf()`
 /// so bulk transfers drain in full multi-chunk batches.
-const READ_CHUNK: usize = 128 * 1024;
-/// Hard ceiling on the frame buffer: sized to hold at least READ_CHUNK free headroom
+#[inline]
+fn read_chunk() -> usize {
+    crate::hardware::HardwareProfile::detect().relay_buf_size
+}
+/// Hard ceiling on the frame buffer: sized to hold at least read_chunk() free headroom
 /// above one max chunk (u16::MAX + tag) to prevent TLS deframer starvation.
-const FRAME_ROOM: usize = 256 * 1024;
+#[inline]
+fn frame_room() -> usize {
+    crate::hardware::HardwareProfile::detect()
+        .stream_max_buf
+        .max(96 * 1024)
+}
 
 /// Only these two securities seal the body; `none` frames it in the clear.
 fn has_aead(security: u8) -> bool {
@@ -371,7 +383,7 @@ impl FrameAssembler {
             cfb,
             checksum: legacy,
             state: AssembleState::Len,
-            frame: Vec::with_capacity(FRAME_ROOM),
+            frame: Vec::new(),
             start: 0,
             pos: 0,
             end: 0,
@@ -614,8 +626,8 @@ fn fill(
         }
         let unconsumed = frame.len() - *at;
         let want = unconsumed
-            .saturating_add(READ_CHUNK)
-            .min(FRAME_ROOM)
+            .saturating_add(read_chunk())
+            .min(frame_room())
             .max(need);
         if frame.capacity() < want {
             frame.reserve_exact(want - frame.len());
@@ -626,7 +638,16 @@ fn fill(
             match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut buf) {
                 Poll::Ready(Ok(())) => buf.filled().len(),
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    if *at == frame.len()
+                        && frame.capacity() > 16 * 1024
+                        && crate::hardware::is_memory_pressured()
+                    {
+                        *frame = Vec::new();
+                        *at = 0;
+                    }
+                    return Poll::Pending;
+                }
             }
         };
         if got == 0 {
@@ -929,9 +950,10 @@ mod tests {
             peak
         };
         let (_, peak) = tokio::join!(feed, read);
+        let ceiling = frame_room();
         assert!(
-            peak <= FRAME_ROOM,
-            "the frame buffer grew to {peak} bytes over {rounds} frames,              the ceiling is {FRAME_ROOM}"
+            peak <= ceiling,
+            "the frame buffer grew to {peak} bytes over {rounds} frames, the ceiling is {ceiling}"
         );
     }
 

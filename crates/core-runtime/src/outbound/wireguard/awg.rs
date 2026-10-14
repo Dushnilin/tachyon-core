@@ -497,9 +497,17 @@ fn decode_hex(val: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub(crate) fn fill_random(buf: &mut [u8]) {
-    use getrandom::fill as gr_fill;
-    gr_fill(buf).expect("getrandom");
+    let mut chunks = buf.chunks_exact_mut(8);
+    for c in &mut chunks {
+        c.copy_from_slice(&super::noise::fast_prng_u64().to_le_bytes());
+    }
+    let rem = chunks.into_remainder();
+    if !rem.is_empty() {
+        let r = super::noise::fast_prng_u64().to_le_bytes();
+        rem.copy_from_slice(&r[..rem.len()]);
+    }
 }
 
 /// Uniform pick in `lo..=hi` (`UintRange.PickOne` / `magicHeader.Generate`).
@@ -510,9 +518,7 @@ pub fn pick_range(range: HeaderRange) -> u32 {
         return lo;
     }
     let span = hi as u64 - lo as u64 + 1;
-    let mut buf = [0u8; 8];
-    fill_random(&mut buf);
-    lo + (u64::from_le_bytes(buf) % span) as u32
+    lo + (super::noise::fast_prng_u64() % span) as u32
 }
 
 /// `PickOne` over an optional range; unset → the WireGuard default.
@@ -542,9 +548,7 @@ pub fn trailer_len(udp_window: u32, datagram_size: usize) -> usize {
     if window <= datagram_size {
         return 0;
     }
-    let mut buf = [0u8; 8];
-    fill_random(&mut buf);
-    (u64::from_le_bytes(buf) % (window - datagram_size) as u64) as usize
+    (super::noise::fast_prng_u64() % (window - datagram_size) as u64) as usize
 }
 
 /// Transport plaintext padding for one data packet (`randomPaddingAddition`

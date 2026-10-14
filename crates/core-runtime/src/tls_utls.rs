@@ -150,6 +150,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
             // read is 18 KiB of memset plus a copy out of it, on every read. The
             // cursor is folded away here and nowhere else, because this is the one
             // place that needs the room.
+            if me.rpos == me.raw.len() && me.rpos > 0 {
+                me.raw.clear();
+                me.rpos = 0;
+            }
             if me.raw.len() == me.raw.capacity() {
                 if me.rpos > 0 {
                     let left = me.raw.len() - me.rpos;
@@ -167,7 +171,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                 match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
                     Poll::Ready(Ok(())) => read.filled().len(),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if me.raw.is_empty()
+                            && me.raw.capacity() > CHUNK
+                            && crate::hardware::is_memory_pressured()
+                        {
+                            me.raw = Vec::new();
+                        }
+                        return Poll::Pending;
+                    }
                 }
             };
             if got == 0 {

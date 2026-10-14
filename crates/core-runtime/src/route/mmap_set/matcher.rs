@@ -126,7 +126,13 @@ impl<'a> MmapView<'a> {
 
     /// Match exact domain, suffix, or keyword.
     pub fn matches_domain(&self, domain: &str) -> bool {
-        let domain_lower = domain.to_ascii_lowercase();
+        let domain_lower: std::borrow::Cow<'_, str> =
+            if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(domain.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(domain)
+            };
+        let domain_lower = domain_lower.as_ref();
 
         // Exact domain binary search O(log N)
         if !self.domains.is_empty() {
@@ -134,7 +140,7 @@ impl<'a> MmapView<'a> {
                 entry
                     .as_str(self.string_table)
                     .unwrap_or("")
-                    .cmp(&domain_lower)
+                    .cmp(domain_lower)
             });
             if found.is_ok() {
                 return true;
@@ -143,7 +149,7 @@ impl<'a> MmapView<'a> {
 
         // Domain suffix matching by walking label parents
         if !self.suffixes.is_empty() {
-            let mut curr = domain_lower.as_str();
+            let mut curr = domain_lower;
             loop {
                 let found = self.suffixes.binary_search_by(|entry| {
                     entry.as_str(self.string_table).unwrap_or("").cmp(curr)

@@ -179,22 +179,19 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // handoffs — while every task switch could have been a plain loop over the
     // ready queue, so that case takes the current-thread runtime instead.
     // TACHYON_WORKERS overrides the guess (benchmarks, cpu-restricted cgroups).
-    let workers = std::env::var("TACHYON_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let hw = core_runtime::hardware::HardwareProfile::detect();
+    let workers = hw.workers;
     let runtime = if workers == 1 {
         tokio::runtime::Builder::new_current_thread()
             .event_interval(31)
-            .max_blocking_threads(16)
+            .max_blocking_threads(hw.max_blocking_threads)
             .enable_all()
             .build()
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .event_interval(31)
-            .max_blocking_threads(16 * workers.max(1))
+            .max_blocking_threads(hw.max_blocking_threads)
             .enable_all()
             .build()
     }

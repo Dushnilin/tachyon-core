@@ -130,6 +130,10 @@ impl H2Conn {
         })
     }
 
+    pub(crate) fn try_read_packet(&mut self) -> Option<Vec<u8>> {
+        self.rx.try_recv().ok()
+    }
+
     /// Send one outbound IP packet as a capsule DATAGRAM inside a single
     /// DATA frame. Compose failures drop the packet silently; unlike h3
     /// there is no datagram-too-large path (the configured MTU is capped at

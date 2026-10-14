@@ -25,12 +25,10 @@ use smoltcp::phy::{
     TxToken as PhyTxToken,
 };
 use smoltcp::socket::tcp::State as TcpState;
-use smoltcp::socket::tcp::{
-    RecvError as TcpRecvError, Socket as TcpSock, SocketBuffer as TcpBuffer,
-};
+use smoltcp::socket::tcp::{Socket as TcpSock, SocketBuffer as TcpBuffer};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
@@ -54,12 +52,11 @@ const DEFAULT_MTU: usize = 1408;
 const DEFAULT_PORT: u16 = 51820;
 const EPHEMERAL_BASE: u16 = 49152;
 
-const SCRATCH_BUF: usize = 16_384;
-const CALLER_BUF: usize = 65_536;
-const CMD_QUEUE: usize = 256;
-const REPLY_QUEUE: usize = 64;
+const SCRATCH_BUF: usize = 65_536;
+const CMD_QUEUE: usize = 512;
+const REPLY_QUEUE: usize = 256;
 const PENDING_MAX: usize = 512;
-const EGRESS_BUF_MAX: usize = 1 << 20;
+const EGRESS_BUF_MAX: usize = 16 << 20;
 const MAX_DATAGRAM: usize = 65_535;
 
 /// Endpoint fields accepted by check but not honored by the runtime.
@@ -191,10 +188,10 @@ enum Cmd {
 struct WgShared {
     cmd_tx: mpsc::Sender<Cmd>,
     next_id: AtomicU32,
+    waker: Arc<tokio::sync::Notify>,
 }
 
 /// WireGuard endpoint outbound (see module docs).
-#[derive(Debug)]
 pub struct WireGuard {
     cfg: WgConfig,
     system: bool,
@@ -202,6 +199,17 @@ pub struct WireGuard {
     #[allow(dead_code)]
     kernel_guard: AsyncMutex<Option<Arc<kernel::KernelWireGuard>>>,
     shared: AsyncMutex<Option<Arc<WgShared>>>,
+    router: std::sync::OnceLock<Arc<crate::route::Router>>,
+}
+
+impl std::fmt::Debug for WireGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuard")
+            .field("cfg", &self.cfg)
+            .field("system", &self.system)
+            .field("interface_name", &self.interface_name)
+            .finish()
+    }
 }
 
 impl WireGuard {
@@ -397,7 +405,12 @@ impl WireGuard {
             interface_name,
             kernel_guard: AsyncMutex::new(None),
             shared: AsyncMutex::new(None),
+            router: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn attach_router(&self, router: Arc<crate::route::Router>) {
+        let _ = self.router.set(router);
     }
 
     async fn shared(&self) -> io::Result<Arc<WgShared>> {
@@ -416,16 +429,10 @@ impl WireGuard {
                     ),
                 )
             })?;
-        let _ = socket2::SockRef::from(&sock)
-            .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
-        let _ = socket2::SockRef::from(&sock)
-            .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+        set_wg_udp_socket_buffers(&sock);
         let sock_v6 = match UdpSocket::bind(("[::]", self.cfg.listen_port)).await {
             Ok(s) => {
-                let _ = socket2::SockRef::from(&s)
-                    .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
-                let _ = socket2::SockRef::from(&s)
-                    .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+                set_wg_udp_socket_buffers(&s);
                 Some(Arc::new(s))
             }
             Err(_) => None,
@@ -437,16 +444,33 @@ impl WireGuard {
             ));
         }
         let (tx, rx) = mpsc::channel(CMD_QUEUE);
+        let waker = Arc::new(tokio::sync::Notify::new());
         let shared = Arc::new(WgShared {
             cmd_tx: tx,
             next_id: AtomicU32::new(1),
+            waker: Arc::clone(&waker),
         });
         let cfg = Arc::new(self.cfg.clone());
-        tokio::spawn(async move {
-            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx).await {
-                logging::error(format_args!("wireguard stack exited: {e}"));
-            }
-        });
+        let router = self.router.get().cloned();
+        let handle = tokio::runtime::Handle::current();
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            let h = handle.clone();
+            let _ = std::thread::Builder::new()
+                .name("tachyon-wg".into())
+                .spawn(move || {
+                    let _enter = h.enter();
+                    if let Err(e) = h.block_on(run(cfg, Arc::new(sock), sock_v6, rx, router, waker))
+                    {
+                        logging::error(format_args!("wireguard stack exited: {e}"));
+                    }
+                });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx, router, waker).await {
+                    logging::error(format_args!("wireguard stack exited: {e}"));
+                }
+            });
+        }
         *guard = Some(Arc::clone(&shared));
         Ok(shared)
     }
@@ -497,8 +521,6 @@ impl WireGuard {
         let dst = resolve_target(target).await?;
         let shared = self.shared().await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (local, remote) = tokio::io::duplex(CALLER_BUF);
-        let (caller_read, caller_write) = tokio::io::split(local);
         let (to_caller_tx, to_caller_rx) = mpsc::channel(REPLY_QUEUE);
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -513,51 +535,17 @@ impl WireGuard {
             .await
             .map_err(|_| io::Error::other("wireguard: stack task stopped"))?;
 
-        // caller → stack: forward reads as TCP data chunks.
-        let cmd_tx = Arc::clone(&shared).cmd_tx.clone();
-        tokio::spawn(async move {
-            let mut read = caller_read;
-            let mut buf = vec![0u8; SCRATCH_BUF];
-            loop {
-                match read.read(&mut buf).await {
-                    Ok(0) => {
-                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
-                        break;
-                    }
-                    Ok(n) => {
-                        if cmd_tx
-                            .send(Cmd::TcpData {
-                                id,
-                                bytes: bytes::Bytes::copy_from_slice(&buf[..n]),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        // stack → caller: pump replies with per-connection backpressure.
-        tokio::spawn(async move {
-            let mut write = caller_write;
-            let mut replies = to_caller_rx;
-            while let Some(bytes) = replies.recv().await {
-                if write.write_all(&bytes).await.is_err() {
-                    break;
-                }
-                let _ = write.flush().await;
-            }
-        });
+        let stream = WgTcpStream {
+            id,
+            rx: to_caller_rx,
+            cmd_tx: shared.cmd_tx.clone(),
+            waker: Arc::clone(&shared.waker),
+            current: None,
+            closed_write: false,
+        };
 
         match tokio::time::timeout(CONNECT_TIMEOUT, resp_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Box::new(remote)),
+            Ok(Ok(Ok(()))) => Ok(Box::new(stream)),
             Ok(Ok(Err(e))) => Err(io::Error::other(format!("wireguard: {e}"))),
             Ok(Err(_)) => Err(io::Error::other("wireguard: stack task stopped")),
             Err(_) => Err(io::Error::new(
@@ -644,6 +632,160 @@ impl WireGuard {
     }
 }
 
+fn set_wg_udp_socket_buffers(sock: &UdpSocket) {
+    let sz = crate::outbound::quic::UDP_SOCKET_BUFFER;
+    let _ = socket2::SockRef::from(sock).set_recv_buffer_size(sz);
+    let _ = socket2::SockRef::from(sock).set_send_buffer_size(sz);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let val = (sz / 2) as libc::c_int;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUFFORCE,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
+struct WgTcpStream {
+    id: u32,
+    rx: mpsc::Receiver<bytes::Bytes>,
+    cmd_tx: mpsc::Sender<Cmd>,
+    waker: Arc<tokio::sync::Notify>,
+    current: Option<(bytes::Bytes, usize)>,
+    closed_write: bool,
+}
+
+impl AsyncRead for WgTcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let mut copied_any = false;
+        let mut notify_stack = self.rx.len() >= 4;
+        loop {
+            if let Some((chunk, offset)) = &mut self.current {
+                let available = chunk.len() - *offset;
+                if available > 0 {
+                    let to_copy = available.min(buf.remaining());
+                    buf.put_slice(&chunk[*offset..*offset + to_copy]);
+                    *offset += to_copy;
+                    copied_any = true;
+                    if *offset >= chunk.len() {
+                        self.current = None;
+                    }
+                    if buf.remaining() == 0 {
+                        if notify_stack {
+                            self.waker.notify_one();
+                        }
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                } else {
+                    self.current = None;
+                }
+            }
+
+            if copied_any {
+                match self.rx.try_recv() {
+                    Ok(chunk) => {
+                        if self.rx.len() >= 4 {
+                            notify_stack = true;
+                        }
+                        self.current = Some((chunk, 0));
+                    }
+                    Err(_) => {
+                        if notify_stack {
+                            self.waker.notify_one();
+                        }
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                }
+            } else {
+                match self.rx.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(chunk)) => {
+                        if self.rx.len() >= 4 {
+                            notify_stack = true;
+                        }
+                        self.current = Some((chunk, 0));
+                    }
+                    std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for WgTcpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.cmd_tx.try_send(Cmd::TcpData {
+            id: self.id,
+            bytes: bytes::Bytes::copy_from_slice(buf),
+        }) {
+            Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let tx = self.cmd_tx.clone();
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    if tx.reserve().await.is_ok() {
+                        waker.wake();
+                    }
+                });
+                std::task::Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.closed_write {
+            self.closed_write = true;
+            let _ = self.cmd_tx.try_send(Cmd::TcpClose { id: self.id });
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for WgTcpStream {
+    fn drop(&mut self) {
+        if !self.closed_write {
+            self.closed_write = true;
+            let _ = self.cmd_tx.try_send(Cmd::TcpClose { id: self.id });
+        }
+        self.waker.notify_one();
+    }
+}
+
 struct TcpConn {
     handle: SocketHandle,
     #[allow(dead_code)]
@@ -710,6 +852,8 @@ impl PeerRt {
 struct WgDevice {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
+    /// Recycled rx buffers returned by `WgRxToken::consume`.
+    rx_free: Vec<Vec<u8>>,
     /// Recycled tx buffers: the pool behind `WgTxToken::consume`, so the
     /// per-packet `vec![0; len]` stops hitting the allocator on every IP
     /// packet the stack hands us.
@@ -717,27 +861,72 @@ struct WgDevice {
     mtu: usize,
 }
 
+fn ipv4_tcp_key_seq(pkt: &[u8]) -> Option<([u8; 12], u32)> {
+    if pkt.len() < 40 || (pkt[0] >> 4) != 4 {
+        return None;
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    if pkt[9] != 6 || pkt.len() < ihl + 20 {
+        return None;
+    }
+    let flags = pkt[ihl + 13];
+    if (flags & 0x07) != 0 {
+        return None;
+    }
+    let mut key = [0u8; 12];
+    key[0..8].copy_from_slice(&pkt[12..20]);
+    key[8..12].copy_from_slice(&pkt[ihl..ihl + 4]);
+    let seq = u32::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5], pkt[ihl + 6], pkt[ihl + 7]]);
+    Some((key, seq))
+}
+
 impl WgDevice {
     fn new(mtu: usize) -> Self {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
-            free: Vec::new(),
+            rx_free: Vec::with_capacity(256),
+            free: Vec::with_capacity(256),
             mtu,
         }
     }
+
+    fn push_rx(&mut self, pkt: Vec<u8>) {
+        if let Some((key, seq)) = ipv4_tcp_key_seq(&pkt) {
+            let len = self.rx.len();
+            let mut insert_at = len;
+            for i in (0..len).rev() {
+                if let Some((k2, seq2)) = ipv4_tcp_key_seq(&self.rx[i])
+                    && k2 == key
+                    && (seq2.wrapping_sub(seq) as i32) > 0
+                {
+                    insert_at = i;
+                }
+            }
+            if insert_at < len {
+                self.rx.insert(insert_at, pkt);
+                return;
+            }
+        }
+        self.rx.push_back(pkt);
+    }
 }
 
-struct WgRxToken {
+struct WgRxToken<'a> {
     buffer: Vec<u8>,
+    free: &'a mut Vec<Vec<u8>>,
 }
 
-impl PhyRxToken for WgRxToken {
+impl PhyRxToken for WgRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer)
+        let r = f(&self.buffer);
+        if self.free.len() < 256 {
+            self.free.push(self.buffer);
+        }
+        r
     }
 }
 
@@ -765,7 +954,7 @@ impl PhyTxToken for WgTxToken<'_> {
 }
 
 impl Device for WgDevice {
-    type RxToken<'a> = WgRxToken;
+    type RxToken<'a> = WgRxToken<'a>;
     type TxToken<'a> = WgTxToken<'a>;
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -773,6 +962,11 @@ impl Device for WgDevice {
         caps.max_transmission_unit = self.mtu;
         caps.medium = Medium::Ip;
         caps.checksum = ChecksumCapabilities::default();
+        caps.checksum.ipv4 = smoltcp::phy::Checksum::Tx;
+        caps.checksum.tcp = smoltcp::phy::Checksum::Tx;
+        caps.checksum.udp = smoltcp::phy::Checksum::Tx;
+        caps.checksum.icmpv4 = smoltcp::phy::Checksum::Tx;
+        caps.checksum.icmpv6 = smoltcp::phy::Checksum::Tx;
         caps
     }
 
@@ -781,7 +975,10 @@ impl Device for WgDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.rx.pop_front().map(move |buffer| {
-            let rx = WgRxToken { buffer };
+            let rx = WgRxToken {
+                buffer,
+                free: &mut self.rx_free,
+            };
             let tx = WgTxToken {
                 queue: &mut self.tx,
                 free: &mut self.free,
@@ -791,6 +988,9 @@ impl Device for WgDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        if self.tx.len() >= 64 {
+            return None;
+        }
         Some(WgTxToken {
             queue: &mut self.tx,
             free: &mut self.free,
@@ -848,6 +1048,14 @@ struct Stack {
     udp: HashMap<u16, UdpSess>,
     next_port: u16,
     scratch: Vec<u8>,
+    tx_scratch: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    tx_batch: Vec<(std::net::SocketAddrV4, Vec<u8>)>,
+    #[cfg(target_os = "linux")]
+    tx_batch_free: Vec<Vec<u8>>,
+    router: Option<Arc<crate::route::Router>>,
+    srv_tcp: HashMap<(SocketAddr, SocketAddr), crate::inbound::tun::TunTcpSession>,
+    srv_waker: Arc<tokio::sync::Notify>,
 }
 
 impl Stack {
@@ -961,68 +1169,82 @@ impl Stack {
         }
     }
 
-    /// Seal one transport datagram with AWG 3.x dressing: content padding or
-    /// a random trailer inside the AEAD, the s4 random prefix in front, and
-    /// the header masked by the header-protection keystream.
-    fn seal_transport(&mut self, pi: usize, pkt: &[u8]) -> Option<Vec<u8>> {
-        let params = self.cfg.awg.clone();
-        let pad_len = params.as_ref().map(|a| {
-            awg::transport_padding(
-                a,
-                self.peers[pi].udp_window,
-                pkt.len(),
-                a.padding(awg::TRANSPORT),
-            )
-        });
-        let session = self.peers[pi].session.as_mut()?;
-        let msg = match (&params, pad_len) {
-            (None, _) => session.seal(pkt)?,
-            (Some(_), Some(pad_len)) => session.seal_raw(pkt, pkt.len() + pad_len)?,
-            (Some(_), None) => return None,
+    /// Seal one transport datagram with AWG 3.x dressing directly into
+    /// `self.tx_scratch` (zero heap allocations per packet).
+    fn seal_transport_into(&mut self, pi: usize, pkt: &[u8]) -> bool {
+        let (s4, padded_len, hp_key) = match self.cfg.awg.as_ref() {
+            None => (0, pkt.len() + ((16 - (pkt.len() % 16)) % 16), None),
+            Some(a) => {
+                let s4 = a.padding(awg::TRANSPORT);
+                let pad = awg::transport_padding(a, self.peers[pi].udp_window, pkt.len(), s4);
+                (s4, pkt.len() + pad, a.header_protection)
+            }
         };
-        let mut out = msg;
-        if let Some(a) = params.as_ref() {
-            let s4 = a.padding(awg::TRANSPORT);
-            if s4 > 0 {
-                let mut dressed = vec![0u8; s4 + out.len()];
-                awg::fill_random(&mut dressed[..s4]);
-                dressed[s4..].copy_from_slice(&out);
-                out = dressed;
-            }
-            if let Some(key) = &a.header_protection {
-                let nonce = out[..12].to_vec();
-                awg::mask_header(key, &nonce, &mut out[s4..s4 + 16]);
-            }
-            self.peers[pi].udp_window = self.peers[pi].udp_window.max(out.len() as u32);
+        let Some(session) = self.peers[pi].session.as_mut() else {
+            return false;
+        };
+        if !session.seal_raw_into(s4, pkt, padded_len, &mut self.tx_scratch) {
+            return false;
         }
-        Some(out)
+        if self.cfg.awg.is_some() {
+            if s4 > 0 {
+                awg::fill_random(&mut self.tx_scratch[..s4]);
+            }
+            if let Some(key) = &hp_key {
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&self.tx_scratch[..12]);
+                awg::mask_header(key, &nonce, &mut self.tx_scratch[s4..s4 + 16]);
+            }
+            self.peers[pi].udp_window = self.peers[pi].udp_window.max(self.tx_scratch.len() as u32);
+        }
+        true
+    }
+
+    fn send_tx_scratch(&self, pi: usize) {
+        let Some(addr) = self.peers[pi].resolved else {
+            return;
+        };
+        let sock = match addr {
+            SocketAddr::V6(_) => match &self.sock_v6 {
+                Some(s) => s,
+                None => {
+                    logging::debug(format_args!(
+                        "wireguard[{}]: no ipv6 socket for {addr}",
+                        self.cfg.tag
+                    ));
+                    return;
+                }
+            },
+            SocketAddr::V4(_) => &self.sock,
+        };
+        if let Err(e) = sock.try_send_to(&self.tx_scratch, addr)
+            && e.kind() != io::ErrorKind::WouldBlock
+        {
+            logging::debug(format_args!("wireguard[{}]: udp send: {e}", self.cfg.tag));
+        }
     }
 
     /// Queue an IP packet to a peer: seal via the session or buffer until the
     /// handshake completes. Returns the packet back when it was sent and the
     /// caller may recycle it.
     fn xmit_to_peer(&mut self, pi: usize, pkt: Vec<u8>) -> Option<Vec<u8>> {
-        let sealed = self.seal_transport(pi, &pkt);
-        match sealed {
-            Some(msg) => {
-                self.send_raw(pi, &msg);
-                self.peers[pi].last_sent = Some(Instant::now());
-                Some(pkt)
+        if self.seal_transport_into(pi, &pkt) {
+            self.send_tx_scratch(pi);
+            self.peers[pi].last_sent = Some(Instant::now());
+            Some(pkt)
+        } else {
+            // Session missing or counter exhausted — drop the session and
+            // queue for the next handshake.
+            if let Some(old) = self.peers[pi].session.take() {
+                self.index_peer.remove(&old.local_index);
+                self.peers[pi].session_since = None;
             }
-            None => {
-                // Session missing or counter exhausted — drop the session and
-                // queue for the next handshake.
-                if self.peers[pi].session.is_some() {
-                    self.peers[pi].session = None;
-                    self.peers[pi].session_since = None;
-                }
-                if self.peers[pi].pending.len() >= PENDING_MAX {
-                    self.peers[pi].pending.pop_front();
-                }
-                self.peers[pi].pending.push_back(pkt);
-                self.peers[pi].kick = true;
-                None
+            if self.peers[pi].pending.len() >= PENDING_MAX {
+                self.peers[pi].pending.pop_front();
             }
+            self.peers[pi].pending.push_back(pkt);
+            self.peers[pi].kick = true;
+            None
         }
     }
 
@@ -1082,6 +1304,9 @@ impl Stack {
             "wireguard[{}]: initiation sent idx={} peer {pi}",
             self.cfg.tag, hs.sender_index
         ));
+        if let Some(old_hs) = self.peers[pi].hs.take() {
+            self.index_peer.remove(&old_hs.hs.sender_index);
+        }
         self.index_peer.insert(hs.sender_index, pi);
         let retry_at = now + REKEY_TIMEOUT + jitter();
         self.peers[pi].hs = Some(HsRuntime {
@@ -1111,6 +1336,8 @@ impl Stack {
                     TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
                     TcpBuffer::new(vec![0; crate::smol_tcp_buf()]),
                 );
+                socket.set_nagle_enabled(false);
+                socket.set_ack_delay(None);
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
                 )));
@@ -1161,7 +1388,6 @@ impl Stack {
             Cmd::TcpClose { id } => {
                 if let Some(c) = self.tcp.get_mut(&id) {
                     c.caller_eof = true;
-                    c.from_caller.clear();
                 }
             }
             Cmd::UdpOpen { target, resp } => {
@@ -1315,10 +1541,14 @@ impl Stack {
         ));
         self.peers[pi].resolved = Some(src);
         self.index_peer.insert(session.local_index, pi);
-        self.peers[pi].session = Some(session);
+        if let Some(old) = self.peers[pi].session.replace(session) {
+            self.index_peer.remove(&old.local_index);
+        }
         self.peers[pi].session_since = Some(Instant::now());
         self.peers[pi].last_recv = Some(Instant::now());
-        self.peers[pi].hs = None;
+        if let Some(old_hs) = self.peers[pi].hs.take() {
+            self.index_peer.remove(&old_hs.hs.sender_index);
+        }
         self.send_handshake_resp(pi, &resp_msg, src);
         self.peers[pi].last_sent = Some(Instant::now());
         self.peers[pi].flush = true;
@@ -1346,9 +1576,12 @@ impl Stack {
                     "wireguard[{}]: handshake complete (peer {pi})",
                     self.cfg.tag
                 ));
+                self.index_peer.remove(&hsrt.hs.sender_index);
                 self.peers[pi].resolved = Some(src);
                 self.index_peer.insert(session.local_index, pi);
-                self.peers[pi].session = Some(session);
+                if let Some(old) = self.peers[pi].session.replace(session) {
+                    self.index_peer.remove(&old.local_index);
+                }
                 self.peers[pi].session_since = Some(Instant::now());
                 self.peers[pi].last_recv = Some(Instant::now());
                 self.peers[pi].flush = true;
@@ -1407,7 +1640,12 @@ impl Stack {
         // caller channel or goes into device.rx, so a per-packet malloc here
         // would be pure churn — the pool behind device.free is the same one
         // the tx path refills.
-        let mut plain = self.device.free.pop().unwrap_or_default();
+        let mut plain = self
+            .device
+            .rx_free
+            .pop()
+            .or_else(|| self.device.free.pop())
+            .unwrap_or_default();
         let opened = self.peers[pi]
             .session
             .as_mut()
@@ -1467,8 +1705,58 @@ impl Stack {
                 let _ = self.xmit_to_peer(dest_pi, plain);
                 return;
             }
+            if proto == 6
+                && self.cfg.listen_port > 0
+                && let Some(router) = &self.router
+                && plain.len() >= hdr_len + 14
+            {
+                let sport = u16::from_be_bytes([plain[hdr_len], plain[hdr_len + 1]]);
+                let dport = u16::from_be_bytes([plain[hdr_len + 2], plain[hdr_len + 3]]);
+                let flags = plain[hdr_len + 13];
+                let is_syn = (flags & 0x02) != 0 && (flags & 0x10) == 0;
+                crate::inbound::tun::ensure_virtual_tcp_session(
+                    SocketAddr::new(src_ip, sport),
+                    SocketAddr::new(dst, dport),
+                    is_syn,
+                    &self.cfg.tag,
+                    router,
+                    &mut self.sockets,
+                    &mut self.srv_tcp,
+                    &self.srv_waker,
+                );
+                self.device.push_rx(plain);
+                return;
+            }
             self.recycle(plain);
             return;
+        }
+        if proto == 6
+            && self.cfg.listen_port > 0
+            && let Some(router) = &self.router
+            && plain.len() >= hdr_len + 14
+        {
+            let sport = u16::from_be_bytes([plain[hdr_len], plain[hdr_len + 1]]);
+            let dport = u16::from_be_bytes([plain[hdr_len + 2], plain[hdr_len + 3]]);
+            let flags = plain[hdr_len + 13];
+            let is_syn = (flags & 0x02) != 0 && (flags & 0x10) == 0;
+            if !self
+                .tcp
+                .values()
+                .any(|c| c.dst == SocketAddr::new(src_ip, sport))
+            {
+                crate::inbound::tun::ensure_virtual_tcp_session(
+                    SocketAddr::new(src_ip, sport),
+                    SocketAddr::new(dst, dport),
+                    is_syn,
+                    &self.cfg.tag,
+                    router,
+                    &mut self.sockets,
+                    &mut self.srv_tcp,
+                    &self.srv_waker,
+                );
+                self.device.push_rx(plain);
+                return;
+            }
         }
         if proto == 17 && plain.len() >= hdr_len + 8 {
             let sport = u16::from_be_bytes([plain[hdr_len], plain[hdr_len + 1]]);
@@ -1489,40 +1777,129 @@ impl Stack {
                 return;
             }
         }
-        self.device.rx.push_back(plain);
+        self.device.push_rx(plain);
     }
 
     /// Return a buffer to the pool, capped like the tx path's refill.
     fn recycle(&mut self, buf: Vec<u8>) {
-        if self.device.free.len() < 64 {
-            self.device.free.push(buf);
+        if self.device.rx_free.len() < 256 {
+            self.device.rx_free.push(buf);
         }
     }
 
-    async fn flush_device_tx(&mut self) {
-        while let Some(pkt) = self.device.tx.pop_front() {
-            let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
-                Some(pi) => self.xmit_to_peer(pi, pkt),
-                None => Some(pkt),
+    #[cfg(target_os = "linux")]
+    fn flush_tx_batch_linux(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.tx_batch.is_empty() {
+            return;
+        }
+        if self.tx_batch.len() == 1 {
+            let (v4, pkt) = self.tx_batch.pop().unwrap();
+            let _ = self.sock.try_send_to(&pkt, SocketAddr::V4(v4));
+            if self.tx_batch_free.len() < 64 {
+                self.tx_batch_free.push(pkt);
+            }
+            return;
+        }
+        let count = self.tx_batch.len().min(64);
+        let mut addrs: [libc::sockaddr_in; 64] = unsafe { std::mem::zeroed() };
+        let mut iovecs: [libc::iovec; 64] = unsafe { std::mem::zeroed() };
+        let mut hdrs: [libc::mmsghdr; 64] = unsafe { std::mem::zeroed() };
+        for i in 0..count {
+            let (v4, ref pkt) = self.tx_batch[i];
+            addrs[i].sin_family = libc::AF_INET as _;
+            addrs[i].sin_port = v4.port().to_be();
+            addrs[i].sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            iovecs[i].iov_base = pkt.as_ptr() as *mut libc::c_void;
+            iovecs[i].iov_len = pkt.len();
+            hdrs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+            hdrs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
+            hdrs[i].msg_hdr.msg_iovlen = 1 as _;
+        }
+        let fd = self.sock.as_raw_fd();
+        let _ = self.sock.try_io(tokio::io::Interest::WRITABLE, || {
+            let n = unsafe {
+                libc::sendmmsg(
+                    fd,
+                    hdrs.as_mut_ptr(),
+                    count as libc::c_uint,
+                    libc::MSG_DONTWAIT as _,
+                )
             };
-            if let Some(pkt) = pkt
-                && self.device.free.len() < 64
-            {
-                self.device.free.push(pkt);
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        });
+        for (_, pkt) in self.tx_batch.drain(..) {
+            if self.tx_batch_free.len() < 64 {
+                self.tx_batch_free.push(pkt);
             }
         }
     }
 
-    fn maintain_tcp(&mut self) {
-        let ids: Vec<u32> = self.tcp.keys().copied().collect();
-        for id in ids {
-            let Some(mut conn) = self.tcp.remove(&id) else {
-                continue;
+    async fn flush_device_tx(&mut self) {
+        #[cfg(target_os = "linux")]
+        let use_batch = self.device.tx.len() > 1;
+        while let Some(pkt) = self.device.tx.pop_front() {
+            let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
+                Some(pi) => {
+                    #[cfg(target_os = "linux")]
+                    if use_batch
+                        && let Some(SocketAddr::V4(v4)) = self.peers[pi].resolved
+                        && self.seal_transport_into(pi, &pkt)
+                    {
+                        let mut out = self
+                            .tx_batch_free
+                            .pop()
+                            .unwrap_or_else(|| Vec::with_capacity(2048));
+                        std::mem::swap(&mut out, &mut self.tx_scratch);
+                        self.tx_batch.push((v4, out));
+                        self.peers[pi].last_sent = Some(Instant::now());
+                        if self.tx_batch.len() >= 64 {
+                            self.flush_tx_batch_linux();
+                        }
+                        Some(pkt)
+                    } else {
+                        self.xmit_to_peer(pi, pkt)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        self.xmit_to_peer(pi, pkt)
+                    }
+                }
+                None => Some(pkt),
             };
-            let mut rbuf = std::mem::take(&mut self.scratch);
+            if let Some(pkt) = pkt
+                && self.device.free.len() < 256
+            {
+                self.device.free.push(pkt);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !self.tx_batch.is_empty() {
+            self.flush_tx_batch_linux();
+        }
+    }
+
+    fn maintain_tcp(&mut self) {
+        let mut finished_ids = Vec::new();
+        for (&id, conn) in self.tcp.iter_mut() {
             let mut remote_closed = false;
-            let mut caller_gone = false;
-            let state = {
+            let mut caller_gone = conn.to_caller.is_closed();
+
+            if let Some(stash) = conn.stash.take() {
+                match conn.to_caller.try_send(stash) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(v)) => conn.stash = Some(v),
+                    Err(mpsc::error::TrySendError::Closed(_)) => caller_gone = true,
+                }
+            }
+
+            let (pre_close_state, state) = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
 
                 while let Some(front) = conn.from_caller.front_mut() {
@@ -1542,52 +1919,45 @@ impl Stack {
                 }
 
                 if conn.stash.is_none() {
-                    loop {
-                        match sock.recv_slice(&mut rbuf) {
-                            Ok(0) => break,
-                            Ok(n) => match conn
-                                .to_caller
-                                .try_send(bytes::Bytes::copy_from_slice(&rbuf[..n]))
-                            {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(v)) => {
-                                    conn.stash = Some(v);
-                                    break;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    caller_gone = true;
-                                    break;
-                                }
-                            },
-                            Err(TcpRecvError::InvalidState) => break,
-                            Err(TcpRecvError::Finished) => {
-                                remote_closed = true;
+                    while conn.to_caller.capacity() > 0 && sock.can_recv() {
+                        let chunk = match sock.recv(|data| {
+                            let n = data.len().min(SCRATCH_BUF);
+                            if n == 0 {
+                                (0, None)
+                            } else {
+                                (n, Some(bytes::Bytes::copy_from_slice(&data[..n])))
+                            }
+                        }) {
+                            Ok(Some(c)) => c,
+                            _ => break,
+                        };
+                        match conn.to_caller.try_send(chunk) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(v)) => {
+                                conn.stash = Some(v);
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                caller_gone = true;
                                 break;
                             }
                         }
                     }
+                    if !sock.can_recv() && !sock.may_recv() {
+                        remote_closed = true;
+                    }
                 }
+                let pre = sock.state();
                 // The caller is gone: FIN the remote, or `finished` waits for
                 // a remote FIN that can never arrive (we never sent one) and
                 // the socket leaks in the set forever — three cancelled LuCI
                 // pings used to be three leaked sockets and ports.
-                if conn.caller_eof && !remote_closed {
+                if (conn.caller_eof || caller_gone) && conn.from_caller.is_empty() && !remote_closed
+                {
                     sock.close();
                 }
-                sock.state()
+                (pre, sock.state())
             };
-            self.scratch = rbuf;
-
-            if let Some(stash) = conn.stash.take() {
-                match conn.to_caller.try_send(stash) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(v)) => conn.stash = Some(v),
-                    Err(mpsc::error::TrySendError::Closed(_)) => caller_gone = true,
-                }
-            }
-            if conn.to_caller.is_closed() {
-                caller_gone = true;
-            }
 
             if state == TcpState::Established
                 && let Some(resp) = conn.resp.take()
@@ -1601,8 +1971,14 @@ impl Stack {
             let connect_failed = conn.resp.is_some()
                 && (state == TcpState::Closed || conn.created.elapsed() >= CONNECT_TIMEOUT);
             let finished = state == TcpState::Closed
-                || caller_gone
-                || (conn.caller_eof && remote_closed && conn.stash.is_none());
+                || state == TcpState::TimeWait
+                || (conn.caller_eof
+                    && conn.from_caller.is_empty()
+                    && remote_closed
+                    && conn.stash.is_none())
+                || (caller_gone
+                    && conn.from_caller.is_empty()
+                    && pre_close_state != TcpState::Established);
 
             if connect_failed && let Some(resp) = conn.resp.take() {
                 let _ = resp.send(Err(match state {
@@ -1614,9 +1990,12 @@ impl Stack {
                 if let Some(resp) = conn.resp.take() {
                     let _ = resp.send(Err("connection closed".into()));
                 }
+                finished_ids.push(id);
+            }
+        }
+        for id in finished_ids {
+            if let Some(conn) = self.tcp.remove(&id) {
                 self.sockets.remove(conn.handle);
-            } else {
-                self.tcp.insert(id, conn);
             }
         }
     }
@@ -1656,7 +2035,9 @@ impl Stack {
                     .map(|a| awg::pick_opt(a.max_handshake_attempts, REKEY_ATTEMPT_COUNT))
                     .unwrap_or(REKEY_ATTEMPT_COUNT);
                 if attempt >= max_attempts || now.duration_since(started) >= REKEY_ATTEMPT_TIME {
-                    self.peers[pi].hs = None;
+                    if let Some(old_hs) = self.peers[pi].hs.take() {
+                        self.index_peer.remove(&old_hs.hs.sender_index);
+                    }
                     self.peers[pi].pending.clear();
                 } else {
                     self.send_handshake_init(pi, &initiation);
@@ -1683,7 +2064,9 @@ impl Stack {
                 && let Some(since) = self.peers[pi].session_since
                 && now.duration_since(since) >= reject_after
             {
-                self.peers[pi].session = None;
+                if let Some(old) = self.peers[pi].session.take() {
+                    self.index_peer.remove(&old.local_index);
+                }
                 self.peers[pi].session_since = None;
             }
 
@@ -1713,21 +2096,17 @@ impl Stack {
                 let due = self.peers[pi]
                     .last_sent
                     .is_none_or(|t| now.duration_since(t) >= interval);
-                if due && self.peers[pi].hs.is_none() {
-                    let confirm = self.seal_transport(pi, &[]);
-                    if let Some(msg) = confirm {
-                        self.send_raw(pi, &msg);
-                        self.peers[pi].last_sent = Some(Instant::now());
-                    }
+                if due && self.peers[pi].hs.is_none() && self.seal_transport_into(pi, &[]) {
+                    self.send_tx_scratch(pi);
+                    self.peers[pi].last_sent = Some(Instant::now());
                 }
             }
 
             if self.peers[pi].flush && self.peers[pi].session.is_some() {
                 self.peers[pi].flush = false;
                 // Key confirmation: an empty transport packet right away.
-                let confirm = self.seal_transport(pi, &[]);
-                if let Some(msg) = confirm {
-                    self.send_raw(pi, &msg);
+                if self.seal_transport_into(pi, &[]) {
+                    self.send_tx_scratch(pi);
                     self.peers[pi].last_sent = Some(Instant::now());
                 }
                 let pending: Vec<Vec<u8>> = std::mem::take(&mut self.peers[pi].pending)
@@ -1783,11 +2162,11 @@ impl Stack {
         // default deadline below.
         let now_smol = SmolInstant::now();
         if let Some(at) = self.iface.poll_at(now_smol, &self.sockets) {
-            let due = if at <= now_smol {
-                Duration::from_millis(1)
-            } else {
-                Duration::from_micros((at - now_smol).total_micros()).min(Duration::from_millis(50))
-            };
+            if at <= now_smol {
+                return tokio::time::Instant::from_std(now);
+            }
+            let due = Duration::from_micros((at - now_smol).total_micros())
+                .min(Duration::from_millis(50));
             consider(now + due);
         }
         let deadline = match best {
@@ -1798,9 +2177,91 @@ impl Stack {
         tokio::time::Instant::from_std(deadline)
     }
 
-    fn poll_stack(&mut self) -> PollResult {
+    fn poll_ingress(&mut self) {
         let now = SmolInstant::now();
-        self.iface.poll(now, &mut self.device, &mut self.sockets)
+        self.iface.poll_maintenance(now);
+        while self
+            .iface
+            .poll_ingress_single(now, &mut self.device, &mut self.sockets)
+            != smoltcp::iface::PollIngressSingleResult::None
+        {}
+    }
+
+    fn poll_egress(&mut self) -> PollResult {
+        let now = SmolInstant::now();
+        self.iface
+            .poll_egress(now, &mut self.device, &mut self.sockets)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recv_batch_linux(&mut self, bufs: &mut [Vec<u8>]) -> usize {
+        use std::os::fd::AsRawFd;
+        let batch = bufs.len().min(64);
+        let mut addrs: [libc::sockaddr_storage; 64] = unsafe { std::mem::zeroed() };
+        let mut iovecs: [libc::iovec; 64] = unsafe { std::mem::zeroed() };
+        let mut hdrs: [libc::mmsghdr; 64] = unsafe { std::mem::zeroed() };
+        for i in 0..batch {
+            iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut libc::c_void;
+            iovecs[i].iov_len = bufs[i].len();
+            hdrs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+            hdrs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
+            hdrs[i].msg_hdr.msg_iovlen = 1 as _;
+        }
+        let fd = self.sock.as_raw_fd();
+        let res = self.sock.try_io(tokio::io::Interest::READABLE, || {
+            let n = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    hdrs.as_mut_ptr(),
+                    batch as libc::c_uint,
+                    libc::MSG_DONTWAIT as _,
+                    std::ptr::null_mut(),
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        });
+        let Ok(count) = res else {
+            return 0;
+        };
+        for i in 0..count {
+            let len = hdrs[i].msg_len as usize;
+            if let Some(src) = sockaddr_to_std(&addrs[i], hdrs[i].msg_hdr.msg_namelen) {
+                self.process_inbound(&bufs[i][..len], src);
+            }
+        }
+        count
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sockaddr_to_std(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET if (len as usize) >= std::mem::size_of::<libc::sockaddr_in>() => {
+            let sin: &libc::sockaddr_in =
+                unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6 if (len as usize) >= std::mem::size_of::<libc::sockaddr_in6>() => {
+            let sin6: &libc::sockaddr_in6 =
+                unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                port,
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
     }
 }
 
@@ -1809,6 +2270,8 @@ async fn run(
     sock: Arc<UdpSocket>,
     sock_v6: Option<Arc<UdpSocket>>,
     mut rx: mpsc::Receiver<Cmd>,
+    router: Option<Arc<crate::route::Router>>,
+    srv_waker: Arc<tokio::sync::Notify>,
 ) -> io::Result<()> {
     let mtu = cfg.mtu;
     let mut device = WgDevice::new(mtu);
@@ -1817,6 +2280,9 @@ async fn run(
     getrandom::fill(&mut seed).map_err(|e| io::Error::other(format!("getrandom: {e}")))?;
     iconfig.random_seed = u64::from_le_bytes(seed);
     let mut iface = Interface::new(iconfig, &mut device, SmolInstant::now());
+    if cfg.listen_port > 0 {
+        iface.set_any_ip(true);
+    }
     iface.update_ip_addrs(|list| {
         for cidr in &cfg.local_cidrs {
             let _ = list.push(*cidr);
@@ -1844,6 +2310,14 @@ async fn run(
         udp: HashMap::new(),
         next_port: EPHEMERAL_BASE,
         scratch: vec![0u8; SCRATCH_BUF],
+        tx_scratch: Vec::with_capacity(2048),
+        #[cfg(target_os = "linux")]
+        tx_batch: Vec::with_capacity(64),
+        #[cfg(target_os = "linux")]
+        tx_batch_free: Vec::with_capacity(64),
+        router,
+        srv_tcp: HashMap::new(),
+        srv_waker,
     };
     // Peer configs live in cfg (Arc) — materialize runtime state.
     let peer_cfgs = stack.cfg.peers.clone();
@@ -1851,28 +2325,98 @@ async fn run(
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut buf_v6 = vec![0u8; MAX_DATAGRAM];
+    #[cfg(target_os = "linux")]
+    let mut rx_batch_bufs: Vec<Vec<u8>> =
+        (0..64).map(|_| vec![0u8; (mtu + 512).max(2048)]).collect();
+    let dedicated_thread = tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread;
+    let mut idle_spins = 128u32;
     loop {
-        while let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) {
-            stack.process_inbound(&buf[..n], src);
-        }
-        let s6_recv = stack.sock_v6.clone();
-        if let Some(s6) = &s6_recv {
-            while let Ok((n, src)) = s6.try_recv_from(&mut buf_v6) {
-                stack.process_inbound(&buf_v6[..n], src);
+        let mut busy = false;
+        for _ in 0..16 {
+            #[cfg(target_os = "linux")]
+            let mut rx_count = stack.recv_batch_linux(&mut rx_batch_bufs);
+            #[cfg(not(target_os = "linux"))]
+            let mut rx_count = {
+                let mut c = 0usize;
+                while c < 64 {
+                    match stack.sock.try_recv_from(&mut buf) {
+                        Ok((n, src)) => {
+                            stack.process_inbound(&buf[..n], src);
+                            c += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                c
+            };
+            let s6_recv = stack.sock_v6.clone();
+            if let Some(s6) = &s6_recv {
+                while rx_count < 64 {
+                    match s6.try_recv_from(&mut buf_v6) {
+                        Ok((n, src)) => {
+                            stack.process_inbound(&buf_v6[..n], src);
+                            rx_count += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
+            let mut cmd_count = 0usize;
+            while cmd_count < 64 {
+                match rx.try_recv() {
+                    Ok(cmd) => {
+                        stack.process_cmd(cmd);
+                        cmd_count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !stack.device.rx.is_empty() {
+                stack.poll_ingress();
+            }
+            stack.maintain_tcp();
+            if !stack.srv_tcp.is_empty() {
+                crate::inbound::tun::pump_virtual_tcp_sockets(
+                    &mut stack.sockets,
+                    &mut stack.srv_tcp,
+                    &mut stack.scratch,
+                );
+            }
+            let mut egress_changed = false;
+            while stack.device.tx.len() < 64
+                && stack.poll_egress() == PollResult::SocketStateChanged
+            {
+                egress_changed = true;
+            }
+            if egress_changed && stack.device.tx.is_empty() {
+                stack.maintain_tcp();
+            }
+            let tx_count = stack.device.tx.len();
+            stack.flush_device_tx().await;
+            if rx_count == 0 && cmd_count == 0 && tx_count == 0 {
+                break;
+            }
+            busy = true;
+            idle_spins = 0;
         }
-        while let Ok(cmd) = rx.try_recv() {
-            stack.process_cmd(cmd);
+        if busy {
+            stack.maintain_peers().await;
+            if !dedicated_thread {
+                tokio::task::yield_now().await;
+            }
+            continue;
         }
-        // Caller data must reach the sockets before the stack polls, or every
-        // freshly written chunk waits a whole extra wake cycle on the wire.
-        stack.maintain_tcp();
-        stack.poll_stack();
-        stack.flush_device_tx().await;
+        if dedicated_thread && idle_spins < 128 {
+            idle_spins += 1;
+            std::hint::spin_loop();
+            continue;
+        }
         stack.maintain_peers().await;
         let deadline = stack.next_deadline();
         let sock = Arc::clone(&stack.sock);
         let s6_opt = stack.sock_v6.as_ref().map(Arc::clone);
+        let srv_waker = Arc::clone(&stack.srv_waker);
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(cmd) => stack.process_cmd(cmd),
@@ -1891,6 +2435,7 @@ async fn run(
                 Ok((n, src)) => stack.process_inbound(&buf_v6[..n], src),
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             },
+            _ = srv_waker.notified() => {}
             _ = tokio::time::sleep_until(deadline) => {}
         }
     }

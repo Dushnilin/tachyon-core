@@ -18,7 +18,7 @@ pub struct Mieru {
     server: String,
     ports: Vec<u16>,
     username: String,
-    password: String,
+    hashed: [u8; 32],
     pub dial: crate::outbound::dial::DialOptions,
 }
 
@@ -98,11 +98,12 @@ impl Mieru {
             }
         };
 
+        let hashed = crate::mieru::hashed_password(&username, &password);
         Ok(Self {
             server,
             ports,
             username,
-            password,
+            hashed,
             dial: crate::outbound::dial::DialOptions::parse(obj)?,
         })
     }
@@ -120,7 +121,7 @@ impl Mieru {
         let tcp =
             crate::outbound::dial::connect_tcp(&self.server, self.pick_port(), &self.dial).await?;
         let _ = tcp.set_nodelay(true);
-        let mut stream = MieruStream::client(tcp, &self.username, &self.password);
+        let mut stream = MieruStream::client_with_hash(tcp, &self.username, &self.hashed);
 
         let request = match target {
             Target::Ip(addr) => socks5_request("", Some(addr.ip()), addr.port())?,

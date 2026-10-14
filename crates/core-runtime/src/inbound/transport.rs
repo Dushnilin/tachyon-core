@@ -178,7 +178,22 @@ impl Transport {
             if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
                 return Accepted::xhttp_h2(stream, self).await;
             }
-            return self.xhttp_accept(stream).await.map(Accepted::Once);
+            let mut stream = stream;
+            let (raw, pending) = read_head_split(&mut stream).await?;
+            if raw.starts_with(b"PRI * HTTP/2.0\r\n") {
+                let mut combined = raw;
+                combined.extend_from_slice(&pending);
+                let pref_stream: AnyStream = Box::new(PrefixStream {
+                    prefix: combined,
+                    prefix_pos: 0,
+                    inner: stream,
+                });
+                return Accepted::xhttp_h2(pref_stream, self).await;
+            }
+            return self
+                .xhttp_accept(stream, raw, pending)
+                .await
+                .map(Accepted::Once);
         }
         if self.kind == Kind::Http {
             if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
@@ -1114,8 +1129,12 @@ impl Transport {
     /// `GET` that takes the session, an upload `POST` that attaches to one
     /// (or births it, if the upload wins the race), and the single
     /// bidirectional `POST` of stream-one, whose session nothing attaches to.
-    async fn xhttp_accept(&self, mut stream: AnyStream) -> anyhow::Result<AnyStream> {
-        let (raw, pending) = read_head_split(&mut stream).await?;
+    async fn xhttp_accept(
+        &self,
+        stream: AnyStream,
+        raw: Vec<u8>,
+        pending: Vec<u8>,
+    ) -> anyhow::Result<AnyStream> {
         let (method, target, headers) = parse_head(&raw)?;
 
         let (path, query) = match target.split_once('?') {

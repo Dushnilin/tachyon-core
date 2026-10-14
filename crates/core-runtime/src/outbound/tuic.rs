@@ -2,10 +2,10 @@
 //! TCP CONNECT header, native datagram or uni-stream UDP relay with
 //! fragmentation (reference sing-quic tuic client).
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use portable_atomic::AtomicU64;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -460,7 +460,7 @@ fn spawn_heartbeat(conn: quinn::Connection, period: Duration) -> tokio::task::Jo
             tokio::select! {
                 _ = ticker.tick() => {
                     if conn
-                        .send_datagram(vec![TUIC_VERSION, CMD_HEARTBEAT].into())
+                        .send_datagram(bytes::Bytes::from_static(&[TUIC_VERSION, CMD_HEARTBEAT]))
                         .is_err()
                     {
                         break;

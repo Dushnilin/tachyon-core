@@ -89,6 +89,9 @@ def run_sink(cpus):
 
 
 # ---------------------------------------------------------------- SOCKS5 client
+_sink_host = "127.0.0.1"
+
+
 def socks_connect(timeout=10, retries=8):
     last_err = None
     for attempt in range(retries):
@@ -98,7 +101,7 @@ def socks_connect(timeout=10, retries=8):
             s.sendall(b"\x05\x01\x00")
             auth = recvn(s, 2)
             assert auth == b"\x05\x00", f"socks auth failed: {auth!r}"
-            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack(">H", SINK_PORT))
+            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(_sink_host) + struct.pack(">H", SINK_PORT))
             reply = recvn(s, 10)
             assert reply[1] == 0, f"socks connect refused: {reply!r}"
             return s
@@ -121,19 +124,25 @@ def recvn(s, n):
 
 # ---------------------------------------------------------------- steer env
 def ensure_steer_env(bin_path):
-    """Sets up musl libc symlink, steerd in /usr/sbin, and libsteer in /usr/lib."""
+    """Sets up musl libc symlink, all steer* binaries in /usr/sbin, and libsteer* in /usr/lib."""
     try:
-        if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
+        need_musl = not os.path.exists("/lib/ld-musl-x86_64.so.1")
+        need_ip = not (os.path.exists("/sbin/ip") or os.path.exists("/usr/sbin/ip") or os.path.exists("/bin/ip"))
+        need_nft = not (os.path.exists("/usr/sbin/nft") or os.path.exists("/sbin/nft"))
+        if need_musl or need_ip or need_nft:
             subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # iproute2 provides `ip`, used by steer_net_setup to address the tunnel iface.
-        # nftables provides `nft`, which steer's ctl needs to apply its ruleset
-        # (without it apply fails with `nft refused the ruleset` -> SOCKS 0x04).
-        subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["apt-get", "install", "-y", "-qq", "iproute2", "nftables"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pkgs = []
+            if need_musl:
+                pkgs.append("musl")
+            if need_ip:
+                pkgs.append("iproute2")
+            if need_nft:
+                pkgs.append("nftables")
+            subprocess.run(["apt-get", "install", "-y", "-qq"] + pkgs, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         os.makedirs("/usr/sbin", exist_ok=True)
         os.makedirs("/usr/lib", exist_ok=True)
+        os.makedirs("/usr/lib/x86_64-linux-musl", exist_ok=True)
 
         if os.path.exists("/lib/ld-musl-x86_64.so.1") and not os.path.exists("/usr/lib/libc.so"):
             try:
@@ -144,26 +153,28 @@ def ensure_steer_env(bin_path):
         bin_dir = os.path.dirname(os.path.abspath(bin_path))
         steer_base = os.path.dirname(bin_dir)
 
-        for name in ("steerd", "steer"):
-            candidates = [
-                os.path.join(bin_dir, "..", "sbin", name),
-                os.path.join(steer_base, "sbin", name),
-                os.path.join(os.path.dirname(steer_base), "usr", "sbin", name),
-                os.path.join(bin_dir, name),
-            ]
-            for c in candidates:
-                if os.path.exists(c):
-                    try:
-                        os.chmod(c, 0o755)
-                    except OSError:
-                        pass
-                    dst = f"/usr/sbin/{name}"
-                    if not os.path.exists(dst):
-                        try:
-                            os.symlink(os.path.abspath(c), dst)
-                        except OSError:
-                            pass
-                    break
+        sbin_dirs = [
+            os.path.join(bin_dir, "..", "sbin"),
+            os.path.join(steer_base, "sbin"),
+            os.path.join(os.path.dirname(steer_base), "usr", "sbin"),
+            bin_dir,
+        ]
+        for sdir in sbin_dirs:
+            if os.path.exists(sdir):
+                for name in os.listdir(sdir):
+                    if name == "steerd" or name == "steer" or name.startswith("steer-"):
+                        src = os.path.abspath(os.path.join(sdir, name))
+                        if os.path.isfile(src):
+                            try:
+                                os.chmod(src, 0o755)
+                            except OSError:
+                                pass
+                            dst = f"/usr/sbin/{name}"
+                            if not os.path.exists(dst):
+                                try:
+                                    os.symlink(src, dst)
+                                except OSError:
+                                    pass
 
         for ldir in (
             os.path.join(bin_dir, "..", "lib"),
@@ -173,12 +184,14 @@ def ensure_steer_env(bin_path):
         ):
             if os.path.exists(ldir):
                 for f in os.listdir(ldir):
-                    dst = os.path.join("/usr/lib", f)
-                    if not os.path.exists(dst):
-                        try:
-                            os.symlink(os.path.abspath(os.path.join(ldir, f)), dst)
-                        except OSError:
-                            pass
+                    src = os.path.abspath(os.path.join(ldir, f))
+                    for target_dir in ("/usr/lib", "/usr/lib/x86_64-linux-musl"):
+                        dst = os.path.join(target_dir, f)
+                        if not os.path.exists(dst):
+                            try:
+                                os.symlink(src, dst)
+                            except OSError:
+                                pass
     except Exception as e:
         print(f"Warning: ensure_steer_env error: {e}", file=sys.stderr)
 
@@ -208,13 +221,13 @@ def _set_addr(iface, ip, prefix="24"):
     try:
         r = subprocess.run(["ip", "addr", "add", f"{ip}/{prefix}", "dev", iface],
                            capture_output=True, text=True)
-        if r.returncode == 0:
+        if r.returncode == 0 or "File exists" in (r.stderr or ""):
             return True
     except (FileNotFoundError, OSError):
         pass
     try:
         r = subprocess.run(["ifconfig", iface, f"{ip}", "netmask",
-                            ".".join(["255"] * (4 - prefix // 24) + ["0"] * (prefix // 24))],
+                            ".".join(["255"] * (4 - int(prefix) // 24) + ["0"] * (int(prefix) // 24))],
                            capture_output=True, text=True)
         return r.returncode == 0
     except (FileNotFoundError, OSError):
@@ -227,6 +240,9 @@ def steer_net_setup():
     accept_local=1 lets the module's SYN-ACK (src=the sink addr) back in through
     sbx0 instead of being dropped as a martian; needs --privileged. And we add the
     sink addr (198.18.0.1) to lo so it is a real, non-loopback destination.
+    Moving `lookup local` to pref 60 and putting `fwmark 0x1/0xff lookup 300` at
+    pref 50 routes marked Steer client packets into sbx0 while unmarked server
+    packets (or mark=2) reach the local sink on lo.
     """
     global _steered_net
     if _steered_net:
@@ -242,9 +258,12 @@ def steer_net_setup():
         print(f"Warning: accept_local not set (need --privileged): {e}", file=sys.stderr)
     if not _set_addr("lo", STEER_SINK, prefix="32"):
         print(f"Warning: cannot add {STEER_SINK} to lo", file=sys.stderr)
+    subprocess.run(["ip", "rule", "add", "pref", "60", "lookup", "local"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "rule", "del", "pref", "0", "lookup", "local"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "rule", "add", "pref", "50", "fwmark", "0x1/0xff", "lookup", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def steer_wait_ready(timeout=1.5):
+def steer_wait_ready(timeout=8.0):
     """steer races its own startup: ctl apply runs before sbx0 is up, so the first
     apply fails with `on_fail=drop` and the proxy answers EOF until the --watch
     supervisor reapplies. Poll until a real SOCKS CONNECT to the sink succeeds."""
@@ -257,20 +276,21 @@ def steer_wait_ready(timeout=1.5):
             if s.recv(2) == b"\x05\x00":
                 s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(STEER_SINK) + struct.pack(">H", SINK_PORT))
                 reply = s.recv(10)
-                print(f"[steer_wait_ready] CONNECT reply: {reply!r}", file=sys.stderr)
-                if reply[1] == 0:
+                if len(reply) >= 2 and reply[1] == 0:
                     s.close()
                     return
             s.close()
         except OSError:
             pass
         time.sleep(0.2)
-    print("Warning: steer tunnel not ready after %.0fs" % (time.perf_counter() - t0), file=sys.stderr)
+    print("Warning: steer tunnel not ready after %.1fs" % (time.perf_counter() - t0), file=sys.stderr)
 
 
 def steer_component(case):
     """Which steer module handles this protocol (for the report column)."""
     cid = case.get("id", "")
+    if "xhttp" in cid:
+        return "steer-xsteer"
     if cid.startswith(("ss-", "ss2022-", "trojan")):
         return "steer-proxy"
     if cid.startswith("vless"):
@@ -283,27 +303,49 @@ def steer_component(case):
 
 
 # ---------------------------------------------------------------- proc info
+def _target_pids(pid):
+    pids = [pid]
+    if _sink_host == STEER_SINK:
+        try:
+            for entry in os.listdir("/proc"):
+                if entry.isdigit() and int(entry) != pid:
+                    try:
+                        cmd = open(f"/proc/{entry}/cmdline", "rb").read()
+                        if b"/sbin/steer" in cmd:
+                            pids.append(int(entry))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return pids
+
+
 def proc_status(pid):
     out = {"VmRSS": 0.0, "VmHWM": 0.0}
-    try:
-        with open(f"/proc/{pid}/status") as f:
-            for line in f:
-                if line.startswith(("VmRSS", "VmHWM")):
-                    k, v = line.split(":")
-                    out[k] = int(v.split()[0]) / 1024
-    except Exception:
-        pass
+    for p in _target_pids(pid):
+        try:
+            with open(f"/proc/{p}/status") as f:
+                for line in f:
+                    if line.startswith(("VmRSS", "VmHWM")):
+                        k, v = line.split(":")
+                        out[k] += int(v.split()[0]) / 1024
+        except Exception:
+            pass
     return out
 
 
 def cpu_split(pid):
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            fields = f.read().rsplit(")", 1)[1].split()
-        tick = os.sysconf("SC_CLK_TCK")
-        return int(fields[11]) / tick, int(fields[12]) / tick
-    except Exception:
-        return 0.0, 0.0
+    u_tot, s_tot = 0.0, 0.0
+    tick = os.sysconf("SC_CLK_TCK")
+    for p in _target_pids(pid):
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            u_tot += int(fields[11]) / tick
+            s_tot += int(fields[12]) / tick
+        except Exception:
+            pass
+    return u_tot, s_tot
 
 
 # ---------------------------------------------------------------- measurements
@@ -886,8 +928,10 @@ def get_cases(certs):
             "id": "mieru",
             "cat": "Modern / Mieru",
             "name": "Mieru (TCP)",
-            "server": {"type": "mieru", "users": [{"username": "bench-user", "password": "bench-password"}], "transport": "TCP"},
-            "client_sb": {"type": "mieru", "server": "127.0.0.1", "server_port": SERVER_PORT, "username": "bench-user", "password": "bench-password", "transport": "TCP"},
+            "server_type": "tachyon",
+            "server": {"type": "mieru", "users": [{"name": "bench-user", "password": "bench-password"}], "transport": "TCP"},
+            "client_tachyon": {"type": "mieru", "server": "127.0.0.1", "server_port": SERVER_PORT, "username": "bench-user", "password": "bench-password", "transport": "TCP"},
+            "client_sb": None,
             "client_xray": None,
             "client_mihomo": {"type": "mieru", "username": "bench-user", "password": "bench-password", "transport": "TCP"},
         },
@@ -897,35 +941,71 @@ def get_cases(certs):
             "id": "shadowtls",
             "cat": "VPN / Tunnel",
             "name": "ShadowTLS v3 (TLS SNI Obfs)",
+            "server_type": "tachyon",
             "server": {"type": "shadowtls", "version": 3, "password": "bench-shadowtls-pass", "handshake": {"server": "127.0.0.1", "server_port": SINK_PORT}, "detour": "direct"},
-            "client_sb": {"type": "shadowtls", "server": "127.0.0.1", "server_port": SERVER_PORT, "version": 3, "password": "bench-shadowtls-pass", "tls": {"enabled": True, "server_name": "localhost"}},
+            "client_tachyon": {"type": "shadowtls", "server": "127.0.0.1", "server_port": SERVER_PORT, "version": 3, "password": "bench-shadowtls-pass", "tls": {"enabled": True, "server_name": "localhost"}},
+            "client_sb": None,
             "client_xray": None,
-            "client_mihomo": {"type": "shadow-tls", "version": 3, "password": "bench-shadowtls-pass", "sni": "localhost"},
+            "client_mihomo": None,
         },
         {
             "id": "wireguard",
             "cat": "VPN / Tunnel",
             "name": "WireGuard (UDP Native)",
-            "server": {"type": "wireguard", "private_key": "a" * 44, "peers": [{"public_key": "b" * 44, "allowed_ips": ["10.0.0.2/32"]}]},
-            "client_sb": {"type": "wireguard", "server": "127.0.0.1", "server_port": SERVER_PORT, "private_key": "b" * 44, "peer_public_key": "a" * 44, "local_address": ["10.0.0.2/32"]},
-            "client_xray": {"protocol": "wireguard", "settings": {"secretKey": "b" * 44, "peers": [{"publicKey": "a" * 44, "endpoint": f"127.0.0.1:{SERVER_PORT}"}]}},
-            "client_mihomo": {"type": "wireguard", "private-key": "b" * 44, "public-key": "a" * 44, "ip": "10.0.0.2"},
+            "l3_tunnel": True,
+            "server_endpoint": {
+                "type": "wireguard",
+                "tag": "wg-srv",
+                "listen_port": SERVER_PORT,
+                "address": ["10.77.77.1/24"],
+                "private_key": "6IhML+ZbjcTQrDTVyz9DwCigboy1vFliAZ9sRQbNYX0=",
+                "peers": [{"public_key": "zSWHwMlGNt+0KwdMlwKCmL8hNRjojhDm8SH7txFZxQU=", "allowed_ips": ["0.0.0.0/0", "10.77.77.2/32"]}],
+            },
+            "client_endpoint": {
+                "type": "wireguard",
+                "tag": "proxy",
+                "address": ["10.77.77.2/24"],
+                "private_key": "8JNkX+3Io6sYFOCCkvyJ9DzgnPMKAI8Q/LpT29bK61s=",
+                "peers": [{"address": "127.0.0.1", "port": SERVER_PORT, "public_key": "KaHrbpksVQeCNBLaknGaYF52xowR5fpfCYmCuoy56mk=", "allowed_ips": ["0.0.0.0/0"]}],
+            },
+            "client_sb": None,
+            "client_xray": {"protocol": "wireguard", "settings": {"secretKey": "8JNkX+3Io6sYFOCCkvyJ9DzgnPMKAI8Q/LpT29bK61s=", "address": ["10.77.77.2/32"], "peers": [{"publicKey": "KaHrbpksVQeCNBLaknGaYF52xowR5fpfCYmCuoy56mk=", "endpoint": f"127.0.0.1:{SERVER_PORT}"}]}},
+            "client_mihomo": {"type": "wireguard", "private-key": "8JNkX+3Io6sYFOCCkvyJ9DzgnPMKAI8Q/LpT29bK61s=", "public-key": "KaHrbpksVQeCNBLaknGaYF52xowR5fpfCYmCuoy56mk=", "ip": "10.77.77.2", "udp": True},
         },
         {
             "id": "amneziawg",
             "cat": "VPN / Tunnel",
             "name": "AmneziaWG (Obfuscated WG)",
-            "server": {"type": "wireguard", "private_key": "a" * 44, "peers": [{"public_key": "b" * 44, "allowed_ips": ["10.0.0.2/32"]}], "awg": {"jc": 4, "jmin": 40, "jmax": 70, "s1": 20, "s2": 40, "h1": 1, "h2": 2, "h3": 3, "h4": 4}},
-            "client_sb": {"type": "wireguard", "server": "127.0.0.1", "server_port": SERVER_PORT, "private_key": "b" * 44, "peer_public_key": "a" * 44, "local_address": ["10.0.0.2/32"], "awg": {"jc": 4, "jmin": 40, "jmax": 70, "s1": 20, "s2": 40, "h1": 1, "h2": 2, "h3": 3, "h4": 4}},
+            "l3_tunnel": True,
+            "server_endpoint": {
+                "type": "wireguard",
+                "tag": "awg-srv",
+                "listen_port": SERVER_PORT,
+                "address": ["10.77.77.1/24"],
+                "private_key": "6IhML+ZbjcTQrDTVyz9DwCigboy1vFliAZ9sRQbNYX0=",
+                "peers": [{"public_key": "zSWHwMlGNt+0KwdMlwKCmL8hNRjojhDm8SH7txFZxQU=", "allowed_ips": ["0.0.0.0/0", "10.77.77.2/32"]}],
+                "jc": 3, "jmin": 60, "jmax": 120, "s1": 64, "s2": 32, "h1": 123, "h2": 234, "h3": 345, "h4": 456,
+            },
+            "client_endpoint": {
+                "type": "wireguard",
+                "tag": "proxy",
+                "address": ["10.77.77.2/24"],
+                "private_key": "8JNkX+3Io6sYFOCCkvyJ9DzgnPMKAI8Q/LpT29bK61s=",
+                "peers": [{"address": "127.0.0.1", "port": SERVER_PORT, "public_key": "KaHrbpksVQeCNBLaknGaYF52xowR5fpfCYmCuoy56mk=", "allowed_ips": ["0.0.0.0/0"]}],
+                "jc": 3, "jmin": 60, "jmax": 120, "s1": 64, "s2": 32, "h1": 123, "h2": 234, "h3": 345, "h4": 456,
+            },
+            "client_sb": None,
             "client_xray": None,
-            "client_mihomo": {"type": "wireguard", "private-key": "b" * 44, "public-key": "a" * 44, "ip": "10.0.0.2"},
+            "client_mihomo": None,
         },
         {
             "id": "masque",
             "cat": "VPN / Tunnel",
             "name": "MASQUE (HTTP/3 WARP)",
-            "server": {"type": "masque", "uri": "https://localhost/bench", "tls": tls_s},
-            "client_sb": {"type": "masque", "server": "127.0.0.1", "server_port": SERVER_PORT, "uri": "https://localhost/bench", "tls": tls_c},
+            "server_type": "tachyon",
+            "l3_tunnel": True,
+            "server": {"type": "masque", "tls": tls_s},
+            "client_sb": {"type": "masque", "profile": "standard", "server": "127.0.0.1", "server_port": SERVER_PORT, "uri": f"https://localhost:{SERVER_PORT}/.well-known/masque/ip/*/*/", "ip": "172.16.0.2", "tls": tls_c},
             "client_xray": None,
             "client_mihomo": None,
         },
@@ -933,8 +1013,11 @@ def get_cases(certs):
             "id": "fptn",
             "cat": "VPN / Tunnel",
             "name": "FPTN (Fast Packet Tunnel Network)",
-            "server": {"type": "fptn", "users": [{"token": "bench-fptn-token"}], "tls": tls_s},
-            "client_sb": {"type": "fptn", "server": "127.0.0.1", "server_port": SERVER_PORT, "token": "bench-fptn-token", "tls": tls_c},
+            "server_type": "tachyon",
+            "l3_tunnel": True,
+            "server": {"type": "fptn", "users": [{"username": "bench", "password": "bench-password"}], "tls": tls_s},
+            "client_tachyon": {"type": "fptn", "server": "127.0.0.1", "server_port": SERVER_PORT, "username": "bench", "password": "bench-password", "sni": "localhost", "obfuscation": "none"},
+            "client_sb": None,
             "client_xray": None,
             "client_mihomo": None,
         },
@@ -943,17 +1026,22 @@ def get_cases(certs):
 
 
 # ---------------------------------------------------------------- proxy launcher
-def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None):
+def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None, tachyon_bin=None):
     wait_port_free(SERVER_PORT)
     d = tempfile.mkdtemp(prefix="proto_srv_")
 
     if case.get("server_type") == "xray" and xray_bin:
         cfg_path = os.path.join(d, "config.json")
-        inbound = dict(case["server_xray"], port=SERVER_PORT, listen="127.0.0.1")
+        inbound = dict(case["server_xray"], port=SERVER_PORT, listen="0.0.0.0")
         cfg = {
             "log": {"loglevel": "error"},
             "inbounds": [inbound],
-            "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {"finalRules": [{"action": "allow"}]}}]
+            "outbounds": [{
+                "protocol": "freedom",
+                "tag": "direct",
+                "streamSettings": {"sockopt": {"mark": 2}},
+                "settings": {"finalRules": [{"action": "allow"}]},
+            }]
         }
         with open(cfg_path, "w") as f:
             json.dump(cfg, f)
@@ -965,16 +1053,29 @@ def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None
         wait_listen(SERVER_PORT)
         return proc, d
 
-    srv_inbound = case["server"]
+    srv_bin = tachyon_bin if case.get("server_type") == "tachyon" and tachyon_bin else ref_bin
     cfg_path = os.path.join(d, "config.json")
-    # Bind to :: so both IPv4 127.0.0.1 and IPv6 ::1 are bound
-    inbound = dict(srv_inbound, tag="srv-in", listen="::", listen_port=SERVER_PORT)
-    cfg = {
-        "log": {"level": "error"},
-        "inbounds": [inbound],
-        "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final": "direct"}
-    }
+    if case.get("server_endpoint"):
+        ep = dict(case["server_endpoint"], listen_port=SERVER_PORT)
+        cfg = {
+            "log": {"level": "error"},
+            "endpoints": [ep],
+            "outbounds": [{"type": "direct", "tag": "direct", "routing_mark": 2}],
+            "route": {"final": "direct"}
+        }
+        is_udp = True
+    else:
+        srv_inbound = case["server"]
+        # Bind to :: so both IPv4 127.0.0.1 and IPv6 ::1 are bound
+        inbound = dict(srv_inbound, tag="srv-in", listen="::", listen_port=SERVER_PORT)
+        cfg = {
+            "log": {"level": "error"},
+            "inbounds": [inbound],
+            "outbounds": [{"type": "direct", "tag": "direct", "routing_mark": 2}],
+            "route": {"final": "direct"}
+        }
+        is_udp = srv_inbound.get("type") in ("hysteria2", "tuic", "masque", "wireguard")
+
     with open(cfg_path, "w") as f:
         json.dump(cfg, f)
     env = os.environ.copy()
@@ -982,9 +1083,8 @@ def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None
         env["GOMAXPROCS"] = str(server_workers)
         env["TACHYON_WORKERS"] = str(server_workers)
     pre = (lambda: os.sched_setaffinity(0, server_cpus)) if hasattr(os, "sched_setaffinity") else None
-    proc = subprocess.Popen([ref_bin, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
-    
-    is_udp = srv_inbound.get("type") in ("hysteria2", "tuic")
+    proc = subprocess.Popen([srv_bin, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
+
     if not is_udp:
         wait_listen(SERVER_PORT)
     else:
@@ -1003,27 +1103,54 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
     pre = (lambda: os.sched_setaffinity(0, client_cpus)) if hasattr(os, "sched_setaffinity") else None
 
     if core_name in ("tachyon", "sing-box", "steer"):
-        spec = case.get("client_tachyon") if core_name == "tachyon" and case.get("client_tachyon") else case.get("client_sb")
-        if not spec:
-            return None, d
-        if core_name == "steer":
-            if not steer_available():
-                return None, d  # -> reported as NO_TUN
-            ensure_steer_env(bin_path)
-            steer_net_setup()
-            curr_ld = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
-        outbound = dict(spec, tag="proxy")
-        cfg_path = os.path.join(d, "config.json")
-        cfg = {
-            "log": {"level": "debug" if core_name == "steer" else "error"},
-            "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
-            "outbounds": [outbound],
-            "route": {"final": "proxy"}
-        }
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f)
-        cmd = [bin_path, "run", "-c", cfg_path]
+        if case.get("client_endpoint"):
+            if core_name == "steer":
+                return None, d
+            ep = dict(case["client_endpoint"], tag="proxy")
+            cfg_path = os.path.join(d, "config.json")
+            cfg = {
+                "log": {"level": "error"},
+                "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
+                "endpoints": [ep],
+                "route": {"final": "proxy"}
+            }
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+            cmd = [bin_path, "run", "-c", cfg_path]
+        else:
+            spec = case.get("client_tachyon") if core_name == "tachyon" and case.get("client_tachyon") else case.get("client_sb")
+            if not spec:
+                return None, d
+            outbound = dict(spec, tag="proxy")
+            if core_name == "steer":
+                ob_type = outbound.get("type", "")
+                tr_type = (outbound.get("transport") or {}).get("type", "")
+                if ob_type in ("tuic", "naive", "anytls", "snell", "masque") or tr_type == "http":
+                    return None, d
+                if not steer_available():
+                    return None, d  # -> reported as NO_TUN
+                ensure_steer_env(bin_path)
+                steer_net_setup()
+                curr_ld = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = f"/usr/lib:{curr_ld}" if curr_ld else "/usr/lib"
+                cip = container_ip()
+                if cip and outbound.get("server") == "127.0.0.1":
+                    outbound["server"] = cip
+            cfg_path = os.path.join(d, "config.json")
+            route_cfg = (
+                {"final": "proxy", "rules": [{"ip_cidr": [f"{STEER_SINK}/32"], "outbound": "proxy"}]}
+                if core_name == "steer"
+                else {"final": "proxy"}
+            )
+            cfg = {
+                "log": {"level": "error"},
+                "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}],
+                "outbounds": [outbound],
+                "route": route_cfg
+            }
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+            cmd = [bin_path, "run", "-c", cfg_path]
 
     elif core_name == "xray":
         spec = case.get("client_xray")
@@ -1194,7 +1321,7 @@ def generate_html_report(results, profile, out_path):
             cpu = cdata.get("cpu_s_per_gib")
             cpu_str = f"{cpu:.2f} s/G" if (cpu is not None and cpu > 0) else "—"
             spd = max(t1, t8)
-            pct = int(min(100, max(5, spd / max_row_spd * 100)))
+            pct = int(min(100, max(5, spd / max_row_spd * 100))) if max_row_spd > 0 else 5
             bar_color = "var(--win-ink)" if is_t else "var(--accent)"
             
             diff_badge = ""
@@ -1689,7 +1816,7 @@ def main():
 
         srv_proc = None
         try:
-            srv_proc, srv_dir = launch_server(args.sing_box, case, server_cpus, server_workers=server_workers, xray_bin=args.xray)
+            srv_proc, srv_dir = launch_server(args.sing_box, case, server_cpus, server_workers=server_workers, xray_bin=args.xray, tachyon_bin=args.tachyon)
         except Exception as e:
             print(f"  [SERVER FAIL] Cannot launch reference server: {e}", flush=True)
             continue
@@ -1699,6 +1826,13 @@ def main():
         for c_name, c_bin in clients:
             if not os.path.exists(c_bin):
                 continue
+            global _sink_host
+            if c_name == "steer":
+                _sink_host = STEER_SINK
+            elif case.get("l3_tunnel"):
+                _sink_host = container_ip() or "127.0.0.1"
+            else:
+                _sink_host = "127.0.0.1"
             cli_proc = None
             try:
                 cli_proc, cli_dir = launch_client(c_name, c_bin, case, client_cpus, workers)
@@ -1709,10 +1843,10 @@ def main():
                     )
                     continue
 
-                t1, cpu1 = measure_throughput(1, args.seconds, cli_proc.pid)
-                t8, cpu8 = measure_throughput(8, args.seconds, cli_proc.pid)
                 lat_rounds = min(args.latency_rounds, 30) if "xhttp" in cid else args.latency_rounds
                 lat = measure_latency(lat_rounds)
+                t1, cpu1 = measure_throughput(1, args.seconds, cli_proc.pid)
+                t8, cpu8 = measure_throughput(8, args.seconds, cli_proc.pid)
                 peak_rss = round(proc_status(cli_proc.pid)["VmHWM"], 1)
 
                 case_res[c_name] = {
@@ -1737,6 +1871,10 @@ def main():
                         cli_proc.wait(timeout=2)
                     except Exception:
                         cli_proc.kill()
+                    if c_name == "steer":
+                        subprocess.run(["pkill", "-9", "-f", "^/usr/sbin/steer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(["pkill", "-9", "-f", "^/bench/steer/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(["nft", "delete", "table", "inet", "sbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     wait_port_free(PROXY_PORT)
 
         if srv_proc:

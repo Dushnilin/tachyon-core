@@ -15,36 +15,32 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection: 16 MiB a stream, 64 MiB a
-/// connection, sized to sustain 20+ Gbps transfers without ballooning
-/// client RSS across concurrent pooled connections. The window is also the
-/// memory ceiling for whatever a fast peer has in flight to a slow reader.
-const STREAM_WINDOW: u32 = 16 << 20;
-const CONN_WINDOW: u32 = 64 << 20;
 /// Largest DATA frame we ask the peer to send.
 const MAX_FRAME: u32 = 256 * 1024;
 
-/// The client handshake every h2-based transport shares, with windows sized
-/// for throughput.
+/// The client handshake every h2-based transport shares, with windows scaled
+/// dynamically by [`crate::hardware::HardwareProfile`].
 pub(crate) fn client_builder() -> h2::client::Builder {
+    let hw = crate::hardware::HardwareProfile::detect();
     let mut builder = h2::client::Builder::new();
     builder
-        .initial_window_size(STREAM_WINDOW)
-        .initial_connection_window_size(CONN_WINDOW)
-        .max_frame_size(MAX_FRAME)
-        .max_send_buffer_size(16 << 20);
+        .initial_window_size(hw.h2_stream_window)
+        .initial_connection_window_size(hw.h2_conn_window)
+        .max_frame_size(MAX_FRAME.min(hw.h2_stream_window))
+        .max_send_buffer_size(hw.h2_max_send_buf);
     builder
 }
 
 /// The server half of the same handshake: same windows, so a server this side
 /// runs is measured against the same conditions the client half asks for.
 pub(crate) fn server_builder() -> h2::server::Builder {
+    let hw = crate::hardware::HardwareProfile::detect();
     let mut builder = h2::server::Builder::new();
     builder
-        .initial_window_size(STREAM_WINDOW)
-        .initial_connection_window_size(CONN_WINDOW)
-        .max_frame_size(MAX_FRAME)
-        .max_send_buffer_size(4 << 20);
+        .initial_window_size(hw.h2_stream_window)
+        .initial_connection_window_size(hw.h2_conn_window)
+        .max_frame_size(MAX_FRAME.min(hw.h2_stream_window))
+        .max_send_buffer_size(hw.h2_max_send_buf);
     builder
 }
 
@@ -82,6 +78,22 @@ impl H2Stream {
     /// A stream that borrows a connection task owned by a session pool.
     pub(crate) fn shared(response: ResponseFuture, send: h2::SendStream<Bytes>) -> Self {
         Self::build(response, send, None)
+    }
+
+    /// Write-only stream borrow for XHTTP `stream-up` over HTTP/2, where the
+    /// response status and body are watched by a separate ack task.
+    pub(crate) fn upload_only(send: h2::SendStream<Bytes>) -> Self {
+        Self {
+            send: Some(send),
+            response: None,
+            recv: None,
+            pending: VecDeque::new(),
+            pending_len: 0,
+            out: Bytes::new(),
+            report: 0,
+            eof: true,
+            conn_task: None,
+        }
     }
 
     /// The same, for a caller that has already read the head -- naive does, so
@@ -303,37 +315,55 @@ impl H2Stream {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let initial_filled = out.filled().len();
-        loop {
+        let mut released = 0usize;
+        let res = loop {
             if !self.pending.is_empty() {
-                self.serve(out, usize::MAX);
+                let mut left = out.remaining().min(self.pending_len);
+                let want = left;
+                while left > 0 {
+                    let Some(front) = self.pending.front_mut() else {
+                        break;
+                    };
+                    let take = front.len().min(left);
+                    out.put_slice(&front[..take]);
+                    front.advance(take);
+                    self.pending_len -= take;
+                    left -= take;
+                    if front.is_empty() {
+                        self.pending.pop_front();
+                    }
+                }
+                released += want - left;
                 if out.remaining() == 0 {
-                    return Poll::Ready(Ok(()));
+                    break Poll::Ready(Ok(()));
                 }
             }
 
             if self.eof {
-                return Poll::Ready(Ok(()));
+                break Poll::Ready(Ok(()));
             }
 
             if self.recv.is_none() {
                 let Some(response) = self.response.as_mut() else {
                     self.eof = true;
-                    return Poll::Ready(Ok(()));
+                    break Poll::Ready(Ok(()));
                 };
-                let resp = match ready!(response.as_mut().poll(cx)) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        return Poll::Ready(Err(io::Error::other(format!("h2: response: {e}"))));
+                match response.as_mut().poll(cx) {
+                    Poll::Pending => break Poll::Pending,
+                    Poll::Ready(Ok(resp)) => {
+                        if resp.status().as_u16() != 200 {
+                            break Poll::Ready(Err(io::Error::other(format!(
+                                "h2: unexpected status: {}",
+                                resp.status()
+                            ))));
+                        }
+                        self.recv = Some(resp.into_body());
+                        self.response = None;
                     }
-                };
-                if resp.status().as_u16() != 200 {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "h2: unexpected status: {}",
-                        resp.status()
-                    ))));
+                    Poll::Ready(Err(e)) => {
+                        break Poll::Ready(Err(io::Error::other(format!("h2: response: {e}"))));
+                    }
                 }
-                self.recv = Some(resp.into_body());
-                self.response = None;
             }
 
             let recv = self.recv.as_mut().expect("recv set above");
@@ -344,9 +374,7 @@ impl H2Stream {
                     // Only what reaches the caller right now is repaid; the
                     // tail waits in `pending` and is repaid by `serve`.
                     let served = want.min(len);
-                    if served > 0 {
-                        let _ = recv.flow_control().release_capacity(served);
-                    }
+                    released += served;
                     if want >= len {
                         out.put_slice(&chunk);
                     } else if want > 0 {
@@ -354,28 +382,30 @@ impl H2Stream {
                         chunk.advance(want);
                         self.pending_len += chunk.len();
                         self.pending.push_back(chunk);
-                        return Poll::Ready(Ok(()));
+                        break Poll::Ready(Ok(()));
                     } else {
                         self.pending_len += len;
                         self.pending.push_back(chunk);
-                        return Poll::Ready(Ok(()));
+                        break Poll::Ready(Ok(()));
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(format!("h2: recv: {e}"))));
+                    break Poll::Ready(Err(io::Error::other(format!("h2: recv: {e}"))));
                 }
                 Poll::Ready(None) => {
                     self.eof = true;
-                    return Poll::Ready(Ok(()));
+                    break Poll::Ready(Ok(()));
                 }
                 Poll::Pending => {
                     if out.filled().len() > initial_filled {
-                        return Poll::Ready(Ok(()));
+                        break Poll::Ready(Ok(()));
                     }
-                    return Poll::Pending;
+                    break Poll::Pending;
                 }
             }
-        }
+        };
+        self.release(released);
+        res
     }
 
     /// Half-close: flush staged bytes, then END_STREAM on the send side.

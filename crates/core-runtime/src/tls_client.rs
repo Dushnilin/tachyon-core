@@ -220,6 +220,11 @@ impl TlsOptions {
         &self.server_name
     }
 
+    /// Configured ALPN protocol list (empty when unset).
+    pub fn alpn(&self) -> &[Vec<u8>] {
+        &self.alpn
+    }
+
     /// Parse outbound `tls` options; `None` when TLS is absent or disabled.
     pub fn from_outbound(
         obj: &serde_json::Map<String, Value>,
@@ -477,6 +482,8 @@ impl TlsOptions {
         for cert in &self.ca_certs {
             cert.as_ref().hash(&mut ca);
         }
+        self.certificate_sha256.hash(&mut ca);
+        self.certificate_public_key_sha256.hash(&mut ca);
         let key = (
             self.min_tls13,
             self.max_tls12,
@@ -516,6 +523,20 @@ impl TlsOptions {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth()
+        } else if !self.certificate_sha256.is_empty()
+            || !self.certificate_public_key_sha256.is_empty()
+        {
+            let inner =
+                core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner();
+            let verifier = core_tls::verify::PinVerifier::new(
+                inner,
+                self.certificate_sha256.clone(),
+                self.certificate_public_key_sha256.clone(),
+            );
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
             builder
@@ -559,6 +580,20 @@ impl TlsOptions {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth()
+        } else if !self.certificate_sha256.is_empty()
+            || !self.certificate_public_key_sha256.is_empty()
+        {
+            let inner =
+                core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner();
+            let verifier = core_tls::verify::PinVerifier::new(
+                inner,
+                self.certificate_sha256.clone(),
+                self.certificate_public_key_sha256.clone(),
+            );
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
             builder

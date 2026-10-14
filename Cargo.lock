@@ -326,7 +326,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "core-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "brotli",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -384,11 +384,11 @@ dependencies = [
 
 [[package]]
 name = "core-experimental"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "core-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "brotli",

@@ -316,7 +316,7 @@ impl RuleSetCompiler {
         let dest_v4_count = sorted_v4.len() as u32;
         offset += sorted_v4.len() * std::mem::size_of::<Ipv4Entry>();
 
-        offset = align_8(offset);
+        offset = (offset + 15) & !15;
         let dest_v6_offset = offset as u32;
         let dest_v6_count = sorted_v6.len() as u32;
         offset += sorted_v6.len() * std::mem::size_of::<Ipv6Entry>();

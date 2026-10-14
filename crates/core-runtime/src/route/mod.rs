@@ -1260,6 +1260,8 @@ impl Router {
                     .lock()
                     .expect("probe tasks")
                     .push(handle);
+            } else if let Outbound::WireGuard(wg) = outbound {
+                wg.attach_router(Arc::clone(&router));
             }
         }
         Ok(router)
@@ -1464,6 +1466,8 @@ impl Router {
                     .lock()
                     .expect("probe tasks")
                     .push(handle);
+            } else if let Outbound::WireGuard(wg) = outbound {
+                wg.attach_router(Arc::clone(self));
             }
         }
 

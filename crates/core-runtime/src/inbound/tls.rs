@@ -532,7 +532,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
             }
             // Nothing is being handed over here, so what has been opened can go.
             if me.rd > 0 {
-                me.raw.drain(..me.rd);
+                if me.rd >= me.raw.len() {
+                    me.raw.clear();
+                } else {
+                    me.raw.copy_within(me.rd.., 0);
+                    me.raw.truncate(me.raw.len() - me.rd);
+                }
                 me.rd = 0;
                 me.pend_at = 0;
                 me.pend_end = 0;
@@ -554,7 +559,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
                     unsafe { me.raw.set_len(have + got) };
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    if me.raw.is_empty()
+                        && me.raw.capacity() > CHUNK
+                        && crate::hardware::is_memory_pressured()
+                    {
+                        me.raw = Vec::new();
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }

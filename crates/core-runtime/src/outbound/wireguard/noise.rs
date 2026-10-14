@@ -7,9 +7,11 @@
 use blake2::digest::typenum::U16;
 use blake2::digest::{KeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::aead::{Aead, AeadInPlace, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+use crate::fastchacha::ChaChaPoly;
 
 const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -41,6 +43,28 @@ pub const HDR_RESPONSE: HeaderRange = (MSG_RESPONSE as u32, MSG_RESPONSE as u32)
 pub const HDR_COOKIE: HeaderRange = (MSG_COOKIE_REPLY as u32, MSG_COOKIE_REPLY as u32);
 pub const HDR_TRANSPORT: HeaderRange = (MSG_TRANSPORT as u32, MSG_TRANSPORT as u32);
 
+/// Fast thread-local xorshift64* PRNG seeded once per thread from OS CSPRNG
+/// for non-cryptographic AWG header ranges and transport padding.
+#[inline]
+pub(crate) fn fast_prng_u64() -> u64 {
+    thread_local! {
+        static STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    STATE.with(|cell| {
+        let mut x = cell.get();
+        if x == 0 {
+            let mut seed = [0u8; 8];
+            let _ = getrandom::fill(&mut seed);
+            x = u64::from_le_bytes(seed) | 1;
+        }
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        cell.set(x);
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    })
+}
+
 /// `magicHeader.Generate()` (Leadaxe/wireguard-go device/magic-header.go):
 /// uniform pick inside the inclusive range.
 pub fn gen_type(range: HeaderRange) -> u32 {
@@ -50,9 +74,7 @@ pub fn gen_type(range: HeaderRange) -> u32 {
         return lo;
     }
     let span = (hi - lo + 1) as u64;
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("getrandom");
-    lo + (u64::from_le_bytes(buf) % span) as u32
+    lo + (fast_prng_u64() % span) as u32
 }
 
 /// First 4 bytes of a datagram as the LE type word the device layer checks.
@@ -363,8 +385,8 @@ pub fn process_response(
     Ok(Session {
         local_index: hs.sender_index,
         remote_index,
-        send_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
-        recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key)),
+        send_cipher: ChaChaPoly::new(&send_key),
+        recv_cipher: ChaChaPoly::new(&recv_key),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -519,8 +541,8 @@ pub fn build_response(
     let session = Session {
         local_index: r_sender_index,
         remote_index: init_res.sender_index,
-        send_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key_initiator)),
-        recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key_initiator)),
+        send_cipher: ChaChaPoly::new(&recv_key_initiator),
+        recv_cipher: ChaChaPoly::new(&send_key_initiator),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -538,8 +560,8 @@ const RECV_WINDOW: u64 = 2048;
 pub struct Session {
     pub local_index: u32,
     pub remote_index: u32,
-    send_cipher: ChaCha20Poly1305,
-    recv_cipher: ChaCha20Poly1305,
+    send_cipher: ChaChaPoly,
+    recv_cipher: ChaChaPoly,
     send_counter: u64,
     /// Highest accepted receive counter; bit `i` = counter `recv_max - i`.
     recv_max: u64,
@@ -564,30 +586,43 @@ impl Session {
     /// Seal with an explicit final plaintext length (AWG 3.x content
     /// padding / trailers replace the multiple-of-16 alignment).
     pub fn seal_raw(&mut self, packet: &[u8], padded_len: usize) -> Option<Vec<u8>> {
+        let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded_len + 16);
+        self.seal_raw_into(0, packet, padded_len, &mut msg)
+            .then_some(msg)
+    }
+
+    /// Seal into a caller-provided scratch buffer with `prefix_len` bytes
+    /// reserved in front (for AWG `s4` random prefix), avoiding per-packet
+    /// heap allocations on the outbound datapath.
+    pub fn seal_raw_into(
+        &mut self,
+        prefix_len: usize,
+        packet: &[u8],
+        padded_len: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
         if self.send_counter > REJECT_AFTER_MESSAGES {
-            return None;
+            return false;
         }
         debug_assert!(padded_len >= packet.len());
         let counter = self.send_counter;
         self.send_counter += 1;
-        let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded_len + 16);
-        msg.extend_from_slice(&gen_type(self.awg_transport).to_le_bytes());
-        msg.extend_from_slice(&self.remote_index.to_le_bytes());
-        msg.extend_from_slice(&counter.to_le_bytes());
-        msg.extend_from_slice(packet);
-        msg.resize(TRANSPORT_HEADER_LEN + padded_len, 0);
+        let total = prefix_len + TRANSPORT_HEADER_LEN + padded_len + 16;
+        out.clear();
+        out.reserve(total);
+        out.resize(prefix_len, 0);
+        out.extend_from_slice(&gen_type(self.awg_transport).to_le_bytes());
+        out.extend_from_slice(&self.remote_index.to_le_bytes());
+        out.extend_from_slice(&counter.to_le_bytes());
+        out.extend_from_slice(packet);
+        out.resize(prefix_len + TRANSPORT_HEADER_LEN + padded_len, 0);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
         let tag = self
             .send_cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &[],
-                &mut msg[TRANSPORT_HEADER_LEN..],
-            )
-            .ok()?;
-        msg.extend_from_slice(&tag);
-        Some(msg)
+            .seal(&nonce, &[], &mut out[prefix_len + TRANSPORT_HEADER_LEN..]);
+        out.extend_from_slice(&tag);
+        true
     }
 
     /// Open a transport message addressed to us; enforces the replay window.
@@ -622,15 +657,14 @@ impl Session {
         }
         let body = &msg[TRANSPORT_HEADER_LEN..];
         let (ciphertext, tag) = body.split_at(body.len() - 16);
+        let tag_arr: [u8; 16] = tag.try_into().unwrap();
         // The one copy that is not going away: the plaintext must outlive
         // the recv buffer, and the AEAD opens in place.
         out.clear();
         out.extend_from_slice(ciphertext);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        self.recv_cipher
-            .decrypt_in_place_detached(Nonce::from_slice(&nonce), &[], out, Tag::from_slice(tag))
-            .is_ok()
+        self.recv_cipher.open(&nonce, &[], out, &tag_arr)
     }
 
     fn accept_counter(&mut self, counter: u64) -> bool {
@@ -803,8 +837,8 @@ mod tests {
         let mut a = Session {
             local_index: 1,
             remote_index: 2,
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[1u8; 32])),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[2u8; 32])),
+            send_cipher: ChaChaPoly::new(&[1u8; 32]),
+            recv_cipher: ChaChaPoly::new(&[2u8; 32]),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -814,8 +848,8 @@ mod tests {
         let mut b = Session {
             local_index: 2,
             remote_index: 1,
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[2u8; 32])),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[1u8; 32])),
+            send_cipher: ChaChaPoly::new(&[2u8; 32]),
+            recv_cipher: ChaChaPoly::new(&[1u8; 32]),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -843,8 +877,8 @@ mod tests {
         let mut s = Session {
             local_index: 1,
             remote_index: 2,
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[0u8; 32])),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[0u8; 32])),
+            send_cipher: ChaChaPoly::new(&[0u8; 32]),
+            recv_cipher: ChaChaPoly::new(&[0u8; 32]),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,

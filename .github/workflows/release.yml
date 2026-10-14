@@ -232,7 +232,6 @@ jobs:
           bin="target/${{ matrix.target }}/release/tachyon-core.exe"
           cp "$bin" "./tachyon-core.exe"
           sha256sum "./tachyon-core.exe" > "./${name}.sha256"
-          tar -czf "${name}.tar.gz" "./tachyon-core.exe"
           powershell -Command "Compress-Archive -Path './tachyon-core.exe' -DestinationPath '${name}.zip'"
 
       - uses: actions/upload-artifact@v4
@@ -253,6 +252,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -265,20 +266,45 @@ jobs:
           cat SHA256SUMS
       - name: The notes for this version, not the whole file
         run: |
-          ver="${{ inputs.tag || github.ref_name }}"
-          ver="${ver#v}"
+          tag="${{ inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
           awk -v want="## $ver" '
             /^## / { inside = ($0 == want) }
             inside
-          ' CHANGELOG.md > notes.md
-          if ! grep -q '^## ' notes.md; then
+          ' CHANGELOG.md > section.md
+          if ! grep -q '^## ' section.md; then
             echo "::error::CHANGELOG.md has no section for $ver"
             exit 1
           fi
+          prev=$(git tag --sort=-v:refname | grep -v "^${tag}$" | head -n 1 || true)
+          {
+            echo "# ⚡ Tachyon Core v${ver}"
+            echo ""
+            echo "> **Независимое высокопроизводительное сетевое ядро для OpenWrt на чистом Rust**"
+            echo ""
+            echo "[![GitHub Release](https://img.shields.io/github/v/release/Dushnilin/tachyon-core?color=6366F1)](https://github.com/Dushnilin/tachyon-core/releases) [![Build Status](https://img.shields.io/github/actions/workflow/status/Dushnilin/tachyon-core/release.yml?logo=githubactions&logoColor=white)](https://github.com/Dushnilin/tachyon-core/actions) [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981)](https://github.com/Dushnilin/tachyon-core) [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981)](https://github.com/Dushnilin/tachyon-core/blob/main/BENCHMARK.md) [![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x-10B981)](https://openwrt.org/) [![Arch](https://img.shields.io/badge/Arch-aarch64_%7C_arm_%7C_mips_%7C_x86--64-8B5CF6)](https://github.com/Dushnilin/tachyon-core/releases/tag/${tag}) [![License](https://img.shields.io/badge/License-GPL--3.0-FF6B4A)](https://github.com/Dushnilin/tachyon-core/blob/main/LICENSE)"
+            echo ""
+            echo "---"
+            echo ""
+            tail -n +2 section.md | sed 's/^### Исправления и улучшения$/---\n\n### 🌟 Ключевые нововведения и исправления/'
+            echo ""
+            echo "---"
+            echo ""
+            echo "### 📦 Контрольные суммы бинарников (SHA-256)"
+            echo ""
+            echo "\`\`\`text"
+            cat artifacts/SHA256SUMS
+            echo "\`\`\`"
+            if [ -n "$prev" ]; then
+              echo ""
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${prev}...${tag}"
+            fi
+          } > notes.md
           cat notes.md
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          name: "⚡ Tachyon Core ${{ inputs.tag || github.ref_name }} — Сетевое ядро для OpenWrt (XHTTP поверх HTTP/2, HardwareProfile, MASQUE инбаунд, WgPool, X.509 v1 REALITY, фикс %2F в Clash API)"
           tag_name: ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
           files: |

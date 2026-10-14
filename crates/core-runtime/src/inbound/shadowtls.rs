@@ -345,7 +345,7 @@ async fn handle_connection(
     decoy_map: &HashMap<String, DecoyServer>,
     strict_mode: bool,
     _wildcard_sni: bool,
-    _detour: Option<&str>,
+    detour: Option<&str>,
 ) -> io::Result<()> {
     // 1. Read TLS Record header (5 bytes)
     let mut header = [0u8; 5];
@@ -412,30 +412,49 @@ async fn handle_connection(
     ));
 
     // 4. Client is authenticated: fetch real ServerHello from decoy and forward to client
-    if let Some(decoy) = decoy {
-        let mut decoy_stream = TcpStream::connect((decoy.server.as_str(), decoy.port)).await?;
-        decoy_stream.write_all(&raw_client_hello).await?;
-        decoy_stream.flush().await?;
-
-        // Read ServerHello from decoy
-        let mut s_header = [0u8; 5];
-        decoy_stream.read_exact(&mut s_header).await?;
-        if s_header[0] == 0x16 {
-            let s_len = u16::from_be_bytes([s_header[3], s_header[4]]) as usize;
-            let mut s_body = vec![0u8; s_len];
-            decoy_stream.read_exact(&mut s_body).await?;
-
-            // Send ServerHello to client
-            stream.write_all(&s_header).await?;
-            stream.write_all(&s_body).await?;
-            stream.flush().await?;
+    let mut forwarded_hello = false;
+    if let Some(decoy) = decoy
+        && let Ok(Ok(mut decoy_stream)) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            TcpStream::connect((decoy.server.as_str(), decoy.port)),
+        )
+        .await
+    {
+        if decoy_stream.write_all(&raw_client_hello).await.is_ok()
+            && decoy_stream.flush().await.is_ok()
+        {
+            let mut s_header = [0u8; 5];
+            if let Ok(Ok(_)) = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                decoy_stream.read_exact(&mut s_header),
+            )
+            .await
+                && s_header[0] == 0x16
+            {
+                let s_len = u16::from_be_bytes([s_header[3], s_header[4]]) as usize;
+                let mut s_body = vec![0u8; s_len];
+                if decoy_stream.read_exact(&mut s_body).await.is_ok() {
+                    stream.write_all(&s_header).await?;
+                    stream.write_all(&s_body).await?;
+                    stream.flush().await?;
+                    forwarded_hello = true;
+                }
+            }
         }
-        // Decoy handshake complete, drop decoy connection
         let _ = decoy_stream.shutdown().await;
+    }
+    if !forwarded_hello {
+        let synthetic_server_hello = [0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00];
+        stream.write_all(&synthetic_server_hello).await?;
+        stream.flush().await?;
     }
 
     // 5. Route client application stream
-    let target = if !sni.is_empty() {
+    let target = if let Some(d) = default_decoy
+        && (detour.is_some() || sni.is_empty() || sni == "localhost" || sni == "127.0.0.1")
+    {
+        Target::Domain(d.server.clone(), d.port)
+    } else if !sni.is_empty() {
         Target::Domain(sni.to_string(), 443)
     } else {
         Target::Ip(SocketAddr::from(([127, 0, 0, 1], 443)))

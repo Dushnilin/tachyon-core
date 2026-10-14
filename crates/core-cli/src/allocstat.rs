@@ -9,7 +9,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 const BUCKETS: usize = 40;
 /// Everything at or above this is counted by its exact size: the buckets say
@@ -17,12 +17,12 @@ const BUCKETS: usize = 40;
 /// of the three big buffers that is.
 const BIG_MIN: usize = 64 * 1024;
 
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static FREES: AtomicU64 = AtomicU64::new(0);
-static LIVE_B: AtomicU64 = AtomicU64::new(0);
-static PEAK_B: AtomicU64 = AtomicU64::new(0);
-static LIVE_N: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
-static LIVE_S: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static FREES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_B: AtomicUsize = AtomicUsize::new(0);
+static PEAK_B: AtomicUsize = AtomicUsize::new(0);
+static LIVE_N: [AtomicUsize; BUCKETS] = [const { AtomicUsize::new(0) }; BUCKETS];
+static LIVE_S: [AtomicUsize; BUCKETS] = [const { AtomicUsize::new(0) }; BUCKETS];
 /// size -> (live objects, live bytes) for allocations of `BIG_MIN` and up
 static BIG: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
 
@@ -52,24 +52,24 @@ fn bucket(size: usize) -> usize {
 
 fn add(size: usize) {
     ALLOCS.fetch_add(1, Relaxed);
-    LIVE_B.fetch_add(size as u64, Relaxed);
+    LIVE_B.fetch_add(size, Relaxed);
     PEAK_B.fetch_max(LIVE_B.load(Relaxed), Relaxed);
     let b = bucket(size);
     LIVE_N[b].fetch_add(1, Relaxed);
-    LIVE_S[b].fetch_add(size as u64, Relaxed);
+    LIVE_S[b].fetch_add(size, Relaxed);
     big(size, true);
 }
 
 fn sub(size: usize) {
     FREES.fetch_add(1, Relaxed);
-    dec(&LIVE_B, size as u64);
+    dec(&LIVE_B, size);
     let b = bucket(size);
     dec(&LIVE_N[b], 1);
-    dec(&LIVE_S[b], size as u64);
+    dec(&LIVE_S[b], size);
     big(size, false);
 }
 
-fn dec(c: &AtomicU64, by: u64) {
+fn dec(c: &AtomicUsize, by: usize) {
     loop {
         let v = c.load(Relaxed);
         if c.compare_exchange_weak(v, v.saturating_sub(by), Relaxed, Relaxed)
@@ -120,7 +120,7 @@ pub(crate) fn start() {
     }
     std::thread::spawn(|| {
         let started = std::time::Instant::now();
-        let mut last = (0u64, 0u64);
+        let mut last = (0usize, 0usize);
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             let a = ALLOCS.load(Relaxed);

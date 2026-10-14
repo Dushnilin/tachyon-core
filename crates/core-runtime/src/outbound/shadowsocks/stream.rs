@@ -11,15 +11,20 @@ use crate::inbound::{AnyRead, AnyStream, AnyWrite, Target};
 /// several records while staying cache-resident on in-order Cortex-A55 cores.
 /// Multi-core hosts use 256 KiB for maximum syscall amortization.
 fn default_read_buf() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let workers = std::env::var("TACHYON_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        if workers == 1 { 48 * 1024 } else { 256 * 1024 }
-    })
+    use crate::hardware::{HardwareProfile, MemoryTier};
+    let hp = HardwareProfile::detect();
+    match hp.mem_tier {
+        MemoryTier::Constrained => 32 * 1024,
+        MemoryTier::Router => 48 * 1024,
+        MemoryTier::Midrange => 128 * 1024,
+        MemoryTier::DesktopServer => {
+            if hp.workers == 1 {
+                48 * 1024
+            } else {
+                256 * 1024
+            }
+        }
+    }
 }
 
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
@@ -28,15 +33,20 @@ const BLOCK_OVERHEAD: usize = 2 + AEAD_TAG + AEAD_TAG;
 
 /// Largest frame a connection keeps between writes.
 fn write_buf_keep() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let workers = std::env::var("TACHYON_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        if workers == 1 { 64 * 1024 } else { 256 * 1024 }
-    })
+    use crate::hardware::{HardwareProfile, MemoryTier};
+    let hp = HardwareProfile::detect();
+    match hp.mem_tier {
+        MemoryTier::Constrained => 32 * 1024,
+        MemoryTier::Router => 64 * 1024,
+        MemoryTier::Midrange => 128 * 1024,
+        MemoryTier::DesktopServer => {
+            if hp.workers == 1 {
+                64 * 1024
+            } else {
+                256 * 1024
+            }
+        }
+    }
 }
 
 /// Read buffer floor for `method`: enough for one whole record of `method`

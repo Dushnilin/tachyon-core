@@ -121,6 +121,7 @@ impl ShadowTls {
             let (mut reader, mut writer) = tokio::io::split(stream);
             let mut buf_in = vec![0u8; 65535];
             let mut buf_out = vec![0u8; 65535];
+            let idle = std::time::Duration::from_secs(300);
             loop {
                 tokio::select! {
                     res = peer.recv(&mut buf_in) => {
@@ -134,6 +135,9 @@ impl ShadowTls {
                         if n == 0 || (peer.send(&buf_out[..n]).await).is_err() {
                             break;
                         }
+                    }
+                    _ = tokio::time::sleep(idle) => {
+                        break;
                     }
                 }
             }
@@ -248,6 +252,37 @@ fn build_tls_client_hello(
     extensions.extend_from_slice(&0x0010u16.to_be_bytes());
     extensions.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
     extensions.extend_from_slice(&alpn);
+
+    // 4. Supported Groups (0x000a) -> x25519 (0x001d), secp256r1 (0x0017)
+    let supported_groups = [0x00, 0x04, 0x00, 0x1d, 0x00, 0x17];
+    extensions.extend_from_slice(&0x000au16.to_be_bytes());
+    extensions.extend_from_slice(&(supported_groups.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&supported_groups);
+
+    // 5. Signature Algorithms (0x000d)
+    let sig_algs = [0x00, 0x08, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x08, 0x07];
+    extensions.extend_from_slice(&0x000du16.to_be_bytes());
+    extensions.extend_from_slice(&(sig_algs.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&sig_algs);
+
+    // 6. PSK Key Exchange Modes (0x002d) -> psk_dhe_ke (0x01)
+    let psk_modes = [0x01, 0x01];
+    extensions.extend_from_slice(&0x002du16.to_be_bytes());
+    extensions.extend_from_slice(&(psk_modes.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&psk_modes);
+
+    // 7. Key Share (0x0033) -> X25519 (0x001d) 32-byte public key
+    let mut eph_secret = [0u8; 32];
+    getrandom::fill(&mut eph_secret).map_err(|e| io::Error::other(e.to_string()))?;
+    let eph_pub = x25519_dalek::x25519(eph_secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+    let mut key_share = Vec::with_capacity(38);
+    key_share.extend_from_slice(&36u16.to_be_bytes()); // client_shares length
+    key_share.extend_from_slice(&0x001du16.to_be_bytes()); // X25519
+    key_share.extend_from_slice(&32u16.to_be_bytes());
+    key_share.extend_from_slice(&eph_pub);
+    extensions.extend_from_slice(&0x0033u16.to_be_bytes());
+    extensions.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&key_share);
 
     // Append extensions length and extensions
     handshake.extend_from_slice(&(extensions.len() as u16).to_be_bytes());

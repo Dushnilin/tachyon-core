@@ -293,15 +293,25 @@ def wait_listen(port, proc=None, timeout=15):
 
 # ------------------------------------------------------------------ configurations
 def ensure_steer_env(bin_path):
-    """Sets up musl libc symlink, steerd in /usr/sbin, and libsteer in /usr/lib."""
+    """Sets up musl libc symlink, all steer* binaries in /usr/sbin, and libsteer* in /usr/lib."""
     try:
-        # Check if musl ld exists
-        if not os.path.exists("/lib/ld-musl-x86_64.so.1"):
+        need_musl = not os.path.exists("/lib/ld-musl-x86_64.so.1")
+        need_ip = not (os.path.exists("/sbin/ip") or os.path.exists("/usr/sbin/ip") or os.path.exists("/bin/ip"))
+        need_nft = not (os.path.exists("/usr/sbin/nft") or os.path.exists("/sbin/nft"))
+        if need_musl or need_ip or need_nft:
             subprocess.run(["apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["apt-get", "install", "-y", "-qq", "musl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pkgs = []
+            if need_musl:
+                pkgs.append("musl")
+            if need_ip:
+                pkgs.append("iproute2")
+            if need_nft:
+                pkgs.append("nftables")
+            subprocess.run(["apt-get", "install", "-y", "-qq"] + pkgs, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         os.makedirs("/usr/sbin", exist_ok=True)
         os.makedirs("/usr/lib", exist_ok=True)
+        os.makedirs("/usr/lib/x86_64-linux-musl", exist_ok=True)
 
         if os.path.exists("/lib/ld-musl-x86_64.so.1") and not os.path.exists("/usr/lib/libc.so"):
             try:
@@ -312,47 +322,29 @@ def ensure_steer_env(bin_path):
         bin_dir = os.path.dirname(os.path.abspath(bin_path))
         steer_base = os.path.dirname(bin_dir)  # e.g. /bench/steer/usr
 
-        # Symlink steerd
-        candidates_steerd = [
-            os.path.join(bin_dir, "..", "sbin", "steerd"),
-            os.path.join(steer_base, "sbin", "steerd"),
-            os.path.join(os.path.dirname(steer_base), "usr", "sbin", "steerd"),
-            os.path.join(bin_dir, "steerd"),
+        sbin_dirs = [
+            os.path.join(bin_dir, "..", "sbin"),
+            os.path.join(steer_base, "sbin"),
+            os.path.join(os.path.dirname(steer_base), "usr", "sbin"),
+            bin_dir,
         ]
-        for c in candidates_steerd:
-            if os.path.exists(c):
-                try:
-                    os.chmod(c, 0o755)
-                except OSError:
-                    pass
-                if not os.path.exists("/usr/sbin/steerd"):
-                    try:
-                        os.symlink(os.path.abspath(c), "/usr/sbin/steerd")
-                    except OSError:
-                        pass
-                break
+        for sdir in sbin_dirs:
+            if os.path.exists(sdir):
+                for name in os.listdir(sdir):
+                    if name == "steerd" or name == "steer" or name.startswith("steer-"):
+                        src = os.path.abspath(os.path.join(sdir, name))
+                        if os.path.isfile(src):
+                            try:
+                                os.chmod(src, 0o755)
+                            except OSError:
+                                pass
+                            dst = f"/usr/sbin/{name}"
+                            if not os.path.exists(dst):
+                                try:
+                                    os.symlink(src, dst)
+                                except OSError:
+                                    pass
 
-        # Symlink steer
-        candidates_steer = [
-            os.path.join(bin_dir, "..", "sbin", "steer"),
-            os.path.join(steer_base, "sbin", "steer"),
-            os.path.join(os.path.dirname(steer_base), "usr", "sbin", "steer"),
-            os.path.join(bin_dir, "steer"),
-        ]
-        for c in candidates_steer:
-            if os.path.exists(c):
-                try:
-                    os.chmod(c, 0o755)
-                except OSError:
-                    pass
-                if not os.path.exists("/usr/sbin/steer"):
-                    try:
-                        os.symlink(os.path.abspath(c), "/usr/sbin/steer")
-                    except OSError:
-                        pass
-                break
-
-        # Copy or symlink libsteer
         lib_candidates = [
             os.path.join(bin_dir, "..", "lib"),
             os.path.join(steer_base, "lib"),
@@ -362,13 +354,14 @@ def ensure_steer_env(bin_path):
         for ldir in lib_candidates:
             if os.path.exists(ldir):
                 for f in os.listdir(ldir):
-                    dst = os.path.join("/usr/lib", f)
-                    src = os.path.join(ldir, f)
-                    if not os.path.exists(dst):
-                        try:
-                            os.symlink(os.path.abspath(src), dst)
-                        except OSError:
-                            pass
+                    src = os.path.abspath(os.path.join(ldir, f))
+                    for target_dir in ("/usr/lib", "/usr/lib/x86_64-linux-musl"):
+                        dst = os.path.join(target_dir, f)
+                        if not os.path.exists(dst):
+                            try:
+                                os.symlink(src, dst)
+                            except OSError:
+                                pass
     except Exception as e:
         print(f"Warning: ensure_steer_env error: {e}", file=sys.stderr)
 

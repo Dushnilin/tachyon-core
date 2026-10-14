@@ -226,7 +226,7 @@ impl Socks {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(relay).await?;
         // the control connection has to stay open for the whole session
-        tokio::spawn(async move {
+        let control_task = tokio::spawn(async move {
             let mut control = control;
             let mut sink = [0u8; 1];
             while let Ok(n) = control.read(&mut sink).await {
@@ -243,28 +243,11 @@ impl Socks {
         let socket = std::sync::Arc::new(socket);
         let out_relay = std::sync::Arc::clone(&socket);
         let in_relay = std::sync::Arc::clone(&socket);
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65_535];
-            let mut datagram = Vec::with_capacity(64_000);
-            loop {
-                let Ok(n) = in_socket.recv(&mut buf).await else {
-                    break;
-                };
-                datagram.clear();
-                datagram.extend_from_slice(&[0, 0, 0]);
-                if crate::outbound::packet::put_addr_port(&mut datagram, &target).is_err() {
-                    break;
-                }
-                datagram.extend_from_slice(&buf[..n]);
-                if out_relay.send(&datagram).await.is_err() {
-                    break;
-                }
-            }
-        });
-        tokio::spawn(async move {
+        let idle = std::time::Duration::from_secs(300);
+        let in_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
             loop {
-                let Ok(n) = in_relay.recv(&mut buf).await else {
+                let Ok(Ok(n)) = tokio::time::timeout(idle, in_relay.recv(&mut buf)).await else {
                     break;
                 };
                 if n < 4 || buf[2] != 0 {
@@ -279,6 +262,26 @@ impl Socks {
                     break;
                 }
             }
+        });
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            let mut datagram = Vec::with_capacity(64_000);
+            loop {
+                let Ok(Ok(n)) = tokio::time::timeout(idle, in_socket.recv(&mut buf)).await else {
+                    break;
+                };
+                datagram.clear();
+                datagram.extend_from_slice(&[0, 0, 0]);
+                if crate::outbound::packet::put_addr_port(&mut datagram, &target).is_err() {
+                    break;
+                }
+                datagram.extend_from_slice(&buf[..n]);
+                if out_relay.send(&datagram).await.is_err() {
+                    break;
+                }
+            }
+            in_task.abort();
+            control_task.abort();
         });
         Ok(local)
     }

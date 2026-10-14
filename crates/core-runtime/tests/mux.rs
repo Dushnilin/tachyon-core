@@ -221,7 +221,7 @@ async fn default_multiplex_reuses_single_connection_up_to_default_min_streams() 
     });
 
     let options = mux::MuxOptions::parse(
-        &serde_json::json!({"enabled": true, "protocol": "h2mux", "max_connections": 1}),
+        &serde_json::json!({"enabled": true, "protocol": "h2mux"}),
         "multiplex",
     )
     .expect("options");

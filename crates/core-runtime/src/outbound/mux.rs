@@ -42,6 +42,7 @@ pub struct MuxOptions {
     pub min_streams: usize,
     pub max_streams: usize,
     pub padding: bool,
+    pub explicit_min_streams: bool,
 }
 
 impl MuxOptions {
@@ -68,12 +69,13 @@ impl MuxOptions {
                 .unwrap_or(0) as usize
         };
         let max_connections = number("max_connections");
-        let min_streams = number("min_streams");
+        let raw_min_streams = number("min_streams");
         let max_streams = number("max_streams");
-        let min_streams = if max_streams == 0 && max_connections == 0 && min_streams == 0 {
+        let explicit_min_streams = raw_min_streams > 0;
+        let min_streams = if max_streams == 0 && max_connections == 0 && raw_min_streams == 0 {
             8
         } else {
-            min_streams
+            raw_min_streams
         };
         let max_connections = if max_connections == 0 {
             8
@@ -89,6 +91,7 @@ impl MuxOptions {
                 .get("padding")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
+            explicit_min_streams,
         })
     }
 
@@ -252,7 +255,7 @@ struct Session {
     /// go closes it
     conn_task: Arc<ConnectionTask>,
     streams: AtomicU32,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 /// Aborts the h2 connection task when the last reference goes away.
@@ -504,7 +507,7 @@ impl Client {
         };
         let conn_task = Arc::clone(&session.conn_task);
 
-        let request = http::Request::builder()
+        let request = match http::Request::builder()
             .method("CONNECT")
             .uri(format!(
                 "https://{}",
@@ -512,15 +515,30 @@ impl Client {
             ))
             .header("version", VERSION0.to_string())
             .body(())
-            .map_err(|e| io::Error::other(format!("vmess: mux request: {e}")))?;
+        {
+            Ok(req) => req,
+            Err(e) => {
+                self.release(&session);
+                return Err(io::Error::other(format!("vmess: mux request: {e}")));
+            }
+        };
         let (response, send) = {
             let mut send_guard = session.send.lock().await;
-            std::future::poll_fn(|cx| send_guard.poll_ready(cx))
-                .await
-                .map_err(|e| io::Error::other(format!("vmess: mux h2 ready: {e}")))?;
-            send_guard
-                .send_request(request, false)
-                .map_err(|e| io::Error::other(format!("vmess: mux send: {e}")))?
+            if let Err(e) = std::future::poll_fn(|cx| send_guard.poll_ready(cx)).await {
+                session.closed.store(true, Ordering::SeqCst);
+                drop(send_guard);
+                self.release(&session);
+                return Err(io::Error::other(format!("vmess: mux h2 ready: {e}")));
+            }
+            match send_guard.send_request(request, false) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    session.closed.store(true, Ordering::SeqCst);
+                    drop(send_guard);
+                    self.release(&session);
+                    return Err(io::Error::other(format!("vmess: mux send: {e}")));
+                }
+            }
         };
         let stream: AnyStream = Box::new(crate::outbound::transport::h2io::H2Io {
             h2: crate::outbound::transport::h2io::H2Stream::shared(response, send),
@@ -557,8 +575,8 @@ impl Client {
             return Some(Arc::clone(session));
         }
         if sessions.len() < max_conns {
-            let threshold = if self.options.min_streams > 0 && self.options.min_streams != 8 {
-                self.options.min_streams
+            let threshold = if self.options.explicit_min_streams {
+                self.options.min_streams.max(1)
             } else {
                 1
             };
@@ -598,8 +616,11 @@ impl Client {
         .await
         .map_err(|_| io::Error::other("vmess: mux h2 handshake timeout"))?
         .map_err(|e| io::Error::other(format!("vmess: mux h2 handshake: {e}")))?;
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_task = Arc::clone(&closed);
         let conn_task = Arc::new(ConnectionTask::new(tokio::spawn(async move {
             let _ = connection.await;
+            closed_task.store(true, Ordering::SeqCst);
         })));
         let session = Arc::new(Session {
             send: Mutex::new(
@@ -610,7 +631,7 @@ impl Client {
             ),
             conn_task,
             streams: AtomicU32::new(0),
-            closed: AtomicBool::new(false),
+            closed,
         });
         Ok(session)
     }

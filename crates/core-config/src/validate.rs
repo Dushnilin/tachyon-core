@@ -251,6 +251,7 @@ const KNOWN_INBOUND_TYPES: &[&str] = &[
     "cloudflared",
     "fptn",
     "mieru",
+    "masque",
 ];
 
 const KNOWN_OUTBOUND_TYPES: &[&str] = &[
@@ -738,6 +739,7 @@ const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
     ("snell", "SnellInboundOptions"),
     ("fptn", "FPTNInboundOptions"),
     ("mieru", "MieruInboundOptions"),
+    ("masque", "MASQUEInboundOptions"),
 ];
 
 /// Fields each simple inbound type declares beyond `ListenOptions` and the
@@ -870,6 +872,7 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
         ],
     ),
     ("mieru", &["users", "transport"]),
+    ("masque", &["tls", "users", "ipv4_pool", "ipv6_pool", "mtu"]),
     (
         "fptn",
         &[

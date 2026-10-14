@@ -1158,6 +1158,9 @@ impl Defragger {
         if frag_id >= frag_total {
             return None;
         }
+        if self.items.len() >= 64 && !self.items.contains_key(&packet_id) {
+            self.items.clear();
+        }
         let entry = self
             .items
             .entry(packet_id)

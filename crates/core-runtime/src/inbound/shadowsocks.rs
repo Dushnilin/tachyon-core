@@ -519,15 +519,20 @@ struct ChunkReader {
 /// several records while staying cache-resident on in-order Cortex-A55 cores.
 /// Multi-core hosts use 256 KiB for maximum syscall amortization.
 fn default_read_buf() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let workers = std::env::var("TACHYON_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        if workers == 1 { 48 * 1024 } else { 256 * 1024 }
-    })
+    use crate::hardware::{HardwareProfile, MemoryTier};
+    let hp = HardwareProfile::detect();
+    match hp.mem_tier {
+        MemoryTier::Constrained => 32 * 1024,
+        MemoryTier::Router => 48 * 1024,
+        MemoryTier::Midrange => 128 * 1024,
+        MemoryTier::DesktopServer => {
+            if hp.workers == 1 {
+                48 * 1024
+            } else {
+                256 * 1024
+            }
+        }
+    }
 }
 
 /// Every sealed block carries a tag; the wire overhead of one chunk is its length
@@ -543,15 +548,7 @@ fn read_buf(method: Method) -> usize {
 /// Most plaintext one write turns into a frame, sized to the relay's read so a
 /// frame of several records leaves as one syscall.
 fn write_frame_limit() -> usize {
-    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let workers = std::env::var("TACHYON_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        if workers == 1 { 32 * 1024 } else { 128 * 1024 }
-    })
+    crate::hardware::HardwareProfile::detect().relay_buf_size
 }
 
 /// How much of `avail` one frame takes: whole chunks, and as much of
@@ -654,7 +651,14 @@ fn poll_fill(
                 *rend += n;
             }
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => {
+                if *rpos == *rend && crate::hardware::is_memory_pressured() {
+                    *rbuf = Vec::new();
+                    *rpos = 0;
+                    *rend = 0;
+                }
+                return Poll::Pending;
+            }
         }
     }
     Poll::Ready(Ok(()))

@@ -180,15 +180,15 @@
       <rect width="130" height="34" rx="8" fill="#0B132B" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="1"/>
       <circle cx="14" cy="17" r="4" fill="#10B981" class="beacon-dot"/>
       <text x="26" y="15" class="hud-label">RAM (RSS)</text>
-      <text x="26" y="28" class="hud-value" fill="#10B981">2.4 MB</text>
+      <text x="26" y="28" class="hud-value" fill="#10B981">4.2 MiB</text>
     </g>
 
     <!-- Badge 2: Right Center -->
     <g transform="translate(1030, 183)">
-      <rect width="125" height="34" rx="8" fill="#0B132B" stroke="#818CF8" stroke-opacity="0.4" stroke-width="1"/>
+      <rect width="135" height="34" rx="8" fill="#0B132B" stroke="#818CF8" stroke-opacity="0.4" stroke-width="1"/>
       <circle cx="14" cy="17" r="4" fill="#38BDF8"/>
-      <text x="26" y="15" class="hud-label">BINARY</text>
-      <text x="26" y="28" class="hud-value" fill="#38BDF8">3.5 MB MUSL</text>
+      <text x="26" y="15" class="hud-label">ARCHIVE / MUSL</text>
+      <text x="26" y="28" class="hud-value" fill="#38BDF8">3.7 MiB TAR.GZ</text>
     </g>
 
     <!-- Badge 3: Bottom Left -->
@@ -216,7 +216,7 @@
     <text x="0" y="78" class="title-main">TACHYON CORE</text>
 
     <!-- Subtitle -->
-    <text x="0" y="112" class="subtitle-text">sing-box-lx compatible proxy core in Rust, built for routers</text>
+    <text x="0" y="112" class="subtitle-text">High-performance pure-Rust network routing core for OpenWrt routers &amp; servers</text>
 
     <!-- 4 Quick Pills -->
     <g transform="translate(0, 142)">
@@ -226,13 +226,13 @@
       </g>
       <g transform="translate(135, 0)">
         <rect width="135" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
-        <text x="12" y="17" class="hud-value" fill="#10B981">🧠 2.4 MB RAM</text>
+        <text x="12" y="17" class="hud-value" fill="#10B981">🧠 4.2 MiB RAM</text>
       </g>
       <g transform="translate(280, 0)">
-        <rect width="135" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
-        <text x="12" y="17" class="hud-value" fill="#C084FC">📦 3.5 MB Musl</text>
+        <rect width="145" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
+        <text x="12" y="17" class="hud-value" fill="#C084FC">📦 3.7 MiB tar.gz</text>
       </g>
-      <g transform="translate(425, 0)">
+      <g transform="translate(435, 0)">
         <rect width="135" height="26" rx="6" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
         <text x="12" y="17" class="hud-value" fill="#FF8A65">🛡️ Zero-GC</text>
       </g>
@@ -244,27 +244,27 @@
       <g transform="translate(0, 0)">
         <rect width="205" height="88" rx="10" fill="url(#card-grad)" stroke="#38BDF8" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
         <use href="#tachyon-mini-logo" x="14" y="15"/>
-        <text x="40" y="30" class="tile-h">Zero-GC Runtime</text>
+        <text x="40" y="30" class="tile-h">Adaptive Engine</text>
         <text x="16" y="54" class="tile-sub" fill="#38BDF8">0.00 ms GC PAUSES</text>
-        <text x="16" y="70" class="tile-sub" fill="#64748B">Deterministic RAII</text>
+        <text x="16" y="70" class="tile-sub" fill="#64748B">4 RAM Tiers · Auto-Tune</text>
       </g>
 
       <!-- Tile 2 -->
       <g transform="translate(220, 0)">
         <rect width="205" height="88" rx="10" fill="url(#card-grad)" stroke="#818CF8" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
         <use href="#tachyon-mini-logo" x="14" y="15"/>
-        <text x="40" y="30" class="tile-h">Flash-Optimized</text>
-        <text x="16" y="54" class="tile-sub" fill="#818CF8">3.5 MB MUSL STATIC</text>
-        <text x="16" y="70" class="tile-sub" fill="#64748B">Fits 16–32 MB Flash</text>
+        <text x="40" y="30" class="tile-h">11 Architectures</text>
+        <text x="16" y="54" class="tile-sub" fill="#818CF8">~7.0 MiB MUSL STATIC</text>
+        <text x="16" y="70" class="tile-sub" fill="#64748B">ARM · MIPS · RISC-V · x86</text>
       </g>
 
       <!-- Tile 3 -->
       <g transform="translate(440, 0)">
         <rect width="215" height="88" rx="10" fill="url(#card-grad)" stroke="#C084FC" stroke-opacity="0.3" stroke-width="1" class="hud-card"/>
         <use href="#tachyon-mini-logo" x="14" y="15"/>
-        <text x="40" y="30" class="tile-h">Next-Gen Stealth</text>
-        <text x="16" y="54" class="tile-sub" fill="#C084FC">POST-QUANTUM VLESS</text>
-        <text x="16" y="70" class="tile-sub" fill="#64748B">AmneziaWG 2/3 · REALITY</text>
+        <text x="40" y="30" class="tile-h">Next-Gen Transports</text>
+        <text x="16" y="54" class="tile-sub" fill="#C084FC">POST-QUANTUM TLS 1.3</text>
+        <text x="16" y="70" class="tile-sub" fill="#64748B">AWG 2/3 · REALITY · XHTTP</text>
       </g>
     </g>
   </g>

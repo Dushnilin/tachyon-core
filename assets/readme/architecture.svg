@@ -187,8 +187,8 @@
     <!-- Inbound Items -->
     <g transform="translate(15, 68)">
       <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#1E293B" stroke-width="1"/>
-      <text x="10" y="20" class="node-title" font-size="12">Linux TProxy</text>
-      <text x="10" y="34" class="tag-mono" fill="#38BDF8">IP_TRANSPARENT (v4/v6)</text>
+      <text x="10" y="20" class="node-title" font-size="12">TProxy &amp; TUN</text>
+      <text x="10" y="34" class="tag-mono" fill="#38BDF8">IP_TRANSPARENT · SMOLTCP</text>
     </g>
     <g transform="translate(15, 118)">
       <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#1E293B" stroke-width="1"/>
@@ -202,8 +202,8 @@
     </g>
     <g transform="translate(15, 218)">
       <rect width="150" height="42" rx="6" fill="#0B132B" stroke="#00F0FF" stroke-opacity="0.4" stroke-width="1"/>
-      <text x="10" y="20" class="node-title" font-size="12" fill="#38BDF8">Server Inbounds</text>
-      <text x="10" y="34" class="tag-mono" fill="#34D399">VLESS · TROJAN · VMESS</text>
+      <text x="10" y="20" class="node-title" font-size="12" fill="#38BDF8">12 Server Inbounds</text>
+      <text x="10" y="34" class="tag-mono" fill="#34D399">VLESS · HY2 · TUIC · AWG</text>
     </g>
   </g>
 
@@ -217,7 +217,7 @@
       <circle cx="18" cy="18" r="16" fill="#00F0FF" fill-opacity="0.15"/>
       <use href="#tachyon-mini-logo" x="8" y="8"/>
       <text x="44" y="16" class="node-title" fill="#00F0FF">Tachyon Core</text>
-      <text x="44" y="30" class="node-sub">Rust Tokio + Zero-Copy</text>
+      <text x="44" y="30" class="node-sub">Rust Tokio + Adaptive Engine</text>
     </g>
 
     <!-- Sub-Engines in Core -->
@@ -238,19 +238,19 @@
         <text x="26" y="38" class="tag-mono" fill="#38BDF8">TLS SNI, HTTP, QUIC, DNS</text>
       </g>
 
-      <!-- 3. Tokio Splicer -->
+      <!-- 3. Adaptive Splicer -->
       <g transform="translate(0, 120)">
         <rect width="204" height="52" rx="8" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
         <circle cx="14" cy="26" r="4" fill="#A855F7" class="led-dot"/>
-        <text x="26" y="22" class="node-title" font-size="12">Tokio Splicer</text>
-        <text x="26" y="38" class="tag-mono" fill="#C084FC">ZERO-COPY PIPE &amp; NETNS</text>
+        <text x="26" y="22" class="node-title" font-size="12">Adaptive Splicer</text>
+        <text x="26" y="38" class="tag-mono" fill="#C084FC">ZERO-COPY · 3 RAM PRESSURE</text>
       </g>
 
       <!-- 4. RustCrypto Provider -->
       <g transform="translate(0, 180)">
         <rect width="204" height="52" rx="8" fill="#0F172A" stroke="#1E293B" stroke-width="1"/>
         <circle cx="14" cy="26" r="4" fill="#F59E0B" class="led-dot"/>
-        <text x="26" y="22" class="node-title" font-size="12">RustCrypto Provider</text>
+        <text x="26" y="22" class="node-title" font-size="12">Oxitls + AF_ALG</text>
         <text x="26" y="38" class="tag-mono" fill="#FBBF24">PURE RUST (NO RING/CGO)</text>
       </g>
 
@@ -289,7 +289,7 @@
       <text x="38" y="16" class="node-title" fill="#00F0FF">VLESS Post-Quantum</text>
       <text x="38" y="30" class="tag-mono" fill="#38BDF8">ML-KEM-768 · UTLS · REALITY</text>
     </g>
-    <text x="16" y="62" class="node-sub">Квантовая защита + фрагментация SNI</text>
+    <text x="16" y="62" class="node-sub">Гибридный обмен ключами + профили TLS</text>
   </g>
 
   <!-- DESTINATION 3: AMNEZIAWG 2.0 / 3.x (PURPLE) y=275..355, center=315 -->
@@ -299,9 +299,9 @@
       <circle cx="16" cy="16" r="14" fill="#8B5CF6" fill-opacity="0.15"/>
       <use href="#tachyon-mini-logo" x="6" y="6"/>
       <text x="38" y="16" class="node-title" fill="#C084FC">AmneziaWG 2.0 / 3.x</text>
-      <text x="38" y="30" class="tag-mono" fill="#C084FC">JUNK HEADERS · DPI MASQUERADE</text>
+      <text x="38" y="30" class="tag-mono" fill="#C084FC">WGPOOL · EXTENDED HEADERS · CPS</text>
     </g>
-    <text x="16" y="62" class="node-sub">jc/jmin/jmax + DNS/STUN/QUIC decoys</text>
+    <text x="16" y="62" class="node-sub">5-tuple flow hash + H1–H4 / I1–I5 framing</text>
   </g>
 
   <!-- DESTINATION 4: XHTTP & HYSTERIA2 (AMBER) y=375..455, center=415 -->
@@ -310,10 +310,10 @@
     <g transform="translate(14, 14)">
       <circle cx="16" cy="16" r="14" fill="#F59E0B" fill-opacity="0.15"/>
       <use href="#tachyon-mini-logo" x="6" y="6"/>
-      <text x="38" y="16" class="node-title" fill="#FBBF24">XHTTP · TUIC · Hy2</text>
-      <text x="38" y="30" class="tag-mono" fill="#F59E0B">HTTP/1.1 XMUX · QUIC V5</text>
+      <text x="38" y="16" class="node-title" fill="#FBBF24">XHTTP · Hy2 · TUIC · MASQUE</text>
+      <text x="38" y="30" class="tag-mono" fill="#F59E0B">H2/H1.1 XMUX · QUIC V5</text>
     </g>
-    <text x="16" y="62" class="node-sub">Xray 26.9 interop · Quinn · Naive · Snell</text>
+    <text x="16" y="62" class="node-sub">Xray 26.9 interop · Mieru · AnyTLS · Snell</text>
   </g>
 
   <!-- DESTINATION 5: SMART DNS & FAKEIP (PINK) y=475..555, center=515 -->

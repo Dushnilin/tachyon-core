@@ -48,8 +48,8 @@
   <g transform="translate(35, 25)">
     <rect width="44" height="44" rx="10" fill="#065F46" fill-opacity="0.25" stroke="#10B981" stroke-width="1.2"/>
     <text x="11" y="29" font-size="22">⚡</text>
-    <text x="56" y="20" class="cli-title">100% Drop-In Замена CLI и Конфигурации `sing-box`</text>
-    <text x="56" y="38" class="cli-desc">Идентичные флаги `check -c`, `version`, `run`. Скрипты генерации Tachyon ucode работают без единого изменения.</text>
+    <text x="56" y="20" class="cli-title">Единый CLI управления, проверки схем и генерации ключей</text>
+    <text x="56" y="38" class="cli-desc">Полная поддержка `check -c`, `run`, `version`, `format`, `merge`, `generate` (reality/wg/tls-keypair, uuid, rand). Без правок ucode.</text>
   </g>
 
   <!-- Animated Connection Stream -->
@@ -64,7 +64,7 @@
     <g transform="translate(0, 0)">
       <rect width="265" height="36" rx="6" fill="#0B132B" stroke="#10B981" stroke-opacity="0.5" stroke-width="1"/>
       <circle cx="12" cy="18" r="3" fill="#10B981" class="cli-dot"/>
-      <text x="24" y="16" class="cli-tag">SING-BOX CHECK -C</text>
+      <text x="24" y="16" class="cli-tag">SCHEMA CHECK -C</text>
       <text x="24" y="29" class="cli-subtag">Строгая валидация JSON схемы</text>
     </g>
 
@@ -72,8 +72,8 @@
     <g transform="translate(285, 0)">
       <rect width="265" height="36" rx="6" fill="#0B132B" stroke="#00F0FF" stroke-opacity="0.5" stroke-width="1"/>
       <circle cx="12" cy="18" r="3" fill="#00F0FF" class="cli-dot"/>
-      <text x="24" y="16" class="cli-tag" fill="#00F0FF">ARGV[0] EMULATION</text>
-      <text x="24" y="29" class="cli-subtag">Ответ в формате upstream sing-box</text>
+      <text x="24" y="16" class="cli-tag" fill="#00F0FF">ARGV[0] COMPAT MODE</text>
+      <text x="24" y="29" class="cli-subtag">Прозрачный режим обратной совместимости</text>
     </g>
 
     <!-- Badge 3: Tachyon ucode -->

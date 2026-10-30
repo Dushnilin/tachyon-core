@@ -261,6 +261,17 @@ jobs:
           cp "$bin" "./${name}"
           sha256sum "./${name}" > "./${name}.sha256"
           tar -czf "${name}.tar.gz" "./${name}"
+          case "${{ matrix.target }}" in
+            *-linux-musl*)
+              python3 scripts/build_openwrt_pkg.py \
+                --bin "$bin" \
+                --arch "${{ matrix.name }}" \
+                --version "$ver" \
+                --out-ipk "./${name}.ipk" \
+                --out-apk "./${name}.apk"
+              sha256sum "./${name}.ipk" "./${name}.apk" >> "./${name}.sha256"
+              ;;
+          esac
 
       - name: Pack (Windows)
         if: ${{ matrix.is_windows }}
@@ -278,6 +289,8 @@ jobs:
           name: release-${{ matrix.name }}
           path: |
             tachyon-core-${{ matrix.name }}-*.tar.gz
+            tachyon-core-${{ matrix.name }}-*.ipk
+            tachyon-core-${{ matrix.name }}-*.apk
             tachyon-core-${{ matrix.name }}-*.zip
             tachyon-core-${{ matrix.name }}-*.sha256
           if-no-files-found: warn
@@ -378,6 +391,8 @@ jobs:
           body_path: notes.md
           files: |
             artifacts/*.tar.gz
+            artifacts/*.ipk
+            artifacts/*.apk
             artifacts/*.zip
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false

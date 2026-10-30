@@ -99,6 +99,15 @@ jobs:
             target: aarch64-apple-darwin
             os: macos-latest
             budget: 16777216
+          # Android NDK targets (Bionic PIE binary, API 24+, 16 KB page alignment)
+          - name: aarch64-linux-android
+            target: aarch64-linux-android
+            ndk_clang: aarch64-linux-android24-clang
+            budget: 16777216
+          - name: x86_64-linux-android
+            target: x86_64-linux-android
+            ndk_clang: x86_64-linux-android24-clang
+            budget: 16777216
     steps:
       - uses: actions/checkout@v4
         with:
@@ -190,6 +199,28 @@ jobs:
         if: ${{ matrix.is_windows }}
         shell: bash
         run: echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe" >> "$GITHUB_ENV"
+
+      # Android NDK targets link against Bionic libc/libm/libdl using the preinstalled
+      # NDK clang wrapper on ubuntu-latest. Set target-specific LINKER env vars (not
+      # RUSTFLAGS, which would override the ARMv8 crypto cfgs in .cargo/config.toml).
+      - name: Android NDK toolchain
+        if: ${{ matrix.ndk_clang != '' }}
+        shell: bash
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            ndk=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)
+          fi
+          bin_dir="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          clang="$bin_dir/${{ matrix.ndk_clang }}"
+          test -x "$clang"
+          triple_upper=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          triple_lower=$(echo "${{ matrix.target }}" | tr '-' '_')
+          {
+            echo "CARGO_TARGET_${triple_upper}_LINKER=$clang"
+            echo "CC_${triple_lower}=$clang"
+            echo "AR_${triple_lower}=$bin_dir/llvm-ar"
+          } >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash

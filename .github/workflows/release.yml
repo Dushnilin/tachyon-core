@@ -4,8 +4,6 @@ name: Release
 # workspace version: `Cargo.toml` is the one place the version lives, so a tag
 # that disagrees with it is a release whose binary lies about what it is.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -101,6 +99,10 @@ jobs:
             target: aarch64-apple-darwin
             os: macos-latest
             budget: 16777216
+          - name: ios-arm64
+            target: aarch64-apple-ios
+            os: macos-latest
+            budget: 16777216
           # Android NDK targets (Bionic PIE binary, API 24+, 16 KB page alignment)
           - name: aarch64-linux-android
             target: aarch64-linux-android
@@ -184,7 +186,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target == 'aarch64-apple-ios' && 'aarch64-apple-ios,aarch64-apple-ios-sim' || matrix.target }}
 
       - name: Toolchain (std from source)
         if: ${{ matrix.build-std }}
@@ -273,6 +275,23 @@ jobs:
                 --out-apk "./${name}.apk"
               sha256sum "./${name}.ipk" "./${name}.apk" >> "./${name}.sha256"
               ;;
+            aarch64-apple-ios)
+              cargo rustc -p core-runtime --release --target aarch64-apple-ios --crate-type staticlib
+              cargo rustc -p core-runtime --release --target aarch64-apple-ios-sim --crate-type staticlib
+              rm -rf /tmp/ios-headers ./TachyonCore.xcframework
+              mkdir -p /tmp/ios-headers
+              cp include/tachyon_core.h /tmp/ios-headers/
+              printf 'module TachyonCore {\n    header "tachyon_core.h"\n    export *\n}\n' > /tmp/ios-headers/module.modulemap
+              cp target/aarch64-apple-ios/release/libcore_runtime.a /tmp/libtachyon_core-ios.a
+              cp target/aarch64-apple-ios-sim/release/libcore_runtime.a /tmp/libtachyon_core-sim.a
+              xcodebuild -create-xcframework \
+                -library /tmp/libtachyon_core-ios.a -headers /tmp/ios-headers \
+                -library /tmp/libtachyon_core-sim.a -headers /tmp/ios-headers \
+                -output ./TachyonCore.xcframework
+              xcf_archive="tachyon-core-ios-xcframework-${ver}.tar.gz"
+              tar -czf "./${xcf_archive}" ./TachyonCore.xcframework
+              sha256sum "./${xcf_archive}" >> "./${name}.sha256"
+              ;;
           esac
 
       - name: Pack (Windows)
@@ -291,6 +310,7 @@ jobs:
           name: release-${{ matrix.name }}
           path: |
             tachyon-core-${{ matrix.name }}-*.tar.gz
+            tachyon-core-ios-xcframework-*.tar.gz
             tachyon-core-${{ matrix.name }}-*.ipk
             tachyon-core-${{ matrix.name }}-*.apk
             tachyon-core-${{ matrix.name }}-*.zip
@@ -363,11 +383,13 @@ jobs:
           cat notes.md
 
       - name: Sync docs, changelog & tag to public repository (${{ env.PUBLIC_REPO }})
-        if: ${{ env.PUBLIC_TOKEN != '' }}
+        if: ${{ env.PUBLIC_TOKEN != '' || github.repository == env.PUBLIC_REPO }}
+        env:
+          SYNC_TOKEN: ${{ github.repository == env.PUBLIC_REPO && github.token || env.PUBLIC_TOKEN }}
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
           ver="${tag#v}"
-          git clone "https://x-access-token:${PUBLIC_TOKEN}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
+          git clone "https://x-access-token:${SYNC_TOKEN}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
           # Keep frozen historical source tree in public repo; update only public documentation, changelog, license & benchmark reports
           for item in README.md README.en.md CHANGELOG.md BENCHMARK.md BENCHMARK.html LICENSE assets docs; do
             if [ -e "$item" ]; then
@@ -415,3 +437,12 @@ jobs:
             artifacts/*.zip
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false
+
+      - name: Trigger tachyon-proxy Android APK rebuild
+        if: ${{ env.PUBLIC_TOKEN != '' }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PUBLIC_TOKEN}" \
+            https://api.github.com/repos/Dushnilin/tachyon-proxy/dispatches \
+            -d "{\"event_type\":\"core-updated\",\"client_payload\":{\"tag\":\"${{ inputs.tag || github.ref_name }}\"}}" || true

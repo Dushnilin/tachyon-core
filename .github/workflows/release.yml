@@ -1,15 +1,15 @@
 name: Release
 
-# Sources live in the private repo; this workflow builds them here and
-# publishes the release to this (public) repo. The tag is the only thing
-# that produces a release, and it has to be the workspace version:
-# `Cargo.toml` is the one place the version lives, so a tag that disagrees
-# with it is a release whose binary lies about what it is.
+# A tag is the only thing that produces a release, and the tag has to be the
+# workspace version: `Cargo.toml` is the one place the version lives, so a tag
+# that disagrees with it is a release whose binary lies about what it is.
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "tag to build (must match Cargo.toml in tachyon-core-src)"
+        description: "tag to build (must match Cargo.toml)"
         required: true
 
 permissions:
@@ -27,13 +27,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Read the version the binaries will report
         id: version
         run: |
-          in_cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          tag="${{ inputs.tag }}"
+          echo "source=$(git rev-parse HEAD) ref=$(git describe --tags --always)"
+          tag="${{ inputs.tag || github.ref_name }}"
+          in_cargo=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2 | tr -d '\r')
+          echo "checked cargo=$in_cargo tag=$tag commit=$(git rev-parse HEAD)"
           echo "cargo=$in_cargo tag=$tag" >> "$GITHUB_OUTPUT"
           if [ "$in_cargo" != "${tag#v}" ]; then
             echo "::error::Cargo.toml says $in_cargo, the release is tagged $tag"
@@ -112,8 +114,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Install musl-tools (x86_64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -188,7 +190,7 @@ jobs:
         if: ${{ matrix.build-std }}
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-10-30
           components: rust-src
 
       # All musl targets are explicitly configured in .cargo/config.toml with linker = "rust-lld"
@@ -255,7 +257,7 @@ jobs:
         if: ${{ !matrix.is_windows }}
         shell: bash
         run: |
-          ver="${{ inputs.tag }}"
+          ver="${{ inputs.tag || github.ref_name }}"
           name="tachyon-core-${{ matrix.name }}-${ver}"
           bin="target/${{ matrix.target }}/release/tachyon-core"
           cp "$bin" "./${name}"
@@ -277,7 +279,7 @@ jobs:
         if: ${{ matrix.is_windows }}
         shell: bash
         run: |
-          ver="${{ inputs.tag }}"
+          ver="${{ inputs.tag || github.ref_name }}"
           name="tachyon-core-${{ matrix.name }}-${ver}"
           bin="target/${{ matrix.target }}/release/tachyon-core.exe"
           cp "$bin" "./tachyon-core.exe"
@@ -297,21 +299,20 @@ jobs:
 
   release:
     name: attach to the release
-    needs: [check-version, build]
+    needs: [build]
     if: always() && needs.check-version.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       PUBLIC_REPO: Dushnilin/tachyon-core
+      PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN || secrets.PRIVATE_REPO_TOKEN || github.token }}
     steps:
-      # Notes and the previous tag come from the source repo: the public tree
-      # is frozen at the last pre-split release and its CHANGELOG lags behind.
       - uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
@@ -325,7 +326,7 @@ jobs:
           cat SHA256SUMS
       - name: The notes for this version, not the whole file
         run: |
-          tag="${{ inputs.tag }}"
+          tag="${{ inputs.tag || github.ref_name }}"
           ver="${tag#v}"
           awk -v want="## $ver" '
             /^## / { inside = ($0 == want) }
@@ -341,7 +342,7 @@ jobs:
             echo ""
             echo "> **Независимое высокопроизводительное сетевое ядро для OpenWrt на чистом Rust**"
             echo ""
-            echo "[![GitHub Release](https://img.shields.io/github/v/release/${PUBLIC_REPO}?color=6366F1)](https://github.com/${PUBLIC_REPO}/releases) [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981)](https://github.com/${PUBLIC_REPO}) [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981)](https://github.com/${PUBLIC_REPO}/blob/main/BENCHMARK.md) [![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x-10B981)](https://openwrt.org/) [![Arch](https://img.shields.io/badge/Arch-aarch64%7C_arm%7C_mips%7C_x86--64-8B5CF6)](https://github.com/${PUBLIC_REPO}/releases/tag/${tag}) [![License](https://img.shields.io/badge/License-Proprietary-FF6B4A)](https://github.com/${PUBLIC_REPO}/blob/main/LICENSE)"
+            echo "[![GitHub Release](https://img.shields.io/github/v/release/${PUBLIC_REPO}?color=6366F1)](https://github.com/${PUBLIC_REPO}/releases) [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981)](https://github.com/${PUBLIC_REPO}) [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981)](https://github.com/${PUBLIC_REPO}/blob/main/BENCHMARK.md) [![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x-10B981)](https://openwrt.org/) [![Arch](https://img.shields.io/badge/Arch-aarch64_%7C_arm_%7C_mips_%7C_x86--64-8B5CF6)](https://github.com/${PUBLIC_REPO}/releases/tag/${tag}) [![License](https://img.shields.io/badge/License-Proprietary-FF6B4A)](https://github.com/${PUBLIC_REPO}/blob/main/LICENSE)"
             echo ""
             echo "---"
             echo ""
@@ -361,11 +362,12 @@ jobs:
           } > notes.md
           cat notes.md
 
-      - name: Sync docs, changelog & tag to this repository (${{ env.PUBLIC_REPO }})
+      - name: Sync docs, changelog & tag to public repository (${{ env.PUBLIC_REPO }})
+        if: ${{ env.PUBLIC_TOKEN != '' }}
         run: |
-          tag="${{ inputs.tag }}"
+          tag="${{ inputs.tag || github.ref_name }}"
           ver="${tag#v}"
-          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
+          git clone "https://x-access-token:${PUBLIC_TOKEN}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
           # Keep frozen historical source tree in public repo; update only public documentation, changelog, license & benchmark reports
           for item in README.md README.en.md CHANGELOG.md BENCHMARK.md BENCHMARK.html LICENSE assets docs; do
             if [ -e "$item" ]; then
@@ -383,11 +385,28 @@ jobs:
           git push origin main
           git push origin "${tag}" --force
 
-      - name: Publish release
+      - name: Publish release to public repository (${{ env.PUBLIC_REPO }})
+        if: ${{ env.PUBLIC_TOKEN != '' && github.repository != env.PUBLIC_REPO }}
         uses: softprops/action-gh-release@v2
         with:
-          name: "⚡ Tachyon Core ${{ inputs.tag }}"
-          tag_name: ${{ inputs.tag }}
+          repository: ${{ env.PUBLIC_REPO }}
+          token: ${{ env.PUBLIC_TOKEN }}
+          name: "⚡ Tachyon Core ${{ inputs.tag || github.ref_name }}"
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body_path: notes.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.ipk
+            artifacts/*.apk
+            artifacts/*.zip
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: false
+
+      - name: Publish release to current repository
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "⚡ Tachyon Core ${{ inputs.tag || github.ref_name }}"
+          tag_name: ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
           files: |
             artifacts/*.tar.gz

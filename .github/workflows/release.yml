@@ -4,6 +4,9 @@ name: Release
 # workspace version: `Cargo.toml` is the one place the version lives, so a tag
 # that disagrees with it is a release whose binary lies about what it is.
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -105,10 +108,14 @@ jobs:
             target: aarch64-apple-ios
             os: macos-latest
             budget: 16777216
-          # Android NDK targets (Bionic PIE binary, API 24+, 16 KB page alignment)
+          # Android NDK targets (Bionic PIE binary & libtachyon.so JNI library, API 24+, 16 KB page alignment)
           - name: aarch64-linux-android
             target: aarch64-linux-android
             ndk_clang: aarch64-linux-android24-clang
+            budget: 16777216
+          - name: armv7-linux-androideabi
+            target: armv7-linux-androideabi
+            ndk_clang: armv7a-linux-androideabi24-clang
             budget: 16777216
           - name: x86_64-linux-android
             target: x86_64-linux-android
@@ -232,10 +239,10 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.build-std }}" ]; then
-            cargo build --workspace --release --target ${{ matrix.target }} \
+            cargo build -p core-cli --release --target ${{ matrix.target }} \
               -Z build-std=std,panic_abort
           else
-            cargo build --workspace --release --target ${{ matrix.target }}
+            cargo build -p core-cli --release --target ${{ matrix.target }}
           fi
 
       - name: Size budget
@@ -294,6 +301,17 @@ jobs:
               tar -czf "./${xcf_archive}" ./TachyonCore.xcframework
               sha256sum "./${xcf_archive}" >> "./${name}.sha256"
               ;;
+            aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android)
+              case "${{ matrix.target }}" in
+                aarch64-linux-android) abi="arm64-v8a" ;;
+                armv7-linux-androideabi) abi="armeabi-v7a" ;;
+                x86_64-linux-android) abi="x86_64" ;;
+              esac
+              cargo rustc -p core-ffi --release --target ${{ matrix.target }} --crate-type cdylib
+              so_name="libtachyon-${abi}.so"
+              cp "target/${{ matrix.target }}/release/libtachyon.so" "./${so_name}"
+              sha256sum "./${so_name}" >> "./${name}.sha256"
+              ;;
           esac
 
       - name: Pack (Windows)
@@ -316,6 +334,7 @@ jobs:
             tachyon-core-${{ matrix.name }}-*.ipk
             tachyon-core-${{ matrix.name }}-*.apk
             tachyon-core-${{ matrix.name }}-*.zip
+            libtachyon-*.so
             tachyon-core-${{ matrix.name }}-*.sha256
           if-no-files-found: warn
 
@@ -392,7 +411,9 @@ jobs:
           tag="${{ inputs.tag || github.ref_name }}"
           ver="${tag#v}"
           git clone "https://x-access-token:${SYNC_TOKEN}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
-          # Keep frozen historical source tree in public repo; update only public documentation, changelog, license & benchmark reports
+          # Keep frozen historical source tree in public repo; update only public documentation, changelog, license, benchmark reports & release workflow
+          mkdir -p /tmp/public-repo/.github/workflows
+          cp -a .github/workflows/release.yml /tmp/public-repo/.github/workflows/release.yml
           for item in README.md README.en.md CHANGELOG.md BENCHMARK.md BENCHMARK.html LICENSE assets docs; do
             if [ -e "$item" ]; then
               cp -a "$item" /tmp/public-repo/
@@ -423,6 +444,7 @@ jobs:
             artifacts/*.ipk
             artifacts/*.apk
             artifacts/*.zip
+            artifacts/libtachyon-*.so
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false
 
@@ -437,6 +459,7 @@ jobs:
             artifacts/*.ipk
             artifacts/*.apk
             artifacts/*.zip
+            artifacts/libtachyon-*.so
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false
 

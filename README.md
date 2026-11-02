@@ -256,6 +256,26 @@ chmod +x /usr/bin/tachyon-core
   <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
 </p>
 
+## 💖 Поддержать разработку
+
+Если Tachyon помогает вам и делает работу в сети комфортной, вы можете поддержать проект и автора! ☕ 🧀 🌭
+
+⭐ **Boosty (подписки, донаты, эксклюзив):**  
+👉 [**Поддержать на Boosty**](https://boosty.to/tachyon)
+
+💳 **Карты РФ / СБП / Tinkoff Pay:**  
+👉 [**Поддержать проект на CloudTips**](https://pay.cloudtips.ru/p/449c5ef9)
+
+🪙 **Криптовалюта:**
+* **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
+* **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`
+* **TON:** `UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR`
+* **Solana (SOL):** `3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh`
+
+<p align="center">
+  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+</p>
+
 ## 📜 Лицензия
 
 Начиная с версии **`v0.1.3`**, программное обеспечение **tachyon-core** распространяется в виде готовых исполняемых сборок на условиях проприетарной лицензии **[TACHYON CORE BINARY LICENSE v1.0](LICENSE)** (`Copyright (c) 2026 Dushnilin. All rights reserved.`).

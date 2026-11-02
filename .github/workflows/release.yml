@@ -72,6 +72,7 @@ jobs:
           # the standard library built from source via nightly + build-std
           - name: mipsel
             target: mipsel-unknown-linux-musl
+            os: ubuntu-24.04
             build-std: true
             use_musl_lld: true
             # ~350 KiB of .pdr descriptors survive strip, and the gcc-linked
@@ -79,6 +80,7 @@ jobs:
             budget: 16777216
           - name: mips
             target: mips-unknown-linux-musl
+            os: ubuntu-24.04
             build-std: true
             use_musl_lld: true
             budget: 16777216

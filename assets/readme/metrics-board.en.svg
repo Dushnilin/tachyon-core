@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="200" viewBox="0 0 1200 200"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Key Engineering Metrics of tachyon-core</title>
+  <desc id="desc">Measured highlights of tachyon-core: 4.2 MiB idle RSS, 22.3 ms cold start, 0.00 ms GC pauses, 51.7 Gbps direct transit throughput, 36 out of 39 wins in the protocol matrix, and a 6.9–10.2 MiB static musl binary.</desc>
+
+  <rect width="1200" height="200" rx="16" fill="#141415"/>
+  <rect x="0.5" y="0.5" width="1199" height="199" rx="15.5" fill="none" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Primary metric card: Idle RSS (280px wide) -->
+  <g transform="translate(20, 20)">
+    <rect x="0" y="0" width="280" height="160" rx="12" fill="#19191b" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.5"/>
+    <rect x="16" y="16" width="84" height="24" rx="6" fill="#232325"/>
+    <text x="58" y="32" text-anchor="middle" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">4.2 MiB</text>
+    <text x="264" y="32" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">vs 25–41 MiB</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Idle Memory (RSS)</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Around 10 MiB under load</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">No pre-reserved heap on 64–128 MB</text>
+    <text x="16" y="142" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">~10× lower RAM footprint</text>
+  </g>
+
+  <!-- Card 2: Cold Start (164px) -->
+  <g transform="translate(312, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="76" height="24" rx="6" fill="#232325"/>
+    <text x="54" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">22.3 ms</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Cold Start</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Against 160–270 ms</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">on Go network cores</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">7–12× faster boot</text>
+  </g>
+
+  <!-- Card 3: Zero GC (164px) -->
+  <g transform="translate(488, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="76" height="24" rx="6" fill="#232325"/>
+    <text x="54" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">0.00 ms</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Zero GC Pauses</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Deterministic RAII</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">without STW phases</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">p50 170 µs</text>
+  </g>
+
+  <!-- Card 4: Direct Throughput (164px) -->
+  <g transform="translate(664, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="88" height="24" rx="6" fill="#232325"/>
+    <text x="60" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">51.7 Gbps</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Direct Transit</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Zero-copy splice</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">on 1 CPU core</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">0.163 s/GiB CPU</text>
+  </g>
+
+  <!-- Card 5: Protocol Matrix (164px) -->
+  <g transform="translate(840, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="72" height="24" rx="6" fill="#232325"/>
+    <text x="52" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">36 / 39</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Matrix Wins</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">2.1–5.4× lead on</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">H2, gRPC &amp; QUIC</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">39/39 status OK</text>
+  </g>
+
+  <!-- Card 6: Static Binary (164px) -->
+  <g transform="translate(1016, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="76" height="24" rx="6" fill="#232325"/>
+    <text x="54" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">6.9 MiB</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Static Binary</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">3.2–4.2 MiB .tar.gz</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">fits 16 MB flash</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">no USB / extroot</text>
+  </g>
+</svg>

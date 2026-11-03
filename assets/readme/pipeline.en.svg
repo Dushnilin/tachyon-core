@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="304" viewBox="0 0 1200 304"
+     role="img" aria-labelledby="title desc">
+  <title id="title">tachyon-core Traffic Processing Pipeline Architecture</title>
+  <desc id="desc">Four-stage packet pipeline: transparent interception &amp; server inbounds, non-destructive protocol sniffer &amp; Smart DNS, zero-copy .trs/.srs router with live RAM pressure tuning, and outbound tunnels with DPI bypass.</desc>
+
+  <rect width="1200" height="304" rx="16" fill="#141415"/>
+  <rect x="0.5" y="0.5" width="1199" height="303" rx="15.5" fill="none" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Header -->
+  <text x="32" y="40" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="20" font-weight="500">tachyon-core Traffic Processing Pipeline · Zero-Copy Data Plane</text>
+  <text x="32" y="64" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">From Linux kernel interception or userspace TUN to multiplexed outbound tunnels with zero intermediate copies or GC pauses</text>
+
+  <!-- Step 1 (268px) -->
+  <g transform="translate(32, 88)">
+    <rect x="0" y="0" width="268" height="184" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <text x="20" y="32" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">Stage 01 · Inbounds</text>
+    <text x="20" y="60" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Ingress &amp; Capture</text>
+    <text x="20" y="88" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">TProxy (IP_TRANSPARENT),</text>
+    <text x="20" y="108" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Redirect NAT, Mixed, TUN</text>
+    <text x="20" y="136" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Server stack (12 protocols)</text>
+    <text x="20" y="158" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">VLESS · Hy2 · TUIC · Naive · AWG</text>
+  </g>
+
+  <!-- Connector 1 -> 2 -->
+  <line x1="300" y1="180" x2="320" y2="180" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Step 2 (268px) -->
+  <g transform="translate(320, 88)">
+    <rect x="0" y="0" width="268" height="184" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <text x="20" y="32" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">Stage 02 · Sniff &amp; DNS</text>
+    <text x="20" y="60" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Inspection &amp; Smart DNS</text>
+    <text x="20" y="88" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Non-destructive TLS/QUIC SNI</text>
+    <text x="20" y="108" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">and HTTP Host extraction</text>
+    <text x="20" y="136" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">DNS groups &amp; FakeIP pool</text>
+    <text x="20" y="158" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">DoH3 · DoQ · DoH · 198.18.0.0/15</text>
+  </g>
+
+  <!-- Connector 2 -> 3 -->
+  <line x1="588" y1="180" x2="608" y2="180" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Step 3: Highlighted Moment (272px) -->
+  <g transform="translate(608, 88)">
+    <rect x="0" y="0" width="272" height="184" rx="12" fill="#19191b" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.5"/>
+    <text x="20" y="32" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">Stage 03 · Router &amp; RAM</text>
+    <text x="20" y="60" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Routing &amp; Splice</text>
+    <text x="20" y="88" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Zero-copy .trs (mmap) and</text>
+    <text x="20" y="108" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">.srs v5, CIDR, MAC/DHCP, UID</text>
+    <text x="20" y="136" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Live memory pressure engine</text>
+    <text x="20" y="158" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">4 RAM tiers · zero-copy splice</text>
+  </g>
+
+  <!-- Connector 3 -> 4 -->
+  <line x1="880" y1="180" x2="900" y2="180" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Step 4 (268px) -->
+  <g transform="translate(900, 88)">
+    <rect x="0" y="0" width="268" height="184" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <text x="20" y="32" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">Stage 04 · Outbounds</text>
+    <text x="20" y="60" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Tunnels &amp; DPI Bypass</text>
+    <text x="20" y="88" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">VLESS, REALITY (ML-KEM-768),</text>
+    <text x="20" y="108" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">XHTTP, Hy2, TUIC v5, Naive UoT</text>
+    <text x="20" y="136" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">VPN endpoints &amp; desync</text>
+    <text x="20" y="158" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">AWG 2/3 · MASQUE · Desync</text>
+  </g>
+</svg>

@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="200" viewBox="0 0 1200 200"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Командный интерфейс (CLI) и инструменты tachyon-core</title>
+  <desc id="desc">Четыре группы команд CLI: управление жизненным циклом службы и валидация конфигов, компиляция наборов правил .trs и .srs, криптографический генератор ключей и сертификатов на чистом Rust, и интерфейс мониторинга Clash API.</desc>
+
+  <rect width="1200" height="200" rx="16" fill="#141415"/>
+  <rect x="0.5" y="0.5" width="1199" height="199" rx="15.5" fill="none" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Card 1: Lifecycle & Compat (280px, highlighted) -->
+  <g transform="translate(20, 20)">
+    <rect x="0" y="0" width="280" height="160" rx="12" fill="#19191b" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.5"/>
+    <rect x="16" y="16" width="104" height="24" rx="6" fill="#232325"/>
+    <text x="68" y="32" text-anchor="middle" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">run · check -c</text>
+    <text x="264" y="32" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">drop-in</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Запуск и валидация</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Предстартовая проверка схемы</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">JSON, format и слияние merge</text>
+    <text x="16" y="142" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">watchdog.uc · generator.uc</text>
+  </g>
+
+  <!-- Card 2: Rule-set tool (280px) -->
+  <g transform="translate(312, 20)">
+    <rect x="0" y="0" width="280" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="84" height="24" rx="6" fill="#232325"/>
+    <text x="58" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">rule-set</text>
+    <text x="264" y="32" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">.trs / .srs</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Компилятор правил</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Сборка и декомпиляция бинарных</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">наборов, тестирование match</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">compile · decompile · upgrade</text>
+  </g>
+
+  <!-- Card 3: Key & Cert generator (280px) -->
+  <g transform="translate(604, 20)">
+    <rect x="0" y="0" width="280" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="84" height="24" rx="6" fill="#232325"/>
+    <text x="58" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">generate</text>
+    <text x="264" y="32" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">pure rust</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Криптогенератор</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Ключи X25519 REALITY, пары WG</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">и самоподписанные ECDSA P-256</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">reality · wg · tls-keypair · ech</text>
+  </g>
+
+  <!-- Card 4: Clash API & State (284px) -->
+  <g transform="translate(896, 20)">
+    <rect x="0" y="0" width="284" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="88" height="24" rx="6" fill="#232325"/>
+    <text x="60" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">Clash API</text>
+    <text x="268" y="32" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">REST / WS</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Телеметрия и состояние</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Управление группами, трафик,</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">горячая перезагрузка и cache.db</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">/proxies · /connections · /ui</text>
+  </g>
+</svg>

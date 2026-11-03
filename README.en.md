@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/readme/hero.svg" width="100%" alt="tachyon-core — independent pure-Rust network routing, tunneling, and anti-censorship core for OpenWrt, Linux, desktop, and mobile platforms">
+  <img src="./assets/readme/hero-board.svg" width="100%" alt="tachyon-core — independent pure-Rust network routing, tunneling, and anti-censorship core for OpenWrt, Linux, desktop, and mobile platforms">
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="./assets/readme/tachyon_speed.svg" width="100%" alt="Key engineering metrics of tachyon-core: 4.2 MiB idle RSS, 22.3 ms cold start, 0.00 ms GC pauses, 51.7 Gbps direct throughput, 36/39 matrix wins, 6.9 MiB static musl binary">
+  <img src="./assets/readme/metrics-board.svg" width="100%" alt="Key engineering metrics of tachyon-core: 4.2 MiB idle RSS, 22.3 ms cold start, 0.00 ms GC pauses, 51.7 Gbps direct throughput, 36/39 matrix wins, 6.9 MiB static musl binary">
 </p>
 
 **tachyon-core** is an independent, high-performance network routing, tunneling, and traffic-shaping core for routers, servers, desktops, and mobile systems, written from scratch in 100% pure **Rust (Edition 2024)** with zero Go or C/C++ code. It supports standard JSON configuration schemas and CLI subcommands (`check -c`, `version`, `run`, `generate`, `rule-set`, `tools`) for drop-in operation in existing OpenWrt environments without the Go runtime or garbage collector.
@@ -110,7 +110,7 @@ In the single-core router profile, `tachyon-core` leads in **36 out of 39 protoc
 </p>
 
 <p align="center">
-  <img src="./assets/readme/architecture.svg" width="100%" alt="tachyon-core traffic processing pipeline: Inbounds, Sniff & DNS, Router & RAM, Outbounds">
+  <img src="./assets/readme/pipeline.svg" width="100%" alt="tachyon-core traffic processing pipeline: Inbounds, Sniff & DNS, Router & RAM, Outbounds">
 </p>
 
 | Subsystem | Supported Protocols & Capabilities |
@@ -135,7 +135,7 @@ Complete configuration field documentation, defaults, and constraints are availa
 </p>
 
 <p align="center">
-  <img src="./assets/readme/cli_showcase.svg" width="100%" alt="tachyon-core CLI overview: lifecycle & validation, rule-set compiler, pure-Rust key generator, and Clash API">
+  <img src="./assets/readme/cli-board.svg" width="100%" alt="tachyon-core CLI overview: lifecycle & validation, rule-set compiler, pure-Rust key generator, and Clash API">
 </p>
 
 ```bash

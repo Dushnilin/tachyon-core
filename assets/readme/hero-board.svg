@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="400" viewBox="0 0 1200 400"
+     role="img" aria-labelledby="title desc">
+  <title id="title">tachyon-core — сетевое ядро маршрутизации и туннелирования на чистом Rust</title>
+  <desc id="desc">Статическое сетевое ядро маршрутизации, проксирования и обхода фильтрации на 100% чистом Rust без зависимостей от C и CGO для роутеров OpenWrt, серверов Linux, десктопов и мобильных платформ.</desc>
+
+  <!-- Canvas -->
+  <rect width="1200" height="400" rx="16" fill="#141415"/>
+  <rect x="0.5" y="0.5" width="1199" height="399" rx="15.5" fill="none" stroke="#2e2e32" stroke-width="1"/>
+
+  <!-- Left column: identity, platforms, metrics -->
+  <g transform="translate(40, 40)">
+    <!-- Status tag -->
+    <rect x="0" y="0" width="368" height="28" rx="6" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <circle cx="14" cy="14" r="4" fill="#38bdf8"/>
+    <text x="26" y="18" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">tachyon network core · pure rust 2024 · v0.3.1</text>
+
+    <!-- Title & description -->
+    <text x="0" y="76" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="48" font-weight="500" letter-spacing="-1">tachyon-core</text>
+    <text x="0" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="400">Независимое сетевое ядро маршрутизации и туннелирования</text>
+    <text x="0" y="136" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="400">для роутеров OpenWrt, серверов Linux, десктопов и мобильных ОС</text>
+
+    <!-- Target platforms -->
+    <g transform="translate(0, 164)">
+      <rect x="0" y="0" width="124" height="32" rx="6" fill="#19191b" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.5"/>
+      <text x="62" y="20" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">OpenWrt musl</text>
+
+      <rect x="132" y="0" width="96" height="32" rx="6" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="180" y="20" text-anchor="middle" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="400">Linux x64</text>
+
+      <rect x="236" y="0" width="120" height="32" rx="6" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="296" y="20" text-anchor="middle" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="400">Win / macOS</text>
+
+      <rect x="364" y="0" width="108" height="32" rx="6" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="418" y="20" text-anchor="middle" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="400">Android JNI</text>
+
+      <rect x="480" y="0" width="104" height="32" rx="6" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="532" y="20" text-anchor="middle" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="400">iOS FFI</text>
+    </g>
+
+    <!-- Stat cards (same height 68px, 4px grid) -->
+    <g transform="translate(0, 216)">
+      <rect x="0" y="0" width="184" height="68" rx="8" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="16" y="28" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="500">4.2 MiB</text>
+      <text x="108" y="28" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">ОЗУ idle</text>
+      <text x="16" y="50" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">~10 MiB под нагрузкой</text>
+
+      <rect x="196" y="0" width="184" height="68" rx="8" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="212" y="28" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="500">6.9 MiB</text>
+      <text x="304" y="28" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">musl bin</text>
+      <text x="212" y="50" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">~3.7 MiB в архиве .tar.gz</text>
+
+      <rect x="392" y="0" width="192" height="68" rx="8" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+      <text x="408" y="28" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="500">0.00 ms</text>
+      <text x="500" y="28" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">паузы GC</text>
+      <text x="408" y="50" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">22 ms холодный старт</text>
+    </g>
+
+    <!-- Engineering legend -->
+    <g transform="translate(0, 304)">
+      <circle cx="6" cy="8" r="4" fill="#38bdf8"/>
+      <text x="18" y="12" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">39/39</text>
+      <text x="66" y="12" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">протоколов в матрице</text>
+
+      <circle cx="220" cy="8" r="4" fill="#4cc38a"/>
+      <text x="232" y="12" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">0 C/CGO</text>
+      <text x="296" y="12" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">чистый Rust</text>
+
+      <circle cx="396" cy="8" r="4" fill="#e5484d"/>
+      <text x="408" y="12" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">Adaptive</text>
+      <text x="476" y="12" fill="#85858b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">контроль ОЗУ</text>
+    </g>
+  </g>
+
+  <!-- Right column: packet pipeline specimen -->
+  <g transform="translate(664, 32)">
+    <rect x="0" y="0" width="496" height="336" rx="12" fill="#0f0f10" stroke="#2e2e32" stroke-width="1"/>
+
+    <!-- Specimen header -->
+    <rect x="0" y="0" width="496" height="36" rx="12" fill="#19191b"/>
+    <rect x="0" y="24" width="496" height="12" fill="#19191b"/>
+    <line x1="0" y1="36" x2="496" y2="36" stroke="#2e2e32" stroke-width="1"/>
+    <text x="16" y="23" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">inbounds → router (.trs / .srs) → outbounds</text>
+    <text x="480" y="23" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">zero-copy</text>
+
+    <!-- Stage 1 -->
+    <g transform="translate(16, 52)">
+      <rect x="0" y="0" width="464" height="72" rx="8" fill="#141415" stroke="#2e2e32" stroke-width="1"/>
+      <text x="16" y="24" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="500">1. Перехват трафика и серверные инбаунды</text>
+      <text x="448" y="24" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">TProxy · TUN</text>
+      <text x="16" y="44" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">IP_TRANSPARENT · Redirect NAT · Mixed SOCKS5/HTTP · smoltcp</text>
+      <text x="16" y="60" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">12 серверных протоколов: VLESS, Hy2, TUIC, Naive, AWG, MASQUE</text>
+    </g>
+
+    <!-- Connector 1 -->
+    <line x1="248" y1="124" x2="248" y2="140" stroke="#2e2e32" stroke-width="1"/>
+
+    <!-- Stage 2 (highlighted moment) -->
+    <g transform="translate(16, 140)">
+      <rect x="0" y="0" width="464" height="80" rx="8" fill="#19191b" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.5"/>
+      <text x="16" y="24" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="500">2. Маршрутизация, сниффер и адаптивный профиль ОЗУ</text>
+      <text x="448" y="24" text-anchor="end" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">mmap · splice</text>
+      <text x="16" y="46" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Мгновенные правила .trs (mmap) и .srs v5 без аллокаций в памяти</text>
+      <text x="16" y="64" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Инспекция TLS/QUIC SNI, Smart DNS (DoH3/DoQ/FakeIP) и авто-тюнинг</text>
+    </g>
+
+    <!-- Connector 2 -->
+    <line x1="248" y1="220" x2="248" y2="236" stroke="#2e2e32" stroke-width="1"/>
+
+    <!-- Stage 3 -->
+    <g transform="translate(16, 236)">
+      <rect x="0" y="0" width="226" height="84" rx="8" fill="#141415" stroke="#2e2e32" stroke-width="1"/>
+      <text x="16" y="24" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">Туннели и мультиплекс</text>
+      <text x="16" y="46" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">VLESS · REALITY PQ · XHTTP</text>
+      <text x="16" y="66" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">Hy2 · TUIC v5 · Naive UoT</text>
+
+      <rect x="238" y="0" width="226" height="84" rx="8" fill="#141415" stroke="#2e2e32" stroke-width="1"/>
+      <text x="254" y="24" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">VPN и обход DPI</text>
+      <text x="254" y="46" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">AmneziaWG 2/3 · MASQUE</text>
+      <text x="254" y="66" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">Adaptive Desync · OpenVPN</text>
+    </g>
+  </g>
+</svg>

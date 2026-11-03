@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/readme/hero.svg" width="100%" alt="tachyon-core — независимое сетевое ядро маршрутизации, туннелирования и обхода фильтрации на чистом Rust для OpenWrt, Linux, десктопов и мобильных платформ">
+  <img src="./assets/readme/hero-board.svg" width="100%" alt="tachyon-core — независимое сетевое ядро маршрутизации, туннелирования и обхода фильтрации на чистом Rust для OpenWrt, Linux, десктопов и мобильных платформ">
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="./assets/readme/tachyon_speed.svg" width="100%" alt="Ключевые инженерные метрики tachyon-core: 4.2 MiB RSS в простое, 22.3 ms холодный старт, 0.00 ms паузы GC, 51.7 Gbps прямой транзит, 36/39 побед в матрице, 6.9 MiB статический musl бинарник">
+  <img src="./assets/readme/metrics-board.svg" width="100%" alt="Ключевые инженерные метрики tachyon-core: 4.2 MiB RSS в простое, 22.3 ms холодный старт, 0.00 ms паузы GC, 51.7 Gbps прямой транзит, 36/39 побед в матрице, 6.9 MiB статический musl бинарник">
 </p>
 
 **tachyon-core** — независимое сетевое ядро маршрутизации, туннелирования и обхода фильтрации для роутеров, серверов, настольных и мобильных систем, написанное с нуля на 100% чистом **Rust (Edition 2024)** без единой строчки кода на Go или C/C++. Ядро поддерживает стандартный синтаксис JSON-конфигураций и командный интерфейс (`check -c`, `version`, `run`, `generate`, `rule-set`, `tools`) для прямой работы в существующих окружениях OpenWrt без рантайма Go и сборщика мусора.
@@ -110,7 +110,7 @@
 </p>
 
 <p align="center">
-  <img src="./assets/readme/architecture.svg" width="100%" alt="Архитектура конвейера обработки трафика tachyon-core: Inbounds, Sniff & DNS, Router & RAM, Outbounds">
+  <img src="./assets/readme/pipeline.svg" width="100%" alt="Архитектура конвейера обработки трафика tachyon-core: Inbounds, Sniff & DNS, Router & RAM, Outbounds">
 </p>
 
 | Подсистема | Реализованные протоколы и механизмы |
@@ -135,7 +135,7 @@
 </p>
 
 <p align="center">
-  <img src="./assets/readme/cli_showcase.svg" width="100%" alt="Командный интерфейс tachyon-core: запуск и валидация, компилятор правил, криптогенератор и Clash API">
+  <img src="./assets/readme/cli-board.svg" width="100%" alt="Командный интерфейс tachyon-core: запуск и валидация, компилятор правил, криптогенератор и Clash API">
 </p>
 
 ```bash

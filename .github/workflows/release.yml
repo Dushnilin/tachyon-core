@@ -379,26 +379,18 @@ jobs:
           fi
           prev=$(git tag --sort=-v:refname | grep -v "^${tag}$" | head -n 1 || true)
           {
-            echo "# ⚡ Tachyon Core v${ver}"
+            echo "## tachyon-core v${ver}"
             echo ""
-            echo "> **Независимое высокопроизводительное сетевое ядро для OpenWrt на чистом Rust**"
+            tail -n +2 section.md
             echo ""
-            echo "[![GitHub Release](https://img.shields.io/github/v/release/${PUBLIC_REPO}?color=6366F1)](https://github.com/${PUBLIC_REPO}/releases) [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981)](https://github.com/${PUBLIC_REPO}) [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981)](https://github.com/${PUBLIC_REPO}/blob/main/BENCHMARK.md) [![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x-10B981)](https://openwrt.org/) [![Arch](https://img.shields.io/badge/Arch-aarch64_%7C_arm_%7C_mips_%7C_x86--64-8B5CF6)](https://github.com/${PUBLIC_REPO}/releases/tag/${tag}) [![License](https://img.shields.io/badge/License-Proprietary-FF6B4A)](https://github.com/${PUBLIC_REPO}/blob/main/LICENSE)"
-            echo ""
-            echo "---"
-            echo ""
-            tail -n +2 section.md | sed 's/^### Исправления и улучшения$/---\n\n### 🌟 Ключевые нововведения и исправления/'
-            echo ""
-            echo "---"
-            echo ""
-            echo "### 📦 Контрольные суммы бинарников (SHA-256)"
+            echo "### SHA-256"
             echo ""
             echo "\`\`\`text"
             cat artifacts/SHA256SUMS
             echo "\`\`\`"
             if [ -n "$prev" ]; then
               echo ""
-              echo "**Full Changelog**: https://github.com/${PUBLIC_REPO}/compare/${prev}...${tag}"
+              echo "Изменения: https://github.com/${PUBLIC_REPO}/compare/${prev}...${tag}"
             fi
           } > notes.md
           cat notes.md
@@ -436,7 +428,7 @@ jobs:
         with:
           repository: ${{ env.PUBLIC_REPO }}
           token: ${{ env.PUBLIC_TOKEN }}
-          name: "⚡ Tachyon Core ${{ inputs.tag || github.ref_name }}"
+          name: "tachyon-core ${{ inputs.tag || github.ref_name }}"
           tag_name: ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
           files: |
@@ -451,7 +443,7 @@ jobs:
       - name: Publish release to current repository
         uses: softprops/action-gh-release@v2
         with:
-          name: "⚡ Tachyon Core ${{ inputs.tag || github.ref_name }}"
+          name: "tachyon-core ${{ inputs.tag || github.ref_name }}"
           tag_name: ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
           files: |

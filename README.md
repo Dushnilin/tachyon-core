@@ -1,295 +1,267 @@
-<div align="center">
-
-![Tachyon Core Banner](assets/readme/hero.svg)
-
-[![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
-[![Release](https://img.shields.io/github/v/release/Dushnilin/tachyon-core?style=for-the-badge&color=C084FC&logo=github)](https://github.com/Dushnilin/tachyon-core/releases/latest)
-[![Rust](https://img.shields.io/badge/Rust-1.89+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Binary Size](https://img.shields.io/badge/Binary-6.9_--_10.2_MiB_(3.7_MiB_tar.gz)-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core/releases/latest)
-[![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981?style=for-the-badge&logo=speedtest)](https://github.com/Dushnilin/tachyon-core)
-[![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981?style=for-the-badge&logo=speedtest)](BENCHMARK.md)
-[![Interactive Report](https://img.shields.io/badge/Dashboard-HTML_Report-6366F1?style=for-the-badge&logo=html5&logoColor=white)](BENCHMARK.html)
-[![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05_%7C_24.10_%7C_25.x_%7C_SNAPSHOT-10B981?style=for-the-badge&logo=openwrt)](https://openwrt.org/)
-[![License](https://img.shields.io/badge/License-Proprietary-FF6B4A?style=for-the-badge)](LICENSE)
-
-[**🇷🇺 Русский**](README.md) | [**🇬🇧 English**](README.en.md) | [**📦 Скачать билды (Releases)**](https://github.com/Dushnilin/tachyon-core/releases/latest) | [**📊 Свежий бенчмарк**](BENCHMARK.md) | [**🌐 Интерактивный HTML**](BENCHMARK.html)
-
-</div>
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="tachyon-core — независимое сетевое ядро маршрутизации, туннелирования и обхода фильтрации на чистом Rust для OpenWrt, Linux, десктопов и мобильных платформ">
+</p>
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <a href="https://github.com/Dushnilin/tachyon-core/releases/latest"><img src="https://img.shields.io/github/v/release/Dushnilin/tachyon-core?color=38bdf8&labelColor=19191b" alt="Latest Release"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.89%2B%20(2024)-232325?labelColor=19191b" alt="Rust 1.89+ (2024)"></a>
+  <a href="https://github.com/Dushnilin/tachyon-core/releases/latest"><img src="https://img.shields.io/badge/binary-6.9--10.2%20MiB%20(3.7%20MiB%20tar.gz)-232325?labelColor=19191b" alt="Binary Size"></a>
+  <a href="./BENCHMARK.md"><img src="https://img.shields.io/badge/idle%20rss-4.2%20MiB%20%C2%B7%200.00%20ms%20GC-232325?labelColor=19191b" alt="Idle RSS 4.2 MiB"></a>
+  <a href="https://openwrt.org/"><img src="https://img.shields.io/badge/openwrt-23.05%20%C2%B7%2024.10%20%C2%B7%2025.x%20%C2%B7%20SNAPSHOT-232325?labelColor=19191b" alt="OpenWrt"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-proprietary%20binary-232325?labelColor=19191b" alt="License"></a>
+</p>
+
+<p align="center">
+  <a href="./README.md"><b>Русский</b></a> ·
+  <a href="./README.en.md">English</a> ·
+  <a href="https://github.com/Dushnilin/tachyon-core/releases/latest">Релизные сборки</a> ·
+  <a href="./BENCHMARK.md">Отчёт бенчмарков</a> ·
+  <a href="./BENCHMARK.html">Интерактивный дашборд</a> ·
+  <a href="./docs/reference/README.md">Справочник схемы</a>
 </p>
 
 > [!IMPORTANT]
-> **📦 Формат публикаций начиная с версии `0.1.3` (Builds-Only Releases)**
+> **Формат публикаций начиная с версии `0.1.3` (Builds-Only Releases)**
 >
-> Исходный код в этом публичном репозитории (`Dushnilin/tachyon-core`) **заморожен на историческом выпуске `v0.1.2`**.
-> Начиная с релиза **`v0.1.3`**, разработка нового исходного кода ведётся в закрытом приватном репозитории, а сюда через GitHub Actions автоматически подтягиваются и публикуются **только готовые релизные сборки (статические бинарники под 11 архитектур), контрольные суммы `SHA256SUMS`, документация, список изменений и отчёты бенчмарков**.
+> Исходный код в этом публичном репозитории (`Dushnilin/tachyon-core`) заморожен на историческом снимке `v0.1.2`. Начиная с релиза `v0.1.3`, разработка ведётся в закрытом репозитории, а в этот репозиторий через GitHub Actions автоматически публикуются только готовые релизные сборки (статические бинарники и пакеты `.ipk` / `.apk`, десктопные архивы, библиотеки Android JNI и iOS XCFramework), контрольные суммы `SHA256SUMS`, документация, список изменений и отчёты бенчмарков.
 
-## ⚡ О проекте
-
-**tachyon-core** — независимое высокопроизводительное сетевое ядро маршрутизации и туннелирования для роутеров, серверов и встраиваемых систем, написанное с нуля на 100% чистом **Rust** без единой строчки кода на Go или C/C++. Ядро поддерживает стандартный синтаксис JSON-конфигураций и командный интерфейс (`check -c` / `version` / `run` / `generate` / `rule-set`) для бесшовной работы в существующих окружениях OpenWrt без рантайма Go и сборщика мусора.
-
-Реализован полный стек современных сетевых и транспортных протоколов: XHTTP (`H2Pool` + `HTTP/1.1`), AmneziaWG 2.0/3.x (с многопоточным пулом `WgPool`, расширенными заголовками `H1–H4` и фреймингом `I1–I5`), MASQUE/WARP (RFC 9484), Mieru (TCP/UDP), Hysteria2, TUIC v5, AnyTLS, Naive, ShadowTLS v3, uTLS (13 профилей TLS ClientHello), REALITY (с поддержкой сертификатов X.509v1 и пиннинга ключей), DNS-группы, постквантовый обмен ключами `X25519MLKEM768`, нативный Tailscale, zero-copy mmap rule-sets и **адаптивный аппаратный движок `HardwareProfile`**, который в реальном времени подстраивает потоки, окна QUIC/TCP и буферы под объём и давление ОЗУ роутера.
-
-Замеры выполнены на реальных статических musl-сборках в сравнении с популярными Go-ядрами (`Xray-core`, `Mihomo`, `sing-box`) и модульным C-стеком `steer` в одноядерном роутерном профиле (1 worker, CPU pinning). Полные результаты по всем 39 протоколам: **[BENCHMARK.md](BENCHMARK.md)** и **[BENCHMARK.html](BENCHMARK.html)**.
-
-**Средние цифры по всем целевым архитектурам:**
-
-| | tachyon-core | Сетевые ядра на Go | Преимущество |
-|---|:---:|:---:|:---:|
-| **Размер бинарника** | **6.9–10.2 MiB** (3.2–4.2 MiB в `.tar.gz`) | 35–76 MiB | **в ~8–10× меньше** |
-| **RAM в простое** | **4.2 MiB** | 25–41 MiB | **в ~10× меньше** |
-| **RAM под нагрузкой** | **~10 MiB** | 48–85 MiB | **в ~6 раз меньше** |
-| **Паузы GC** | **0.00 ms** | 2–15 ms | **нет джиттера вообще** |
-| **Холодный старт** | **22 ms** | 160–270 ms | **в 7–12 раз быстрее** |
-| **Адаптивный профиль** | **4 профиля RAM + 3 уровня давления** | фиксированные буферы | **авто-тюнинг от 64 МБ до 8+ ГБ** |
-| **Зависимости от C / CGO** | **0** | CGO / BoringSSL | **собирается под любой MIPS / ARMv6** |
-
-> **Прямое преимущество №1 — память.** ~10× меньше в простое на роутере с 64–128 МБ — это разница между «OOM-киллер в неподходящий момент» и запасом для conntrack, Wi-Fi и LuCI.
->
-> **Прямое преимущество №2 — флеш.** 6.9–10.2 MiB в распакованном виде (3.2–4.2 MiB в `.tar.gz`) против 35–76 MiB: ядро ставится во внутреннюю память `/usr/bin/` роутера с 16/32/128 МБ, без USB-накопителя и extroot.
+---
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <img src="./assets/readme/section-overview.svg" width="100%" alt="01 — Инженерная архитектура и преимущества чистого Rust">
 </p>
-
-## ⚔️ Почему Rust, а не Go
-
-| | Сетевые ядра на Go | tachyon-core (Rust) |
-|---|---|---|
-| **Сборщик мусора** | Непрерывный обход кучи + STW-фазы: всплески нагрузки и **паузы 2–15 мс** на слабых CPU роутера. Видны как микрофризы в VoIP и скачки пинга в играх | Сборщика нет. RAII освобождает память детерминированно, в момент выхода сокета из области видимости. **0.00 ms пауз**, плоский график задержек |
-| **Планировщик и пулы** | Внутренние пулы потоков, стеки горутин, резерв через `mheap`: 25–41 MiB в полном простое, под 10k соединений — за 100 MiB и срабатывание OOM-Killer | Ничего не резервируется про запас. 4.2 MiB в простое, ~10 MiB в пике + живой мониторинг `/proc/meminfo` с автоматическим сжатием кэшей и буферов |
-| **Криптография на MIPS** | BoringSSL/CGO ломает сборку под 32-битный softfloat MIPS (MediaTek MT7621, ath79), а `gc` выдаёт неоптимальный код | Криптопровайдер целиком на чистом Rust (`oxitls` + `AF_ALG`, `aes-gcm`, `chacha20poly1305`, `sha2`, `x25519-dalek`, `ml-kem`, `blake3`) с аппаратным NEON/AES-NI. Ни одного внешнего C-файла, никакого `libssl.so` |
-| **Конвейер данных** | Копирования в userspace между клиентским сокетом и туннелем | Пул буферов `bytes::Bytes` + `splice` и драйвер `drive_transparent` — перенаправление без промежуточных копий |
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <img src="./assets/readme/tachyon_speed.svg" width="100%" alt="Ключевые инженерные метрики tachyon-core: 4.2 MiB RSS в простое, 22.3 ms холодный старт, 0.00 ms паузы GC, 51.7 Gbps прямой транзит, 36/39 побед в матрице, 6.9 MiB статический musl бинарник">
 </p>
 
-## 📊 Производительность
+**tachyon-core** — независимое сетевое ядро маршрутизации, туннелирования и обхода фильтрации для роутеров, серверов, настольных и мобильных систем, написанное с нуля на 100% чистом **Rust (Edition 2024)** без единой строчки кода на Go или C/C++. Ядро поддерживает стандартный синтаксис JSON-конфигураций и командный интерфейс (`check -c`, `version`, `run`, `generate`, `rule-set`, `tools`) для прямой работы в существующих окружениях OpenWrt без рантайма Go и сборщика мусора.
 
-<div align="center">
+Реализован полный стек транспортных и туннельных протоколов: **VLESS**, **REALITY** с автоматическим подбором постквантового обмена `X25519MLKEM768` и защитой от подмены сертификата маскировочного домена, **XHTTP** (HTTP/2 XMUX-пул + HTTP/1.1), **Hysteria2** (включая маскировку `Salamander + Gecko` / `finalmask`), **TUIC v5**, **NaiveProxy** (HTTP/2 и HTTP/3 QUIC с поддержкой `UDP-over-TCP`), **AnyTLS**, **ShadowTLS v3**, **VMess**, **Trojan**, **Shadowsocks** (AEAD и 2022), **AmneziaWG 2.0/3.x** (заголовки `H1–H4` и фрейминг рукопожатий `I1–I5`), **MASQUE / WARP** (RFC 9484), **Mieru** (TCP/UDP), **Snell v4/v6**, **FPTN**, **OpenVPN**, **Tailscale**, **uTLS** (13 профилей TLS ClientHello), адаптивный движок десинхронизации DPI (`desync`), универсальный загрузчик и парсер подписок (`Remnawave`, `Marzban`, `3x-ui`, `Pasarguard`, `Hiddify`, `Happ crypt3/crypt4`, `Amnezia vpn://`, `WG/AWG INI`), бинарные наборы правил `.trs` (zero-copy `mmap`) и `.srs` v5, а также адаптивный менеджер памяти, масштабирующий пулы и буферы под доступный объём ОЗУ роутера.
 
-![Tachyon Speed Pipeline](assets/readme/tachyon_speed.svg)
+| Показатель | `tachyon-core` (Rust) | Сетевые ядра на Go | Инженерный эффект на роутере |
+|:---|:---:|:---:|:---|
+| **Размер бинарника** | **6.9–10.2 MiB** (`3.2–4.2 MiB` в `.tar.gz`) | 35–76 MiB | В **8–10× меньше**: устанавливается напрямую во внутренний флеш `/usr/bin/` роутеров с 16/32/128 МБ без USB и `extroot` |
+| **Память в простое (Idle RSS)** | **4.2 MiB** | 25–41 MiB | В **~10× меньше**: запас памяти под `conntrack`, драйверы Wi-Fi и веб-интерфейс LuCI на устройствах с 64–128 МБ ОЗУ |
+| **Память под нагрузкой** | **~10 MiB** | 48–85 MiB | В **~6× меньше**: отсутствие предрезервированной кучи `mheap` и защита от вызова OOM-Killer |
+| **Паузы сборщика мусора** | **0.00 ms** | 2–15 ms | Детерминированное освобождение памяти (RAII) без фаз Stop-The-World, микрофризов в VoIP и скачков пинга в играх |
+| **Холодный старт** | **22.3 ms** | 160–270 ms | В **7–12× быстрее**: мгновенный перезапуск службы при переключении интерфейса или рестарте сети |
+| **Адаптивный профиль памяти** | **4 тира ОЗУ + 3 уровня давления** | Фиксированные буферы | Живой мониторинг `/proc/meminfo` (`MemAvailable`) и лимитов `cgroup` с автоматическим сжатием кэшей и окон |
+| **Зависимости от C / CGO** | **0** | CGO / BoringSSL | Чистый Rust-криптопровайдер (`AEAD`, `X25519`, `ML-KEM-768`, `AF_ALG`) — статическая сборка под любой `mipsel`/`mips` soft-float и `armv6` |
 
-</div>
+<details>
+<summary><b>Архитектурное сравнение: почему чистый Rust вместо Go</b></summary>
 
-### Сквозной тест маршрутизации (SOCKS5 Inbound → Direct Outbound), 1 ядро CPU
+<br>
 
-| Ядро | Бинарник | Холодный старт | RAM (Idle / Peak) | Задержка p50 / p99 | Пропускная | CPU |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **tachyon-core** | **6.99–10.2 MiB** | **22.3 ms** 🥇 | **4.2 / 4.6 MiB** 🥇 | **170.0 / 221.4 µs** 🥇 | **51.7 Gbps** | 0.163 s/G |
+| Подсистема | Сетевые ядра на Go | `tachyon-core` (Pure Rust) |
+|:---|:---|:---|
+| **Управление памятью** | Непрерывный фоновый обход кучи и фазы Stop-The-World создают всплески нагрузки на CPU и паузы 2–15 мс на роутерных процессорах | Сборщика мусора нет. Память сокетов и буферов освобождается детерминированно при выходе из области видимости (`0.00 ms` пауз) |
+| **Планировщик и пулы** | Внутренние пулы потоков, стеки горутин и резервирование виртуальной памяти через `mheap` удерживают 25–41 MiB даже без трафика | Память выделяется строго под активные соединения: 4.2 MiB в простое, ~10 MiB в типовом режиме и автоматическая очистка при нехватке ОЗУ |
+| **Криптография на MIPS и ARM** | Зависимость от BoringSSL/CGO усложняет сборку под 32-битный `mipsel`/`mips` (`+soft-float`), а стандартный компилятор Go уступает LLVM по генерации кода | Полностью собственный криптостек на Rust с аппаратным ускорением `AES-NI` / `ARMv8 NEON` и поддержкой ядерного `AF_ALG` без `libssl.so` и Си-компилятора |
+| **Конвейер передачи данных** | Многократные копирования буферов в пользовательском пространстве между клиентским сокетом и туннелем | Переиспользуемые пулы `bytes::Bytes`, системный вызов `splice` на Linux и сквозная передача данных без лишних аллокаций |
+
+</details>
+
+---
+
+<p align="center">
+  <img src="./assets/readme/section-benchmarks.svg" width="100%" alt="02 — Производительность и сравнение с Go/C-ядрами">
+</p>
+
+Замеры выполнены на статических `musl`-сборках в сравнении с актуальными версиями `sing-box`, `xray-core`, `mihomo` и модульным C-стеком `steer`. Полная методика, профили окружения и таблицы по всем 39 протоколам приведены в **[BENCHMARK.md](BENCHMARK.md)** и интерактивном отчёте **[BENCHMARK.html](BENCHMARK.html)**.
+
+### Сквозной тест маршрутизации (`SOCKS5 Inbound → Direct Outbound`), 1 ядро CPU
+
+| Ядро | Размер бинарника | Холодный старт | RAM (Idle / Peak) | Задержка p50 / p99 | Пропускная способность | CPU |
+|:---|---:|---:|---:|---:|---:|---:|
+| **`tachyon-core`** | **6.99–10.2 MiB** | **22.3 ms** | **4.2 / 4.6 MiB** | **170.0 / 221.4 µs** | **51.7 Gbps** | **0.163 s/G** |
 | `steer` (C, 3 процесса) | 1.76 MiB | 141.9 ms | 5.1 / 5.4 MiB | 173.6 / 221.7 µs | 8.0–9.6 Gbps | 1.067 s/G |
 | `xray-core` (Go, XTLS) | 34.88 MiB | 161.1 ms | 25.0 / 25.6 MiB | 183.9 / 233.4 µs | 53.1 Gbps | 0.158 s/G |
 | `mihomo` (Go, Clash Meta) | 59.12 MiB | 211.3 ms | 32.9 / 33.9 MiB | 188.5 / 251.3 µs | 48.2 Gbps | 0.174 s/G |
 | `sing-box` (Go) | 76.01 MiB | 268.2 ms | 39.9 / 40.8 MiB | 182.6 / 232.8 µs | 51.5 Gbps | 0.166 s/G |
 
-> **Прямое преимущество №3 — холодный старт.** 22 ms против ~210 ms: на роутере, где сервис поднимается при каждой перезагрузке или рестарте сети, это разница между «работает» и «минута ожидания».
->
-> На чистом loopback по пропускной способности `xray-core` ушёл вперёд (53.1 против 51.7 Gbps) — разница в пределах шума. Реальное преимущество tachyon здесь не в гигабайтах в секунду, а в памяти, старте и латентности: **самая низкая p50 и p99 среди всех пяти ядер** при 4.2 MiB вместо 25–41 MiB.
+### Мульти-протокольный бенчмарк (роутерный профиль, 1 поток / 8 потоков, Gbit/s)
 
-### Мульти-протокольный бенчмарк (замер от 14.10.2026)
+В одноядерном роутерном профиле `tachyon-core` лидирует в **36 из 39 протокольных сценариев** (`39/39` в статусе `OK`, 3 паритета, 0 поражений). На мультиплексированных транспортах (`HTTP/2`, `gRPC`, `NaiveProxy`, `Hysteria2`, `TUIC v5`) отрыв составляет **2.1–5.4×** по пропускной способности при кратно меньшем пиковом RSS:
 
-**36 побед из 39 протоколов (39/39 в статусе `OK`), 3 паритета, 0 поражений.** Скорость (1 стрим / 8 стримов), Gbit/s:
+| Протокол | `tachyon-core` | `sing-box` | `xray-core` | `mihomo` | `steer` | Соотношение и RSS |
+|:---|---:|---:|---:|---:|---:|:---|
+| **Shadowsocks AES-128-GCM** | **6.95 / 16.60** | 2.59 / 4.79 | 5.71 / 11.17 | 2.49 / 5.03 | 0.01 / 0.11 | **~3.5× быстрее** `sing-box` |
+| **AnyTLS (H2MUX TLS)** | **6.16 / 14.86** | 5.52 / 10.95 | — | — | — | **~1.4× быстрее** на 8 потоках |
+| **Mieru (TCP / UDP)** | **6.46 / 13.01** | — | — | 5.20 / 5.71 | — | **~2.3× быстрее** (клиент и сервер) |
+| **VMess + HTTP/2 + TLS** | **2.48 / 11.31** | 1.58 / 2.09 | — | 1.21 / 3.06 | — | **~5.4× быстрее** на H2 |
+| **VLESS + HTTP/2 + TLS** | **2.38 / 10.51** | 1.45 / 2.04 | — | 1.46 / 7.52 | — | **~5.2× быстрее** `sing-box` |
+| **NaiveProxy (HTTP/2 TLS)** | **2.80 / 10.47** | 2.49 / 2.41 | — | — | — | **~4.3× быстрее**, поддержка `UoT` |
+| **Trojan + gRPC + TLS** | **2.80 / 10.45** | 1.40 / 1.92 | 1.55 / 2.47 | 1.45 / 2.23 | 1.63 / 2.09 | **~5.4× быстрее** на gRPC |
+| **VLESS + gRPC + TLS** | **2.78 / 9.99** | 1.74 / 2.22 | 1.68 / 2.62 | 1.54 / 2.06 | 1.75 / 2.16 | **~4.5× быстрее** на gRPC |
+| **VLESS + XHTTP + TLS** | **1.36 / 9.33** | 1.08 / 9.14 | 0.99 / 2.38 | — | 1.21 / 1.57 | **p50 в ~73× ниже** (`408 µs`, пул XMUX) |
+| **VMess + WS + TLS** | **3.47 / 7.87** | 3.18 / 6.55 | 2.07 / 4.28 | 2.16 / 4.45 | 2.85 / 2.91 | **~1.2–1.8× быстрее** |
+| **TUIC v5 (QUIC)** | **4.03 / 7.64** | 3.52 / 2.76 | — | 3.08 / 2.72 | — | **~2.8× быстрее** на QUIC |
+| **Hysteria 2 (QUIC)** | **3.30 / 6.84** | 2.59 / 3.21 | — | 3.19 / 3.88 | 1.22 / 0.55 | **~2.1× быстрее** (`13.6M` против `52M` RSS) |
+| **VLESS + TLS + Vision** | **3.23 / 7.22** | 3.31 / 6.78 | 2.26 / 5.63 | 3.24 / 6.98 | 3.91 / 4.36 | Лидер на 8 потоках (`7.1M` RSS) |
+| **ShadowTLS v3** | **48.47 / 45.53** | — | — | — | — | Zero-copy `splice` (`5.8M` RSS) |
+| **VLESS (Plain)** | **25.31 / 30.97** | 25.25 / 30.89 | 8.66 / 16.90 | — | 4.24 / 5.27 | `5.4M` против `42.4M` RSS |
 
-| Протокол | Tachyon | Sing-box | Xray | Mihomo | Steer | Преимущество |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Shadowsocks AES-128-GCM** | **6.95 / 16.60** | 2.59 / 4.79 | 5.71 / 11.17 | 2.49 / 5.03 | 0.01 / 0.11 | **в ~3.5×** |
-| **AnyTLS (H2MUX TLS)** | **6.16 / 14.86** | 5.52 / 10.95 | — | — | — | **в ~1.4×** |
-| **Mieru (TCP / UDP)** | **6.46 / 13.01** | — | — | 5.20 / 5.71 | — | **в ~2.3×** (клиент + сервер) |
-| **VMess + HTTP/2 + TLS** | **2.48 / 11.31** | 1.58 / 2.09 | — | 1.21 / 3.06 | — | **в ~5.4×** |
-| **VLESS + HTTP/2 + TLS** | **2.38 / 10.51** | 1.45 / 2.04 | — | 1.46 / 7.52 | — | **в ~5.2×** |
-| **NaiveProxy (HTTP/2 TLS)** | **2.80 / 10.47** | 2.49 / 2.41 | — | — | — | **в ~4.3×** |
-| **Trojan + gRPC + TLS** | **2.80 / 10.45** | 1.40 / 1.92 | 1.55 / 2.47 | 1.45 / 2.23 | 1.63 / 2.09 | **в ~5.4×** |
-| **VLESS + gRPC + TLS** | **2.78 / 9.99** | 1.74 / 2.22 | 1.68 / 2.62 | 1.54 / 2.06 | 1.75 / 2.16 | **в ~4.5×** |
-| **VLESS + XHTTP + TLS** | **1.36 / 9.33** | 1.08 / 9.14 | 0.99 / 2.38 | — | 1.21 / 1.57 | **p50 в ~73× ниже** (`408 µs`) |
-| **VMess + WS + TLS** | **3.47 / 7.87** | 3.18 / 6.55 | 2.07 / 4.28 | 2.16 / 4.45 | 2.85 / 2.91 | **в ~1.2–1.8×** |
-| **TUIC v5 (QUIC)** | **4.03 / 7.64** | 3.52 / 2.76 | — | 3.08 / 2.72 | — | **в ~2.8×** |
-| **Hysteria 2 (QUIC)** | **3.30 / 6.84** | 2.59 / 3.21 | — | 3.19 / 3.88 | 1.22 / 0.55 | **в ~2.1×** |
-| **VLESS + TLS + Vision** | **3.23 / 7.22** | 3.31 / 6.78 | 2.26 / 5.63 | 3.24 / 6.98 | 3.91 / 4.36 | **лидер на 8s** (`7.1M` RSS) |
-| **ShadowTLS v3** | **48.47 / 45.53** | — | — | — | — | **zero-copy splice** (`5.8M` RSS) |
-| **VLESS (Plain)** | **25.31 / 30.97** | 25.25 / 30.89 | 8.66 / 16.90 | — | 4.24 / 5.27 | **лидер** (`5.4M` против `42.4M` RSS) |
-
-> **Прямое преимущество №4 — HTTP/2, gRPC и QUIC.** На мультиплексированных транспортах (`HTTP/2`, `gRPC`, `NaiveProxy`, `Hysteria2`, `TUIC v5`) отрыв достигает **2.1–5.4×** по пропускной способности при кратно меньшем потреблении памяти (7–22 MiB на QUIC/TLS против 48–55 MiB у Go-ядер).
->
-> **Прямое преимущество №5 — XHTTP.** Встроенный пул соединений `H2Pool` (XMUX) убирает повторные TLS-рукопожатия на каждый запрос в режимах `packet-up` и `stream-up`. Задержка первого байта: **408 µs против ~29 800 µs** у Go-ядер — **в ~73 раза быстрее**, скорость на 8 потоках — **9.33 Gbit/s**.
->
-> Полная таблица из 39 протоколов с задержками p50/p99 и пиковым RSS: **[BENCHMARK.md](BENCHMARK.md)** и **[BENCHMARK.html](BENCHMARK.html)**.
+---
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <img src="./assets/readme/section-protocols.svg" width="100%" alt="03 — Стек протоколов, маршрутизация и конвейер данных">
 </p>
-
-## 🌐 Возможности ядра
-
-<div align="center">
-
-![Tachyon Core Architecture](assets/readme/architecture.svg)
-
-</div>
-
-**Инбаунды (клиентские и серверные).** Прозрачный перехват трафика: Linux **TProxy** (IPv4/IPv6) через `IP_TRANSPARENT` с извлечением реального адреса через OOB `IP_RECVORIGDSTADDR`; **Redirect** (NAT) через `SO_ORIGINAL_DST`; **Mixed SOCKS/HTTP** с полным CONNECT, SOCKS4/4a/5, UDP ASSOCIATE, 407 и keep-alive; **Direct**; **TUN** (`/dev/net/tun`, userspace-стек TCP на `smoltcp` с адаптивным окном `TACHYON_SMOL_TCP_BUF`, GSO-сегментация, policy routing в отдельной таблице 2022). Полный серверный стек (**12 протоколов**): **VLESS**, **Trojan**, **VMess** (AEAD), **Shadowsocks** (AEAD, 2022, multi-user relay), **AnyTLS**, **Naive**, **Hysteria2** (полная совместимость с клиентами hy2, заголовки `Hysteria-CC-RX`/`Hysteria-Padding`, UDP-сессии), **TUIC v5**, **ShadowTLS v3**, **MASQUE** (RFC 9484 CONNECT-IP over HTTP/3), **Mieru** (TCP/UDP), **AmneziaWG / WireGuard** responder и **FPTN** — с собственным TLS 1.3 на чистом Rust.
-
-Схема всех полей — **[docs/reference/](docs/reference/README.md)**: типы инбаундов и аутбаундов, общие блоки (listen, dialer, TLS, транспорты, мультиплексирование), значения по умолчанию и ограничения.
-
-**Аутбаунды.** `direct`, `block`, `socks`, `http`. **Shadowsocks** (все AEAD-шифры, спецификация 2022, UoT, TLS-транспорт). **VLESS** (`flow: xtls-rprx-vision`, все `packet_encoding`, `h2mux`, uTLS). **VMess** (AEAD и legacy, `h2mux`). **Trojan** (SHA224). **Hysteria2** (движок на `quinn`, алгоритмы BBR и Cubic, `routing_mark`/`bind_interface`). **TUIC v5** (с автоматическим выселением неактивных UDP-сессий). **AnyTLS**. **Naive** (HTTP/2 и HTTP/3, `Padding`, `-connect-authority`, блоки `[len:u16][pad:u8]`). **Snell v4/v6**. **ShadowTLS v3**. **MASQUE (WARP)**. **Mieru** (TCP и UDP). **FPTN**. **Tor**, **SSH**, **Desync** (сегментация TCP-потока), **Chain** (`detour`-цепочки). Диспетчеризация: `urltest` и `selector` (`round_robin`, `least_test`, `least_ping`).
-
-**Эндпоинты туннелей.** **AmneziaWG 2.0/3.x** и **WireGuard** — многопоточный пул воркеров `WgPool` с хешированием потоков (5-tuple) без блокировок, расширенными параметрами заголовков сессии (`jc`, `jmin`, `jmax`, `s1–s4`, `h1–h4`) и генератором пакетов инициализации `i1–i5`. **Tailscale** (`tsnet` endpoint). **OpenVPN-клиент**: `static_key` поверх UDP и TCP, сжатие и фрагментация.
-
-**Транспортный уровень и криптография.** TCP, WebSocket (`max_early_data`), HTTPUpgrade, gRPC, HTTP/2, QUIC/HTTP-3. **XHTTP**: HTTP/1.1 chunked, `stream-up`, `packet-up`, `stream-one` и пул `H2Pool` (XMUX) с мультиплексированием HTTP/2-потоков, балансировкой least-loaded и расширенными окнами потока (16 MiB stream / 64 MiB connection). **Pure-Rust uTLS**: 13 байт-точных профилей TLS ClientHello и настраиваемый шаблон рукопожатий. **Pure-Rust REALITY** со сквозным `splice`, поддержкой сертификатов X.509v1 и проверкой `PinVerifier`. **Постквантовая криптография**: гибридный обмен ключами ML-KEM-768 (`X25519MLKEM768`).
-
-**Адаптивный аппаратный движок (`HardwareProfile`).** При старте ядро автоматически определяет объём ОЗУ и число ядер CPU, выбирая один из 4 аппаратных профилей (`Constrained ≤128 MB`, `Router 129–512 MB`, `Midrange 513–2048 MB`, `DesktopServer >2048 MB`), а в рантайме отслеживает `/proc/meminfo` (`MemAvailable`) и лимиты `cgroup`. На лету масштабируются число воркеров Tokio, размеры буферов `splice` и TCP/UDP-релея, окна потоков и соединений HTTP/2 и QUIC (`Hysteria2`, `TUIC`, `MASQUE`), лимиты таблиц UDP NAT, ёмкость кэша DNS и буферы `smoltcp`.
-
-**Smart DNS.** `udp`, `tcp`, `tls` (DoT), `https` (DoH), `quic` (DoQ), `h3` (DoH3), `fakeip`, `local`, `hosts` (файл и инлайн), `mdns`. DNS-группы (`group`) со стратегиями `stable` / `fastest` / `parallel` на скользящей статистике и аварийным режимом. `dns.reverse_mapping` для правил по домену к обращениям по IP. `dns.client_subnet` (EDNS0). LRU-кэш на `Arc<str>` с оптимистичной отдачей устаревших записей и пул FakeIP `198.18.0.0/15`.
-
-**Роутер и инспекция.** Матчеры правил: `inbound`, `network`, `protocol`, домен (suffix, keyword, regex, exact), `ip_cidr`, `ip_is_private`, `source_*`, `port`, `port_range`, `process_name`, `process_path`, `process_path_regex`, `user`, `user_id` (через `/proc/net/*` и дескрипторы сокетов), `clash_mode`, `rule_set`, `rule_set_ipcidr_match_source`. Таблица соседей и DHCP (`find_neighbor`) для `source_mac_address` и `source_hostname`. Сниффер PeekStream: TLS SNI, HTTP Host, QUIC SNI, DNS, BitTorrent, SSH, RDP — без потери начальных байт. Бинарные правила SRS v5: компиляция, декомпиляция, проверка совпадений и удалённая синхронизация списков.
-
-**Системный диалер.** Netns с дочерним процессом-держателем `CLONE_NEWNET` и бесконфликтным dial. `protect_path` — передача дескрипторов сокетов демонам через `SCM_RIGHTS`. Multipath TCP, Happy Eyeballs RFC 6555, fwmark (`routing_mark`), привязка к интерфейсу (`bind_interface`), неблокирующий `connect` с контролем таймаута и защита от шторма пакетов при сбросе соединений.
-
-**API и состояние.** Clash REST API: `/version`, `/proxies`, `/connections`, `/rules`, `/configs`, `/logs`, `/traffic`, `/providers/*`, корректная обработка URL-кодированных слэшей (`%2F`) в именах прокси и групп, WebSocket-трафик, secret-токен, CORS, `clash_mode` и встроенная раздача панелей Yacd / Metacubexd по `/ui`. Файл `cache.db` — B+tree на чистом Rust, побайтово совместимый с форматом bbolt. Встроенный NTP-клиент и реестр HTTP-клиентов `http_clients`.
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <img src="./assets/readme/architecture.svg" width="100%" alt="Архитектура конвейера обработки трафика tachyon-core: Inbounds, Sniff & DNS, Router & RAM, Outbounds">
 </p>
 
-## 🧭 Командный интерфейс (CLI) и обратная совместимость
+| Подсистема | Реализованные протоколы и механизмы |
+|:---|:---|
+| **Клиентские и системные инбаунды** | Прозрачный перехват Linux **TProxy** (IPv4/IPv6) через `IP_TRANSPARENT` и OOB `IP_RECVORIGDSTADDR`; **Redirect** (NAT) через `SO_ORIGINAL_DST`; **Mixed SOCKS/HTTP** (`CONNECT`, SOCKS4/4a/5, `UDP ASSOCIATE`, код 407, keep-alive); **Direct**; **TUN** (`/dev/net/tun`, стек TCP в пространстве пользователя на `smoltcp` с адаптивным окном `TACHYON_SMOL_TCP_BUF`, GSO-сегментация, policy routing в таблице `2022`). |
+| **Серверные инбаунды (12 протоколов)** | **VLESS**, **Trojan**, **VMess** (AEAD), **Shadowsocks** (AEAD, 2022, multi-user relay), **AnyTLS**, **NaiveProxy** (`UoT`), **Hysteria2** (совместимость с клиентами `hy2`, заголовки `Hysteria-CC-RX`/`Hysteria-Padding`, обфускация `Salamander + Gecko`, UDP-сессии), **TUIC v5**, **ShadowTLS v3**, **MASQUE** (RFC 9484 `CONNECT-IP` поверх HTTP/3), **Mieru** (TCP/UDP), **AmneziaWG / WireGuard** responder и **FPTN** — поверх собственного TLS 1.3 на чистом Rust. |
+| **Прокси-аутбаунды** | `direct`, `block`, `socks`, `http`, **Shadowsocks** (AEAD, 2022, UoT, TLS), **VLESS** (`xtls-rprx-vision`, `packet_encoding`, `h2mux`, uTLS), **VMess** (AEAD и legacy, `h2mux`), **Trojan** (SHA224), **Hysteria2** (BBR и Cubic, `Salamander + Gecko`, `udpHop`, `routing_mark`, `bind_interface`), **TUIC v5**, **AnyTLS**, **NaiveProxy** (HTTP/2 и HTTP/3 QUIC, `Padding`, `UoT`), **Snell v4/v6**, **ShadowTLS v3**, **MASQUE (WARP)**, **Mieru** (TCP/UDP), **FPTN**, **Tor**, **SSH**, **Chain** (`detour`-цепочки). Группы: `urltest` и `selector` (`round_robin`, `least_test`, `least_ping`). |
+| **Эндпоинты туннелей** | **AmneziaWG 2.0/3.x** и **WireGuard** — многопоточный пул воркеров с хешированием потоков `5-tuple` без блокировок, расширенные заголовки сессии (`jc`, `jmin`, `jmax`, `s1–s4`, `h1–h4`), генератор пакетов инициализации `i1–i5` и поддержка профилей Cloudflare WARP (`reserved`). **Tailscale** (`tsnet` endpoint). **OpenVPN-клиент** (`static_key` поверх UDP и TCP, сжатие LZO и фрагментация). |
+| **Транспорты и постквантовый TLS** | TCP, WebSocket (`max_early_data`), HTTPUpgrade, gRPC, HTTP/2, QUIC/HTTP-3. **XHTTP**: режимы `stream-up`, `packet-up`, `stream-one`, поддержка `extra` v2 и пул мультиплексирования HTTP/2 (XMUX) с балансировкой least-loaded и окнами `16 MiB` stream / `64 MiB` connection. **uTLS**: 13 байт-точных профилей TLS ClientHello. **REALITY**: сквозной `splice`, поддержка X.509v1, пиннинг ключей и гибридный постквантовый обмен **ML-KEM-768 (`X25519MLKEM768`)** с защитой от редиректа на маскировочный домен (`decoy`). |
+| **Обход фильтрации (`desync`) и подписки** | Адаптивный движок L4/L7 десинхронизации (`preset: "adaptive"`, `tlsspoof`, `MultiDisorder` / `fakeddisorder`, `BadAck`, `IPv6 Hop-by-Hop`, `seqovl`, `ipfrag`, `syndata`, `wsize`, `rndsni`, `udplen`) с контекстным профилированием сервисов. Универсальный парсер подписок: `Remnawave`, `Marzban`, `3x-ui`, `Pasarguard`, `Hiddify`, зашифрованные контейнеры `Happ` (`crypt3` / `crypt4`), `Amnezia` (`vpn://`), `WireGuard / AmneziaWG INI`, `Clash YAML`, `Xray JSON`, `SIP008` с фильтрацией сервисных заглушек. |
+| **Адаптивный профиль ОЗУ** | При старте ядро определяет объём ОЗУ и число ядер CPU, выбирая один из 4 аппаратных профилей (`Constrained ≤128 MB`, `Router 129–512 MB`, `Midrange 513–2048 MB`, `DesktopServer >2048 MB`), и в реальном времени отслеживает `/proc/meminfo` (`MemAvailable`) и лимиты `cgroup`. Автоматически масштабируются потоки Tokio, буферы `splice` и TCP/UDP-релея, окна HTTP/2 и QUIC, таблицы UDP NAT, кэш DNS и буферы `smoltcp`. |
+| **Smart DNS** | Транспорты `udp`, `tcp`, `tls` (DoT), `https` (DoH), `quic` (DoQ), `h3` (DoH3 с переиспользованием QUIC-сессий), `fakeip` (`198.18.0.0/15`), `local`, `hosts` и `mdns`. DNS-группы (`group`) со стратегиями `stable` / `fastest` / `parallel` на скользящей статистике и аварийным режимом, `reverse_mapping`, `client_subnet` (EDNS0) и LRU-кэш с оптимистичной отдачей устаревших записей. |
+| **Роутер, сниффер и наборы правил** | Матчеры: `inbound`, `network`, `protocol`, домены (`suffix`, `keyword`, `regex`, `exact`), `ip_cidr`, `ip_is_private`, `source_*`, `port`, `port_range`, `process_name`, `process_path`, `user`, `user_id` (`/proc/net/*`), `source_mac_address` и `source_hostname` (таблица соседей и DHCP), `clash_mode`, `rule_set`. Неразрушающий сниффер: TLS SNI, HTTP Host, QUIC SNI, DNS, BitTorrent, SSH, RDP. Поддержка нативных бинарных списков **`.trs` v2 (zero-copy `mmap`)** и **`.srs` v5** с горячей перезагрузкой маршрутов. |
+| **Системный диалер и API состояния** | Изоляция `netns` (`CLONE_NEWNET`), передача сокетов через `protect_path` (`SCM_RIGHTS`), Multipath TCP, Happy Eyeballs (RFC 6555), `routing_mark` (fwmark), `bind_interface`. Совместимый **Clash REST / WebSocket API** (`/version`, `/proxies`, `/connections`, `/rules`, `/configs`, `/logs`, `/traffic`, `/providers/*`, панели Yacd / Metacubexd по `/ui`), побайтово совместимый с `bbolt` файл состояния `cache.db` и встроенный NTP-клиент. |
 
-<div align="center">
+Полное описание всех полей конфигурации, значений по умолчанию и ограничений приведено в справочнике **[docs/reference/README.md](docs/reference/README.md)**.
 
-![Tachyon Core CLI Showcase](assets/readme/cli_showcase.svg)
+---
 
-</div>
+<p align="center">
+  <img src="./assets/readme/section-cli.svg" width="100%" alt="04 — Командный интерфейс (CLI) и обратная совместимость">
+</p>
+
+<p align="center">
+  <img src="./assets/readme/cli_showcase.svg" width="100%" alt="Командный интерфейс tachyon-core: запуск и валидация, компилятор правил, криптогенератор и Clash API">
+</p>
 
 ```bash
-tachyon-core check -c /etc/sing-box/config.json                    # проверка конфигурации
-tachyon-core version                                              # вывод версии ядра
-tachyon-core run -c /etc/sing-box/config.json                     # запуск службы
-tachyon-core rule-set compile rules.json -o rules.srs            # компиляция правил SRS v5
-tachyon-core generate reality-keypair                             # генерация ключей X25519 для REALITY
-tachyon-core generate wg-keypair                                  # генерация ключей WireGuard / AmneziaWG
+tachyon-core check -c /etc/sing-box/config.json                    # предстартовая валидация конфигурации
+tachyon-core version                                              # вывод версии ядра (поддержка симлинка sing-box)
+tachyon-core run -c /etc/sing-box/config.json                     # запуск рабочего процесса службы
+tachyon-core rule-set compile rules.json -o rules.srs            # компиляция бинарного набора правил SRS v5
+tachyon-core generate reality-keypair                             # генерация пары ключей X25519 для REALITY
+tachyon-core generate wg-keypair                                  # генерация пары ключей WireGuard / AmneziaWG
 tachyon-core generate tls-keypair example.com -m 12               # самоподписанный сертификат ECDSA P-256 (PEM)
 ```
 
-| Команда | Назначение | Статус |
-|---|---|:---:|
-| `check -c <path>` | Предстартовая проверка конфига в `watchdog.uc` | **Готово** |
-| `version` | Определение версии в `generator.uc` | **Готово** |
-| `run -c <path>` | Запуск рабочего процесса службы | **Готово** |
-| `format -c <path>` / `merge` | Форматирование и слияние JSON-конфигов | **Готово** |
-| `rule-set compile\|decompile\|upgrade` | Бинарные правила `.srs` (SRS v5) и обновление списков | **Готово** |
-| `rule-set match\|format` | Проверка правил и форматирование | **Готово** |
-| `api` | Управление и мониторинг через Clash API | **Готово** |
-| `generate reality-keypair` | Ключи X25519 для REALITY | **Готово** |
-| `generate wg-keypair` | Ключи WireGuard / AmneziaWG | **Готово** |
-| `generate tls-keypair <sni> [-m <months>]` | Генерация TLS-сертификата и ключа ECDSA P-256 на чистом Rust | **Готово** |
-| `generate uuid` / `generate rand` | Генерация UUID v4 и случайных ключей (`--hex` / `--base64`) | **Готово** |
-| `tools synech` / `tools fptn-decode` | Генерация ECH ConfigList и декодер токенов FPTN | **Готово** |
+<details>
+<summary><b>Полная таблица команд и подкоманд CLI</b></summary>
 
-> Обратная совместимость со сторонним JSON-форматом конфигурации — **временная мера для плавной миграции**, см. дорожную карту ниже.
+<br>
+
+| Команда | Назначение | Статус |
+|:---|:---|:---:|
+| `check -c <path>` | Предстартовая проверка схемы и семантики конфига (интеграция с `watchdog.uc`) | Готово |
+| `version` | Определение версии ядра (автоматическая адаптация вывода при вызове через симлинк `sing-box`) | Готово |
+| `run -c <path>` | Запуск рабочего процесса службы маршрутизации | Готово |
+| `format -c <path>` / `merge` | Форматирование и слияние JSON-конфигураций | Готово |
+| `rule-set compile\|decompile\|upgrade` | Сборка и декомпиляция бинарных наборов `.srs` (SRS v5) и обновление удалённых списков | Готово |
+| `rule-set match\|format` | Проверка срабатывания правил на тестовом адресе/домене и форматирование исходников | Готово |
+| `api` | Клиент управления и мониторинга через Clash REST API | Готово |
+| `generate reality-keypair` | Генерация пары ключей X25519 для протокола REALITY | Готово |
+| `generate wg-keypair` | Генерация ключей WireGuard и AmneziaWG | Готово |
+| `generate tls-keypair <sni> [-m <months>]` | Генерация самоподписанного TLS-сертификата и ключа ECDSA P-256 на чистом Rust | Готово |
+| `generate uuid` / `generate rand` | Генерация UUID v4 и криптостойких случайных последовательностей (`--hex` / `--base64`) | Готово |
+| `tools synech` / `tools fptn-decode` | Генерация `ECH ConfigList` и декодирование токенов доступа FPTN | Готово |
+
+</details>
+
+---
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <img src="./assets/readme/section-releases.svg" width="100%" alt="05 — Релизные сборки, целевые платформы и установка">
 </p>
 
-## 📦 Релизные сборки и установка
+Готовые сборки без внешних системных зависимостей (`musl`, `strip = "symbols"`, а также пакеты `.ipk` для `opkg` и `.apk` для OpenWrt 24.10+/SNAPSHOT) публикуются на странице **[Releases](https://github.com/Dushnilin/tachyon-core/releases/latest)** вместе с файлом контрольных сумм `SHA256SUMS`:
 
-> [!NOTE]
-> **Только готовые билды с версии `0.1.3`:** этот публичный репозиторий служит официальным каналом доставки релизных бинарников `tachyon-core`. Исходный код хранится и собирается в закрытом приватном репозитории, откуда сборки автоматически публикуются сюда через GitHub Actions вместе с `SHA256SUMS`.
+| Платформа / Ассет | Таргет сборки | Целевые устройства и окружения | Форматы поставки |
+|:---|:---|:---|:---:|
+| **`aarch64`** | `aarch64-unknown-linux-musl` | MediaTek Filogic 820/830/880, GL.iNet Flint 2, NanoPi R3S/R4S/R6S, Qualcomm IPQ807x/60xx/50xx, RPi 4/5 | `.tar.gz` · `.ipk` · `.apk` (`~3.7 MiB`) |
+| **`armv7`** | `armv7-unknown-linux-musleabihf` | Qualcomm IPQ4019, MediaTek MT7622/MT7623, Marvell Armada 385, Keenetic Hopper/Peak | `.tar.gz` · `.ipk` · `.apk` (`~3.8 MiB`) |
+| **`armv6`** | `arm-unknown-linux-musleabi` | Broadcom BCM2835, Raspberry Pi Zero / 1, встраиваемые ARMv6-шлюзы | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
+| **`mipsel`** | `mipsel-unknown-linux-musl` (`+soft-float`) | MediaTek MT7621, MT7628, Ralink RT305x/RT5350, Keenetic Extra/Viva/Giga/Speedster | `.tar.gz` · `.ipk` · `.apk` (`~4.2 MiB`) |
+| **`mips`** | `mips-unknown-linux-musl` (`+soft-float`) | Qualcomm Atheros AR71xx / AR934x / QCA95xx (`ath79` Big-Endian) | `.tar.gz` · `.ipk` · `.apk` (`~4.2 MiB`) |
+| **`riscv64`** | `riscv64gc-unknown-linux-musl` | StarFive VisionFive 2, Milk-V, SiFive и платы на архитектуре RISC-V | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
+| **`x86_64`** | `x86_64-unknown-linux-musl` | Мини-ПК (Intel N100/N5105), x86 OpenWrt, контейнеры Alpine и статические Linux-окружения | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
+| **`linux-amd64`** | `x86_64-unknown-linux-gnu` | Выделенные серверы и VPS на Debian, Ubuntu, Fedora, Arch и Proxmox | `.tar.gz` (`~3.9 MiB`) |
+| **`windows-amd64`** | `x86_64-pc-windows-msvc` | Настольные системы и серверы Windows x64 | `.zip` (`~3.4 MiB`) |
+| **`darwin-arm64` / `amd64`** | `aarch64` / `x86_64-apple-darwin` | Компьютеры macOS на базе Apple Silicon (M1–M4) и Intel | `.tar.gz` (`~3.2–3.5 MiB`) |
+| **`android` (JNI & CLI)** | `aarch64` / `armv7` / `x86_64-linux-android` | Встраивание в Android-клиенты (`VpnService`, выравнивание страниц 16 KB для Android 15+) | `libtachyon-*.so` · `.tar.gz` |
+| **`ios` (XCFramework)** | `aarch64-apple-ios` (+ Simulator) | Встраивание в сетевые расширения iOS (`NEPacketTunnelProvider`, C-FFI + `module.modulemap`) | `tachyon-core-ios-xcframework-*.tar.gz` |
 
-Готовые статические сборки без внешних зависимостей (`musl`, `strip = "symbols"`) доступны в разделе **[Releases](https://github.com/Dushnilin/tachyon-core/releases/latest)** под все популярные роутерные и серверные платформы:
-
-| Архитектура (Ассет) | Таргет | Целевые устройства | Размер архива |
-|---|---|---|:---:|
-| **`aarch64`** | `aarch64-unknown-linux-musl` | MediaTek Filogic 820/830/880, Flint 2, NanoPi R3S/R4S/R6S, IPQ807x/60xx/50xx, RPi 4/5 | **~3.7 MiB** |
-| **`armv7`** | `armv7-unknown-linux-musleabihf` | Qualcomm IPQ4019, MediaTek MT7622/MT7623, Marvell Armada 385, Keenetic Hopper/Peak | **~3.8 MiB** |
-| **`armv6`** | `arm-unknown-linux-musleabi` | Raspberry Pi Zero / 1, Broadcom BCM2835 | **~3.9 MiB** |
-| **`mipsel`** | `mipsel-unknown-linux-musl` (`+soft-float`) | MediaTek MT7621, MT7628, Ralink RT305x/RT5350, Keenetic Extra/Viva/Giga/Speedster | **~4.2 MiB** |
-| **`mips`** | `mips-unknown-linux-musl` (`+soft-float`) | Qualcomm Atheros AR71xx / AR934x / QCA95xx (`ath79` Big-Endian) | **~4.2 MiB** |
-| **`riscv64`** | `riscv64gc-unknown-linux-musl` | StarFive VisionFive 2, Milk-V, SiFive | **~3.9 MiB** |
-| **`x86_64` / `linux-amd64`** | `x86_64-unknown-linux-musl` | Мини-ПК (Intel N100/N5105), Proxmox, x86 OpenWrt, VPS и выделенные серверы | **~3.9 MiB** |
-| **`windows-amd64`** | `x86_64-pc-windows-msvc` | Настольные системы и серверы Windows x64 | **~3.4 MiB** |
-| **`darwin-arm64` / `amd64`** | `aarch64` / `x86_64-apple-darwin` | macOS (Apple Silicon M1–M4 и Intel) | **~3.2–3.5 MiB** |
-
-Быстрая установка или обновление на роутере OpenWrt (или Linux-сервере):
+**Быстрая установка или обновление бинарника на роутере OpenWrt / Linux-сервере:**
 
 ```bash
-# Пример для ARM64 (aarch64): скачивание, распаковка и установка
 ARCH="aarch64"
-VER="v0.1.3"
+VER="v0.3.1"
 wget -O /tmp/tachyon-core.tar.gz "https://github.com/Dushnilin/tachyon-core/releases/download/${VER}/tachyon-core-${ARCH}-${VER}.tar.gz"
 tar -xzf /tmp/tachyon-core.tar.gz -C /usr/bin/
-mv -f "/usr/bin/tachyon-core-${ARCH}-${VER}" /usr/bin/tachyon-core
+mv -f "/usr/bin/tachyon-core-${ARCH}-${VER}" /usr/bin/tachyon-core 2>/dev/null || true
 chmod +x /usr/bin/tachyon-core
 /usr/bin/tachyon-core version
 ```
 
-<p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
-</p>
-
-## 🗺️ Дорожная карта
-
-| Фаза | Область | Статус |
-|:---:|---|:---:|
-| **F0** | Фундамент: валидатор схемы конфигурации `check` и CLI `version` (247/0 тестов) | **Завершено** |
-| **F1** | Data Plane v1: инбаунды tproxy/redirect/mixed/direct, аутбаунды socks/ss/vless/trojan/vmess, Smart DNS + FakeIP + LRU, роутер и сниффер | **Завершено** |
-| **F2** | Транспортные протоколы: Hysteria2, TUIC, WireGuard + AmneziaWG, XHTTP, uTLS/REALITY, Naive, Snell, AnyTLS, ShadowTLS | **Завершено** |
-| **F3** | Правила SRS v5 и удалённые обновления списков | **Завершено** |
-| **F4** | Экспериментальный стек: Clash API (Yacd, secret, WebSocket), `cache.db` (bbolt r/w) | **Завершено** |
-| **F5** | Серверная часть: все 12 серверных инбаундов (VLESS, Trojan, VMess, SS, Hy2, TUIC, AnyTLS, Naive, ShadowTLS, MASQUE, Mieru, AWG) с собственным TLS 1.3 и UDP | **Завершено** |
-| **F6** | TUN-подсистема: userspace-стек на `smoltcp`, TCP-прокси, UDP NAT, routing table 2022 + fwmark, GRO/virtio_net_hdr | **Завершено** |
-| **F7** | Системный демон и метрики: совместимость со службой Windows и демоном, расширенная телеметрия | Запланировано |
-| **F8** | Мобильные платформы: UniFFI/JNI биндинги | Запланировано |
-| **F9** | MIPS softfloat musl: статические сборки `mipsel` и `mips` (`+soft-float`) через `-Zbuild-std` | **Завершено** |
-| **F10** | Интеграция в Tachyon + адаптивный движок `HardwareProfile` (4 профиля RAM, 3 уровня давления памяти) и переход на поставку готовых билдов (`v0.1.3+`) | **Завершено** |
-| **F11** | **Собственная система конфигурации и хранения данных на флеше** | **Декабрь 2026** |
-| **F12** | **Полный переход на нативный формат конфигурации Tachyon** | **1 января 2027** |
-
-### Переход на собственный формат конфигурации
-
-**Декабрь 2026 — родной формат и своё хранилище.** Ядро получает собственный формат конфигурации, спроектированный специально под задачи роутера, и собственное хранилище состояния на флеше (`/etc/tachyon/`) вместо разрозненных файлов и внешних путей. Правила, списки и кэши переезжают в единый компактный формат.
-
-**1 января 2027 — завершение миграции.** Чтобы переход не ломал существующие установки, **автоматическая миграция отдаётся вместе с F11, до 1 января**: при первом запуске новой версии существующий конфиг один раз конвертируется на месте с резервной копией и проверкой результата. После этого ядро работает исключительно со своим родным форматом.
+---
 
 <p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
+  <img src="./assets/readme/section-roadmap.svg" width="100%" alt="06 — Дорожная карта, поддержка и условия лицензии">
 </p>
 
-## 💖 Поддержать разработку
+| Фаза | Область разработки | Статус |
+|:---:|:---|:---:|
+| **F0** | Фундамент: валидатор схемы конфигурации `check` и CLI `version` (247/0 тестов корпуса) | Завершено |
+| **F1** | Data Plane v1: инбаунды `tproxy`/`redirect`/`mixed`/`direct`, аутбаунды `socks`/`ss`/`vless`/`trojan`/`vmess`, Smart DNS + FakeIP + LRU, роутер и сниффер | Завершено |
+| **F2** | Транспортные протоколы: Hysteria2, TUIC v5, WireGuard + AmneziaWG, XHTTP, uTLS/REALITY, NaiveProxy, Snell, AnyTLS, ShadowTLS v3 | Завершено |
+| **F3** | Бинарные правила `.trs` (zero-copy `mmap`) и `.srs` (SRS v5), удалённая синхронизация списков | Завершено |
+| **F4** | Экспериментальный стек: Clash API (Yacd / Metacubexd, secret, WebSocket), побайтово совместимый `cache.db` (bbolt r/w) | Завершено |
+| **F5** | Серверная часть: все 12 серверных инбаундов (VLESS, Trojan, VMess, SS, Hy2, TUIC, AnyTLS, Naive, ShadowTLS, MASQUE, Mieru, AWG) с собственным TLS 1.3 и UDP | Завершено |
+| **F6** | TUN-подсистема: стек в пространстве пользователя на `smoltcp`, TCP-прокси, UDP NAT, таблица маршрутизации `2022` + fwmark, GSO/GRO | Завершено |
+| **F7** | Системный демон и расширенная телеметрия: интеграция со службой Windows и системным демоном | Запланировано |
+| **F8** | Мобильные платформы: нативные библиотеки Android JNI (`libtachyon-*.so`, 16 KB page alignment) и iOS C-FFI (`TachyonCore.xcframework`) | Завершено |
+| **F9** | MIPS soft-float musl: статические сборки `mipsel` и `mips` (`+soft-float`) через `-Zbuild-std` | Завершено |
+| **F10** | Интеграция в экосистему Tachyon, адаптивный менеджер памяти (4 профиля ОЗУ, 3 уровня давления) и переход на поставку готовых сборок (`v0.1.3+`) | Завершено |
+| **F11** | Собственная система конфигурации и единое хранилище состояния на флеше (`/etc/tachyon/`) с автоматической миграцией | Декабрь 2026 |
+| **F12** | Полный переход на нативный формат конфигурации Tachyon | 1 января 2027 |
 
-Если Tachyon помогает вам и делает работу в сети комфортной, вы можете поддержать проект и автора! ☕ 🧀 🌭
+<details>
+<summary><b>План миграции на нативный формат конфигурации (F11–F12)</b></summary>
 
-⭐ **Boosty (подписки, донаты, эксклюзив):**  
-👉 [**Поддержать на Boosty**](https://boosty.to/tachyon)
+<br>
 
-💳 **Карты РФ / СБП / Tinkoff Pay:**  
-👉 [**Поддержать проект на CloudTips**](https://pay.cloudtips.ru/p/449c5ef9)
+- **Декабрь 2026 (F11) — нативный формат и единое хранилище.** Ядро получает собственный формат конфигурации, спроектированный под роутерные сценарии, и компактное хранилище состояния в `/etc/tachyon/` вместо разрозненных файлов. Вместе с обновлением поставляется встроенный конвертер: при первом запуске существующий JSON-конфиг автоматически переводится в новый формат с сохранением резервной копии и проверкой результата.
+- **1 января 2027 (F12) — завершение переходного периода.** Обратная совместимость со сторонней JSON-схемой отключается, и ядро переходит на работу исключительно с нативным форматом конфигурации.
 
-🪙 **Криптовалюта:**
-* **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
-* **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`
-* **TON:** `UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR`
-* **Solana (SOL):** `3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh`
+</details>
 
-<p align="center">
-  <img src="assets/readme/divider_stream.svg" width="100%" alt="divider" />
-</p>
+---
 
-## 📜 Лицензия
+## Поддержать разработку
 
-Начиная с версии **`v0.1.3`**, программное обеспечение **tachyon-core** распространяется в виде готовых исполняемых сборок на условиях проприетарной лицензии **[TACHYON CORE BINARY LICENSE v1.0](LICENSE)** (`Copyright (c) 2026 Dushnilin. All rights reserved.`).
+Если Tachyon помогает в работе, вы можете поддержать развитие проекта:
+
+- **Boosty:** [boosty.to/tachyon](https://boosty.to/tachyon)
+- **Карты РФ и СБП (CloudTips):** [pay.cloudtips.ru/p/449c5ef9](https://pay.cloudtips.ru/p/449c5ef9)
+- **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
+- **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`
+- **TON:** `UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR`
+- **Solana (SOL):** `3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh`
+
+---
+
+## Лицензия и правовая информация
+
+Начиная с версии **`v0.1.3`**, программное обеспечение **tachyon-core** распространяется в виде готовых исполняемых сборок на условиях проприетарной лицензии **[TACHYON CORE BINARY LICENSE v1.0](LICENSE)** (`Copyright (c) 2026 Dushnilin. All rights reserved.`):
 
 - Разрешается бесплатная загрузка, установка и использование неизменённых официальных бинарных сборок в личных некоммерческих целях и во внутренней сетевой инфраструктуре.
-- **Запрещается** копирование, переупаковка, повторное распространение в составе сторонних прошивок/пакетов, коммерческое использование, продажа, декомпиляция, модификация, создание производных продуктов или удаление уведомлений об авторских правах без предварительного письменного разрешения правообладателя.
-- Исторические выпуски до версии `v0.1.2` включительно остаются доступными на условиях лицензии GPL-3.0-only, действовавшей на момент их публикации.
+- **Запрещается** копирование, переупаковка, повторное распространение в составе сторонних прошивок или пакетов, коммерческое использование, продажа, декомпиляция, модификация, создание производных продуктов или удаление уведомлений об авторских правах без предварительного письменного разрешения правообладателя.
+- Исторические выпуски до версии `v0.1.2` включительно остаются доступными на условиях лицензии `GPL-3.0-only`, действовавшей на момент их публикации.
 
-## ⚖️ Правовая информация и отказ от ответственности
+**Отказ от ответственности:**
 
 1. **Назначение программного обеспечения.** `tachyon-core` является универсальным техническим средством маршрутизации сетевого трафика, балансировки нагрузки, диагностики сетевых соединений, обеспечения информационной безопасности и построения защищённых корпоративных и личных каналов связи (VPN).
-2. **Соблюдение законодательства.** Программное обеспечение **не создавалось, не предназначено и не распространяется** для целей нарушения законодательства Российской Федерации (включая ФЗ № 149-ФЗ «Об информации, информационных технологиях и о защите информации») или законодательства любой иной юрисдикции, а равно для неправомерного получения доступа к информационным ресурсам, доступ к которым ограничен в соответствии с законом.
-3. **Использование на собственный страх и риск.** Автор и правообладатель не предоставляют никаких прокси/VPN-серверов, узлов связи, подписок, ключей доступа или готовых списков маршрутизации. Программное обеспечение поставляется по принципу «КАК ЕСТЬ» (`AS IS`). Любая установка, настройка и эксплуатация программы осуществляются пользователем исключительно по собственной инициативе, **на свой страх и риск** и под свою полную единоличную ответственность. Правообладатель не несёт ответственности за действия пользователя, выбранные им конфигурации и любые последствия использования программного обеспечения.
-
-<p align="center">
-  <img src="assets/readme/footer_tachyon.svg" width="100%" alt="Tachyon Community Footer" />
-</p>
+2. **Соблюдение законодательства.** Программное обеспечение не создавалось, не предназначено и не распространяется для целей нарушения законодательства Российской Федерации (включая ФЗ № 149-ФЗ «Об информации, информационных технологиях и о защите информации») или законодательства любой иной юрисдикции, а равно для неправомерного получения доступа к информационным ресурсам, доступ к которым ограничен в соответствии с законом.
+3. **Использование на собственный страх и риск.** Автор и правообладатель не предоставляют никаких прокси/VPN-серверов, узлов связи, подписок, ключей доступа или готовых списков маршрутизации. Программное обеспечение поставляется по принципу «КАК ЕСТЬ» (`AS IS`). Любая установка, настройка и эксплуатация программы осуществляются пользователем исключительно по собственной инициативе, на свой страх и риск и под свою полную единоличную ответственность. Правообладатель не несёт ответственности за действия пользователя, выбранные им конфигурации и любые последствия использования программного обеспечения.

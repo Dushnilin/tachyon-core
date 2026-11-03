@@ -1,244 +1,76 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="100%" height="100%">
-  <title>Tachyon Core - Relativistic Speed &amp; Line-Rate Throughput</title>
-  <defs>
-    <!-- Dark Tech Canvas Gradient -->
-    <radialGradient id="speed-bg" cx="50%" cy="30%" r="85%">
-      <stop offset="0%" stop-color="#111827" stop-opacity="0.95"/>
-      <stop offset="45%" stop-color="#090D16" stop-opacity="0.98"/>
-      <stop offset="100%" stop-color="#030712" stop-opacity="1"/>
-    </radialGradient>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="200" viewBox="0 0 1200 200"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Ключевые инженерные метрики tachyon-core</title>
+  <desc id="desc">Сводка замеров tachyon-core: 4.2 MiB ОЗУ в простое, 22.3 ms холодный старт, 0.00 ms пауз сборщика мусора, 51.7 Gbps пропускная способность на прямом транзите, 36 из 39 побед в мульти-протокольном тесте и статический бинарник 6.9–10.2 MiB.</desc>
 
-    <radialGradient id="speed-cyan-glow" cx="20%" cy="55%" r="50%">
-      <stop offset="0%" stop-color="#00F0FF" stop-opacity="0.22"/>
-      <stop offset="60%" stop-color="#00F0FF" stop-opacity="0.03"/>
-      <stop offset="100%" stop-color="#00F0FF" stop-opacity="0"/>
-    </radialGradient>
+  <rect width="1200" height="200" rx="16" fill="#141415"/>
+  <rect x="0.5" y="0.5" width="1199" height="199" rx="15.5" fill="none" stroke="#2e2e32" stroke-width="1"/>
 
-    <radialGradient id="speed-purple-glow" cx="80%" cy="70%" r="50%">
-      <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.18"/>
-      <stop offset="70%" stop-color="#8B5CF6" stop-opacity="0.02"/>
-      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0"/>
-    </radialGradient>
-
-    <!-- Holographic Title Gradient -->
-    <linearGradient id="speed-title-grad" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#00F0FF"/>
-      <stop offset="35%" stop-color="#38BDF8"/>
-      <stop offset="70%" stop-color="#818CF8"/>
-      <stop offset="100%" stop-color="#C084FC"/>
-    </linearGradient>
-
-    <linearGradient id="gauge-grad" x1="0%" y1="100%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#10B981"/>
-      <stop offset="50%" stop-color="#00F0FF"/>
-      <stop offset="85%" stop-color="#818CF8"/>
-      <stop offset="100%" stop-color="#C084FC"/>
-    </linearGradient>
-
-    <linearGradient id="speed-card-grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1E293B" stop-opacity="0.75"/>
-      <stop offset="100%" stop-color="#0F172A" stop-opacity="0.85"/>
-    </linearGradient>
-
-    <linearGradient id="laser-stream-grad" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#00F0FF" stop-opacity="0"/>
-      <stop offset="30%" stop-color="#00F0FF" stop-opacity="0.8"/>
-      <stop offset="70%" stop-color="#C084FC" stop-opacity="0.9"/>
-      <stop offset="100%" stop-color="#00F0FF" stop-opacity="0"/>
-    </linearGradient>
-
-    <!-- Neon Glow Filter -->
-    <filter id="speed-glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1200" height="320">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-
-    <filter id="core-speed-glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1200" height="320">
-      <feGaussianBlur stdDeviation="8" result="blur"/>
-      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
-
-    <!-- Miniature 3D Tachyon Brand Logo Symbol -->
-    <g id="tachyon-mini-logo">
-      <circle cx="10" cy="10" r="9" fill="#00F0FF" fill-opacity="0.12"/>
-      <!-- Left 3D Obsidian Facet -->
-      <polygon points="6,3 2,10 6,17 6,10" fill="#1E293B" stroke="#38BDF8" stroke-width="0.6"/>
-      <polygon points="6,3 6,10 9,10" fill="#334155" stroke="#00F0FF" stroke-width="0.6"/>
-      <polygon points="2,10 6,17 6,10" fill="#0F172A" stroke="#1E293B" stroke-width="0.6"/>
-      <polygon points="9,10 6,17 6,10" fill="#0284C7" stroke="#00F0FF" stroke-width="0.6"/>
-      <!-- Right 3D Obsidian Facet -->
-      <polygon points="14,3 18,10 14,17 14,10" fill="#1E293B" stroke="#818CF8" stroke-width="0.6"/>
-      <polygon points="14,3 14,10 11,10" fill="#334155" stroke="#C084FC" stroke-width="0.6"/>
-      <polygon points="18,10 14,17 14,10" fill="#0F172A" stroke="#1E293B" stroke-width="0.6"/>
-      <polygon points="11,10 14,17 14,10" fill="#7C3AED" stroke="#C084FC" stroke-width="0.6"/>
-      <!-- Central Singularity Core -->
-      <polygon points="10,6 13,10 10,14 7,10" fill="#00F0FF" stroke="#FFFFFF" stroke-width="0.8"/>
-      <circle cx="10" cy="10" r="1.5" fill="#FFFFFF"/>
-    </g>
-  </defs>
-
-  <style>
-    @keyframes warpDash1 {
-      0% { stroke-dashoffset: 240; }
-      100% { stroke-dashoffset: 0; }
-    }
-    @keyframes warpDash2 {
-      0% { stroke-dashoffset: 180; }
-      100% { stroke-dashoffset: 0; }
-    }
-    @keyframes pulseSpeedHub {
-      0%, 100% { transform: scale(1); opacity: 0.9; }
-      50% { transform: scale(1.05); opacity: 1; filter: drop-shadow(0 0 12px #00F0FF); }
-    }
-    @keyframes speedRadarSweep {
-      from { transform: rotate(0deg); }
-      to { transform: rotate(360deg); }
-    }
-    @keyframes beaconFast {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.2; }
-    }
-
-    .warp-track-1 { stroke-dasharray: 24 48; animation: warpDash1 1.4s linear infinite; }
-    .warp-track-2 { stroke-dasharray: 16 32; animation: warpDash2 0.9s linear infinite; }
-    .warp-track-3 { stroke-dasharray: 32 64; animation: warpDash1 2.0s linear infinite; }
-    .gauge-pulse { transform-origin: 190px 185px; animation: pulseSpeedHub 2.5s ease-in-out infinite; }
-    .radar-rot { transform-origin: 190px 185px; animation: speedRadarSweep 4s linear infinite; }
-    .beacon-fast { animation: beaconFast 1.2s ease-in-out infinite; }
-
-    .speed-title { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 900; font-size: 20px; fill: url(#speed-title-grad); letter-spacing: 1px; }
-    .speed-sub { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 500; font-size: 13px; fill: #94A3B8; }
-    .metric-hdr { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 700; font-size: 13px; fill: #F8FAFC; }
-    .metric-num { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 26px; font-weight: 900; }
-    .metric-tag { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10px; font-weight: 700; }
-  </style>
-
-  <!-- Background Base -->
-  <rect width="1200" height="320" rx="16" fill="url(#speed-bg)" stroke="#1E293B" stroke-width="1.5"/>
-  <rect width="1200" height="320" rx="16" fill="url(#speed-cyan-glow)"/>
-  <rect width="1200" height="320" rx="16" fill="url(#speed-purple-glow)"/>
-
-  <!-- Matrix Grid Lines -->
-  <g opacity="0.05" stroke="#FFFFFF" stroke-width="1">
-    <path d="M 0,60 L 1200,60 M 0,130 L 1200,130 M 0,200 L 1200,200 M 0,265 L 1200,265" />
-    <path d="M 120,0 L 120,320 M 240,0 L 240,320 M 360,0 L 360,320 M 480,0 L 480,320 M 600,0 L 600,320 M 720,0 L 720,320 M 840,0 L 840,320 M 960,0 L 960,320 M 1080,0 L 1080,320" />
+  <!-- Primary metric card: Idle RSS (280px wide) -->
+  <g transform="translate(20, 20)">
+    <rect x="0" y="0" width="280" height="160" rx="12" fill="#19191b" stroke="#38bdf8" stroke-width="1" stroke-opacity="0.5"/>
+    <rect x="16" y="16" width="84" height="24" rx="6" fill="#232325"/>
+    <text x="58" y="32" text-anchor="middle" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">4.2 MiB</text>
+    <text x="264" y="32" text-anchor="end" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">против 25–41 MiB</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="500">Память в простое (RSS)</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Около 10 MiB под нагрузкой</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="400">Без резерва кучи и OOM на 64–128 МБ</text>
+    <text x="16" y="142" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">экономия ОЗУ в ~10 раз</text>
   </g>
 
-  <!-- Top Header -->
-  <g transform="translate(45, 28)">
-    <rect width="210" height="22" rx="11" fill="#0B132B" stroke="#00F0FF" stroke-width="1" stroke-opacity="0.6"/>
-    <circle cx="12" cy="11" r="3.5" fill="#00F0FF" class="beacon-fast"/>
-    <text x="24" y="15" font-family="ui-monospace, monospace" font-size="10" font-weight="700" fill="#00F0FF">THROUGHPUT &amp; ZERO-COPY</text>
-
-    <text x="0" y="44" class="speed-title">⚡ TACHYON RELATIVISTIC VELOCITY PIPELINE</text>
-    <text x="0" y="62" class="speed-sub">Линейная аппаратная скорость 10G, нулевое копирование и детерминированный RAII</text>
+  <!-- Card 2: Cold Start (164px) -->
+  <g transform="translate(312, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="76" height="24" rx="6" fill="#232325"/>
+    <text x="54" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">22.3 ms</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Холодный старт</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Против 160–270 ms</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">у ядер на Go</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">в 7–12× быстрее</text>
   </g>
 
-  <!-- ================================================================= -->
-  <!-- LEFT: LINE-RATE SPEEDOMETER HUD GAUGE -->
-  <!-- ================================================================= -->
-  <g transform="translate(190, 185)">
-    <!-- Outer Track -->
-    <circle r="84" fill="none" stroke="#1E293B" stroke-width="5"/>
-    <!-- Animated Arc Track -->
-    <circle r="84" fill="none" stroke="url(#gauge-grad)" stroke-width="5" stroke-dasharray="380 150" stroke-linecap="round" filter="url(#speed-glow)"/>
-    
-    <!-- Rotating Sensor Reticle -->
-    <g class="radar-rot">
-      <circle r="66" fill="none" stroke="#334155" stroke-width="1" stroke-dasharray="6 12"/>
-      <circle cx="66" cy="0" r="3.5" fill="#00F0FF" filter="url(#core-speed-glow)"/>
-      <circle cx="-66" cy="0" r="2.5" fill="#C084FC"/>
-    </g>
-
-    <!-- Speed Ticks -->
-    <line x1="-72" y1="36" x2="-62" y2="30" stroke="#64748B" stroke-width="2"/>
-    <line x1="-72" y1="-36" x2="-62" y2="-30" stroke="#64748B" stroke-width="2"/>
-    <line x1="0" y1="-78" x2="0" y2="-66" stroke="#00F0FF" stroke-width="2"/>
-    <line x1="72" y1="-36" x2="62" y2="-30" stroke="#818CF8" stroke-width="2"/>
-    <line x1="72" y1="36" x2="62" y2="30" stroke="#C084FC" stroke-width="2"/>
-
-    <!-- Central Fusion Core -->
-    <g class="gauge-pulse">
-      <circle r="46" fill="#090E1A" stroke="#00F0FF" stroke-width="2" filter="url(#core-speed-glow)"/>
-      <circle r="36" fill="#0F172A" stroke="#38BDF8" stroke-width="1.2"/>
-      <!-- Lightning Icon -->
-      <path d="M 2,-14 L -8,2 L 0,2 L -2,16 L 10,-2 L 2,-2 Z" fill="url(#speed-title-grad)"/>
-    </g>
-
-    <!-- Speed Readout -->
-    <text y="64" font-family="ui-monospace, monospace" font-size="11" font-weight="700" fill="#00F0FF" text-anchor="middle" letter-spacing="1">51.7 Gbps LINE-SPEED</text>
+  <!-- Card 3: Zero GC (164px) -->
+  <g transform="translate(488, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="76" height="24" rx="6" fill="#232325"/>
+    <text x="54" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">0.00 ms</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Без пауз GC</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Детерминированный</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">RAII без STW-фаз</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">p50 170 µs</text>
   </g>
 
-  <!-- ================================================================= -->
-  <!-- CENTER: DYNAMIC WARP CONDUITS -->
-  <!-- ================================================================= -->
-  <g fill="none" stroke-linecap="round" transform="translate(300, 115)">
-    <path d="M 0,20 L 260,20" stroke="#1E293B" stroke-width="2"/>
-    <path d="M 0,20 L 260,20" stroke="#10B981" stroke-width="2.5" class="warp-track-2" filter="url(#speed-glow)"/>
-
-    <path d="M 0,55 L 260,55" stroke="#1E293B" stroke-width="3"/>
-    <path d="M 0,55 L 260,55" stroke="url(#laser-stream-grad)" stroke-width="3.5" class="warp-track-1" filter="url(#core-speed-glow)"/>
-
-    <path d="M 0,90 L 260,90" stroke="#1E293B" stroke-width="2"/>
-    <path d="M 0,90 L 260,90" stroke="#00F0FF" stroke-width="2.5" class="warp-track-2" filter="url(#speed-glow)"/>
-
-    <path d="M 0,125 L 260,125" stroke="#1E293B" stroke-width="2"/>
-    <path d="M 0,125 L 260,125" stroke="#C084FC" stroke-width="2.5" class="warp-track-3"/>
+  <!-- Card 4: Direct Throughput (164px) -->
+  <g transform="translate(664, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="88" height="24" rx="6" fill="#232325"/>
+    <text x="60" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">51.7 Gbps</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Прямой транзит</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Zero-copy splice</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">на 1 ядре CPU</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">0.163 s/GiB CPU</text>
   </g>
 
-  <!-- ================================================================= -->
-  <!-- RIGHT: 4 CLEAN SPEED PODS (No Clutter, Pure Essence) -->
-  <!-- ================================================================= -->
-  <g transform="translate(600, 95)">
-    <!-- Pod 1: Throughput -->
-    <g transform="translate(0, 0)">
-      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#10B981" stroke-opacity="0.35" stroke-width="1.2"/>
-      <g transform="translate(16, 16)">
-        <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">Peak Throughput</text>
-      </g>
-      <text x="16" y="66" class="metric-num" fill="#34D399">51.7 Gbps</text>
-      <text x="165" y="62" class="metric-tag" fill="#10B981">ZERO-COPY</text>
-      <text x="165" y="75" class="metric-tag" fill="#64748B">Direct / Splice</text>
-    </g>
+  <!-- Card 5: Protocol Matrix (164px) -->
+  <g transform="translate(840, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="72" height="24" rx="6" fill="#232325"/>
+    <text x="52" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">36 / 39</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Побед в матрице</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">Отрыв 2.1–5.4× на</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">H2, gRPC и QUIC</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">39/39 статус OK</text>
+  </g>
 
-    <!-- Pod 2: Packet Forwarding Rate -->
-    <g transform="translate(285, 0)">
-      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#00F0FF" stroke-opacity="0.35" stroke-width="1.2"/>
-      <g transform="translate(16, 16)">
-        <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">Packet Forwarding</text>
-      </g>
-      <text x="16" y="66" class="metric-num" fill="#00F0FF">1.48 Mpps</text>
-      <text x="155" y="62" class="metric-tag" fill="#38BDF8">STEADY-STATE</text>
-      <text x="155" y="75" class="metric-tag" fill="#64748B">Zero Alloc</text>
-    </g>
-
-    <!-- Pod 3: Latency Jitter -->
-    <g transform="translate(0, 108)">
-      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#8B5CF6" stroke-opacity="0.35" stroke-width="1.2"/>
-      <g transform="translate(16, 16)">
-        <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">Tail Jitter (GC)</text>
-      </g>
-      <text x="16" y="66" class="metric-num" fill="#C084FC">0.00 ms</text>
-      <text x="145" y="62" class="metric-tag" fill="#C084FC">ZERO-GC</text>
-      <text x="145" y="75" class="metric-tag" fill="#64748B">Deterministic</text>
-    </g>
-
-    <!-- Pod 4: CPU Cycles -->
-    <g transform="translate(285, 108)">
-      <rect width="265" height="92" rx="10" fill="url(#speed-card-grad)" stroke="#F59E0B" stroke-opacity="0.35" stroke-width="1.2"/>
-      <g transform="translate(16, 16)">
-        <use href="#tachyon-mini-logo" x="0" y="0"/>
-        <text x="28" y="15" class="metric-hdr">CPU Efficiency</text>
-      </g>
-      <text x="16" y="66" class="metric-num" fill="#FBBF24">0.16 s/GiB</text>
-      <text x="160" y="62" class="metric-tag" fill="#FBBF24">-40% CPU</text>
-      <text x="160" y="75" class="metric-tag" fill="#64748B">vs Go cores</text>
-    </g>
+  <!-- Card 6: Static Binary (164px) -->
+  <g transform="translate(1016, 20)">
+    <rect x="0" y="0" width="164" height="160" rx="12" fill="#19191b" stroke="#2e2e32" stroke-width="1"/>
+    <rect x="16" y="16" width="76" height="24" rx="6" fill="#232325"/>
+    <text x="54" y="32" text-anchor="middle" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500">6.9 MiB</text>
+    <text x="16" y="68" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="16" font-weight="500">Бинарник musl</text>
+    <text x="16" y="92" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">3.2–4.2 MiB в .tar.gz</text>
+    <text x="16" y="112" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="13" font-weight="400">встаёт во флеш 16 МБ</text>
+    <text x="16" y="142" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">без USB / extroot</text>
   </g>
 </svg>

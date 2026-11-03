@@ -2,7 +2,7 @@
      width="1200" height="400" viewBox="0 0 1200 400"
      role="img" aria-labelledby="title desc">
   <title id="title">tachyon-core — сетевое ядро маршрутизации и туннелирования на чистом Rust</title>
-  <desc id="desc">Статическое сетевое ядро маршрутизации, проксирования и обхода фильтрации на 100% чистом Rust без зависимостей от C и CGO для роутеров OpenWrt, серверов Linux, десктопов и мобильных платформ.</desc>
+  <desc id="desc">Статическое сетевое ядро маршрутизации, проксирования и управления трафиком на 100% чистом Rust без зависимостей от C и CGO для роутеров OpenWrt, серверов Linux, десктопов и мобильных платформ.</desc>
 
   <!-- Canvas -->
   <rect width="1200" height="400" rx="16" fill="#141415"/>
@@ -115,7 +115,7 @@
       <text x="16" y="66" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">Hy2 · TUIC v5 · Naive UoT</text>
 
       <rect x="238" y="0" width="226" height="84" rx="8" fill="#141415" stroke="#2e2e32" stroke-width="1"/>
-      <text x="254" y="24" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">VPN и обход DPI</text>
+      <text x="254" y="24" fill="#ededed" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500">VPN и L4/L7-шейпинг</text>
       <text x="254" y="46" fill="#a1a1a6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">AmneziaWG 2/3 · MASQUE</text>
       <text x="254" y="66" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400">Adaptive Desync · OpenVPN</text>
     </g>

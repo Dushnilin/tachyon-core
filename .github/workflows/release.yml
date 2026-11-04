@@ -96,17 +96,10 @@ jobs:
             os: windows-latest
             is_windows: true
             budget: 20971520
-          - name: darwin-amd64
-            target: x86_64-apple-darwin
-            os: macos-latest
-            budget: 16777216
-          - name: darwin-arm64
+          - name: apple
             target: aarch64-apple-darwin
             os: macos-latest
-            budget: 16777216
-          - name: ios-arm64
-            target: aarch64-apple-ios
-            os: macos-latest
+            is_apple_bundle: true
             budget: 16777216
           # Android NDK targets (Bionic PIE binary & libtachyon.so JNI library, API 24+, 16 KB page alignment)
           - name: aarch64-linux-android
@@ -140,22 +133,39 @@ jobs:
       # names it cannot resolve. Build a real musl and link through the apt
       # cross gcc driver with `-B` pointed at the musl lib dir. (musl.cc, the
       # usual prebuilt toolchain for this, times out from the runner network.)
+      - name: Prepare MIPS musl cache dir
+        if: startsWith(matrix.target, 'mips')
+        run: |
+          sudo mkdir -p /opt/mipsel-musl /opt/mips-musl
+          sudo chown -R "$(id -u):$(id -g)" /opt/mipsel-musl /opt/mips-musl
+
+      - name: Cache MIPS musl toolchain
+        if: startsWith(matrix.target, 'mips')
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/mipsel-musl
+            /opt/mips-musl
+          key: mips-musl-1.2.5-softfloat-${{ matrix.target }}-v1
+
       - name: MIPS musl toolchain (mipsel)
         if: matrix.target == 'mipsel-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu
-          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
-            https://musl.libc.org/releases/musl-1.2.5.tar.gz
-          tar -xzf /tmp/musl.tar.gz -C /tmp
-          (cd /tmp/musl-1.2.5 && \
-            CROSS_COMPILE=mipsel-linux-gnu- CFLAGS="-mips32r2 -msoft-float" ./configure --prefix=/opt/mipsel-musl && \
-            make -j"$(nproc)" && sudo make install)
-          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
-          mipsel-linux-gnu-gcc -mips32r2 -msoft-float -c /tmp/dlfo.c -o /tmp/dlfo.o
-          rm -rf /tmp/eh-mipsel && mkdir -p /tmp/eh-mipsel
-          (cd /tmp/eh-mipsel && mipsel-linux-gnu-ar x "$(mipsel-linux-gnu-gcc -mips32r2 -msoft-float -print-file-name=libgcc_eh.a)")
-          sudo mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a /tmp/eh-mipsel/*.o /tmp/dlfo.o
+          if [ ! -f /opt/mipsel-musl/lib/libunwind.a ]; then
+            curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
+              https://musl.libc.org/releases/musl-1.2.5.tar.gz
+            tar -xzf /tmp/musl.tar.gz -C /tmp
+            (cd /tmp/musl-1.2.5 && \
+              CROSS_COMPILE=mipsel-linux-gnu- CFLAGS="-mips32r2 -msoft-float" ./configure --prefix=/opt/mipsel-musl && \
+              make -j"$(nproc)" && make install)
+            echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
+            mipsel-linux-gnu-gcc -mips32r2 -msoft-float -c /tmp/dlfo.c -o /tmp/dlfo.o
+            rm -rf /tmp/eh-mipsel && mkdir -p /tmp/eh-mipsel
+            (cd /tmp/eh-mipsel && mipsel-linux-gnu-ar x "$(mipsel-linux-gnu-gcc -mips32r2 -msoft-float -print-file-name=libgcc_eh.a)")
+            mipsel-linux-gnu-ar crs /opt/mipsel-musl/lib/libunwind.a /tmp/eh-mipsel/*.o /tmp/dlfo.o
+          fi
           {
             echo "CC_mipsel_unknown_linux_musl=mipsel-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-gnu-gcc"
@@ -173,17 +183,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-mips-linux-gnu binutils-mips-linux-gnu
-          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
-            https://musl.libc.org/releases/musl-1.2.5.tar.gz
-          tar -xzf /tmp/musl.tar.gz -C /tmp
-          (cd /tmp/musl-1.2.5 && \
-            CROSS_COMPILE=mips-linux-gnu- CFLAGS="-mips32r2 -msoft-float" ./configure --prefix=/opt/mips-musl && \
-            make -j"$(nproc)" && sudo make install)
-          echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
-          mips-linux-gnu-gcc -mips32r2 -msoft-float -c /tmp/dlfo.c -o /tmp/dlfo.o
-          rm -rf /tmp/eh-mips && mkdir -p /tmp/eh-mips
-          (cd /tmp/eh-mips && mips-linux-gnu-ar x "$(mips-linux-gnu-gcc -mips32r2 -msoft-float -print-file-name=libgcc_eh.a)")
-          sudo mips-linux-gnu-ar crs /opt/mips-musl/lib/libunwind.a /tmp/eh-mips/*.o /tmp/dlfo.o
+          if [ ! -f /opt/mips-musl/lib/libunwind.a ]; then
+            curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
+              https://musl.libc.org/releases/musl-1.2.5.tar.gz
+            tar -xzf /tmp/musl.tar.gz -C /tmp
+            (cd /tmp/musl-1.2.5 && \
+              CROSS_COMPILE=mips-linux-gnu- CFLAGS="-mips32r2 -msoft-float" ./configure --prefix=/opt/mips-musl && \
+              make -j"$(nproc)" && make install)
+            echo 'int _dl_find_object(void *pc, void *dlfo) { return -1; }' > /tmp/dlfo.c
+            mips-linux-gnu-gcc -mips32r2 -msoft-float -c /tmp/dlfo.c -o /tmp/dlfo.o
+            rm -rf /tmp/eh-mips && mkdir -p /tmp/eh-mips
+            (cd /tmp/eh-mips && mips-linux-gnu-ar x "$(mips-linux-gnu-gcc -mips32r2 -msoft-float -print-file-name=libgcc_eh.a)")
+            mips-linux-gnu-ar crs /opt/mips-musl/lib/libunwind.a /tmp/eh-mips/*.o /tmp/dlfo.o
+          fi
           {
             echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-gnu-gcc"
@@ -195,7 +207,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-          targets: ${{ matrix.target == 'aarch64-apple-ios' && 'aarch64-apple-ios,aarch64-apple-ios-sim' || matrix.target }}
+          targets: ${{ matrix.is_apple_bundle && 'aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim' || matrix.target }}
 
       - name: Toolchain (std from source)
         if: ${{ matrix.build-std }}
@@ -203,6 +215,17 @@ jobs:
         with:
           toolchain: nightly-2026-10-30
           components: rust-src
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-reg-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-reg-
 
       # All musl targets are explicitly configured in .cargo/config.toml with linker = "rust-lld"
       # and target-specific rustflags. We do not set RUSTFLAGS in env to avoid wiping those flags.
@@ -238,7 +261,11 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          if [ -n "${{ matrix.build-std }}" ]; then
+          if [ "${{ matrix.is_apple_bundle }}" = "true" ]; then
+            for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios; do
+              cargo build -p core-cli --release --target "$t"
+            done
+          elif [ -n "${{ matrix.build-std }}" ]; then
             cargo build -p core-cli --release --target ${{ matrix.target }} \
               -Z build-std=std,panic_abort
           else
@@ -248,27 +275,70 @@ jobs:
       - name: Size budget
         shell: bash
         run: |
-          if [ "${{ matrix.is_windows }}" = "true" ]; then
+          budget="${{ matrix.budget || env.SIZE_BUDGET }}"
+          if [ "${{ matrix.is_apple_bundle }}" = "true" ]; then
+            for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios; do
+              bin="target/${t}/release/tachyon-core"
+              size=$(wc -c < "$bin" | tr -d ' ')
+              echo "${t}: $size bytes, budget $budget"
+              test "$size" -le "$budget"
+            done
+          elif [ "${{ matrix.is_windows }}" = "true" ]; then
             bin="target/${{ matrix.target }}/release/tachyon-core.exe"
+            size=$(wc -c < "$bin" | tr -d ' ')
+            echo "${{ matrix.name }}: $size bytes, budget $budget"
+            test "$size" -le "$budget"
           else
             bin="target/${{ matrix.target }}/release/tachyon-core"
+            size=$(wc -c < "$bin" | tr -d ' ')
+            echo "${{ matrix.name }}: $size bytes, budget $budget"
+            test "$size" -le "$budget"
           fi
-          size=$(wc -c < "$bin" | tr -d ' ')
-          budget="${{ matrix.budget || env.SIZE_BUDGET }}"
-          echo "${{ matrix.name }}: $size bytes, budget $budget"
-          test "$size" -le "$budget"
 
       - name: The binary is for this architecture
         if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
-          file "target/${{ matrix.target }}/release/tachyon-core"
+          if [ "${{ matrix.is_apple_bundle }}" = "true" ]; then
+            for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios; do
+              file "target/${t}/release/tachyon-core"
+            done
+          else
+            file "target/${{ matrix.target }}/release/tachyon-core"
+          fi
 
       - name: Pack (Unix)
         if: ${{ !matrix.is_windows }}
         shell: bash
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
+          if [ "${{ matrix.is_apple_bundle }}" = "true" ]; then
+            for pair in "darwin-arm64:aarch64-apple-darwin" "darwin-amd64:x86_64-apple-darwin" "ios-arm64:aarch64-apple-ios"; do
+              arch_name="${pair%%:*}"
+              triple="${pair#*:}"
+              name="tachyon-core-${arch_name}-${ver}"
+              bin="target/${triple}/release/tachyon-core"
+              cp "$bin" "./${name}"
+              sha256sum "./${name}" > "./${name}.sha256"
+              tar -czf "${name}.tar.gz" "./${name}"
+            done
+            cargo rustc -p core-runtime --release --target aarch64-apple-ios --crate-type staticlib
+            cargo rustc -p core-runtime --release --target aarch64-apple-ios-sim --crate-type staticlib
+            rm -rf /tmp/ios-headers ./TachyonCore.xcframework
+            mkdir -p /tmp/ios-headers
+            cp include/tachyon_core.h /tmp/ios-headers/
+            printf 'module TachyonCore {\n    header "tachyon_core.h"\n    export *\n}\n' > /tmp/ios-headers/module.modulemap
+            cp target/aarch64-apple-ios/release/libcore_runtime.a /tmp/libtachyon_core-ios.a
+            cp target/aarch64-apple-ios-sim/release/libcore_runtime.a /tmp/libtachyon_core-sim.a
+            xcodebuild -create-xcframework \
+              -library /tmp/libtachyon_core-ios.a -headers /tmp/ios-headers \
+              -library /tmp/libtachyon_core-sim.a -headers /tmp/ios-headers \
+              -output ./TachyonCore.xcframework
+            xcf_archive="tachyon-core-ios-xcframework-${ver}.tar.gz"
+            tar -czf "./${xcf_archive}" ./TachyonCore.xcframework
+            sha256sum "./${xcf_archive}" >> "./tachyon-core-ios-arm64-${ver}.sha256"
+            exit 0
+          fi
           name="tachyon-core-${{ matrix.name }}-${ver}"
           bin="target/${{ matrix.target }}/release/tachyon-core"
           cp "$bin" "./${name}"
@@ -283,23 +353,6 @@ jobs:
                 --out-ipk "./${name}.ipk" \
                 --out-apk "./${name}.apk"
               sha256sum "./${name}.ipk" "./${name}.apk" >> "./${name}.sha256"
-              ;;
-            aarch64-apple-ios)
-              cargo rustc -p core-runtime --release --target aarch64-apple-ios --crate-type staticlib
-              cargo rustc -p core-runtime --release --target aarch64-apple-ios-sim --crate-type staticlib
-              rm -rf /tmp/ios-headers ./TachyonCore.xcframework
-              mkdir -p /tmp/ios-headers
-              cp include/tachyon_core.h /tmp/ios-headers/
-              printf 'module TachyonCore {\n    header "tachyon_core.h"\n    export *\n}\n' > /tmp/ios-headers/module.modulemap
-              cp target/aarch64-apple-ios/release/libcore_runtime.a /tmp/libtachyon_core-ios.a
-              cp target/aarch64-apple-ios-sim/release/libcore_runtime.a /tmp/libtachyon_core-sim.a
-              xcodebuild -create-xcframework \
-                -library /tmp/libtachyon_core-ios.a -headers /tmp/ios-headers \
-                -library /tmp/libtachyon_core-sim.a -headers /tmp/ios-headers \
-                -output ./TachyonCore.xcframework
-              xcf_archive="tachyon-core-ios-xcframework-${ver}.tar.gz"
-              tar -czf "./${xcf_archive}" ./TachyonCore.xcframework
-              sha256sum "./${xcf_archive}" >> "./${name}.sha256"
               ;;
             aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android)
               case "${{ matrix.target }}" in
@@ -329,13 +382,13 @@ jobs:
         with:
           name: release-${{ matrix.name }}
           path: |
-            tachyon-core-${{ matrix.name }}-*.tar.gz
+            tachyon-core-*.tar.gz
             tachyon-core-ios-xcframework-*.tar.gz
             tachyon-core-${{ matrix.name }}-*.ipk
             tachyon-core-${{ matrix.name }}-*.apk
             tachyon-core-${{ matrix.name }}-*.zip
             libtachyon-*.so
-            tachyon-core-${{ matrix.name }}-*.sha256
+            tachyon-core-*.sha256
           if-no-files-found: warn
 
   release:
@@ -403,9 +456,7 @@ jobs:
           tag="${{ inputs.tag || github.ref_name }}"
           ver="${tag#v}"
           git clone "https://x-access-token:${SYNC_TOKEN}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
-          # Keep frozen historical source tree in public repo; update only public documentation, changelog, license, benchmark reports & release workflow
-          mkdir -p /tmp/public-repo/.github/workflows
-          cp -a .github/workflows/release.yml /tmp/public-repo/.github/workflows/release.yml
+          # Keep frozen historical source tree in public repo; update only public documentation, changelog, license & benchmark reports
           for item in README.md README.en.md CHANGELOG.md BENCHMARK.md BENCHMARK.html LICENSE assets docs; do
             if [ -e "$item" ]; then
               cp -a "$item" /tmp/public-repo/

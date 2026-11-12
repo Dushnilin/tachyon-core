@@ -187,6 +187,7 @@ Prebuilt static binaries with zero external dependencies (`musl`, `strip = "symb
 | **`mips`** | `mips-unknown-linux-musl` (`+soft-float`) | Qualcomm Atheros AR71xx / AR934x / QCA95xx (`ath79` Big-Endian) | `.tar.gz` · `.ipk` · `.apk` (`~4.2 MiB`) |
 | **`riscv64`** | `riscv64gc-unknown-linux-musl` | StarFive VisionFive 2, Milk-V, SiFive, and RISC-V boards | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
 | **`x86_64`** | `x86_64-unknown-linux-musl` | Mini-PCs (Intel N100/N5105), x86 OpenWrt, Alpine containers, and static Linux environments | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
+| **`i386_pentium4`** | `i686-unknown-linux-musl` | 32-bit x86 OpenWrt routers (`x86/generic`, Pentium 4, Celeron M, Intel Atom, AMD Geode) | `.tar.gz` · `.ipk` · `.apk` (`~3.8 MiB`) |
 | **`linux-amd64`** | `x86_64-unknown-linux-gnu` | Dedicated servers and VPS running Debian, Ubuntu, Fedora, Arch, and Proxmox | `.tar.gz` (`~3.9 MiB`) |
 | **`windows-amd64`** | `x86_64-pc-windows-msvc` | Windows x64 desktops and servers | `.zip` (`~3.4 MiB`) |
 | **`darwin-arm64` / `amd64`** | `aarch64` / `x86_64-apple-darwin` | macOS systems on Apple Silicon (M1–M4) and Intel | `.tar.gz` (`~3.2–3.5 MiB`) |

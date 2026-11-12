@@ -187,6 +187,7 @@ tachyon-core generate tls-keypair example.com -m 12               # самопо
 | **`mips`** | `mips-unknown-linux-musl` (`+soft-float`) | Qualcomm Atheros AR71xx / AR934x / QCA95xx (`ath79` Big-Endian) | `.tar.gz` · `.ipk` · `.apk` (`~4.2 MiB`) |
 | **`riscv64`** | `riscv64gc-unknown-linux-musl` | StarFive VisionFive 2, Milk-V, SiFive и платы на архитектуре RISC-V | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
 | **`x86_64`** | `x86_64-unknown-linux-musl` | Мини-ПК (Intel N100/N5105), x86 OpenWrt, контейнеры Alpine и статические Linux-окружения | `.tar.gz` · `.ipk` · `.apk` (`~3.9 MiB`) |
+| **`i386_pentium4`** | `i686-unknown-linux-musl` | 32-битные маршрутизаторы x86 OpenWrt (`x86/generic`, Pentium 4, Celeron M, Intel Atom, AMD Geode) | `.tar.gz` · `.ipk` · `.apk` (`~3.8 MiB`) |
 | **`linux-amd64`** | `x86_64-unknown-linux-gnu` | Выделенные серверы и VPS на Debian, Ubuntu, Fedora, Arch и Proxmox | `.tar.gz` (`~3.9 MiB`) |
 | **`windows-amd64`** | `x86_64-pc-windows-msvc` | Настольные системы и серверы Windows x64 | `.zip` (`~3.4 MiB`) |
 | **`darwin-arm64` / `amd64`** | `aarch64` / `x86_64-apple-darwin` | Компьютеры macOS на базе Apple Silicon (M1–M4) и Intel | `.tar.gz` (`~3.2–3.5 MiB`) |

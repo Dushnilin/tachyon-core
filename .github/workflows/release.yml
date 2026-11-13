@@ -56,6 +56,10 @@ jobs:
             target: x86_64-unknown-linux-musl
             use_musl_lld: true
             budget: 14680064
+          - name: i386_pentium4
+            target: i686-unknown-linux-musl
+            use_musl_lld: true
+            budget: 14680064
           - name: aarch64
             target: aarch64-unknown-linux-musl
             budget: 14680064
@@ -175,7 +179,7 @@ jobs:
             # -C target-cpu=mips32r2 -C target-feature=+soft-float and -msoft-float
             # are mandatory: OpenWrt MIPS routers (24Kc, 24KEc, 1004Kc on ath79/ramips)
             # have no hardware FPU, so any COP1 opcode triggers SIGILL (exit code 132).
-            echo "RUSTFLAGS=-C target-cpu=mips32r2 -C target-feature=+crt-static,+soft-float -C opt-level=z -C lto=fat -C codegen-units=1 -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-mips32r2 -C link-arg=-msoft-float -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-L/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "RUSTFLAGS=-C target-cpu=mips32r2 -C target-feature=+crt-static,+soft-float -C opt-level=z -C lto=fat -C codegen-units=1 -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -Z location-detail=none -Z fmt-debug=shallow -Z remap-cwd-prefix=. -C link-arg=-mips32r2 -C link-arg=-msoft-float -C link-arg=-B/opt/mipsel-musl/lib -C link-arg=-L/opt/mipsel-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: MIPS musl toolchain (mips)
@@ -199,7 +203,7 @@ jobs:
           {
             echo "CC_mips_unknown_linux_musl=mips-linux-gnu-gcc"
             echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-linux-gnu-gcc"
-            echo "RUSTFLAGS=-C target-cpu=mips32r2 -C target-feature=+crt-static,+soft-float -C opt-level=z -C lto=fat -C codegen-units=1 -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -C link-arg=-mips32r2 -C link-arg=-msoft-float -C link-arg=-B/opt/mips-musl/lib -C link-arg=-L/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+            echo "RUSTFLAGS=-C target-cpu=mips32r2 -C target-feature=+crt-static,+soft-float -C opt-level=z -C lto=fat -C codegen-units=1 -C link-self-contained=no -C force-unwind-tables=no -C panic=abort -Z location-detail=none -Z fmt-debug=shallow -Z remap-cwd-prefix=. -C link-arg=-mips32r2 -C link-arg=-msoft-float -C link-arg=-B/opt/mips-musl/lib -C link-arg=-L/opt/mips-musl/lib -C link-arg=-static -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           } >> "$GITHUB_ENV"
 
       - name: Toolchain (prebuilt std)
@@ -506,11 +510,13 @@ jobs:
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false
 
-      - name: Trigger tachyon-proxy Android APK rebuild
+      - name: Trigger tachyon-proxy and tachyon-desync rebuilds
         if: ${{ env.PUBLIC_TOKEN != '' }}
         run: |
-          curl -fsSL -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${PUBLIC_TOKEN}" \
-            https://api.github.com/repos/Dushnilin/tachyon-proxy/dispatches \
-            -d "{\"event_type\":\"core-updated\",\"client_payload\":{\"tag\":\"${{ inputs.tag || github.ref_name }}\"}}" || true
+          for repo in Dushnilin/tachyon-proxy Dushnilin/tachyon-desync; do
+            curl -fsSL -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${PUBLIC_TOKEN}" \
+              "https://api.github.com/repos/${repo}/dispatches" \
+              -d "{\"event_type\":\"core-updated\",\"client_payload\":{\"tag\":\"${{ inputs.tag || github.ref_name }}\"}}" || true
+          done

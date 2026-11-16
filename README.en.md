@@ -245,6 +245,7 @@ chmod +x /usr/bin/tachyon-core
 If Tachyon is useful in your infrastructure or daily workflow, you can support ongoing development:
 
 - **Boosty:** [boosty.to/tachyon](https://boosty.to/tachyon)
+- **SBP (Ozon Bank):** [finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5](https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5)
 - **Russian Cards & SBP (CloudTips):** [pay.cloudtips.ru/p/449c5ef9](https://pay.cloudtips.ru/p/449c5ef9)
 - **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
 - **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`

@@ -58,6 +58,7 @@
 | Тип | Страница |
 |---|---|
 | `direct` | [direct](outbounds/direct.md) |
+| `desync` | [desync](outbounds/desync.md) — прямое соединение с TCP/UDP-сегментацией и decoy-пакетами. |
 | `block` | [block](outbounds/block.md) |
 | `socks` | [socks](outbounds/socks.md) |
 | `http` | [http](outbounds/http.md) |

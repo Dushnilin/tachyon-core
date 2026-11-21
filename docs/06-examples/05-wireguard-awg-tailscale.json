@@ -1,0 +1,132 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local"
+      },
+      {
+        "type": "tailscale",
+        "tag": "dns-magic",
+        "endpoint": "ep-tailscale",
+        "accept_default_resolvers": true
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".ts.net"
+        ],
+        "server": "dns-magic"
+      }
+    ],
+    "final": "dns-local",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "ep-awg",
+      "mtu": 1280,
+      "address": [
+        "10.8.0.2/32",
+        "fd00:8::2/128"
+      ],
+      "private_key": "cAcE0GdL/DCVvsl7EhrdXO2AV7cBqLik4nSszE0tF3k=",
+      "jc": 4,
+      "jmin": 40,
+      "jmax": 70,
+      "s1": 24,
+      "s2": 36,
+      "s3": 16,
+      "s4": 12,
+      "h1": "100001-100999",
+      "h2": "200001-200999",
+      "h3": "300001-300999",
+      "h4": "400001-400999",
+      "i1": "<b 0xc0000001><r 16>",
+      "i2": "<t><r 24>",
+      "i3": "<c><r 12>",
+      "i4": "<rc 8><rd 8>",
+      "i5": "<r 32>",
+      "peers": [
+        {
+          "address": "203.0.113.10",
+          "port": 51820,
+          "server_ports": [
+            "51820-51920",
+            "60000-60050"
+          ],
+          "hop_interval": "30s",
+          "public_key": "r1co3JV3H+nignaFl9sREmKpqNsuarAaAcIeSPzAH3w=",
+          "allowed_ips": [
+            "0.0.0.0/0",
+            "::/0"
+          ],
+          "persistent_keepalive_interval": 25
+        }
+      ]
+    },
+    {
+      "type": "tailscale",
+      "tag": "ep-tailscale",
+      "state_directory": "/var/lib/tachyon-core/tailscale",
+      "auth_key": "tskey-auth-replace-with-real-key",
+      "hostname": "tachyon-gw",
+      "accept_routes": true,
+      "exit_node": "100.64.0.1",
+      "exit_node_allow_lan_access": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local",
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "domain_suffix": [
+          ".ts.net"
+        ],
+        "outbound": "ep-tailscale"
+      },
+      {
+        "ip_cidr": [
+          "100.64.0.0/10"
+        ],
+        "outbound": "ep-tailscale"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".example.org"
+        ],
+        "outbound": "ep-awg"
+      }
+    ],
+    "final": "direct"
+  }
+}

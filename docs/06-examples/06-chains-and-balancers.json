@@ -1,0 +1,230 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local"
+      }
+    ],
+    "final": "dns-local"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "hop-entry",
+      "server": "entry.example.com",
+      "server_port": 443,
+      "uuid": "0e6a87bc-d521-423b-bba6-cec333a85935",
+      "flow": "xtls-rprx-vision",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4"
+        }
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "hop-detour-exit",
+      "server": "exit-a.example.com",
+      "server_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "d1op/P5nu8O++mj2YqReVA==",
+      "detour": "hop-entry"
+    },
+    {
+      "type": "anytls",
+      "tag": "hop-mid",
+      "server": "mid.example.com",
+      "server_port": 443,
+      "password": "replace-with-anytls-password",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "mid.example.com"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "hop-final",
+      "server": "exit-b.example.com",
+      "server_port": 443,
+      "password": "replace-with-trojan-password",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "exit-b.example.com"
+      }
+    },
+    {
+      "type": "chain",
+      "tag": "chain-3hop",
+      "outbounds": [
+        "hop-entry",
+        "hop-mid",
+        "hop-final"
+      ],
+      "idle_timeout": "5m"
+    },
+    {
+      "type": "vless",
+      "tag": "node-eu-1",
+      "server": "eu1.example.com",
+      "server_port": 443,
+      "uuid": "0e6a87bc-d521-423b-bba6-cec333a85935",
+      "flow": "xtls-rprx-vision",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4"
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "node-eu-2",
+      "server": "eu2.example.com",
+      "server_port": 443,
+      "uuid": "cdf5ea2b-177e-4876-8e56-b6f8d0505ff5",
+      "flow": "xtls-rprx-vision",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "firefox"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4"
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "node-us-backup",
+      "server": "us1.example.com",
+      "server_port": 8443,
+      "password": "replace-with-hy2-password",
+      "up_mbps": 50,
+      "down_mbps": 200,
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "us1.example.com"
+      }
+    },
+    {
+      "type": "urltest",
+      "tag": "lb-sticky",
+      "outbounds": [
+        "node-eu-1",
+        "node-eu-2",
+        "node-us-backup"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 50,
+      "mode": "sticky",
+      "balancer": {
+        "pool": 2,
+        "pool_tolerance": 80,
+        "sticky_hash": [
+          "source_ip",
+          "domain"
+        ]
+      }
+    },
+    {
+      "type": "urltest",
+      "tag": "lb-priority-tiers",
+      "outbounds": [
+        "node-eu-1",
+        "node-eu-2",
+        "node-us-backup"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "mode": "priority",
+      "balancer": {
+        "tiers": [
+          [
+            "node-eu-1",
+            "node-eu-2"
+          ],
+          [
+            "node-us-backup"
+          ]
+        ]
+      }
+    },
+    {
+      "type": "selector",
+      "tag": "egress-main",
+      "outbounds": [
+        "lb-sticky",
+        "lb-priority-tiers",
+        "chain-3hop",
+        "hop-detour-exit",
+        "direct"
+      ],
+      "default": "lb-sticky",
+      "auto_failover": true,
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": "dns-local",
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".secure.example.org"
+        ],
+        "outbound": "chain-3hop"
+      }
+    ],
+    "final": "egress-main"
+  }
+}

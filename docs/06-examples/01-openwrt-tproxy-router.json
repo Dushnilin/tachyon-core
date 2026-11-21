@@ -1,0 +1,158 @@
+{
+  "log": {
+    "level": "info",
+    "output": "/tmp/tachyon-core/tachyon-core.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local"
+      },
+      {
+        "type": "https",
+        "tag": "dns-doh",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "proxy-vless-pq"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".lan",
+          ".local",
+          ".home.arpa"
+        ],
+        "server": "dns-local"
+      },
+      {
+        "rule_set": [
+          "tunnel-domains"
+        ],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-local",
+    "strategy": "prefer_ipv4",
+    "independent_cache": true
+  },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "::",
+      "listen_port": 7893,
+      "udp_mapping": "endpoint_independent"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy-vless-pq",
+      "server": "edge.example.com",
+      "server_port": 443,
+      "uuid": "0e6a87bc-d521-423b-bba6-cec333a85935",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome_pq"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4",
+          "support_x25519mlkem768": true
+        }
+      }
+    },
+    {
+      "type": "desync",
+      "tag": "fallback-desync",
+      "preset": "adaptive",
+      "auto_tune": true
+    },
+    {
+      "type": "selector",
+      "tag": "egress-select",
+      "outbounds": [
+        "proxy-vless-pq",
+        "fallback-desync",
+        "direct"
+      ],
+      "default": "proxy-vless-pq",
+      "auto_failover": true,
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_mark": 255,
+    "default_domain_resolver": "dns-local",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "tunnel-domains",
+        "format": "trs",
+        "url": "https://rules.example.com/tunnel-domains.trs",
+        "download_detour": "direct",
+        "update_interval": "1d",
+        "mmap": true
+      }
+    ],
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "tunnel-domains"
+        ],
+        "outbound": "egress-select"
+      }
+    ],
+    "final": "direct"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "replace-with-api-secret"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "/tmp/tachyon-core/cache.db",
+      "store_fakeip": true,
+      "store_rdrc": true
+    }
+  }
+}

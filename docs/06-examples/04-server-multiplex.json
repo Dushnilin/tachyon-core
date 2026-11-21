@@ -1,0 +1,233 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "alice",
+          "uuid": "0e6a87bc-d521-423b-bba6-cec333a85935",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.example.com",
+            "server_port": 443
+          },
+          "private_key": "TIzKTnynZatXK58861-8PoNiX-nv_e1eIUx39QTBjWc",
+          "short_id": [
+            "a1b2c3d4"
+          ]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "up_mbps": 200,
+      "down_mbps": 200,
+      "obfs": {
+        "type": "salamander",
+        "password": "replace-with-salamander-secret"
+      },
+      "users": [
+        {
+          "name": "alice",
+          "password": "replace-with-hy2-password"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "alpn": [
+          "h3"
+        ],
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIBajCCARCgAwIBAgIQLozZMJx5n9QfQJ/BWCspFzAKBggqhkjOPQQDAjAdMRsw",
+          "GQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wHhcNMjYxMTIxMTQzODAyWhcNMjcx",
+          "MTE2MTUzODAyWjAdMRswGQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wWTATBgcq",
+          "hkjOPQIBBggqhkjOPQMBBwNCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeHtj7YrvXF",
+          "7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/HozIwMDAdBgNVHREE",
+          "FjAUghJzZXJ2ZXIuZXhhbXBsZS5jb20wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjO",
+          "PQQDAgNIADBFAiEApxKfP//Omsi7NJjfF5NrUBaOeYqx99BkeAzK1+AnR8ICIARC",
+          "2lbetoE65rXQHGcIGDVzqwZ+ZSSHFvf5GtQOa730",
+          "-----END CERTIFICATE-----"
+        ],
+        "key": [
+          "-----BEGIN PRIVATE KEY-----",
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXQErg4arp4eF/wNF",
+          "zKJLd0nsqqd4XiJTdoWkfjV+U4GhRANCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeH",
+          "tj7YrvXF7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/H",
+          "-----END PRIVATE KEY-----"
+        ]
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-v5-in",
+      "listen": "::",
+      "listen_port": 9443,
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": false,
+      "users": [
+        {
+          "name": "alice",
+          "uuid": "cdf5ea2b-177e-4876-8e56-b6f8d0505ff5",
+          "password": "replace-with-tuic-password"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "alpn": [
+          "h3"
+        ],
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIBajCCARCgAwIBAgIQLozZMJx5n9QfQJ/BWCspFzAKBggqhkjOPQQDAjAdMRsw",
+          "GQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wHhcNMjYxMTIxMTQzODAyWhcNMjcx",
+          "MTE2MTUzODAyWjAdMRswGQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wWTATBgcq",
+          "hkjOPQIBBggqhkjOPQMBBwNCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeHtj7YrvXF",
+          "7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/HozIwMDAdBgNVHREE",
+          "FjAUghJzZXJ2ZXIuZXhhbXBsZS5jb20wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjO",
+          "PQQDAgNIADBFAiEApxKfP//Omsi7NJjfF5NrUBaOeYqx99BkeAzK1+AnR8ICIARC",
+          "2lbetoE65rXQHGcIGDVzqwZ+ZSSHFvf5GtQOa730",
+          "-----END CERTIFICATE-----"
+        ],
+        "key": [
+          "-----BEGIN PRIVATE KEY-----",
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXQErg4arp4eF/wNF",
+          "zKJLd0nsqqd4XiJTdoWkfjV+U4GhRANCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeH",
+          "tj7YrvXF7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/H",
+          "-----END PRIVATE KEY-----"
+        ]
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": 10443,
+      "users": [
+        {
+          "name": "alice",
+          "password": "replace-with-anytls-password"
+        }
+      ],
+      "padding_scheme": [
+        "stop=8",
+        "0=30-30",
+        "1=100-400",
+        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+        "3=9-9,500-1000",
+        "4=500-1000",
+        "5=500-1000",
+        "6=500-1000",
+        "7=500-1000"
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIBajCCARCgAwIBAgIQLozZMJx5n9QfQJ/BWCspFzAKBggqhkjOPQQDAjAdMRsw",
+          "GQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wHhcNMjYxMTIxMTQzODAyWhcNMjcx",
+          "MTE2MTUzODAyWjAdMRswGQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wWTATBgcq",
+          "hkjOPQIBBggqhkjOPQMBBwNCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeHtj7YrvXF",
+          "7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/HozIwMDAdBgNVHREE",
+          "FjAUghJzZXJ2ZXIuZXhhbXBsZS5jb20wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjO",
+          "PQQDAgNIADBFAiEApxKfP//Omsi7NJjfF5NrUBaOeYqx99BkeAzK1+AnR8ICIARC",
+          "2lbetoE65rXQHGcIGDVzqwZ+ZSSHFvf5GtQOa730",
+          "-----END CERTIFICATE-----"
+        ],
+        "key": [
+          "-----BEGIN PRIVATE KEY-----",
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXQErg4arp4eF/wNF",
+          "zKJLd0nsqqd4XiJTdoWkfjV+U4GhRANCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeH",
+          "tj7YrvXF7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/H",
+          "-----END PRIVATE KEY-----"
+        ]
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-in",
+      "listen": "::",
+      "listen_port": 11443,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "d1op/P5nu8O++mj2YqReVA==",
+      "users": [
+        {
+          "name": "alice",
+          "password": "slckldyZusO4dhIoHbgyAw=="
+        }
+      ]
+    },
+    {
+      "type": "fptn",
+      "tag": "fptn-in",
+      "listen": "::",
+      "listen_port": 12443,
+      "ipv4_pool": "10.10.0.0/16",
+      "dns": "1.1.1.1",
+      "users": [
+        {
+          "username": "alice",
+          "password": "replace-with-fptn-password"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIBajCCARCgAwIBAgIQLozZMJx5n9QfQJ/BWCspFzAKBggqhkjOPQQDAjAdMRsw",
+          "GQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wHhcNMjYxMTIxMTQzODAyWhcNMjcx",
+          "MTE2MTUzODAyWjAdMRswGQYDVQQDDBJzZXJ2ZXIuZXhhbXBsZS5jb20wWTATBgcq",
+          "hkjOPQIBBggqhkjOPQMBBwNCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeHtj7YrvXF",
+          "7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/HozIwMDAdBgNVHREE",
+          "FjAUghJzZXJ2ZXIuZXhhbXBsZS5jb20wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjO",
+          "PQQDAgNIADBFAiEApxKfP//Omsi7NJjfF5NrUBaOeYqx99BkeAzK1+AnR8ICIARC",
+          "2lbetoE65rXQHGcIGDVzqwZ+ZSSHFvf5GtQOa730",
+          "-----END CERTIFICATE-----"
+        ],
+        "key": [
+          "-----BEGIN PRIVATE KEY-----",
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXQErg4arp4eF/wNF",
+          "zKJLd0nsqqd4XiJTdoWkfjV+U4GhRANCAAT/fwU/QiHIEPQylvscDi6nyqwkPDeH",
+          "tj7YrvXF7ziaPbB/LkyVe0CHfXyhSro3bAC/YonoGhftL5F0TnC1dK/H",
+          "-----END PRIVATE KEY-----"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "ip_is_private": true,
+        "action": "reject"
+      }
+    ],
+    "final": "direct"
+  }
+}

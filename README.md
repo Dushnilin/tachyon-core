@@ -17,7 +17,7 @@
   <a href="https://github.com/Dushnilin/tachyon-core/releases/latest">Релизные сборки</a> ·
   <a href="./BENCHMARK.md">Отчёт бенчмарков</a> ·
   <a href="./BENCHMARK.html">Интерактивный дашборд</a> ·
-  <a href="./docs/reference/README.md">Справочник схемы</a>
+  <a href="./docs/README.md">Документация</a>
 </p>
 
 > [!IMPORTANT]
@@ -126,7 +126,8 @@
 | **Роутер, сниффер и наборы правил** | Матчеры: `inbound`, `network`, `protocol`, домены (`suffix`, `keyword`, `regex`, `exact`), `ip_cidr`, `ip_is_private`, `source_*`, `port`, `port_range`, `process_name`, `process_path`, `user`, `user_id` (`/proc/net/*`), `source_mac_address` и `source_hostname` (таблица соседей и DHCP), `clash_mode`, `rule_set`. Неразрушающий сниффер: TLS SNI, HTTP Host, QUIC SNI, DNS, BitTorrent, SSH, RDP. Поддержка нативных бинарных списков **`.trs` v2 (zero-copy `mmap`)** и **`.srs` v5** с горячей перезагрузкой маршрутов. |
 | **Системный диалер и API состояния** | Изоляция `netns` (`CLONE_NEWNET`), передача сокетов через `protect_path` (`SCM_RIGHTS`), Multipath TCP, Happy Eyeballs (RFC 6555), `routing_mark` (fwmark), `bind_interface`. Совместимый **Clash REST / WebSocket API** (`/version`, `/proxies`, `/connections`, `/rules`, `/configs`, `/logs`, `/traffic`, `/providers/*`, панели Yacd / Metacubexd по `/ui`), побайтово совместимый с `bbolt` файл состояния `cache.db` и встроенный NTP-клиент. |
 
-Полное описание всех полей конфигурации, значений по умолчанию и ограничений приведено в справочнике **[docs/reference/README.md](docs/reference/README.md)**.
+Полная документация — архитектура, схема конфигурации, спецификации протоколов, CLI/API, интеграция и проверенные примеры — собрана в **[docs/README.md](docs/README.md)**:
+- [Архитектура](docs/01-architecture/overview.md) · [Схема конфигурации](docs/02-config/schema-overview.md) · [Протоколы и форматы](docs/03-protocols-and-formats/transports-and-mux.md) · [CLI и API](docs/04-api-and-cli/cli-and-runtime.md) · [Интеграция](docs/05-integration/openwrt.md) · [Готовые примеры](docs/06-examples/README.md)
 
 ---
 

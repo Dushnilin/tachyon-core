@@ -17,7 +17,7 @@
   <a href="https://github.com/Dushnilin/tachyon-core/releases/latest">Release Builds</a> ·
   <a href="./BENCHMARK.md">Benchmark Report</a> ·
   <a href="./BENCHMARK.html">Interactive Dashboard</a> ·
-  <a href="./docs/reference/README.md">Schema Reference</a>
+  <a href="./docs/README.md">Documentation</a>
 </p>
 
 > [!IMPORTANT]
@@ -126,7 +126,8 @@ In the single-core router profile, `tachyon-core` leads in **36 out of 39 protoc
 | **Router, Sniffer & Rule-Sets** | Matchers: `inbound`, `network`, `protocol`, domain (`suffix`, `keyword`, `regex`, `exact`), `ip_cidr`, `ip_is_private`, `source_*`, `port`, `port_range`, `process_name`, `process_path`, `user`, `user_id` (`/proc/net/*`), `source_mac_address` and `source_hostname` (neighbour table & DHCP leases), `clash_mode`, `rule_set`. Non-destructive sniffer: TLS SNI, HTTP Host, QUIC SNI, DNS, BitTorrent, SSH, RDP. Native binary **`.trs` v2 (zero-copy `mmap`)** and **`.srs` v5** rule-sets with live route revalidation on hot reload. |
 | **System Dialer & State API** | `netns` isolation (`CLONE_NEWNET`), `protect_path` socket passing over `SCM_RIGHTS`, Multipath TCP, Happy Eyeballs (RFC 6555), `routing_mark` (fwmark), `bind_interface`. Compatible **Clash REST / WebSocket API** (`/version`, `/proxies`, `/connections`, `/rules`, `/configs`, `/logs`, `/traffic`, `/providers/*`, built-in Yacd / Metacubexd UI under `/ui`), byte-compatible `bbolt` state store `cache.db`, and built-in NTP client. |
 
-Complete configuration field documentation, defaults, and constraints are available in **[docs/reference/README.md](docs/reference/README.md)**.
+Complete documentation — architecture, configuration schema, protocol specifications, CLI/API, platform integration, and validated examples — is indexed in **[docs/README.md](docs/README.md)**:
+- [Architecture](docs/01-architecture/overview.md) · [Configuration Schema](docs/02-config/schema-overview.md) · [Protocols & Formats](docs/03-protocols-and-formats/transports-and-mux.md) · [CLI & API](docs/04-api-and-cli/cli-and-runtime.md) · [Platform Integration](docs/05-integration/openwrt.md) · [Ready-to-Use Examples](docs/06-examples/README.md)
 
 ---
 

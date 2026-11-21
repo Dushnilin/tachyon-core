@@ -1,0 +1,111 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local"
+      },
+      {
+        "type": "https",
+        "tag": "dns-doh",
+        "server": "9.9.9.9",
+        "server_port": 443,
+        "path": "/dns-query"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".lan",
+          ".local",
+          ".corp.example"
+        ],
+        "server": "dns-local"
+      }
+    ],
+    "final": "dns-doh",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun-opt",
+      "mtu": 1500,
+      "address": [
+        "172.19.10.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "smoltcp"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "desync",
+      "tag": "desync-adaptive",
+      "preset": "adaptive",
+      "auto_tune": true,
+      "quic_desync": true,
+      "udp_out_range": "1-2"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local",
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".corp.example",
+          ".local"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".video.example.org",
+          ".media.example.net"
+        ],
+        "time_window": [
+          "mon-fri 09:00-18:00 UTC+3"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".video.example.org",
+          ".media.example.net",
+          ".cdn.example.com"
+        ],
+        "outbound": "desync-adaptive"
+      }
+    ],
+    "final": "direct"
+  }
+}

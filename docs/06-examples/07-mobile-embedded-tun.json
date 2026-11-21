@@ -1,0 +1,118 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": false
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local"
+      },
+      {
+        "type": "https",
+        "tag": "dns-doh",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "proxy-mobile"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fakeip",
+        "inet4_range": "198.18.0.0/15"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".local",
+          ".lan"
+        ],
+        "server": "dns-local"
+      },
+      {
+        "query_type": [
+          "A"
+        ],
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-doh",
+    "strategy": "ipv4_only",
+    "independent_cache": false
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-mobile",
+      "interface_name": "utun0",
+      "mtu": 1400,
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "smoltcp",
+      "udp_timeout": "1m",
+      "udp_nat_max": 256
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy-mobile",
+      "server": "mobile-edge.example.com",
+      "server_port": 443,
+      "uuid": "0e6a87bc-d521-423b-bba6-cec333a85935",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "ios"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4",
+          "support_x25519mlkem768": true
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local",
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "250ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy-mobile"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true,
+      "store_rdrc": false
+    }
+  }
+}

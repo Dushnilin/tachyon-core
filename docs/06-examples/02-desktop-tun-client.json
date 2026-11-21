@@ -1,0 +1,194 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "dns-local"
+      },
+      {
+        "type": "https",
+        "tag": "dns-remote",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": "auto-best"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".local",
+          ".lan",
+          ".internal"
+        ],
+        "server": "dns-local"
+      },
+      {
+        "domain_suffix": [
+          ".example.org",
+          ".example.net"
+        ],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-local",
+    "strategy": "prefer_ipv4",
+    "independent_cache": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "mtu": 1500,
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "smoltcp",
+      "gso": true
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-xhttp-eu",
+      "server": "eu1.example.com",
+      "server_port": 443,
+      "uuid": "0e6a87bc-d521-423b-bba6-cec333a85935",
+      "packet_encoding": "xudp",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4"
+        }
+      },
+      "transport": {
+        "type": "xhttp",
+        "host": "www.example.com",
+        "path": "/xhttp-stream",
+        "mode": "stream-up",
+        "xmux": {
+          "max_concurrency": "16-32",
+          "c_max_reuse_times": "64-128",
+          "h_max_request_times": "600-900",
+          "h_max_reusable_secs": "1800-3000",
+          "h_keep_alive_period": 0
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-vision-eu",
+      "server": "eu2.example.com",
+      "server_port": 443,
+      "uuid": "cdf5ea2b-177e-4876-8e56-b6f8d0505ff5",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "domain_resolver": "dns-local",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome_pq"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "9jr066Au19oq2J4Ve6OBxG5GdSoMQ7AZEaiwMbMQMmk",
+          "short_id": "a1b2c3d4",
+          "support_x25519mlkem768": true
+        }
+      }
+    },
+    {
+      "type": "urltest",
+      "tag": "auto-best",
+      "outbounds": [
+        "vless-xhttp-eu",
+        "vless-vision-eu"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 50,
+      "idle_timeout": "30m",
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local",
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".local",
+          ".lan",
+          ".internal"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".example.org",
+          ".example.net"
+        ],
+        "outbound": "auto-best"
+      }
+    ],
+    "final": "direct"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true,
+      "store_rdrc": true
+    }
+  }
+}

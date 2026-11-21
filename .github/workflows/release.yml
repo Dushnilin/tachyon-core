@@ -460,7 +460,8 @@ jobs:
           tag="${{ inputs.tag || github.ref_name }}"
           ver="${tag#v}"
           git clone "https://x-access-token:${SYNC_TOKEN}@github.com/${PUBLIC_REPO}.git" /tmp/public-repo
-          # Keep frozen historical source tree in public repo; update only public documentation, changelog, license & benchmark reports
+          # Keep frozen historical source tree in public repo; replace only public documentation, changelog, license & benchmark reports
+          rm -rf /tmp/public-repo/docs /tmp/public-repo/COMPAT.md /tmp/public-repo/lx-specs
           for item in README.md README.en.md CHANGELOG.md BENCHMARK.md BENCHMARK.html LICENSE assets docs; do
             if [ -e "$item" ]; then
               cp -a "$item" /tmp/public-repo/

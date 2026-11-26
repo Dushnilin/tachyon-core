@@ -47,6 +47,9 @@ jobs:
     name: ${{ matrix.name }}
     needs: check-version
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    env:
+      # Required on stable Cargo for `-Z build-std` (rustc already gets it from `.cargo/config.toml`).
+      RUSTC_BOOTSTRAP: 1
     strategy:
       fail-fast: false
       matrix:
@@ -211,6 +214,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
+          components: rust-src
           targets: ${{ matrix.is_apple_bundle && 'aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim' || matrix.target }}
 
       - name: Toolchain (std from source)
@@ -267,13 +271,12 @@ jobs:
         run: |
           if [ "${{ matrix.is_apple_bundle }}" = "true" ]; then
             for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios; do
-              cargo build -p core-cli --release --target "$t"
+              cargo build -p core-cli --release --target "$t" \
+                -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
             done
-          elif [ -n "${{ matrix.build-std }}" ]; then
-            cargo build -p core-cli --release --target ${{ matrix.target }} \
-              -Z build-std=std,panic_abort
           else
-            cargo build -p core-cli --release --target ${{ matrix.target }}
+            cargo build -p core-cli --release --target ${{ matrix.target }} \
+              -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
           fi
 
       - name: Size budget
@@ -326,8 +329,10 @@ jobs:
               sha256sum "./${name}" > "./${name}.sha256"
               tar -czf "${name}.tar.gz" "./${name}"
             done
-            cargo rustc -p core-runtime --release --target aarch64-apple-ios --crate-type staticlib
-            cargo rustc -p core-runtime --release --target aarch64-apple-ios-sim --crate-type staticlib
+            cargo rustc -p core-runtime --release --target aarch64-apple-ios --crate-type staticlib \
+              -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
+            cargo rustc -p core-runtime --release --target aarch64-apple-ios-sim --crate-type staticlib \
+              -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
             rm -rf /tmp/ios-headers ./TachyonCore.xcframework
             mkdir -p /tmp/ios-headers
             cp include/tachyon_core.h /tmp/ios-headers/
@@ -364,7 +369,8 @@ jobs:
                 armv7-linux-androideabi) abi="armeabi-v7a" ;;
                 x86_64-linux-android) abi="x86_64" ;;
               esac
-              cargo rustc -p core-ffi --release --target ${{ matrix.target }} --crate-type cdylib
+              cargo rustc -p core-ffi --release --target ${{ matrix.target }} --crate-type cdylib \
+                -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
               so_name="libtachyon-${abi}.so"
               cp "target/${{ matrix.target }}/release/libtachyon.so" "./${so_name}"
               sha256sum "./${so_name}" >> "./${name}.sha256"
@@ -397,8 +403,8 @@ jobs:
 
   release:
     name: attach to the release
-    needs: [build]
-    if: always() && needs.check-version.result == 'success'
+    needs: [check-version, build]
+    if: needs.check-version.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

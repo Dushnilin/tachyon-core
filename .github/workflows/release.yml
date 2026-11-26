@@ -25,7 +25,7 @@ jobs:
     name: tag matches the workspace version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
@@ -122,7 +122,7 @@ jobs:
             ndk_clang: x86_64-linux-android24-clang
             budget: 16777216
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
@@ -148,7 +148,7 @@ jobs:
 
       - name: Cache MIPS musl toolchain
         if: startsWith(matrix.target, 'mips')
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             /opt/mipsel-musl
@@ -225,7 +225,7 @@ jobs:
           components: rust-src
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -388,7 +388,7 @@ jobs:
           sha256sum "./tachyon-core.exe" > "./${name}.sha256"
           powershell -Command "Compress-Archive -Path './tachyon-core.exe' -DestinationPath '${name}.zip'"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.name }}
           path: |
@@ -412,13 +412,13 @@ jobs:
       PUBLIC_REPO: Dushnilin/tachyon-core
       PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN || secrets.PRIVATE_REPO_TOKEN || github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
           ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
@@ -486,7 +486,7 @@ jobs:
 
       - name: Publish release to public repository (${{ env.PUBLIC_REPO }})
         if: ${{ env.PUBLIC_TOKEN != '' && github.repository != env.PUBLIC_REPO }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           repository: ${{ env.PUBLIC_REPO }}
           token: ${{ env.PUBLIC_TOKEN }}
@@ -503,7 +503,7 @@ jobs:
           fail_on_unmatched_files: false
 
       - name: Publish release to current repository
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: "tachyon-core ${{ inputs.tag || github.ref_name }}"
           tag_name: ${{ inputs.tag || github.ref_name }}

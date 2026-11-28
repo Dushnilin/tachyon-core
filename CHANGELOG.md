@@ -31,6 +31,9 @@
   * Расширен разбор параметров ссылок (`?fragment=` в формате через запятую, расширенные параметры `TLS`, `Hysteria 2`, `TUIC`, `gRPC`, `HTTP/2`, `AnyTLS`, `NaiveProxy`, `SOCKS4`/`SOCKS4a`, `OpenConnect` и `MTProto`).
   * Добавлена поддержка сжатия ответов `Brotli` при загрузке подписок, учтён приоритет заголовков метаданных подписки, добавлена поддержка `YAML`-якорей и слияний (`&anchor` / `*alias` / `<<:`) в `Clash YAML`, а также исправлены особенности импорта `Xray JSON` (включая `XHTTP`, `REALITY`, `VMess` и `Shadowsocks`).
   * Добавлен импорт конфигураций и ссылок `OpenVPN` (`.ovpn`, `openvpn://`, включая параметры обфускации `Amnezia`), ссылок маршрутизации (`happ://routing/...`, `incy://routing/...`), плагинов `Shadowsocks` с автоматическим разворачиванием `ShadowTLS`, мультиплексирования (`multiplex` / `smux`), параметров `Reserved` и `DNS` из `WireGuard`-профилей, а также полный импорт групп прокси (`proxy-groups`), правил маршрутизации (`rules`) и настроек `DNS` из `Clash YAML` и `Xray JSON`.
+* **Горячее обновление серверных TLS-сертификатов без разрыва соединений:**
+  * Добавлена замена сертификата и приватного ключа (`certificate_path`/`key_path` и inline `certificate`/`key`) на лету при `SIGHUP` и `PUT /configs` для `Hysteria 2`, `TUIC`, `MASQUE`, `NaiveProxy`, `TrustTunnel`, `TewFai`, `FPTN`, `VLESS`, `Trojan`, `VMess`, `AnyTLS`, `Mixed`, `OpenConnect` и `Shadowsocks` без перезапуска слушателей и без обрыва активных соединений на остальных входах.
+  * Перед применением новая пара сертификата и ключа проверяется на соответствие (`SigningKey::public_key` + `CertifiedKey::keys_match`); при ошибке прежний сертификат сохраняется активным.
 * **Кросс-движковая совместимость:**
   * Подтверждена полная двусторонняя совместимость (`143` сценария в ролях клиента и сервера против `tachyon-core`, `sing-box-extended`, `sing-box`, `podkop`, `Xray` и `Mihomo` — `0` ошибок).
 
